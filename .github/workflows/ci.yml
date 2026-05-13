@@ -33,9 +33,9 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - uses: actions-rust-lang/setup-rust-toolchain@v1
-      - name: Install maturin and build extension
-        run: |
-          pip install maturin pytest
-          maturin develop --release --manifest-path crates/core/Cargo.toml
+      - name: Install ifcfast (builds Rust extension via maturin)
+        run: pip install .
+      - name: Install pytest
+        run: pip install pytest
       - name: Run pytest
         run: pytest -q
