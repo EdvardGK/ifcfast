@@ -29,7 +29,7 @@ python = ["dep:pyo3"]
 mesh = ["dep:earcutr", "dep:glam"]
 
 [dependencies]
-pyo3 = { version = "0.22", features = ["extension-module"], optional = true }
+pyo3 = { version = "0.22", features = ["extension-module", "abi3-py310"], optional = true }
 memchr = "2.7"
 memmap2 = "0.9"
 earcutr = { version = "0.4", optional = true }

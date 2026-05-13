@@ -32,7 +32,7 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.target }}
-          args: --release --out dist --find-interpreter --manifest-path crates/core/Cargo.toml
+          args: --release --out dist --manifest-path crates/core/Cargo.toml
           manylinux: auto
       - uses: actions/upload-artifact@v6
         with:
@@ -50,7 +50,7 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           target: x64
-          args: --release --out dist --find-interpreter --manifest-path crates/core/Cargo.toml
+          args: --release --out dist --manifest-path crates/core/Cargo.toml
       - uses: actions/upload-artifact@v6
         with:
           name: wheels-windows-x64
@@ -75,7 +75,7 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.target }}
-          args: --release --out dist --find-interpreter --manifest-path crates/core/Cargo.toml
+          args: --release --out dist --manifest-path crates/core/Cargo.toml
       - uses: actions/upload-artifact@v6
         with:
           name: wheels-macos-${{ matrix.target }}
