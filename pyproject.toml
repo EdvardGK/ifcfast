@@ -1,0 +1,49 @@
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "ifcfast"
+version = "0.1.0"
+description = "Fast native IFC parsing, data extraction, and geometric analytics"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [
+    { name = "Edvard Granskogen Kjorstad", email = "ed.subscript@gmail.com" },
+]
+keywords = ["IFC", "BIM", "QTO", "parser", "rust"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Rust",
+    "Topic :: Scientific/Engineering",
+]
+dependencies = [
+    "pandas>=2.0.0",
+    "pyarrow>=14.0.0",
+    "pyyaml>=6.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4.0",
+    "openpyxl>=3.1.0",          # used by validate.py for Solibri ITO reads
+    "ifcopenshell>=0.8.0",      # only required if you want to cross-check against ifcopenshell
+]
+
+[project.scripts]
+ifcfast = "ifcfast.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/EdvardGK/ifcfast"
+Issues = "https://github.com/EdvardGK/ifcfast/issues"
+
+[tool.maturin]
+manifest-path = "crates/core/Cargo.toml"
+module-name = "ifcfast._core"
+features = ["python", "mesh"]
+strip = true
+python-source = "python"

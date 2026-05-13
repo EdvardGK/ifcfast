@@ -1,0 +1,208 @@
+//! `IfcMappedItem` → instance of a shared shape with a transform.
+//!
+//! Algorithm (Agent C spec):
+//!   1. `src = MappingSource` (IfcRepresentationMap)
+//!   2. `target = MappingTarget` (IfcCartesianTransformationOperator3D[NonUniform])
+//!   3. `t_target` = transformation operator matrix
+//!   4. `t_origin` = axis-placement matrix of `src.MappingOrigin`
+//!   5. For each item in `src.MappedRepresentation.Items`, mesh it once
+//!      (cached by step_id) and transform every vertex by
+//!      `(t_target @ t_origin)`.
+//!
+//! Mapped items can nest, so the meshing recursion lives in
+//! `super::mesh_item`; this module just resolves the references and the
+//! composition matrix.
+
+use std::collections::HashMap;
+
+use glam::{Mat4, Vec3, Vec4};
+
+use crate::entity_table::EntityTable;
+use crate::lexer::{parse_field, split_top_level_args, Field};
+use crate::mesh::extrusion::LocalMesh;
+use crate::mesh::placement::axis_placement_3d_from_id;
+
+/// Resolve an `IfcMappedItem`, recursing into its source's items.
+pub fn expand(
+    table: &EntityTable,
+    item_id: u64,
+    shape_cache: &mut HashMap<u64, Vec<(LocalMesh, &'static str)>>,
+) -> Vec<(LocalMesh, &'static str)> {
+    let (type_name, args) = match table.get(item_id) {
+        Some(x) => x,
+        None => return Vec::new(),
+    };
+    if !type_name.eq_ignore_ascii_case(b"IFCMAPPEDITEM") {
+        return Vec::new();
+    }
+    let fields = split_top_level_args(args);
+    // IfcMappedItem(MappingSource, MappingTarget)
+    let src_id = match parse_field(*fields.first().unwrap_or(&&[][..])) {
+        Field::Ref(id) => id,
+        _ => return Vec::new(),
+    };
+    let target_id = match parse_field(*fields.get(1).unwrap_or(&&[][..])) {
+        Field::Ref(id) => Some(id),
+        _ => None,
+    };
+
+    // src: IfcRepresentationMap(MappingOrigin, MappedRepresentation)
+    let (src_type, src_args) = match table.get(src_id) {
+        Some(x) => x,
+        None => return Vec::new(),
+    };
+    if !src_type.eq_ignore_ascii_case(b"IFCREPRESENTATIONMAP") {
+        return Vec::new();
+    }
+    let src_fields = split_top_level_args(src_args);
+    let origin_id = match parse_field(*src_fields.first().unwrap_or(&&[][..])) {
+        Field::Ref(id) => Some(id),
+        _ => None,
+    };
+    let mapped_repr_id = match parse_field(*src_fields.get(1).unwrap_or(&&[][..])) {
+        Field::Ref(id) => id,
+        _ => return Vec::new(),
+    };
+
+    let t_origin = origin_id
+        .map(|id| axis_placement_3d_from_id(table, id))
+        .unwrap_or(Mat4::IDENTITY);
+    let t_target = target_id
+        .map(|id| transformation_operator_matrix(table, id))
+        .unwrap_or(Mat4::IDENTITY);
+    let composed = t_target * t_origin;
+
+    // Walk the source representation's Items (it's an IfcShapeRepresentation).
+    let item_ids = super::representation_items(table, mapped_repr_id);
+    let mut out: Vec<(LocalMesh, &'static str)> = Vec::new();
+    for inner in item_ids {
+        for (mesh, src) in super::mesh_item(table, inner, shape_cache) {
+            out.push((transform_mesh(&mesh, composed), if src == "extrusion" { "mapped" } else { src }));
+        }
+    }
+    out
+}
+
+fn transform_mesh(mesh: &LocalMesh, m: Mat4) -> LocalMesh {
+    let mut verts = Vec::with_capacity(mesh.vertices.len());
+    for chunk in mesh.vertices.chunks_exact(3) {
+        let p = Vec3::new(chunk[0], chunk[1], chunk[2]);
+        let r = m * Vec4::new(p.x, p.y, p.z, 1.0);
+        verts.push(r.x);
+        verts.push(r.y);
+        verts.push(r.z);
+    }
+    LocalMesh {
+        vertices: verts,
+        indices: mesh.indices.clone(),
+    }
+}
+
+fn transformation_operator_matrix(table: &EntityTable, id: u64) -> Mat4 {
+    let (type_name, args) = match table.get(id) {
+        Some(x) => x,
+        None => return Mat4::IDENTITY,
+    };
+    let is_3d = type_name.eq_ignore_ascii_case(b"IFCCARTESIANTRANSFORMATIONOPERATOR3D");
+    let is_3d_non = type_name.eq_ignore_ascii_case(b"IFCCARTESIANTRANSFORMATIONOPERATOR3DNONUNIFORM");
+    if !is_3d && !is_3d_non {
+        return Mat4::IDENTITY;
+    }
+    let fields = split_top_level_args(args);
+    // IfcCartesianTransformationOperator3D
+    //   arg[0] = Axis1, arg[1] = Axis2, arg[2] = LocalOrigin, arg[3] = Scale, arg[4] = Axis3
+    // *3DnonUniform adds Scale2 (arg[5]) + Scale3 (arg[6]).
+    let read_dir = |idx: usize| -> Option<Vec3> {
+        let f = fields.get(idx).copied()?;
+        match parse_field(f) {
+            Field::Ref(did) => direction(table, did),
+            _ => None,
+        }
+    };
+    let read_pt = |idx: usize| -> Vec3 {
+        fields
+            .get(idx)
+            .copied()
+            .and_then(|f| match parse_field(f) {
+                Field::Ref(pid) => cartesian_point(table, pid),
+                _ => None,
+            })
+            .unwrap_or(Vec3::ZERO)
+    };
+    let read_num = |idx: usize, default: f32| -> f32 {
+        fields
+            .get(idx)
+            .copied()
+            .and_then(|f| match parse_field(f) {
+                Field::Number(n) => Some(n as f32),
+                _ => None,
+            })
+            .unwrap_or(default)
+    };
+
+    let axis1 = read_dir(0).unwrap_or(Vec3::X).normalize_or_zero();
+    let axis2 = read_dir(1).unwrap_or(Vec3::Y).normalize_or_zero();
+    let origin = read_pt(2);
+    let scale = read_num(3, 1.0);
+    let axis3 = read_dir(4).unwrap_or(axis1.cross(axis2)).normalize_or_zero();
+    let (s1, s2, s3) = if is_3d_non {
+        (scale, read_num(5, scale), read_num(6, scale))
+    } else {
+        (scale, scale, scale)
+    };
+
+    Mat4::from_cols(
+        Vec4::new(axis1.x * s1, axis1.y * s1, axis1.z * s1, 0.0),
+        Vec4::new(axis2.x * s2, axis2.y * s2, axis2.z * s2, 0.0),
+        Vec4::new(axis3.x * s3, axis3.y * s3, axis3.z * s3, 0.0),
+        Vec4::new(origin.x, origin.y, origin.z, 1.0),
+    )
+}
+
+fn cartesian_point(table: &EntityTable, id: u64) -> Option<Vec3> {
+    let (type_name, args) = table.get(id)?;
+    if !type_name.eq_ignore_ascii_case(b"IFCCARTESIANPOINT") {
+        return None;
+    }
+    let fields = split_top_level_args(args);
+    let body = match parse_field(*fields.first()?) {
+        Field::List(b) => b,
+        _ => return None,
+    };
+    let coords: Vec<f32> = split_top_level_args(body)
+        .into_iter()
+        .filter_map(|f| match parse_field(f) {
+            Field::Number(n) => Some(n as f32),
+            _ => None,
+        })
+        .collect();
+    Some(Vec3::new(
+        *coords.first().unwrap_or(&0.0),
+        *coords.get(1).unwrap_or(&0.0),
+        *coords.get(2).unwrap_or(&0.0),
+    ))
+}
+
+fn direction(table: &EntityTable, id: u64) -> Option<Vec3> {
+    let (type_name, args) = table.get(id)?;
+    if !type_name.eq_ignore_ascii_case(b"IFCDIRECTION") {
+        return None;
+    }
+    let fields = split_top_level_args(args);
+    let body = match parse_field(*fields.first()?) {
+        Field::List(b) => b,
+        _ => return None,
+    };
+    let ratios: Vec<f32> = split_top_level_args(body)
+        .into_iter()
+        .filter_map(|f| match parse_field(f) {
+            Field::Number(n) => Some(n as f32),
+            _ => None,
+        })
+        .collect();
+    Some(Vec3::new(
+        *ratios.first().unwrap_or(&0.0),
+        *ratios.get(1).unwrap_or(&0.0),
+        *ratios.get(2).unwrap_or(&0.0),
+    ))
+}

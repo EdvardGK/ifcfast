@@ -1,0 +1,36 @@
+[package]
+name = "ifcfast-core"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Fast native IFC parser and data extractors"
+repository = "https://github.com/EdvardGK/ifcfast"
+
+[lib]
+# Python sees this module at `ifcfast._core` thanks to maturin's
+# `module-name` setting in pyproject.toml. The user-facing API in
+# python/ifcfast/__init__.py wraps this.
+name = "_core"
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "ifcfast-bench"
+path = "src/bin/bench.rs"
+required-features = []
+
+[[bin]]
+name = "ifcfast-mesh"
+path = "src/bin/mesh.rs"
+required-features = ["mesh"]
+
+[features]
+default = ["python"]
+python = ["dep:pyo3"]
+mesh = ["dep:earcutr", "dep:glam"]
+
+[dependencies]
+pyo3 = { version = "0.22", features = ["extension-module"], optional = true }
+memchr = "2.7"
+memmap2 = "0.9"
+earcutr = { version = "0.4", optional = true }
+glam = { version = "0.29", optional = true }

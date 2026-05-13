@@ -1,0 +1,41 @@
+# Federated-floor rule for Skiplum LBK Building C.
+#
+# Storey-name conventions used by the discipline authors on this specific
+# building. Lives next to the project, NOT in the parser module — every
+# project needs its own config because authoring conventions vary by team.
+#
+# Pass via `validate_against_ito.py --project-config data/projects/lbk-building-c.yaml`
+# (or load directly via `load_rule_from_yaml(...)`).
+#
+# Validated against `data/reference/20260510_ITO_SkiplumStandard_LBK.xlsx`
+# at 100% federated_floor agreement on 2026-05-11.
+
+# Prepended to every cluster label that isn't already in final form.
+prefix: "C - "
+
+# Storey names that map to a fixed final label, bypassing the prefix.
+# Keys may be raw names OR their drop-leading-zero normalisation; the
+# rule scans every cluster member, so authoring divergence between
+# disciplines is handled (e.g. RIE author writes `Plan U1`, ARK writes
+# `C - U1` for the same physical level — either triggers the override).
+overrides:
+  # Basement / sea-level slab — different authors call it different things.
+  Plan U1: Hav
+  Grunn U1: Hav
+  C - U1: Hav
+  2.  C - U1: Hav       # RIVv author prefixes a discipline tag
+  C - bunnarmering: Hav # RIVr structural sub-layer: bottom reinforcement
+  C - topparmering: Hav # RIVr structural sub-layer: top reinforcement
+  "1. Hav": Hav
+  HAV: Hav
+  Undefined: Hav        # RIBp Tekla export lumps the whole basement here
+
+# Labels in final form — never re-prefix even if they don't start with the
+# building prefix.
+idempotent_labels:
+  - Hav
+
+# Whether to apply leading-zero stripping to numeric tokens before the
+# prefix is added. Most authoring tools emit `Plan 01`; most ITO
+# conventions strip the zero.
+apply_drop_leading_zero: true
