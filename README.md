@@ -109,6 +109,21 @@ Disk footprint on a 200 MB Archicad IFC: **2.4 MB total** zstd-compressed.
 All extractors return long-format (one row per fact, no nested fields).
 Easy to join, easy to filter, easy to flatten to Excel.
 
+**Missing values:** string columns use pandas `StringDtype` with `nan`
+as the NULL sentinel (chosen for memory and pyarrow round-trip).
+Cells corresponding to a STEP `$` field hold `float('nan')`, **not**
+Python `None`. Use `.isna()` to test, not `== None` or `is None`:
+
+```python
+m.classifications[m.classifications.identification.isna()]   # correct
+m.classifications[m.classifications.identification == None]  # always False
+[r for r in m.classifications.itertuples() if r.identification is None]  # always False
+```
+
+If you're cross-checking against `ifcopenshell` (which returns `None`),
+normalise NaN→None on the comparison side.
+
+
 ### psets
 
 | column | type | description |

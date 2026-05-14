@@ -49,7 +49,7 @@ def _cmd_extract(args: argparse.Namespace) -> int:
     }
     cold = layers.timing_ms.get("cold_parse", False)
     total = layers.timing_ms.get("total_ms", 0)
-    print(f"{'cold parse' if cold else 'cache hit'} — {total:.0f} ms")
+    print(f"{'cold parse' if cold else 'cache hit'}: {total:.0f} ms")
     for name, n in rows.items():
         print(f"  {name:<16} {n}")
     return 0
@@ -61,7 +61,7 @@ def _cmd_drift(args: argparse.Namespace) -> int:
     layers = extract_data_layers(args.file, include_drift=True)
     df = layers.drift
     if df is None:
-        print("drift unavailable — _core built without `mesh` feature")
+        print("drift unavailable: _core built without `mesh` feature")
         return 1
     print(f"products with geometry: {len(df)}")
     counts = df["drift_severity"].value_counts().to_dict()

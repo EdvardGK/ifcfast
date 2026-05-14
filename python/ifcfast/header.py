@@ -49,6 +49,21 @@ class IFCHeader:
     def size_mb(self) -> float:
         return self.size_bytes / (1024 * 1024)
 
+    @property
+    def authoring_app(self) -> Optional[str]:
+        """Alias for ``originating_system`` (STEP ``FILE_NAME`` slot 6).
+
+        Note this can differ from :attr:`Model.authoring_app`, which reads
+        ``IfcApplication.ApplicationFullName`` from the entity table. The
+        STEP header records the *exporter* that wrote the file; the
+        IfcApplication entity records the *authoring tool* the user worked
+        in. They often disagree (e.g. "Graphisoft - Archicad - 29.0.2" vs
+        "Archicad 29.0.2 (3200) NOR FULL"). Both are exposed under the
+        same name for ergonomics; use ``originating_system`` if you want
+        the STEP-spec terminology.
+        """
+        return self.originating_system
+
 
 def header(path: str | Path) -> IFCHeader:
     """Parse the STEP header of an IFC file."""

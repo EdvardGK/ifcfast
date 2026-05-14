@@ -29,6 +29,8 @@ def test_header():
     assert h.schema == "IFC4"
     assert h.preprocessor_version == "ifcfast"
     assert h.originating_system == "ifcfast-tests"
+    # authoring_app is an alias for originating_system (matches Model.authoring_app naming)
+    assert h.authoring_app == h.originating_system
     assert "ifcfast tests" in h.author
     assert h.size_bytes == FIXTURE.stat().st_size
     assert len(h.cache_key) == 16  # 16-hex-char short digest
