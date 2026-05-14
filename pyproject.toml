@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "ifcfast"
-version = "0.1.0a1"
+version = "0.1.0a2"
 description = "Fast native IFC parsing, data extraction, and geometric analytics"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -47,3 +47,4 @@ module-name = "ifcfast._core"
 features = ["python", "mesh"]
 strip = true
 python-source = "python"
+include = [{ path = "LICENSE", format = "sdist" }]
