@@ -38,7 +38,7 @@ jobs:
         if: ${{ matrix.target == 'x86_64' }}
         run: |
           pip install pytest
-          pip install ifcfast --no-index --find-links dist
+          pip install ifcfast --find-links dist
           pytest tests/test_smoke.py -q
       - uses: actions/upload-artifact@v6
         with:
@@ -60,7 +60,7 @@ jobs:
       - name: Smoke-test built wheel
         run: |
           pip install pytest
-          pip install ifcfast --no-index --find-links dist
+          pip install ifcfast --find-links dist
           pytest tests/test_smoke.py -q
       - uses: actions/upload-artifact@v6
         with:
@@ -90,7 +90,7 @@ jobs:
       - name: Smoke-test built wheel
         run: |
           pip install pytest
-          pip install ifcfast --no-index --find-links dist
+          pip install ifcfast --find-links dist
           pytest tests/test_smoke.py -q
       - uses: actions/upload-artifact@v6
         with:
