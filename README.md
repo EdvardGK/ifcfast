@@ -1,5 +1,10 @@
 # ifcfast
 
+[![PyPI](https://img.shields.io/pypi/v/ifcfast.svg)](https://pypi.org/project/ifcfast/)
+[![Python versions](https://img.shields.io/pypi/pyversions/ifcfast.svg)](https://pypi.org/project/ifcfast/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![CI](https://github.com/EdvardGK/ifcfast/actions/workflows/ci.yml/badge.svg)](https://github.com/EdvardGK/ifcfast/actions/workflows/ci.yml)
+
 Fast native IFC parsing, data extraction and geometric analytics. Python
 on top, Rust underneath, no `ifcopenshell.open()` on the hot path.
 
@@ -36,14 +41,27 @@ parity vs `ifcopenshell`. See
 
 ## Install
 
+```bash
+pip install ifcfast
+```
+
+Pre-built abi3 wheels are available for Python 3.10+ on:
+- Linux x86_64 and aarch64 (manylinux2014)
+- macOS x86_64 (10.12+) and arm64 (11.0+)
+- Windows x64
+
+### From source (contributors)
+
 Needs Rust 1.95+ and Python 3.10+.
 
 ```bash
+git clone https://github.com/EdvardGK/ifcfast
+cd ifcfast
 pip install maturin
 maturin develop --release      # builds the Rust extension, ~30 s first time
 ```
 
-For production: `maturin build --release` produces a wheel.
+For a release wheel: `maturin build --release`.
 
 ## Quick start
 
