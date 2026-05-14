@@ -34,6 +34,12 @@ jobs:
           target: ${{ matrix.target }}
           args: --release --out dist --manifest-path crates/core/Cargo.toml
           manylinux: auto
+      - name: Smoke-test built wheel (native arch only)
+        if: ${{ matrix.target == 'x86_64' }}
+        run: |
+          pip install pytest
+          pip install ifcfast --no-index --find-links dist
+          pytest tests/test_smoke.py -q
       - uses: actions/upload-artifact@v6
         with:
           name: wheels-linux-${{ matrix.target }}
@@ -51,6 +57,11 @@ jobs:
         with:
           target: x64
           args: --release --out dist --manifest-path crates/core/Cargo.toml
+      - name: Smoke-test built wheel
+        run: |
+          pip install pytest
+          pip install ifcfast --no-index --find-links dist
+          pytest tests/test_smoke.py -q
       - uses: actions/upload-artifact@v6
         with:
           name: wheels-windows-x64
@@ -76,6 +87,11 @@ jobs:
         with:
           target: ${{ matrix.target }}
           args: --release --out dist --manifest-path crates/core/Cargo.toml
+      - name: Smoke-test built wheel
+        run: |
+          pip install pytest
+          pip install ifcfast --no-index --find-links dist
+          pytest tests/test_smoke.py -q
       - uses: actions/upload-artifact@v6
         with:
           name: wheels-macos-${{ matrix.target }}

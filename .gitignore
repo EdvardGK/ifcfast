@@ -36,3 +36,4 @@ Thumbs.db
 *.obj
 *.parquet
 !examples/**/*.ifc
+!tests/fixtures/*.ifc
