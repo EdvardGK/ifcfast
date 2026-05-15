@@ -1,0 +1,742 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>ifcfast graph &mdash; __FILENAME__</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #0e1116; color: #d1d5db;
+    font: 13px/1.45 -apple-system, "Segoe UI", system-ui, sans-serif; overflow: hidden; }
+  #app { display: grid; grid-template-columns: 280px 1fr 380px; height: 100vh; }
+  #right { display: grid; grid-template-rows: 280px 1fr; min-height: 0;
+    border-left: 1px solid #2a3140; background: #11161f; }
+  #mesh-wrap { position: relative; border-bottom: 1px solid #2a3140;
+    min-height: 0; overflow: hidden; background: #0e1116; }
+  #mesh-wrap canvas { display: block; }
+  #mesh-hud { position: absolute; top: 6px; left: 8px; right: 8px;
+    font-size: 10px; color: #64748b; z-index: 10; pointer-events: none;
+    display: flex; justify-content: space-between; }
+  #mesh-hud b { color: #cbd5e1; font-weight: 600; }
+  #mesh-empty { position: absolute; inset: 0; display: flex;
+    align-items: center; justify-content: center; color: #475569;
+    font-size: 11px; text-align: center; padding: 16px; pointer-events: none; }
+
+  #types { background: #0b0f17; border-right: 1px solid #2a3140;
+    display: flex; flex-direction: column; overflow: hidden; }
+  #types-header { padding: 10px 12px; border-bottom: 1px solid #2a3140;
+    font-size: 12px; color: #94a3b8; display: flex; justify-content: space-between; }
+  #types-header h2 { margin: 0; font-size: 13px; color: #f1f5f9; }
+  #types-header button { background: none; border: none; color: #60a5fa;
+    cursor: pointer; font-size: 12px; padding: 0; }
+  #types-header button:hover { color: #93c5fd; }
+  #types-search { padding: 8px 12px; border-bottom: 1px solid #2a3140; }
+  #types-search input { width: 100%; background: #1a1f2a; border: 1px solid #2a3140;
+    color: #d1d5db; padding: 4px 8px; border-radius: 4px; font-size: 12px;
+    box-sizing: border-box; }
+  #types-list { overflow-y: auto; flex: 1; }
+  .ent-group { border-bottom: 1px solid #1a1f2a; }
+  .ent-header { padding: 8px 12px; cursor: pointer; display: flex;
+    justify-content: space-between; align-items: center;
+    color: #cbd5e1; background: #11161f; font-weight: 600; font-size: 12px;
+    user-select: none; }
+  .ent-header:hover { background: #1a1f2a; }
+  .ent-header .count { color: #64748b; font-weight: 400; font-size: 11px; }
+  .ent-types { display: none; }
+  .ent-group.open .ent-types { display: block; }
+  .ent-group.open .ent-header .arrow { transform: rotate(90deg); }
+  .arrow { display: inline-block; width: 10px; transition: transform 100ms; }
+  .type-row { padding: 4px 12px 4px 28px; cursor: pointer; display: flex;
+    justify-content: space-between; gap: 8px; align-items: center; font-size: 12px; }
+  .type-row:hover { background: #1a1f2a; }
+  .type-row.selected { background: #1e293b; border-left: 2px solid #fbbf24;
+    padding-left: 26px; }
+  .type-row .name { flex: 1; overflow: hidden; text-overflow: ellipsis;
+    white-space: nowrap; }
+  .type-row .name.synthetic { color: #94a3b8; font-style: italic; }
+  .type-row .pill { background: #1e293b; color: #94a3b8;
+    padding: 1px 6px; border-radius: 10px; font-size: 10px; flex-shrink: 0; }
+
+  #graph-wrap { position: relative; min-height: 0; overflow: hidden; }
+  #hud { position: absolute; top: 12px; left: 12px; max-width: 360px;
+    background: rgba(26,31,42,0.85); border: 1px solid #2a3140; padding: 10px 12px;
+    border-radius: 6px; pointer-events: none; z-index: 10; backdrop-filter: blur(4px); }
+  #hud h1 { margin: 0 0 4px; font-size: 13px; font-weight: 600; color: #f1f5f9; }
+  #hud .stat { color: #94a3b8; }
+  #legend { position: absolute; bottom: 12px; left: 12px;
+    background: rgba(26,31,42,0.85); border: 1px solid #2a3140; padding: 8px 10px;
+    border-radius: 6px; font-size: 12px; z-index: 10; backdrop-filter: blur(4px); }
+  #legend .row { display: flex; align-items: center; gap: 6px; margin: 2px 0; }
+  #legend .swatch { width: 12px; height: 12px; border-radius: 50%; }
+  #tip { position: fixed; pointer-events: none; background: #1a1f2a;
+    border: 1px solid #2a3140; padding: 6px 8px; border-radius: 4px;
+    font-size: 12px; display: none; max-width: 280px; z-index: 30; }
+  svg { display: block; }
+  .link { stroke: #2a3140; stroke-opacity: 0.6; }
+  .link.contain { stroke-dasharray: 2 3; }
+  .link.highlight { stroke: #fbbf24; stroke-opacity: 0.9; stroke-width: 1.5; }
+  .link.dim { stroke-opacity: 0.08; }
+  .node { stroke: #0e1116; stroke-width: 1px; cursor: pointer; }
+  .node.dim { opacity: 0.15; }
+  .node.type-match { stroke: #fbbf24; stroke-width: 2px; }
+  .node.selected { stroke: #fbbf24; stroke-width: 2.5px; }
+  .label { fill: #e2e8f0; font-size: 11px; pointer-events: none;
+    paint-order: stroke; stroke: #0e1116; stroke-width: 3px; stroke-linejoin: round; }
+
+  #info { overflow-y: auto; box-sizing: border-box; padding: 16px 18px;
+    min-height: 0; }
+  #info.empty .placeholder { display: flex; }
+  #info .placeholder { display: none; height: calc(100% - 32px);
+    align-items: center; justify-content: center; text-align: center;
+    color: #475569; font-size: 12px; padding: 20px; }
+  #info h2 { margin: 0 0 4px; font-size: 15px; color: #f1f5f9;
+    word-break: break-word; }
+  #info .ent { color: #94a3b8; font-size: 12px; margin-bottom: 12px; }
+  #info h3 { margin: 14px 0 6px; font-size: 12px; color: #94a3b8;
+    text-transform: uppercase; letter-spacing: 0.04em; border-top: 1px solid #2a3140;
+    padding-top: 10px; }
+  #info table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  #info table td { padding: 2px 4px; vertical-align: top; }
+  #info table td.k { color: #94a3b8; width: 42%; white-space: nowrap; }
+  #info table td.v { color: #e2e8f0; word-break: break-word; }
+  #info code { font: 11px/1.4 ui-monospace, Consolas, monospace; color: #cbd5e1; }
+  #info .chain { font-size: 12px; margin-bottom: 8px; }
+  #info .ancestor, #info .pset-name, #info .inst-link, #info .type-link {
+    color: #60a5fa; cursor: pointer; }
+  #info .ancestor:hover, #info .inst-link:hover, #info .type-link:hover {
+    text-decoration: underline; }
+  #info .crumb { color: #475569; margin: 0 4px; }
+  #info ul { margin: 4px 0 0; padding-left: 16px; }
+  #info li { margin: 1px 0; }
+  #info .pset-name { color: #fbbf24; cursor: default; }
+  #info .badges { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 10px; }
+  #info .badge { background: #1e293b; color: #cbd5e1; padding: 2px 8px;
+    border-radius: 10px; font-size: 11px; }
+  #info .badge.warn { background: #422006; color: #fbbf24; }
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="types">
+    <div id="types-header">
+      <h2>Types</h2>
+      <button onclick="clearTypeFilter()">clear</button>
+    </div>
+    <div id="types-search"><input type="text" placeholder="filter types..." id="types-search-input"></div>
+    <div id="types-list"></div>
+  </div>
+
+  <div id="graph-wrap">
+    <div id="hud">
+      <h1>__FILENAME__</h1>
+      <div class="stat">__SIZE__ MB &middot; __NPROD__ products &middot; __NSTOREY__ storeys &middot; __NTYPES__ types</div>
+      <div class="stat">graph: __NNODES__ nodes &middot; __NLINKS__ edges</div>
+      <div class="stat">scroll = zoom, drag = pan, click node = instance, click type = filter</div>
+    </div>
+    <div id="legend"></div>
+    <div id="tip"></div>
+    <svg></svg>
+  </div>
+
+  <div id="right">
+    <div id="mesh-wrap">
+      <div id="mesh-hud"><span><b>preview</b></span><span id="mesh-stats">loading mesh...</span></div>
+      <div id="mesh-empty">select an instance or type to preview</div>
+    </div>
+    <div id="info" class="empty">
+      <div class="placeholder">Click a node in the graph for instance details, or a type on the left to filter.</div>
+      <div id="info-body"></div>
+    </div>
+  </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/d3@7"></script>
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.169.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.169.0/examples/jsm/"
+  }
+}
+</script>
+<script>
+// Expose to both classic and module scripts. `const` at script-scope is
+// not visible to module scripts; explicit window assignment is.
+window.data = __DATA__;
+window.GLB_B64 = "__GLB_B64__";
+const data = window.data;
+const byId = new Map(data.nodes.map(n => [n.id, n]));
+const typeById = new Map(data.types.map(t => [t.id, t]));
+const instancesOf = new Map();
+for (const n of data.nodes) {
+  if (n.type_id) {
+    if (!instancesOf.has(n.type_id)) instancesOf.set(n.type_id, []);
+    instancesOf.get(n.type_id).push(n.id);
+  }
+}
+
+const kidsOf = new Map();
+for (const l of data.links) {
+  const tgt = typeof l.target === "object" ? l.target.id : l.target;
+  const src = typeof l.source === "object" ? l.source.id : l.source;
+  if (!kidsOf.has(tgt)) kidsOf.set(tgt, []);
+  kidsOf.get(tgt).push(src);
+}
+
+const PALETTE = {
+  IfcProject:"#fbbf24", IfcSite:"#f59e0b", IfcBuilding:"#ef4444",
+  IfcBuildingStorey:"#ec4899", IfcSpace:"#a78bfa",
+  IfcElementAssembly:"#22d3ee", IfcSlab:"#10b981", IfcWall:"#34d399",
+  IfcBeam:"#84cc16", IfcColumn:"#3b82f6", IfcMember:"#0ea5e9",
+  IfcPlate:"#06b6d4", IfcDiscreteAccessory:"#a3a3a3",
+  IfcFastener:"#737373", IfcReinforcingBar:"#94a3b8",
+  IfcReinforcingMesh:"#64748b", IfcGrid:"#f472b6",
+};
+const colorFor = (entity) => PALETTE[entity] ?? "#6b7280";
+const RADIUS = { IfcProject:14, IfcSite:12, IfcBuilding:10, IfcBuildingStorey:8,
+  IfcSpace:6, IfcElementAssembly:5 };
+const radiusFor = (entity) => RADIUS[entity] ?? 3;
+
+const typesByEntity = new Map();
+for (const t of data.types) {
+  const e = t.instance_entity;
+  if (!typesByEntity.has(e)) typesByEntity.set(e, []);
+  typesByEntity.get(e).push(t);
+}
+for (const arr of typesByEntity.values()) {
+  arr.sort((a, b) => b.instance_count - a.instance_count);
+}
+const entityOrder = [...typesByEntity.keys()].sort((a, b) =>
+  typesByEntity.get(b).reduce((s,t) => s+t.instance_count, 0)
+  - typesByEntity.get(a).reduce((s,t) => s+t.instance_count, 0));
+
+const typesList = document.getElementById("types-list");
+for (const ent of entityOrder) {
+  const arr = typesByEntity.get(ent);
+  const total = arr.reduce((s,t) => s+t.instance_count, 0);
+  const group = document.createElement("div");
+  group.className = "ent-group";
+  group.dataset.entity = ent;
+  group.innerHTML = `
+    <div class="ent-header"><span><span class="arrow">&rsaquo;</span> ${esc(ent)}</span>
+      <span class="count">${arr.length} types &middot; ${total} inst</span></div>
+    <div class="ent-types"></div>`;
+  const tl = group.querySelector(".ent-types");
+  for (const t of arr) {
+    const row = document.createElement("div");
+    row.className = "type-row";
+    row.dataset.typeId = t.id;
+    row.innerHTML = `
+      <span class="name ${t.kind === 'synthetic' ? 'synthetic' : ''}" title="${esc(t.type_name)}">${esc(t.type_name)}</span>
+      <span class="pill">${t.instance_count}</span>`;
+    row.onclick = (e) => { e.stopPropagation(); selectType(t.id); };
+    tl.appendChild(row);
+  }
+  group.querySelector(".ent-header").onclick = () => group.classList.toggle("open");
+  typesList.appendChild(group);
+}
+
+document.getElementById("types-search-input").addEventListener("input", (e) => {
+  const q = e.target.value.toLowerCase().trim();
+  for (const grp of typesList.querySelectorAll(".ent-group")) {
+    let anyMatch = false;
+    for (const row of grp.querySelectorAll(".type-row")) {
+      const m = !q || row.textContent.toLowerCase().includes(q);
+      row.style.display = m ? "" : "none";
+      if (m) anyMatch = true;
+    }
+    grp.style.display = anyMatch ? "" : "none";
+    if (q && anyMatch) grp.classList.add("open");
+  }
+});
+
+const seen = new Set(data.nodes.map(n => n.entity));
+const legend = d3.select("#legend");
+const orderedEntities = [
+  "IfcProject","IfcSite","IfcBuilding","IfcBuildingStorey","IfcSpace",
+  "IfcElementAssembly","IfcSlab","IfcWall","IfcBeam","IfcColumn",
+  "IfcMember","IfcPlate","IfcDiscreteAccessory","IfcFastener",
+  "IfcReinforcingBar","IfcReinforcingMesh","IfcGrid",
+].filter(e => seen.has(e));
+for (const ent of orderedEntities) {
+  const row = legend.append("div").attr("class", "row");
+  row.append("div").attr("class", "swatch").style("background", colorFor(ent));
+  row.append("div").text(ent);
+}
+
+const wrap = document.getElementById("graph-wrap");
+function dims() { return [wrap.clientWidth, wrap.clientHeight]; }
+let [W, H] = dims();
+const svg = d3.select("svg").attr("width", W).attr("height", H);
+const g = svg.append("g");
+
+svg.call(d3.zoom().scaleExtent([0.1, 10]).on("zoom", (e) => g.attr("transform", e.transform)));
+
+const link = g.append("g").selectAll("line")
+  .data(data.links).join("line").attr("class", d => "link " + d.kind);
+
+const node = g.append("g").selectAll("circle")
+  .data(data.nodes).join("circle")
+  .attr("class", "node")
+  .attr("r", d => radiusFor(d.entity))
+  .attr("fill", d => colorFor(d.entity))
+  .on("mouseenter", (e, d) => {
+    const tip = document.getElementById("tip");
+    tip.style.display = "block";
+    tip.textContent = `${d.entity} - ${d.name || "(unnamed)"}`;
+  })
+  .on("mousemove", (e) => {
+    const tip = document.getElementById("tip");
+    tip.style.left = (e.clientX + 12) + "px";
+    tip.style.top = (e.clientY + 12) + "px";
+  })
+  .on("mouseleave", () => { document.getElementById("tip").style.display = "none"; })
+  .on("click", (e, d) => { e.stopPropagation(); selectInstance(d.id); });
+
+svg.on("click", () => { closeInfo(); clearTypeFilter(); });
+
+const labelEntities = new Set(["IfcProject","IfcSite","IfcBuilding","IfcBuildingStorey"]);
+const label = g.append("g").selectAll("text")
+  .data(data.nodes.filter(d => labelEntities.has(d.entity)))
+  .join("text").attr("class", "label").attr("dy", -10).attr("text-anchor", "middle")
+  .text(d => d.name || d.entity);
+
+const sim = d3.forceSimulation(data.nodes)
+  .force("link", d3.forceLink(data.links).id(d => d.id)
+    .distance(d => d.kind === "agg" ? 25 : 35).strength(0.5))
+  .force("charge", d3.forceManyBody().strength(-25))
+  .force("center", d3.forceCenter(W/2, H/2))
+  .force("collide", d3.forceCollide().radius(d => radiusFor(d.entity) + 2))
+  .alphaDecay(0.02)
+  .on("tick", () => {
+    link.attr("x1", d => d.source.x).attr("y1", d => d.source.y)
+        .attr("x2", d => d.target.x).attr("y2", d => d.target.y);
+    node.attr("cx", d => d.x).attr("cy", d => d.y);
+    label.attr("x", d => d.x).attr("y", d => d.y);
+  });
+
+node.call(d3.drag()
+  .on("start", (e, d) => { if (!e.active) sim.alphaTarget(0.3).restart(); d.fx = d.x; d.fy = d.y; })
+  .on("drag",  (e, d) => { d.fx = e.x; d.fy = e.y; })
+  .on("end",   (e, d) => { if (!e.active) sim.alphaTarget(0); d.fx = null; d.fy = null; }));
+
+window.addEventListener("resize", () => {
+  [W, H] = dims();
+  svg.attr("width", W).attr("height", H);
+  sim.force("center", d3.forceCenter(W/2, H/2)).alpha(0.3).restart();
+});
+
+let selectedTypeId = null;
+let selectedInstanceId = null;
+
+function esc(s) {
+  if (s == null) return "";
+  return String(s).replace(/[&<>"']/g, c =>
+    ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+function applyTypeFilter() {
+  const tid = selectedTypeId;
+  if (!tid) {
+    node.classed("dim", false).classed("type-match", false);
+    link.classed("dim", false);
+    return;
+  }
+  const members = new Set(instancesOf.get(tid) || []);
+  const keepEntities = new Set(["IfcProject","IfcSite","IfcBuilding","IfcBuildingStorey"]);
+  node
+    .classed("type-match", d => members.has(d.id))
+    .classed("dim", d => !members.has(d.id) && !keepEntities.has(d.entity));
+  link.classed("dim", l => {
+    const s = typeof l.source === "object" ? l.source.id : l.source;
+    const t = typeof l.target === "object" ? l.target.id : l.target;
+    return !(members.has(s) || members.has(t) ||
+             keepEntities.has((byId.get(s)||{}).entity) ||
+             keepEntities.has((byId.get(t)||{}).entity));
+  });
+}
+
+function selectType(tid) {
+  selectedTypeId = tid;
+  document.querySelectorAll(".type-row").forEach(r =>
+    r.classList.toggle("selected", r.dataset.typeId === tid));
+  applyTypeFilter();
+  renderTypePanel(tid);
+}
+
+function clearTypeFilter() {
+  selectedTypeId = null;
+  document.querySelectorAll(".type-row").forEach(r => r.classList.remove("selected"));
+  applyTypeFilter();
+}
+
+function selectInstance(id) {
+  selectedInstanceId = id;
+  const n = byId.get(id);
+  if (!n) return;
+  node.classed("selected", d => d.id === id);
+  link.classed("highlight", l => {
+    const s = typeof l.source === "object" ? l.source.id : l.source;
+    const t = typeof l.target === "object" ? l.target.id : l.target;
+    return s === id || t === id;
+  });
+  renderInstancePanel(id);
+}
+
+function closeInfo() {
+  document.getElementById("info").classList.add("empty");
+  document.getElementById("info-body").innerHTML = "";
+  node.classed("selected", false);
+  link.classed("highlight", false);
+  selectedInstanceId = null;
+}
+
+function ancestorChain(id) {
+  const out = []; let cur = id; const seen = new Set();
+  while (cur && !seen.has(cur)) { seen.add(cur); out.push(cur);
+    const n = byId.get(cur); cur = n && n.parent_guid; }
+  return out;
+}
+
+function groupPsets(rows) {
+  const groups = new Map();
+  for (const [pset, prop, val] of rows) {
+    const key = pset || "(no pset name)";
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push([prop, val]);
+  }
+  return groups;
+}
+
+function renderInstancePanel(id) {
+  const n = byId.get(id); if (!n) return;
+  const chain = ancestorChain(id).reverse();
+  const kids = kidsOf.get(id) || [];
+  const t = n.type_id ? typeById.get(n.type_id) : null;
+  const html = [];
+  html.push(`<h2>${esc(n.name) || "<em style='color:#64748b'>(unnamed)</em>"}</h2>`);
+  html.push(`<div class="ent">Instance &middot; ${esc(n.entity)}`);
+  if (t) html.push(` &middot; type <span class="type-link" onclick="selectType('${t.id}')">${esc(t.type_name)}</span> (&times;${t.instance_count})`);
+  html.push(`</div>`);
+
+  if (chain.length > 1) {
+    html.push(`<div class="chain">`);
+    chain.forEach((g, i) => {
+      const an = byId.get(g);
+      const lbl = an ? `${esc(an.entity.replace("Ifc",""))}: ${esc(an.name || "(unnamed)")}` : esc(g);
+      if (i > 0) html.push(`<span class="crumb">&rsaquo;</span>`);
+      html.push(g === id
+        ? `<span style="color:#e2e8f0">${lbl}</span>`
+        : `<span class="ancestor" onclick="selectInstance('${g}')">${lbl}</span>`);
+    });
+    html.push(`</div>`);
+  }
+
+  html.push(`<h3>Identity</h3><table>`);
+  html.push(`<tr><td class="k">guid</td><td class="v"><code>${esc(n.id)}</code></td></tr>`);
+  if (n.step_id != null) html.push(`<tr><td class="k">step_id</td><td class="v">#${n.step_id}</td></tr>`);
+  if (n.predefined_type) html.push(`<tr><td class="k">predefined_type</td><td class="v">${esc(n.predefined_type)}</td></tr>`);
+  if (n.object_type) html.push(`<tr><td class="k">object_type</td><td class="v">${esc(n.object_type)}</td></tr>`);
+  if (n.tag) html.push(`<tr><td class="k">tag</td><td class="v">${esc(n.tag)}</td></tr>`);
+  if (n.mode) html.push(`<tr><td class="k">mode</td><td class="v">${esc(n.mode)}</td></tr>`);
+  if (n.elevation != null) html.push(`<tr><td class="k">elevation</td><td class="v">${esc(n.elevation)}</td></tr>`);
+  html.push(`<tr><td class="k">direct children</td><td class="v">${kids.length}</td></tr>`);
+  html.push(`</table>`);
+
+  if (n.mats && n.mats.length) {
+    html.push(`<h3>Materials (${n.mats.length})</h3><ul>`);
+    for (const m of n.mats) html.push(`<li>${esc(m)}</li>`);
+    html.push(`</ul>`);
+  }
+  if (n.cls && n.cls.length) {
+    html.push(`<h3>Classifications (${n.cls.length})</h3><table>`);
+    for (const [sys, ident] of n.cls) html.push(
+      `<tr><td class="k">${esc(sys||"")}</td><td class="v">${esc(ident||"")}</td></tr>`);
+    html.push(`</table>`);
+  }
+  if (n.qtos && n.qtos.length) {
+    html.push(`<h3>Quantities (${n.qtos.length})</h3><table>`);
+    for (const [qto, name, val] of n.qtos) html.push(
+      `<tr><td class="k">${esc(name)}</td><td class="v">${esc(val)}</td></tr>`);
+    html.push(`</table>`);
+  }
+  if (n.psets && n.psets.length) {
+    const groups = groupPsets(n.psets);
+    html.push(`<h3>Property sets (${n.psets.length} props in ${groups.size} sets)</h3>`);
+    for (const [psetName, rows] of groups) {
+      html.push(`<div style="margin-top:8px"><span class="pset-name" style="font-weight:600">${esc(psetName)}</span></div>`);
+      html.push(`<table>`);
+      for (const [prop, val] of rows) html.push(
+        `<tr><td class="k">${esc(prop)}</td><td class="v">${esc(val)}</td></tr>`);
+      html.push(`</table>`);
+    }
+  }
+  if (kids.length) {
+    html.push(`<h3>Direct children (${kids.length})</h3>`);
+    const byEnt = new Map();
+    for (const k of kids) {
+      const kn = byId.get(k);
+      const e = kn ? kn.entity : "?";
+      if (!byEnt.has(e)) byEnt.set(e, []);
+      byEnt.get(e).push(k);
+    }
+    for (const [e, ids] of byEnt) {
+      html.push(`<div style="margin-top:6px;color:#94a3b8">${esc(e)} &times;${ids.length}</div>`);
+      html.push(`<ul>`);
+      for (const k of ids.slice(0, 12)) {
+        const kn = byId.get(k);
+        const lbl = kn ? esc(kn.name || "(unnamed)") : esc(k);
+        html.push(`<li><span class="inst-link" onclick="selectInstance('${k}')">${lbl}</span></li>`);
+      }
+      if (ids.length > 12) html.push(`<li style="color:#64748b">&hellip; ${ids.length - 12} more</li>`);
+      html.push(`</ul>`);
+    }
+  }
+  document.getElementById("info-body").innerHTML = html.join("");
+  document.getElementById("info").classList.remove("empty");
+}
+
+function renderTypePanel(tid) {
+  const t = typeById.get(tid); if (!t) return;
+  const members = instancesOf.get(tid) || [];
+  const html = [];
+  html.push(`<h2>${esc(t.type_name) || "(unnamed type)"}</h2>`);
+  html.push(`<div class="ent">Type &middot; ${esc(t.instance_entity)}`);
+  if (t.type_entity) html.push(` &middot; <code>${esc(t.type_entity)}</code>`);
+  html.push(`</div>`);
+  html.push(`<div class="badges">`);
+  html.push(`<span class="badge">${t.instance_count} instances</span>`);
+  if (t.kind === "ifc_type") html.push(`<span class="badge">IfcRelDefinesByType</span>`);
+  else html.push(`<span class="badge warn">synthetic (name-based)</span>`);
+  if (t.type_guid) html.push(`<span class="badge"><code>${esc(t.type_guid)}</code></span>`);
+  html.push(`</div>`);
+
+  if (t.materials.length) {
+    html.push(`<h3>Materials (union, ${t.materials.length})</h3><ul>`);
+    for (const m of t.materials) html.push(`<li>${esc(m)}</li>`);
+    html.push(`</ul>`);
+  }
+
+  if (t.common_psets.length) {
+    html.push(`<h3>Common props (identical across all ${t.instance_count} instances, ${t.common_psets.length})</h3>`);
+    const groups = new Map();
+    for (const [ps, pr, val] of t.common_psets) {
+      const key = ps || "(no pset)";
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push([pr, val]);
+    }
+    for (const [psName, rows] of groups) {
+      html.push(`<div style="margin-top:8px"><span class="pset-name" style="font-weight:600">${esc(psName)}</span></div>`);
+      html.push(`<table>`);
+      for (const [pr, val] of rows) html.push(
+        `<tr><td class="k">${esc(pr)}</td><td class="v">${esc(val)}</td></tr>`);
+      html.push(`</table>`);
+    }
+  }
+
+  if (t.varying_psets.length) {
+    html.push(`<h3>Varying props (${t.varying_psets.length})</h3>`);
+    html.push(`<table>`);
+    for (const [ps, pr, n] of t.varying_psets.slice(0, 40)) {
+      const detail = n < 0 ? `missing on ${-n} inst` : `${n} distinct values`;
+      html.push(`<tr><td class="k">${esc(ps||"")} &middot; ${esc(pr||"")}</td><td class="v" style="color:#94a3b8">${detail}</td></tr>`);
+    }
+    html.push(`</table>`);
+    if (t.varying_psets.length > 40) html.push(`<div style="color:#64748b;margin-top:4px">&hellip; ${t.varying_psets.length - 40} more</div>`);
+  }
+
+  html.push(`<h3>Instances (${members.length})</h3><ul>`);
+  for (const g of members.slice(0, 30)) {
+    const inst = byId.get(g);
+    const lbl = inst ? esc(inst.name || "(unnamed)") : esc(g);
+    html.push(`<li><span class="inst-link" onclick="selectInstance('${g}')">${lbl}</span></li>`);
+  }
+  if (members.length > 30) html.push(`<li style="color:#64748b">&hellip; ${members.length - 30} more</li>`);
+  html.push(`</ul>`);
+
+  document.getElementById("info-body").innerHTML = html.join("");
+  document.getElementById("info").classList.remove("empty");
+}
+
+window.selectType = selectType;
+window.selectInstance = selectInstance;
+window.closeInfo = closeInfo;
+window.clearTypeFilter = clearTypeFilter;
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+const wrap = document.getElementById('mesh-wrap');
+const statsEl = document.getElementById('mesh-stats');
+const emptyEl = document.getElementById('mesh-empty');
+
+// Gracefully skip the viewer if no GLB was inlined (e.g., --no-mesh).
+if (!window.GLB_B64) {
+  statsEl.textContent = '(no mesh)';
+  emptyEl.textContent = 'pass --mesh-bin to enable 3D preview';
+} else {
+  const scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x0e1116);
+  const camera = new THREE.PerspectiveCamera(50, wrap.clientWidth / wrap.clientHeight, 1, 1e7);
+  camera.position.set(50000, 50000, 50000);
+
+  const renderer = new THREE.WebGLRenderer({ antialias: true });
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+  renderer.setSize(wrap.clientWidth, wrap.clientHeight);
+  wrap.appendChild(renderer.domElement);
+
+  scene.add(new THREE.AmbientLight(0xffffff, 0.45));
+  const dl = new THREE.DirectionalLight(0xffffff, 0.95);
+  dl.position.set(1, 1, 0.7);
+  scene.add(dl);
+
+  const controls = new OrbitControls(camera, renderer.domElement);
+  controls.target.set(0, 0, 0);
+
+  const previewMat = new THREE.MeshLambertMaterial({
+    color: 0xfbbf24, side: THREE.DoubleSide, flatShading: true, emissive: 0x4a2c00,
+  });
+
+  const meshesByGuid = new Map();
+  let glbReady = false;
+  let currentPreviewGuid = null;
+
+  function loadGlb() {
+    const bin = atob(window.GLB_B64);
+    const buf = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) buf[i] = bin.charCodeAt(i);
+    const loader = new GLTFLoader();
+    const t0 = performance.now();
+    loader.parse(buf.buffer, '', (gltf) => {
+      const dt = performance.now() - t0;
+      gltf.scene.traverse((o) => {
+        if (o.isMesh) {
+          o.material = previewMat;
+          if (!o.geometry.attributes.normal) o.geometry.computeVertexNormals();
+          o.matrixAutoUpdate = false;
+          o.visible = false;
+          // ifcfast-mesh writes extras.guid on the GLTF node. Depending on
+          // whether the node has its own mesh or wraps it in a group,
+          // GLTFLoader places extras on object.userData or its parent's.
+          // Walk up until a guid is found (capped at 3 hops).
+          let guid = null;
+          let cur = o;
+          for (let hop = 0; hop < 3 && cur; hop++) {
+            if (cur.userData && cur.userData.guid) { guid = cur.userData.guid; break; }
+            cur = cur.parent;
+          }
+          if (guid) {
+            if (!meshesByGuid.has(guid)) meshesByGuid.set(guid, []);
+            meshesByGuid.get(guid).push(o);
+          }
+        }
+      });
+      gltf.scene.rotation.x = -Math.PI / 2;
+      gltf.scene.updateMatrixWorld(true);
+      scene.add(gltf.scene);
+
+      let meshN = 0, triN = 0;
+      gltf.scene.traverse(o => {
+        if (o.isMesh) {
+          meshN++;
+          const ig = o.geometry.index;
+          triN += (ig ? ig.count : o.geometry.attributes.position.count) / 3;
+        }
+      });
+      statsEl.innerHTML = `<b>${meshesByGuid.size}</b> guid-indexed &middot; <b>${meshN.toLocaleString()}</b> meshes &middot; ${dt.toFixed(0)} ms`;
+      glbReady = true;
+    }, (err) => {
+      statsEl.textContent = 'glb parse error: ' + (err.message || err);
+    });
+  }
+
+  function previewGuid(guid) {
+    if (!glbReady) return;
+    for (const arr of meshesByGuid.values()) for (const m of arr) m.visible = false;
+    const arr = meshesByGuid.get(guid);
+    if (!arr || !arr.length) {
+      currentPreviewGuid = null;
+      emptyEl.style.display = 'flex';
+      emptyEl.textContent = 'no mesh for this element';
+      return;
+    }
+    for (const m of arr) m.visible = true;
+    currentPreviewGuid = guid;
+    emptyEl.style.display = 'none';
+    const box = new THREE.Box3();
+    for (const m of arr) box.expandByObject(m);
+    const size = new THREE.Vector3(); box.getSize(size);
+    const centre = new THREE.Vector3(); box.getCenter(centre);
+    const diag = Math.max(size.length(), 1);
+    const offset = new THREE.Vector3(0.7, 0.55, 1.0).normalize().multiplyScalar(diag * 1.6);
+    camera.position.copy(centre).add(offset);
+    controls.target.copy(centre);
+    camera.near = Math.max(diag / 1000, 1);
+    camera.far = diag * 50;
+    camera.updateProjectionMatrix();
+    controls.update();
+  }
+
+  function clearPreview() {
+    for (const arr of meshesByGuid.values()) for (const m of arr) m.visible = false;
+    currentPreviewGuid = null;
+    emptyEl.style.display = 'flex';
+    emptyEl.textContent = 'select an instance or type to preview';
+  }
+
+  // Wrap selection functions to also drive the preview.
+  const _selectInstance = window.selectInstance;
+  window.selectInstance = function(id) { _selectInstance(id); previewGuid(id); };
+  const _selectType = window.selectType;
+  window.selectType = function(tid) {
+    _selectType(tid);
+    const members = window.data.nodes.filter(n => n.type_id === tid).map(n => n.id);
+    if (members.length) previewGuid(members[0]); else clearPreview();
+  };
+  const _clearTypeFilter = window.clearTypeFilter;
+  window.clearTypeFilter = function() { _clearTypeFilter(); clearPreview(); };
+  const _closeInfo = window.closeInfo;
+  window.closeInfo = function() { _closeInfo(); clearPreview(); };
+
+  // Re-wire DOM click handlers that captured the pre-wrapped fns.
+  for (const row of document.querySelectorAll('.type-row')) {
+    const tid = row.dataset.typeId;
+    row.onclick = (e) => { e.stopPropagation(); window.selectType(tid); };
+  }
+  d3.selectAll('circle.node').on('click', (e, d) => { e.stopPropagation(); window.selectInstance(d.id); });
+  d3.select('svg').on('click', () => { window.closeInfo(); window.clearTypeFilter(); });
+
+  // Turntable on the previewed instance.
+  let dragging = false;
+  renderer.domElement.addEventListener('pointerdown', () => { dragging = true; });
+  window.addEventListener('pointerup', () => { dragging = false; });
+
+  function tick() {
+    requestAnimationFrame(tick);
+    if (currentPreviewGuid && !dragging) {
+      const target = controls.target;
+      const offset = camera.position.clone().sub(target);
+      const r = Math.hypot(offset.x, offset.z);
+      const angle = Math.atan2(offset.z, offset.x) + 0.003;
+      offset.x = Math.cos(angle) * r;
+      offset.z = Math.sin(angle) * r;
+      camera.position.copy(target).add(offset);
+      camera.lookAt(target);
+    }
+    controls.update();
+    renderer.render(scene, camera);
+  }
+  tick();
+
+  window.addEventListener('resize', () => {
+    camera.aspect = wrap.clientWidth / wrap.clientHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(wrap.clientWidth, wrap.clientHeight);
+  });
+
+  loadGlb();
+}
+</script>
+</body>
+</html>
