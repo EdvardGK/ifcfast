@@ -33,11 +33,17 @@ pub fn faceted_brep(table: &EntityTable, id: u64) -> Option<LocalMesh> {
     closed_shell(table, outer_id)
 }
 
-/// Mesh an `IfcClosedShell` (walked directly, not via a Brep wrapper).
+/// Mesh an `IfcClosedShell` / `IfcOpenShell` / `IfcConnectedFaceSet`
+/// (walked directly, not via a Brep wrapper). All three share the same
+/// shape — a `CfsFaces: LIST OF IfcFace` at attribute 0 — and shells are
+/// just specialised connected face-sets in the schema. Accepting all
+/// three here is what lets IfcFaceBasedSurfaceModel work, since its
+/// `FbsmFaces` list contains `IfcConnectedFaceSet`s, not shells.
 pub fn closed_shell(table: &EntityTable, id: u64) -> Option<LocalMesh> {
     let (type_name, args) = table.get(id)?;
     if !type_name.eq_ignore_ascii_case(b"IFCCLOSEDSHELL")
         && !type_name.eq_ignore_ascii_case(b"IFCOPENSHELL")
+        && !type_name.eq_ignore_ascii_case(b"IFCCONNECTEDFACESET")
     {
         return None;
     }
@@ -64,6 +70,71 @@ pub fn closed_shell(table: &EntityTable, id: u64) -> Option<LocalMesh> {
         return None;
     }
     Some(mesh)
+}
+
+/// Mesh an `IfcFaceBasedSurfaceModel`. Walks each `IfcConnectedFaceSet`
+/// in `FbsmFaces` and unions the triangles.
+pub fn face_based_surface_model(table: &EntityTable, id: u64) -> Option<LocalMesh> {
+    let (type_name, args) = table.get(id)?;
+    if !type_name.eq_ignore_ascii_case(b"IFCFACEBASEDSURFACEMODEL") {
+        return None;
+    }
+    let fields = split_top_level_args(args);
+    // FbsmFaces: SET OF IfcConnectedFaceSet
+    let body = match parse_field(*fields.first()?) {
+        Field::List(b) => b,
+        _ => return None,
+    };
+    let mut combined = LocalMesh::new();
+    for f in split_top_level_args(body) {
+        let face_set_id = match parse_field(f) {
+            Field::Ref(id) => id,
+            _ => continue,
+        };
+        if let Some(m) = closed_shell(table, face_set_id) {
+            let base = (combined.vertices.len() / 3) as u32;
+            combined.vertices.extend_from_slice(&m.vertices);
+            for &idx in &m.indices {
+                combined.indices.push(base + idx);
+            }
+        }
+    }
+    if combined.indices.is_empty() {
+        return None;
+    }
+    Some(combined)
+}
+
+/// Mesh an `IfcShellBasedSurfaceModel` — same shape as FBSM but the
+/// `SbsmBoundary` list holds `IfcShell` (Open|Closed).
+pub fn shell_based_surface_model(table: &EntityTable, id: u64) -> Option<LocalMesh> {
+    let (type_name, args) = table.get(id)?;
+    if !type_name.eq_ignore_ascii_case(b"IFCSHELLBASEDSURFACEMODEL") {
+        return None;
+    }
+    let fields = split_top_level_args(args);
+    let body = match parse_field(*fields.first()?) {
+        Field::List(b) => b,
+        _ => return None,
+    };
+    let mut combined = LocalMesh::new();
+    for f in split_top_level_args(body) {
+        let shell_id = match parse_field(f) {
+            Field::Ref(id) => id,
+            _ => continue,
+        };
+        if let Some(m) = closed_shell(table, shell_id) {
+            let base = (combined.vertices.len() / 3) as u32;
+            combined.vertices.extend_from_slice(&m.vertices);
+            for &idx in &m.indices {
+                combined.indices.push(base + idx);
+            }
+        }
+    }
+    if combined.indices.is_empty() {
+        return None;
+    }
+    Some(combined)
 }
 
 fn mesh_face(

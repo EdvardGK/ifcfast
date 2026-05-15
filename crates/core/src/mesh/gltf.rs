@@ -273,7 +273,37 @@ fn build_json(meshes: &[ProductMesh], views: &BufferViews, binary_len: u32) -> S
     }
     s.push_str("],");
 
-    // 4. Meshes
+    // 4. Materials — one per product, named with the GUID so viewers can
+    //    address each product individually (the demo viewer recolors by
+    //    `material.name == guid`). Default PBR with an entity-aware
+    //    fallback palette; richer colour via IfcSurfaceStyle is tracked
+    //    separately (ifcfast#3).
+    s.push_str(r#""materials":["#);
+    first = true;
+    for mesh in meshes.iter() {
+        if !first { s.push(','); }
+        first = false;
+        let (r, g, b, a) = default_color_for_entity(&mesh.entity);
+        let translucent = a < 1.0;
+        s.push_str(r#"{"name":""#);
+        push_json_string(&mut s, &mesh.guid);
+        s.push_str(r#"","pbrMetallicRoughness":{"baseColorFactor":["#);
+        s.push_str(&format_f32(r));
+        s.push(',');
+        s.push_str(&format_f32(g));
+        s.push(',');
+        s.push_str(&format_f32(b));
+        s.push(',');
+        s.push_str(&format_f32(a));
+        s.push_str(r#"],"metallicFactor":0,"roughnessFactor":0.85}"#);
+        if translucent {
+            s.push_str(r#","alphaMode":"BLEND""#);
+        }
+        s.push_str(r#","doubleSided":true}"#);
+    }
+    s.push_str("],");
+
+    // 5. Meshes — each primitive references its product's material.
     s.push_str(r#""meshes":["#);
     first = true;
     for (i, _pv) in views.products.iter().enumerate() {
@@ -285,11 +315,17 @@ fn build_json(meshes: &[ProductMesh], views: &BufferViews, binary_len: u32) -> S
         s.push_str(&pos_acc.to_string());
         s.push_str(r#"},"indices":"#);
         s.push_str(&idx_acc.to_string());
+        s.push_str(r#","material":"#);
+        s.push_str(&i.to_string());
         s.push_str(r#","mode":4}]}"#);
     }
     s.push_str("],");
 
-    // 5. Nodes — one per product, with extras carrying GUID + entity
+    // 6. Nodes — product nodes (with GUID + entity extras) plus a root
+    //    rotator node that wraps them in a glTF-conformant Y-up frame.
+    //    BIM data is authored Z-up; glTF is spec'd Y-up. The root carries
+    //    a quaternion rotation of −90° about X so the whole scene reads
+    //    upright in any glTF viewer without a viewer-side patch.
     s.push_str(r#""nodes":["#);
     first = true;
     for (i, mesh) in meshes.iter().enumerate() {
@@ -307,19 +343,53 @@ fn build_json(meshes: &[ProductMesh], views: &BufferViews, binary_len: u32) -> S
         push_json_string(&mut s, mesh.source);
         s.push_str(r#""}}"#);
     }
-    s.push_str("],");
-
-    // 6. Scene
-    s.push_str(r#""scenes":[{"nodes":["#);
+    // Root rotator at the end: rotation quat (x, y, z, w) for −90° about X
+    //   = (sin(-π/4), 0, 0, cos(-π/4)) ≈ (-0.7071068, 0, 0, 0.7071068).
+    if !meshes.is_empty() { s.push(','); }
+    s.push_str(r#"{"name":"ifcfast_root","rotation":[-0.70710677,0,0,0.70710677],"children":["#);
     first = true;
     for i in 0..meshes.len() {
         if !first { s.push(','); }
         first = false;
         s.push_str(&i.to_string());
     }
+    s.push_str("]}");
+    s.push_str("],");
+
+    // 7. Scene — only the root node; product nodes hang under it.
+    let root_idx = meshes.len();
+    s.push_str(r#""scenes":[{"nodes":["#);
+    s.push_str(&root_idx.to_string());
     s.push_str(r#"]}],"scene":0}"#);
 
     s
+}
+
+/// Per-entity-type default colour palette. Returns linear-space sRGB +
+/// alpha. Translucent entries (alpha < 1) flag the material as BLEND in
+/// the JSON emitter so the viewer can see *through* spaces and openings
+/// to the solid geometry behind. Real IfcSurfaceStyle colour extraction
+/// is tracked in ifcfast#3 — this is the neutral fallback.
+fn default_color_for_entity(entity: &str) -> (f32, f32, f32, f32) {
+    // Lowercase, strip "Ifc" prefix for matching.
+    let e = entity.to_ascii_lowercase();
+    let e = e.strip_prefix("ifc").unwrap_or(&e);
+    match e {
+        "wall" | "wallstandardcase" => (0.88, 0.85, 0.78, 1.0),
+        "slab"                       => (0.78, 0.78, 0.80, 1.0),
+        "footing"                    => (0.55, 0.55, 0.55, 1.0),
+        "beam" | "member" | "column" => (0.62, 0.66, 0.72, 1.0),
+        "covering"                   => (0.85, 0.83, 0.78, 1.0),
+        "railing"                    => (0.35, 0.35, 0.38, 1.0),
+        "stairflight" | "stair"      => (0.70, 0.68, 0.62, 1.0),
+        "door"                       => (0.50, 0.36, 0.24, 1.0),
+        "window"                     => (0.55, 0.72, 0.85, 0.55),
+        "furnishingelement"          => (0.78, 0.65, 0.48, 1.0),
+        "space"                      => (0.62, 0.80, 0.78, 0.18),
+        "openingelement"             => (0.95, 0.55, 0.20, 0.22),
+        "roof"                       => (0.45, 0.30, 0.25, 1.0),
+        _                             => (0.75, 0.75, 0.75, 1.0),
+    }
 }
 
 fn align4(n: u32) -> u32 {

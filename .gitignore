@@ -38,3 +38,4 @@ Thumbs.db
 !examples/**/*.ifc
 !tests/fixtures/*.ifc
 !python/ifcfast/data/*.ifc
+.vercel

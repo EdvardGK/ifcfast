@@ -311,8 +311,68 @@ fn curve_to_polyline(table: &EntityTable, curve_id: u64) -> Option<Vec<Vec2>> {
         };
         return point_list_2d(table, pts_id);
     }
-    // IfcCompositeCurve, IfcTrimmedCurve etc. — skip for Phase 1A.
+    if type_name.eq_ignore_ascii_case(b"IFCCOMPOSITECURVE") {
+        // (Segments: LIST OF IfcCompositeCurveSegment, SelfIntersect)
+        return composite_curve(table, &fields);
+    }
+    // IfcTrimmedCurve etc. — skip for Phase 1A.
     None
+}
+
+/// Concatenate the parent curves of an IfcCompositeCurve into a single
+/// polyline. Each segment carries a SameSense flag — when false the
+/// segment's parent curve is reversed before joining.
+fn composite_curve(table: &EntityTable, fields: &[&[u8]]) -> Option<Vec<Vec2>> {
+    let body = match parse_field(fields.first()?) {
+        Field::List(b) => b,
+        _ => return None,
+    };
+    let mut out: Vec<Vec2> = Vec::new();
+    for seg_field in split_top_level_args(body) {
+        let seg_id = match parse_field(seg_field) {
+            Field::Ref(id) => id,
+            _ => continue,
+        };
+        let (seg_type, seg_args) = match table.get(seg_id) {
+            Some(x) => x,
+            None => continue,
+        };
+        if !seg_type.eq_ignore_ascii_case(b"IFCCOMPOSITECURVESEGMENT") {
+            continue;
+        }
+        // IfcCompositeCurveSegment(Transition, SameSense, ParentCurve)
+        let seg_fields = split_top_level_args(seg_args);
+        let same_sense = matches!(
+            seg_fields.get(1).copied().map(parse_field),
+            Some(Field::Enum(b"T"))
+        );
+        let parent_id = match seg_fields.get(2).copied().map(parse_field) {
+            Some(Field::Ref(id)) => id,
+            _ => continue,
+        };
+        let mut pts = match curve_to_polyline(table, parent_id) {
+            Some(p) => p,
+            None => continue,
+        };
+        if !same_sense {
+            pts.reverse();
+        }
+        // Stitch: if last point of `out` matches first point of `pts`,
+        // drop the duplicate before joining.
+        if let (Some(last), Some(first)) = (out.last().copied(), pts.first().copied()) {
+            if (last - first).length_squared() < 1e-12 {
+                pts.remove(0);
+            }
+        }
+        out.extend(pts);
+    }
+    if out.len() > 2 && out.first() == out.last() {
+        out.pop();
+    }
+    if out.len() < 3 {
+        return None;
+    }
+    Some(out)
 }
 
 fn point_list_2d(table: &EntityTable, id: u64) -> Option<Vec<Vec2>> {

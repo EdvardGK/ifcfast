@@ -215,12 +215,13 @@ pub(crate) fn mesh_item(
             brep::faceted_brep(table, item_id)
                 .map(|m| vec![(m, "brep")])
                 .unwrap_or_default()
-        } else if type_name.eq_ignore_ascii_case(b"IFCFACEBASEDSURFACEMODEL")
-            || type_name.eq_ignore_ascii_case(b"IFCSHELLBASEDSURFACEMODEL")
-        {
-            // FBSM/SBSM contain one or more IfcClosedShell. Same walk.
-            brep::closed_shell(table, item_id)
-                .map(|m| vec![(m, "shell")])
+        } else if type_name.eq_ignore_ascii_case(b"IFCFACEBASEDSURFACEMODEL") {
+            brep::face_based_surface_model(table, item_id)
+                .map(|m| vec![(m, "faceset_fbsm")])
+                .unwrap_or_default()
+        } else if type_name.eq_ignore_ascii_case(b"IFCSHELLBASEDSURFACEMODEL") {
+            brep::shell_based_surface_model(table, item_id)
+                .map(|m| vec![(m, "faceset_sbsm")])
                 .unwrap_or_default()
         } else {
             // IfcBooleanClippingResult / advanced BREPs — Phase 2.
