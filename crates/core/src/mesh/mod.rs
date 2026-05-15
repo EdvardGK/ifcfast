@@ -85,6 +85,17 @@ pub fn mesh_ifc(buf: &[u8]) -> (Vec<ProductMesh>, MeshStats) {
         if !is_product_type(type_name) {
             continue;
         }
+        // IfcOpeningElement is a void definition — its volume is meant to
+        // be *subtracted* from the host wall/slab via IfcRelVoidsElement,
+        // not rendered as its own solid. Real boolean subtraction is
+        // tracked in ifcfast#4; until then, skipping it removes the
+        // duplicate translucent volume that overlapped walls + doors.
+        if type_name.eq_ignore_ascii_case(b"IFCOPENINGELEMENT") {
+            stats.products_seen += 1;
+            stats.products_deferred += 1;
+            *stats.by_source.entry("opening_skipped".into()).or_insert(0) += 1;
+            continue;
+        }
         stats.products_seen += 1;
 
         let fields = split_top_level_args(args);
@@ -110,6 +121,26 @@ pub fn mesh_ifc(buf: &[u8]) -> (Vec<ProductMesh>, MeshStats) {
         let world = placement_id
             .map(|pid| resolver.world(pid))
             .unwrap_or(Mat4::IDENTITY);
+
+        // Door / window z-fight workaround: scale the product's local
+        // frame by a hair so it wins the depth test against the host
+        // wall's gross geometry. This is a temporary hack until real
+        // IfcRelVoidsElement → boolean subtraction lands (ifcfast#4);
+        // once openings are actually carved out of walls, this can go.
+        // Scale is applied about the placement origin, not the world
+        // origin, so the product doesn't translate.
+        let world = if type_name.eq_ignore_ascii_case(b"IFCDOOR")
+            || type_name.eq_ignore_ascii_case(b"IFCWINDOW")
+        {
+            const K: f32 = 1.003;
+            let origin = world * Vec4::new(0.0, 0.0, 0.0, 1.0);
+            let translate_to_origin = Mat4::from_translation(Vec3::new(-origin.x, -origin.y, -origin.z));
+            let scale = Mat4::from_scale(Vec3::splat(K));
+            let translate_back = Mat4::from_translation(Vec3::new(origin.x, origin.y, origin.z));
+            translate_back * scale * translate_to_origin * world
+        } else {
+            world
+        };
 
         // Find a body/facetation Items list.
         let items = body_items(&table, repr_id);
