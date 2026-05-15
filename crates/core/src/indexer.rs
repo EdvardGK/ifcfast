@@ -6,10 +6,11 @@
 //! pandas / pyarrow without per-row Python object construction.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::OnceLock;
 
 use crate::lexer::{
     data_section_start, endsec_position, for_each_record, parse_field, parse_ref_list,
-    split_top_level_args, Field,
+    split_top_level_args, split_top_level_args_into, Field,
 };
 
 // ----------------------------------------------------------------------
@@ -95,6 +96,55 @@ const CONTAINED_TYPE: &[u8] = b"IFCRELCONTAINEDINSPATIALSTRUCTURE";
 const AGGREGATES_TYPE: &[u8] = b"IFCRELAGGREGATES";
 const SI_UNIT_TYPE: &[u8] = b"IFCSIUNIT";
 const UNIT_ASSIGN_TYPE: &[u8] = b"IFCUNITASSIGNMENT";
+
+// ----------------------------------------------------------------------
+// Dispatch
+// ----------------------------------------------------------------------
+
+/// All the entity categories the indexer reacts to. Everything else in
+/// the file is ignored (but counted in the `total` record stat). One
+/// HashMap lookup per record replaces the previous chain of HashSet
+/// lookups + byte-slice equality checks — a big win on MEP files where
+/// ~99% of records are types we don't care about (e.g. IfcCartesianPoint,
+/// IfcPolyLoop, IfcPropertySingleValue).
+#[derive(Debug, Clone, Copy)]
+enum EntityKind {
+    Product,
+    Storey,
+    Site,
+    Building,
+    Project,
+    Space,
+    Application,
+    ContainedInSpatialStructure,
+    SiUnit,
+    UnitAssignment,
+    Aggregates,
+}
+
+fn dispatch_map() -> &'static HashMap<&'static [u8], EntityKind> {
+    static MAP: OnceLock<HashMap<&'static [u8], EntityKind>> = OnceLock::new();
+    MAP.get_or_init(|| {
+        let mut m: HashMap<&'static [u8], EntityKind> =
+            HashMap::with_capacity(PRODUCT_TYPES.len() + STOREY_TYPES.len() + 9);
+        for t in PRODUCT_TYPES {
+            m.insert(t, EntityKind::Product);
+        }
+        for t in STOREY_TYPES {
+            m.insert(t, EntityKind::Storey);
+        }
+        m.insert(SITE_TYPE, EntityKind::Site);
+        m.insert(BUILDING_TYPE, EntityKind::Building);
+        m.insert(PROJECT_TYPE, EntityKind::Project);
+        m.insert(SPACE_TYPE, EntityKind::Space);
+        m.insert(APPLICATION_TYPE, EntityKind::Application);
+        m.insert(CONTAINED_TYPE, EntityKind::ContainedInSpatialStructure);
+        m.insert(SI_UNIT_TYPE, EntityKind::SiUnit);
+        m.insert(UNIT_ASSIGN_TYPE, EntityKind::UnitAssignment);
+        m.insert(AGGREGATES_TYPE, EntityKind::Aggregates);
+        m
+    })
+}
 
 // ----------------------------------------------------------------------
 // Output containers
@@ -268,8 +318,7 @@ pub fn index(buf: &[u8]) -> IndexedFile {
         out.authoring_app = Some(o);
     }
 
-    let product_set: HashSet<&[u8]> = PRODUCT_TYPES.iter().copied().collect();
-    let storey_set: HashSet<&[u8]> = STOREY_TYPES.iter().copied().collect();
+    let dispatch = dispatch_map();
 
     // Snapshot schema for the extractor — it needs to know IFC2X3 vs IFC4
     // to suppress predefined_type for entities where the trailing-enum
@@ -285,95 +334,117 @@ pub fn index(buf: &[u8]) -> IndexedFile {
     let data_start = data_section_start(buf).unwrap_or(0);
     let data_end = endsec_position(buf, data_start);
 
+    // Reused across every record — saves one Vec allocation per STEP
+    // entity (600K+ on ST28_RIV).
+    let mut fields_buf: Vec<&[u8]> = Vec::with_capacity(16);
+
     // Two-pass would let us resolve some refs, but a single pass is enough:
     // we only need step_id→guid maps that are built as we go, and downstream
     // (Python) does the final guid resolution for relationships.
     for_each_record(buf, data_start, data_end, |rec| {
         let t = rec.type_name;
-
-        if product_set.contains(t) {
-            extract_product(&mut out, rec.id, t, rec.args, is_ifc2x3);
-        } else if storey_set.contains(t) {
-            extract_storey(&mut out, rec.id, rec.args);
-        } else if t == SITE_TYPE {
-            let fields = split_top_level_args(rec.args);
-            if let Some(guid) = string_at(&fields, 0) {
-                out.site_step_id_to_guid.insert(rec.id, guid);
+        // Single-lookup dispatch. Hot-path miss (>99% of records on big
+        // MEP files) is one HashMap probe; previously each miss walked
+        // two HashSets and ~8 byte-slice equality checks.
+        let kind = match dispatch.get(t) {
+            Some(k) => *k,
+            None => return,
+        };
+        match kind {
+            EntityKind::Product => {
+                split_top_level_args_into(rec.args, &mut fields_buf);
+                extract_product(&mut out, rec.id, t, &fields_buf, is_ifc2x3);
             }
-        } else if t == BUILDING_TYPE {
-            let fields = split_top_level_args(rec.args);
-            if let Some(guid) = string_at(&fields, 0) {
-                out.building_step_id_to_guid.insert(rec.id, guid);
+            EntityKind::Storey => {
+                split_top_level_args_into(rec.args, &mut fields_buf);
+                extract_storey(&mut out, rec.id, &fields_buf);
             }
-        } else if t == PROJECT_TYPE {
-            let fields = split_top_level_args(rec.args);
-            if let Some(name) = string_at(&fields, 2) {
-                out.project_name = Some(name);
+            EntityKind::Site => {
+                split_top_level_args_into(rec.args, &mut fields_buf);
+                if let Some(guid) = string_at(&fields_buf, 0) {
+                    out.site_step_id_to_guid.insert(rec.id, guid);
+                }
             }
-            if let Some(guid) = string_at(&fields, 0) {
-                out.project_step_id_to_guid.insert(rec.id, guid);
+            EntityKind::Building => {
+                split_top_level_args_into(rec.args, &mut fields_buf);
+                if let Some(guid) = string_at(&fields_buf, 0) {
+                    out.building_step_id_to_guid.insert(rec.id, guid);
+                }
             }
-        } else if t == SPACE_TYPE {
-            // IfcSpace can be a parent in IfcRelAggregates rels (other
-            // spaces or assemblies aggregated under it). Needs a step_id
-            // resolver entry to avoid silently dropping those rels.
-            let fields = split_top_level_args(rec.args);
-            if let Some(guid) = string_at(&fields, 0) {
-                out.space_step_id_to_guid.insert(rec.id, guid);
+            EntityKind::Project => {
+                split_top_level_args_into(rec.args, &mut fields_buf);
+                if let Some(name) = string_at(&fields_buf, 2) {
+                    out.project_name = Some(name);
+                }
+                if let Some(guid) = string_at(&fields_buf, 0) {
+                    out.project_step_id_to_guid.insert(rec.id, guid);
+                }
             }
-        } else if t == APPLICATION_TYPE {
-            let fields = split_top_level_args(rec.args);
-            // IfcApplication: ApplicationDeveloper, Version, ApplicationFullName, ApplicationIdentifier
-            if let Some(full_name) = string_at(&fields, 2) {
-                out.authoring_app = Some(full_name);
+            EntityKind::Space => {
+                // IfcSpace can be a parent in IfcRelAggregates rels (other
+                // spaces or assemblies aggregated under it). Needs a step_id
+                // resolver entry to avoid silently dropping those rels.
+                split_top_level_args_into(rec.args, &mut fields_buf);
+                if let Some(guid) = string_at(&fields_buf, 0) {
+                    out.space_step_id_to_guid.insert(rec.id, guid);
+                }
             }
-        } else if t == CONTAINED_TYPE {
-            // IfcRelContainedInSpatialStructure(_, _, _, _, RelatedElements, RelatingStructure)
-            let fields = split_top_level_args(rec.args);
-            if fields.len() >= 6 {
-                if let Field::List(body) = parse_field(fields[4]) {
-                    if let Field::Ref(structure_id) = parse_field(fields[5]) {
-                        for child in parse_ref_list(body) {
-                            out.contained_in_child.push(child);
-                            out.contained_in_structure.push(structure_id);
+            EntityKind::Application => {
+                // IfcApplication: ApplicationDeveloper, Version,
+                // ApplicationFullName, ApplicationIdentifier.
+                split_top_level_args_into(rec.args, &mut fields_buf);
+                if let Some(full_name) = string_at(&fields_buf, 2) {
+                    out.authoring_app = Some(full_name);
+                }
+            }
+            EntityKind::ContainedInSpatialStructure => {
+                // IfcRelContainedInSpatialStructure(_,_,_,_, RelatedElements, RelatingStructure).
+                split_top_level_args_into(rec.args, &mut fields_buf);
+                if fields_buf.len() >= 6 {
+                    if let Field::List(body) = parse_field(fields_buf[4]) {
+                        if let Field::Ref(structure_id) = parse_field(fields_buf[5]) {
+                            for child in parse_ref_list(body) {
+                                out.contained_in_child.push(child);
+                                out.contained_in_structure.push(structure_id);
+                            }
                         }
                     }
                 }
             }
-        } else if t == SI_UNIT_TYPE {
-            // IfcSIUnit(Dimensions, UnitType, Prefix, Name).
-            // UnitType is at arg[1], Prefix at arg[2], Name at arg[3].
-            let fields = split_top_level_args(rec.args);
-            let ut = enum_at(&fields, 1).unwrap_or_default();
-            let prefix = enum_at(&fields, 2).unwrap_or_default();
-            let name = enum_at(&fields, 3).unwrap_or_default();
-            si_units.insert(rec.id, (ut, prefix, name));
-        } else if t == UNIT_ASSIGN_TYPE {
-            // IfcUnitAssignment(Units) — Units is a list of refs at arg[0].
-            let fields = split_top_level_args(rec.args);
-            if let Some(f) = fields.first() {
-                if let Field::List(body) = parse_field(f) {
-                    if unit_assignment_refs.is_empty() {
-                        unit_assignment_refs = parse_ref_list(body);
+            EntityKind::SiUnit => {
+                // IfcSIUnit(Dimensions, UnitType, Prefix, Name).
+                split_top_level_args_into(rec.args, &mut fields_buf);
+                let ut = enum_at(&fields_buf, 1).unwrap_or_default();
+                let prefix = enum_at(&fields_buf, 2).unwrap_or_default();
+                let name = enum_at(&fields_buf, 3).unwrap_or_default();
+                si_units.insert(rec.id, (ut, prefix, name));
+            }
+            EntityKind::UnitAssignment => {
+                // IfcUnitAssignment(Units) — Units is a list of refs at arg[0].
+                split_top_level_args_into(rec.args, &mut fields_buf);
+                if let Some(f) = fields_buf.first() {
+                    if let Field::List(body) = parse_field(f) {
+                        if unit_assignment_refs.is_empty() {
+                            unit_assignment_refs = parse_ref_list(body);
+                        }
                     }
                 }
             }
-        } else if t == AGGREGATES_TYPE {
-            // IfcRelAggregates(_, _, _, _, RelatingObject, RelatedObjects)
-            let fields = split_top_level_args(rec.args);
-            if fields.len() >= 6 {
-                if let Field::Ref(rel) = parse_field(fields[4]) {
-                    if let Field::List(body) = parse_field(fields[5]) {
-                        for child in parse_ref_list(body) {
-                            out.aggregates_child.push(child);
-                            out.aggregates_parent.push(rel);
+            EntityKind::Aggregates => {
+                // IfcRelAggregates(_,_,_,_, RelatingObject, RelatedObjects).
+                split_top_level_args_into(rec.args, &mut fields_buf);
+                if fields_buf.len() >= 6 {
+                    if let Field::Ref(rel) = parse_field(fields_buf[4]) {
+                        if let Field::List(body) = parse_field(fields_buf[5]) {
+                            for child in parse_ref_list(body) {
+                                out.aggregates_child.push(child);
+                                out.aggregates_parent.push(rel);
+                            }
                         }
                     }
                 }
             }
         }
-        // Anything else is intentionally ignored; we count product types
-        // only (matches the Python-side `type_counts` semantics).
     });
 
     // Walk aggregates again to populate storey→building from rels whose
@@ -391,25 +462,22 @@ pub fn index(buf: &[u8]) -> IndexedFile {
         }
     }
 
-    // Filter `contained_in` to storey-relating only. fastparse's existing
-    // Python tier-1 walk applies the same filter (it's the assumption the
-    // storey_lookup map encodes). We do it here so the Python side can
-    // use `contained_in` as a flat (child, storey_step_id) array pair.
+    // Filter `contained_in` to storey-relating only. Filter in-place
+    // (write-index pattern) so we don't allocate two fresh Vecs the size
+    // of the unfiltered input — on ST28_RIV that's ~90K entries × 16 B.
     let storey_ids: HashSet<u64> = out.storey_step_id.iter().copied().collect();
-    let mut filtered_child = Vec::with_capacity(out.contained_in_child.len());
-    let mut filtered_struct = Vec::with_capacity(out.contained_in_structure.len());
-    for (c, s) in out
-        .contained_in_child
-        .iter()
-        .zip(out.contained_in_structure.iter())
-    {
-        if storey_ids.contains(s) {
-            filtered_child.push(*c);
-            filtered_struct.push(*s);
+    let n = out.contained_in_child.len();
+    let mut write = 0;
+    for read in 0..n {
+        let s = out.contained_in_structure[read];
+        if storey_ids.contains(&s) {
+            out.contained_in_child[write] = out.contained_in_child[read];
+            out.contained_in_structure[write] = s;
+            write += 1;
         }
     }
-    out.contained_in_child = filtered_child;
-    out.contained_in_structure = filtered_struct;
+    out.contained_in_child.truncate(write);
+    out.contained_in_structure.truncate(write);
 
     // Resolve unit_scale (metres per model unit). Look through the
     // IfcUnitAssignment.Units list for a LENGTHUNIT SI unit, then map
@@ -464,24 +532,23 @@ fn extract_product(
     out: &mut IndexedFile,
     step_id: u64,
     type_name: &[u8],
-    args: &[u8],
+    fields: &[&[u8]],
     is_ifc2x3: bool,
 ) {
-    let fields = split_top_level_args(args);
-    let guid = match string_at(&fields, 0) {
+    let guid = match string_at(fields, 0) {
         Some(g) => g,
         None => return,
     };
     let entity = type_name_uppercase_with_proper_case(type_name);
 
-    let name = string_at(&fields, 2);
-    let object_type = string_at(&fields, 4);
+    let name = string_at(fields, 2);
+    let object_type = string_at(fields, 4);
     // Tag is always the LAST positional argument that isn't an enum on
     // IfcElement subtypes — but the safe, schema-agnostic move is to try
     // arg[7]: that's the position for IfcElement.Tag, and on subtypes
     // that don't inherit Tag (rare) we just get a non-string back and
     // discard it.
-    let tag = string_at(&fields, 7);
+    let tag = string_at(fields, 7);
 
     // PredefinedType is the LAST enum field on most IfcElement subtypes —
     // but in IFC2X3, several entities use the trailing slot for a
@@ -510,7 +577,14 @@ fn extract_product(
         }
     }
 
-    *out.type_counts.entry(entity.clone()).or_insert(0) += 1;
+    // Bump the type count without cloning `entity` on the hot path: only
+    // the first time we see a given entity name does the HashMap own a
+    // copy. Subsequent products of the same type increment in place.
+    if let Some(count) = out.type_counts.get_mut(&entity) {
+        *count += 1;
+    } else {
+        out.type_counts.insert(entity.clone(), 1);
+    }
     out.product_step_id.push(step_id);
     out.product_guid.push(guid);
     out.product_entity.push(entity);
@@ -520,13 +594,12 @@ fn extract_product(
     out.product_tag.push(tag);
 }
 
-fn extract_storey(out: &mut IndexedFile, step_id: u64, args: &[u8]) {
-    let fields = split_top_level_args(args);
-    let guid = match string_at(&fields, 0) {
+fn extract_storey(out: &mut IndexedFile, step_id: u64, fields: &[&[u8]]) {
+    let guid = match string_at(fields, 0) {
         Some(g) => g,
         None => return,
     };
-    let name = string_at(&fields, 2);
+    let name = string_at(fields, 2);
 
     // Elevation is the LAST numeric field on IfcBuildingStorey, with
     // CompositionType (.ELEMENT./.PARTIAL./...) usually preceding it.
@@ -578,20 +651,9 @@ fn string_at(fields: &[&[u8]], idx: usize) -> Option<String> {
     }
 }
 
-/// Produce the title-case IFC entity name used by `ifcopenshell` (and by
-/// the rest of fastparse): the STEP file has `IFCWALLSTANDARDCASE` but
-/// downstream code expects `IfcWallStandardCase`. Map the well-known
-/// classes; unknown ones get `IfcXxxxx` with first-letter-only
-/// capitalisation of the suffix (best-effort).
-fn type_name_uppercase_with_proper_case(t: &[u8]) -> String {
-    // The downstream Python code does case-insensitive matches in places
-    // (qto.classify_element keys are TitleCase), so we need the canonical
-    // Pythonic form. Strategy: keep "Ifc" prefix uppercase only the I,
-    // then for the rest emit the LATIN letters in their original case
-    // (the STEP standard requires uppercase, so we apply a known map).
-    //
-    // Map covers all PRODUCT_TYPES and the spatial / rel / app types.
-    let map: &[(&[u8], &str)] = &[
+/// All known STEP-uppercase → ifcopenshell-titlecase pairs. Exposed as
+/// a `&'static` slice so the lazy HashMap below can be built once.
+const ENTITY_NAME_PAIRS: &[(&[u8], &str)] = &[
         // Walls
         (b"IFCWALL", "IfcWall"),
         (b"IFCWALLSTANDARDCASE", "IfcWallStandardCase"),
@@ -737,11 +799,23 @@ fn type_name_uppercase_with_proper_case(t: &[u8]) -> String {
         (b"IFCAPPLICATION", "IfcApplication"),
         (b"IFCRELCONTAINEDINSPATIALSTRUCTURE", "IfcRelContainedInSpatialStructure"),
         (b"IFCRELAGGREGATES", "IfcRelAggregates"),
-    ];
-    for (k, v) in map {
-        if *k == t {
-            return v.to_string();
-        }
+];
+
+/// Lazy lookup table from STEP uppercase bytes to ifcopenshell title-case.
+/// Replaces an earlier linear scan that became a measurable cost on big
+/// MEP files (87K+ products × ~130 byte-slice compares per call).
+fn entity_name_map() -> &'static HashMap<&'static [u8], &'static str> {
+    static MAP: OnceLock<HashMap<&'static [u8], &'static str>> = OnceLock::new();
+    MAP.get_or_init(|| ENTITY_NAME_PAIRS.iter().copied().collect())
+}
+
+/// Produce the title-case IFC entity name used by `ifcopenshell` (and by
+/// the rest of fastparse): the STEP file has `IFCWALLSTANDARDCASE` but
+/// downstream code expects `IfcWallStandardCase`. Unknown types get
+/// `IfcXxxxx` with first-letter-only capitalisation of the suffix.
+fn type_name_uppercase_with_proper_case(t: &[u8]) -> String {
+    if let Some(canonical) = entity_name_map().get(t) {
+        return (*canonical).to_string();
     }
     // Fallback: keep "Ifc" then title-case the rest.
     if t.len() >= 3 && &t[..3] == b"IFC" {

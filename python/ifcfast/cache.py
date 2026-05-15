@@ -7,6 +7,9 @@ subsequent open). Layout per file:
         meta.json              — manifest
         index.parquet          — one row per IfcProduct (tier 1)
         storeys.parquet        — one row per IfcBuildingStorey
+        contained_in.parquet   — product → storey edges
+        aggregates.parquet     — child → parent edges (decomposition)
+        storey_building.parquet — storey → building edges
         psets.parquet          — long-format property sets
         quantities.parquet     — long-format base quantities
         materials.parquet      — material assignments
@@ -30,7 +33,12 @@ from typing import Optional
 from .header import IFCHeader
 
 # Bumped whenever on-disk layout changes incompatibly.
-CACHE_VERSION = 1
+# v2 (2026-05-15): added contained_in / aggregates / storey_building parquets.
+CACHE_VERSION = 2
+
+CONTAINED_IN_FILE = "contained_in.parquet"
+AGGREGATES_FILE = "aggregates.parquet"
+STOREY_BUILDING_FILE = "storey_building.parquet"
 
 PARQUET_COMPRESSION = "zstd"
 PARQUET_COMPRESSION_LEVEL = 3
@@ -358,6 +366,22 @@ def write_index(model) -> Path:
         index=False,
     )
 
+    # Relationship tables. Each is a small long-format DataFrame; even on
+    # a 200K-product file they sum to <500 KB compressed.
+    for df, name in (
+        (model._contained_in_df, CONTAINED_IN_FILE),
+        (model._aggregates_df, AGGREGATES_FILE),
+        (model._storey_building_df, STOREY_BUILDING_FILE),
+    ):
+        if df is None:
+            continue
+        df.to_parquet(
+            d / name,
+            compression=PARQUET_COMPRESSION,
+            compression_level=PARQUET_COMPRESSION_LEVEL,
+            index=False,
+        )
+
     m = _read_manifest(d) or {}
     m.update({
         "cache_version": CACHE_VERSION,
@@ -376,6 +400,17 @@ def write_index(model) -> Path:
         "encoded_at": time.time(),
         "has_index": True,
         "has_storeys": True,
+        "has_contained_in": model._contained_in_df is not None,
+        "has_aggregates": model._aggregates_df is not None,
+        "has_storey_building": model._storey_building_df is not None,
+        "contained_in_count": (
+            int(len(model._contained_in_df))
+            if model._contained_in_df is not None else 0
+        ),
+        "aggregates_count": (
+            int(len(model._aggregates_df))
+            if model._aggregates_df is not None else 0
+        ),
     })
     _write_manifest(d, m)
     return d
@@ -411,6 +446,16 @@ def read_index(hdr: IFCHeader):
                 StoreyRow(**{k: _none_if_nan(v) for k, v in row.items()})
             )
 
+    contained_in_df = None
+    aggregates_df = None
+    storey_building_df = None
+    if (d / CONTAINED_IN_FILE).exists():
+        contained_in_df = pd.read_parquet(d / CONTAINED_IN_FILE)
+    if (d / AGGREGATES_FILE).exists():
+        aggregates_df = pd.read_parquet(d / AGGREGATES_FILE)
+    if (d / STOREY_BUILDING_FILE).exists():
+        storey_building_df = pd.read_parquet(d / STOREY_BUILDING_FILE)
+
     return Model(
         header=hdr,
         schema=m.get("schema", ""),
@@ -422,6 +467,9 @@ def read_index(hdr: IFCHeader):
         type_counts=dict(m.get("type_counts", {})),
         parse_seconds=time.time() - started,
         _products_df=df,
+        _contained_in_df=contained_in_df,
+        _aggregates_df=aggregates_df,
+        _storey_building_df=storey_building_df,
     )
 
 

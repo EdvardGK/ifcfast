@@ -59,6 +59,13 @@ class Model:
       - Lazy (cache hit): ``products`` is empty and ``_products_df`` holds
         the same data as a pandas DataFrame. Filters and lookups operate
         on the DataFrame directly to keep cold-decode under 500 ms.
+
+    Relationship tables (``contained_in`` / ``aggregates`` /
+    ``storey_building``) are long-format DataFrames built alongside the
+    product index. The traversal helpers (``parent`` / ``children`` /
+    ``ancestors`` / ``descendants`` / ``storey_of`` / ``building_of`` /
+    ``products_in``) lazily compute inverse maps from those tables on
+    first access.
     """
 
     header: IFCHeader
@@ -71,9 +78,16 @@ class Model:
     type_counts: dict[str, int]
     parse_seconds: float
 
-    _products_df: object = field(repr=False, default=None)
+    # All of these are typed as Optional[pandas.DataFrame] in practice;
+    # using `object` keeps the import-graph cheap (model.py shouldn't
+    # force pandas at import time).
+    _products_df: Optional["object"] = field(repr=False, default=None)
     _guid_index: Optional[dict[str, int]] = field(repr=False, default=None)
-    _data_layers: Optional[object] = field(repr=False, default=None)
+    _data_layers: Optional["object"] = field(repr=False, default=None)
+    _contained_in_df: Optional["object"] = field(repr=False, default=None)
+    _aggregates_df: Optional["object"] = field(repr=False, default=None)
+    _storey_building_df: Optional["object"] = field(repr=False, default=None)
+    _graph: Optional["object"] = field(repr=False, default=None)
 
     # ------------------------------------------------------------------
     # Tier-1 queries
@@ -81,6 +95,16 @@ class Model:
 
     def types(self) -> dict[str, int]:
         return dict(self.type_counts)
+
+    def by_type(self, entity: str) -> list[ProductRow]:
+        """All products of a given entity type.
+
+        Mirrors ``ifcopenshell.file.by_type(entity)`` — the single most
+        common ifcopenshell pattern. Drop-in replacement; matches case
+        on the canonical title-case name (e.g. ``"IfcWall"``,
+        ``"IfcWallStandardCase"``).
+        """
+        return list(self.filter(entity=entity))
 
     def __len__(self) -> int:
         if self._products_df is not None:
@@ -182,6 +206,625 @@ class Model:
     def drift(self):
         return self._ensure_data().drift
 
+    # ------------------------------------------------------------------
+    # Spatial hierarchy & relationships
+    # ------------------------------------------------------------------
+
+    @property
+    def contained_in(self):
+        """Long-format ``IfcRelContainedInSpatialStructure`` edges.
+
+        DataFrame with columns ``product_guid`` and ``storey_guid`` —
+        one row per (product, storey) containment. Empty DataFrame if
+        the source IFC had no spatial containment.
+        """
+        import pandas as pd
+
+        if self._contained_in_df is None:
+            self._contained_in_df = pd.DataFrame(
+                columns=["product_guid", "storey_guid"]
+            )
+        return self._contained_in_df
+
+    @property
+    def aggregates(self):
+        """Long-format ``IfcRelAggregates`` edges.
+
+        DataFrame with columns ``child_guid``, ``parent_guid``,
+        ``parent_kind`` — one row per decomposition relationship.
+        ``parent_kind`` is one of ``product`` / ``storey`` / ``building``
+        / ``site`` / ``project`` / ``space``.
+        """
+        import pandas as pd
+
+        if self._aggregates_df is None:
+            self._aggregates_df = pd.DataFrame(
+                columns=["child_guid", "parent_guid", "parent_kind"]
+            )
+        return self._aggregates_df
+
+    @property
+    def storey_building(self):
+        """Storey → building edges as a DataFrame.
+
+        Columns: ``storey_guid``, ``building_guid``. One row per
+        (storey, building) pair derived from aggregates.
+        """
+        import pandas as pd
+
+        if self._storey_building_df is None:
+            self._storey_building_df = pd.DataFrame(
+                columns=["storey_guid", "building_guid"]
+            )
+        return self._storey_building_df
+
+    def _graph_index(self) -> "_GraphIndex":
+        if self._graph is None:
+            if self._products_df is not None:
+                product_guids = set(self._products_df["guid"].values)
+            else:
+                product_guids = {p.guid for p in self.products}
+            self._graph = _GraphIndex(
+                self.contained_in,
+                self.aggregates,
+                self.storey_building,
+                product_guids,
+            )
+        return self._graph
+
+    def parent(self, guid: str) -> Optional[str]:
+        """Unified parent guid.
+
+        Returns the ``IfcRelAggregates`` parent if one exists (typical
+        for assemblies and the spatial chain storey→building→site→
+        project). Otherwise falls back to the spatial container — the
+        storey a product is in. ``None`` if neither.
+        """
+        g = self._graph_index()
+        p = g.parent_of.get(guid)
+        if p is not None:
+            return p
+        return g.storey_of.get(guid)
+
+    def children(self, guid: str) -> list[str]:
+        """Unified direct children.
+
+        For spatial containers (storeys), returns the contained
+        products plus any aggregate children (e.g., IfcSpaces) — products
+        first to keep ordering stable. For aggregates (buildings, sites,
+        projects, assemblies), returns the ``IfcRelAggregates`` children.
+        Empty if there are no children or the guid is unknown.
+        """
+        g = self._graph_index()
+        spatial_kids = g.products_in.get(guid, ())
+        agg_kids = g.children_of.get(guid, ())
+        if not spatial_kids:
+            return list(agg_kids)
+        if not agg_kids:
+            return list(spatial_kids)
+        seen: set[str] = set(spatial_kids)
+        out: list[str] = list(spatial_kids)
+        for k in agg_kids:
+            if k not in seen:
+                seen.add(k)
+                out.append(k)
+        return out
+
+    def ancestors(self, guid: str) -> list[str]:
+        """Chain from ``guid`` to root, exclusive of ``guid``.
+
+        Walks the unified parent chain (aggregates first, falling back
+        to the spatial containment hop product→storey). Order: nearest
+        parent first, project (or whatever the chain ends at) last.
+        Cycle-safe — repeats short-circuit the walk.
+        """
+        out: list[str] = []
+        seen: set[str] = set()
+        cur = self.parent(guid)
+        while cur is not None and cur not in seen:
+            seen.add(cur)
+            out.append(cur)
+            cur = self.parent(cur)
+        return out
+
+    def descendants(self, guid: str) -> list[str]:
+        """BFS over the unified-children tree under ``guid``, exclusive of ``guid``.
+
+        Walks both ``IfcRelAggregates`` (decomposition) and
+        ``IfcRelContainedInSpatialStructure`` (storey → products) so a
+        single call on a project guid yields the whole model.
+        """
+        out: list[str] = []
+        seen: set[str] = set()
+        queue: list[str] = list(self.children(guid))
+        for ch in queue:
+            seen.add(ch)
+        head = 0
+        while head < len(queue):
+            cur = queue[head]
+            head += 1
+            out.append(cur)
+            for ch in self.children(cur):
+                if ch not in seen:
+                    seen.add(ch)
+                    queue.append(ch)
+        return out
+
+    def storey_of(self, guid: str) -> Optional[str]:
+        """Storey guid that contains ``guid`` (via spatial containment)."""
+        return self._graph_index().storey_of.get(guid)
+
+    def building_of(self, guid: str) -> Optional[str]:
+        """Building guid for a product, storey, or itself.
+
+        Resolution order: storey→building map (fastest), then walk
+        ancestors looking for a guid that is itself a building.
+        """
+        g = self._graph_index()
+        if guid in g.storeys_in:  # already a building
+            return guid
+        if guid in g.building_of:  # guid is a storey
+            return g.building_of[guid]
+        s = g.storey_of.get(guid)
+        if s is not None and s in g.building_of:
+            return g.building_of[s]
+        for a in self.ancestors(guid):
+            if a in g.storeys_in:
+                return a
+        return None
+
+    def products_in(self, parent_guid: str) -> list[str]:
+        """Product guids under ``parent_guid``.
+
+        Walks the unified-children tree (aggregates + spatial
+        containment) and returns just the guids that are products
+        according to the tier-1 index. Order: BFS from ``parent_guid``.
+
+        Examples: ``products_in(storey)`` is the contained products;
+        ``products_in(building)`` is all products in all storeys of the
+        building; ``products_in(project)`` covers the whole model.
+        """
+        g = self._graph_index()
+        # Fast path: storey with directly-contained products only.
+        if parent_guid in g.products_in and not g.children_of.get(parent_guid):
+            return [pg for pg in g.products_in[parent_guid] if pg in g.product_guids]
+        out: list[str] = []
+        for guid in self.descendants(parent_guid):
+            if guid in g.product_guids:
+                out.append(guid)
+        return out
+
+    # ------------------------------------------------------------------
+    # Agent-facing introspection
+    # ------------------------------------------------------------------
+
+    def summary(self) -> dict:
+        """Single-call snapshot: everything an agent needs to plan.
+
+        Returns a plain JSON-friendly dict with the model's identity,
+        counts, top entity types, and the shape + loaded-state of every
+        available table. Cheap — no data-layer extraction is triggered;
+        only the already-built tier-1 index and relationship tables are
+        inspected.
+
+        Pattern: an agent calls ``m.summary()`` first, decides which
+        tables it needs (``m.psets``? ``m.contained_in``?), then asks
+        for them. Avoids paying a multi-second extract just to "peek".
+        """
+        top_types = sorted(self.type_counts.items(), key=lambda kv: -kv[1])
+        tables: dict[str, dict] = {
+            "products": {
+                "rows": len(self),
+                "columns": [
+                    f.name for f in ProductRow.__dataclass_fields__.values()
+                ],
+                "loaded": True,
+            },
+            "storeys": {
+                "rows": len(self.storeys),
+                "columns": [
+                    f.name for f in StoreyRow.__dataclass_fields__.values()
+                ],
+                "loaded": True,
+            },
+            "contained_in": _df_meta(self._contained_in_df),
+            "aggregates": _df_meta(self._aggregates_df),
+            "storey_building": _df_meta(self._storey_building_df),
+        }
+        for name in ("psets", "quantities", "materials", "classifications", "drift"):
+            tables[name] = _data_layer_meta(self._data_layers, name)
+
+        return {
+            "path": str(self.header.path),
+            "size_bytes": getattr(self.header, "size_bytes", None),
+            "schema": self.schema,
+            "project_name": self.project_name,
+            "authoring_app": self.authoring_app,
+            "unit_scale": self.unit_scale,
+            "cache_key": getattr(self.header, "cache_key", None),
+            "products": len(self),
+            "storeys": len(self.storeys),
+            "type_counts_total": len(self.type_counts),
+            "top_types": dict(top_types[:20]),
+            "tables": tables,
+            "parse_seconds": self.parse_seconds,
+        }
+
+    @property
+    def schemas(self) -> dict:
+        """Column-level introspection of every table on the model.
+
+        Returns ``{table_name: {columns: [...], dtypes: {col: dtype},
+        rows: int, loaded: bool}}`` for every table. Useful when an
+        agent wants to plan a pandas operation without running
+        ``df.head()`` (which on the lazy layers triggers extract).
+        """
+        out: dict[str, dict] = {
+            "products": _df_schema_from_dataclass(ProductRow, rows=len(self)),
+            "storeys": _df_schema_from_dataclass(StoreyRow, rows=len(self.storeys)),
+            "contained_in": _df_schema(self._contained_in_df),
+            "aggregates": _df_schema(self._aggregates_df),
+            "storey_building": _df_schema(self._storey_building_df),
+        }
+        for name in ("psets", "quantities", "materials", "classifications", "drift"):
+            df = (
+                getattr(self._data_layers, name, None)
+                if self._data_layers is not None
+                else None
+            )
+            out[name] = _df_schema(df, loaded=df is not None)
+        return out
+
+    def type_summary(self, *, sample_guids: int = 3) -> list[dict]:
+        """Type-first view of the model — one dict per IFC entity type.
+
+        Returns a list of ``{entity, count, storeys, predefined_types,
+        object_types, sample_guids}`` sorted by descending count.
+
+        Designed for type-centric workflows like sprucelab's TypeBank:
+        types are the unit of coordination ("50,000 entities, only 300-
+        500 unique types"). All fields derive from the already-built
+        tier-1 index + spatial graph — no data-layer extraction, no
+        materials/classification cost. Add those via ``type_bank()``
+        when you actually need them.
+        """
+        from collections import defaultdict
+
+        per_type: dict[str, dict] = defaultdict(
+            lambda: {
+                "count": 0,
+                "storeys": set(),
+                "predefined_types": set(),
+                "object_types": set(),
+                "sample_guids": [],
+            }
+        )
+
+        if self._products_df is not None:
+            it = self._products_df.itertuples(index=False)
+            fields = list(self._products_df.columns)
+            for row in it:
+                rec = dict(zip(fields, row))
+                _accumulate_type(per_type, rec, sample_guids)
+        else:
+            for p in self.products:
+                rec = {
+                    "entity": p.entity,
+                    "guid": p.guid,
+                    "predefined_type": p.predefined_type,
+                    "object_type": p.object_type,
+                    "storey_name": p.storey_name,
+                    "storey_guid": p.storey_guid,
+                }
+                _accumulate_type(per_type, rec, sample_guids)
+
+        out: list[dict] = []
+        for entity, agg in per_type.items():
+            out.append({
+                "entity": entity,
+                "count": agg["count"],
+                "storeys": sorted(s for s in agg["storeys"] if s),
+                "predefined_types": sorted(
+                    t for t in agg["predefined_types"] if t
+                ),
+                "object_types": sorted(
+                    t for t in agg["object_types"] if t
+                ),
+                "sample_guids": agg["sample_guids"],
+            })
+        out.sort(key=lambda r: (-r["count"], r["entity"]))
+        return out
+
+    def type_bank(self, *, sample_guids: int = 3) -> list[dict]:
+        """Superset of ``type_summary()`` with materials + classifications.
+
+        Triggers the lazy materials and classifications extracts on
+        first call (one-time ~150 ms per layer on a 200 MB IFC, cached
+        afterwards). Each row gains ``materials`` (sorted unique
+        names) and ``classifications`` (sorted unique
+        ``system:identification`` pairs).
+
+        Shape designed for sprucelab's TypeBank: drop this output into
+        a Django bulk_create and you have your type catalogue.
+        """
+        rows = self.type_summary(sample_guids=sample_guids)
+        by_entity = {r["entity"]: r for r in rows}
+        # Build product_guid → entity lookup once for the join below.
+        guid_to_entity: dict[str, str] = {}
+        if self._products_df is not None:
+            for guid, ent in zip(
+                self._products_df["guid"].values,
+                self._products_df["entity"].values,
+            ):
+                guid_to_entity[guid] = ent
+        else:
+            for p in self.products:
+                guid_to_entity[p.guid] = p.entity
+
+        mats = self.materials  # triggers lazy extract
+        if mats is not None and len(mats) > 0:
+            from collections import defaultdict
+            mat_by_entity: dict[str, set] = defaultdict(set)
+            for guid, name in zip(mats["guid"].values, mats["material_name"].values):
+                ent = guid_to_entity.get(guid)
+                if ent is None or name is None:
+                    continue
+                if isinstance(name, float):  # NaN
+                    continue
+                mat_by_entity[ent].add(str(name))
+            for entity, names in mat_by_entity.items():
+                if entity in by_entity:
+                    by_entity[entity]["materials"] = sorted(names)
+        for row in rows:
+            row.setdefault("materials", [])
+
+        cls = self.classifications  # triggers lazy extract
+        if cls is not None and len(cls) > 0:
+            from collections import defaultdict
+            cls_by_entity: dict[str, set] = defaultdict(set)
+            for guid, system, ident in zip(
+                cls["guid"].values,
+                cls["system_name"].values,
+                cls["identification"].values,
+            ):
+                ent = guid_to_entity.get(guid)
+                if ent is None:
+                    continue
+                sys_s = "" if system is None or isinstance(system, float) else str(system)
+                id_s = "" if ident is None or isinstance(ident, float) else str(ident)
+                if not (sys_s or id_s):
+                    continue
+                cls_by_entity[ent].add(f"{sys_s}:{id_s}")
+            for entity, refs in cls_by_entity.items():
+                if entity in by_entity:
+                    by_entity[entity]["classifications"] = sorted(refs)
+        for row in rows:
+            row.setdefault("classifications", [])
+
+        return rows
+
+    def diff(self, other: "Model | str", *, sample: int = 5) -> dict:
+        """Compare this model against another (or against a path).
+
+        Returns a JSON-friendly dict::
+
+            {
+                "left":  {"path": ..., "schema": ..., "products": N},
+                "right": {"path": ..., "schema": ..., "products": M},
+                "products": {
+                    "added":     [guid, ...],     # in right, not in left
+                    "removed":   [guid, ...],     # in left,  not in right
+                    "kept":      int,             # count
+                    "changed":   [
+                        {"guid": ..., "entity": ..., "fields":
+                          {"name": ["old", "new"], "predefined_type": ...}},
+                        ...
+                    ],
+                },
+                "type_deltas": {
+                    "IfcWall":   {"left": 12, "right": 14, "delta":  2},
+                    "IfcDoor":   {"left":  3, "right":  3, "delta":  0},
+                    ...
+                },
+                "storey_deltas": [
+                    {"guid": ..., "name": ..., "elevation": [old, new]},
+                    ...
+                ],
+            }
+
+        Designed for "what changed since v3?" feature surfaces. Lists
+        are truncated to ``sample`` for the ``added``/``removed``/
+        ``changed`` arrays in pretty/JSON output; counts are always
+        exact. Set ``sample=None`` (or 0) to keep full lists.
+        """
+        if isinstance(other, str):
+            other_model = open_ifc(other)
+        else:
+            other_model = other
+
+        # Build guid → product-row dicts on both sides.
+        left = _index_products_by_guid(self)
+        right = _index_products_by_guid(other_model)
+        left_guids = set(left.keys())
+        right_guids = set(right.keys())
+        added = sorted(right_guids - left_guids)
+        removed = sorted(left_guids - right_guids)
+        kept = left_guids & right_guids
+
+        changed: list[dict] = []
+        watched_fields = (
+            "entity", "name", "predefined_type", "object_type",
+            "tag", "storey_name", "storey_guid",
+        )
+        for guid in kept:
+            l, r = left[guid], right[guid]
+            field_changes: dict[str, list] = {}
+            for f in watched_fields:
+                lv, rv = l.get(f), r.get(f)
+                if lv != rv:
+                    field_changes[f] = [lv, rv]
+            if field_changes:
+                changed.append({
+                    "guid": guid,
+                    "entity": r.get("entity") or l.get("entity"),
+                    "fields": field_changes,
+                })
+
+        # Type cardinality deltas.
+        type_deltas: dict[str, dict] = {}
+        all_types = set(self.type_counts) | set(other_model.type_counts)
+        for t in sorted(all_types):
+            lc = int(self.type_counts.get(t, 0))
+            rc = int(other_model.type_counts.get(t, 0))
+            if lc != rc:
+                type_deltas[t] = {"left": lc, "right": rc, "delta": rc - lc}
+
+        # Storey elevation deltas (matched on guid).
+        l_storeys = {s.guid: s for s in self.storeys}
+        r_storeys = {s.guid: s for s in other_model.storeys}
+        storey_deltas: list[dict] = []
+        for guid in l_storeys.keys() & r_storeys.keys():
+            ls, rs = l_storeys[guid], r_storeys[guid]
+            if ls.elevation != rs.elevation or ls.name != rs.name:
+                storey_deltas.append({
+                    "guid": guid,
+                    "name": [ls.name, rs.name],
+                    "elevation": [ls.elevation, rs.elevation],
+                })
+
+        def _trim(lst, n):
+            if not n:
+                return lst
+            return lst[: n]
+
+        return {
+            "left": {
+                "path": str(self.header.path),
+                "schema": self.schema,
+                "products": len(self),
+            },
+            "right": {
+                "path": str(other_model.header.path),
+                "schema": other_model.schema,
+                "products": len(other_model),
+            },
+            "products": {
+                "added": _trim(added, sample),
+                "added_count": len(added),
+                "removed": _trim(removed, sample),
+                "removed_count": len(removed),
+                "kept": len(kept),
+                "changed": _trim(changed, sample),
+                "changed_count": len(changed),
+            },
+            "type_deltas": type_deltas,
+            "storey_deltas": storey_deltas,
+        }
+
+    def preview(self, table: str, n: int = 5) -> list[dict]:
+        """Sample rows from any table as a plain list-of-dicts.
+
+        Supported tables: ``products`` / ``storeys`` / ``contained_in``
+        / ``aggregates`` / ``storey_building`` / ``psets`` /
+        ``quantities`` / ``materials`` / ``classifications`` /
+        ``drift``. Triggers lazy extraction for the four data layers
+        and drift; pure DataFrame slice for the rest. Returns ``[]``
+        for an unknown table or one that's empty.
+        """
+        from dataclasses import asdict
+
+        if table == "products":
+            rows: list[dict] = []
+            if self._products_df is not None:
+                for row in self._products_df.head(n).to_dict(orient="records"):
+                    rows.append({k: _none_if_nan_simple(v) for k, v in row.items()})
+            else:
+                for p in self.products[:n]:
+                    rows.append(asdict(p))
+            return rows
+        if table == "storeys":
+            return [asdict(s) for s in self.storeys[:n]]
+        df_attr = {
+            "contained_in": "_contained_in_df",
+            "aggregates": "_aggregates_df",
+            "storey_building": "_storey_building_df",
+        }.get(table)
+        if df_attr is not None:
+            df = getattr(self, df_attr)
+            if df is None or len(df) == 0:
+                return []
+            return df.head(n).to_dict(orient="records")
+        if table in {"psets", "quantities", "materials", "classifications", "drift"}:
+            df = getattr(self, table)  # triggers extract for data layers
+            if df is None or len(df) == 0:
+                return []
+            rows = []
+            for row in df.head(n).to_dict(orient="records"):
+                rows.append({k: _none_if_nan_simple(v) for k, v in row.items()})
+            return rows
+        return []
+
+
+# ----------------------------------------------------------------------
+# Lazy inverse-map index for traversal helpers
+# ----------------------------------------------------------------------
+
+
+class _GraphIndex:
+    """Built once on first traversal-method access, then cached.
+
+    Single pass over the three relationship DataFrames; O(N) memory.
+    """
+
+    __slots__ = (
+        "parent_of",
+        "children_of",
+        "storey_of",
+        "products_in",
+        "building_of",
+        "storeys_in",
+        "product_guids",
+    )
+
+    def __init__(self, contained_in, aggregates, storey_building, product_guids):
+        self.parent_of: dict[str, str] = {}
+        self.children_of: dict[str, list[str]] = {}
+        self.storey_of: dict[str, str] = {}
+        self.products_in: dict[str, list[str]] = {}
+        self.building_of: dict[str, str] = {}
+        self.storeys_in: dict[str, list[str]] = {}
+        self.product_guids: set[str] = product_guids
+
+        if len(aggregates) > 0:
+            for child, parent in zip(
+                aggregates["child_guid"].values,
+                aggregates["parent_guid"].values,
+            ):
+                if child is None or parent is None:
+                    continue
+                self.parent_of[child] = parent
+                self.children_of.setdefault(parent, []).append(child)
+
+        if len(contained_in) > 0:
+            for product, storey in zip(
+                contained_in["product_guid"].values,
+                contained_in["storey_guid"].values,
+            ):
+                if product is None or storey is None:
+                    continue
+                self.storey_of[product] = storey
+                self.products_in.setdefault(storey, []).append(product)
+
+        if len(storey_building) > 0:
+            for storey, building in zip(
+                storey_building["storey_guid"].values,
+                storey_building["building_guid"].values,
+            ):
+                if storey is None or building is None:
+                    continue
+                self.building_of[storey] = building
+                self.storeys_in.setdefault(building, []).append(storey)
+
 
 # ----------------------------------------------------------------------
 # Open + tier-1 indexer
@@ -267,12 +910,14 @@ def _index_native(p: Path, hdr: IFCHeader, started: float) -> Model:
     }
     sb = raw["storey_building"]
     storey_step_to_building_guid: dict[int, str] = {}
+    storey_building_pairs: list[tuple[str, str]] = []
     for child, building in zip(sb["storey"], sb["building"]):
         ic = int(child)
         if ic in storey_step_to_guid:
             g = bldg_step_to_guid.get(int(building))
             if g is not None:
                 storey_step_to_building_guid[ic] = g
+                storey_building_pairs.append((storey_step_to_guid[ic], g))
     for row, sid in zip(storeys, s["step_id"]):
         row.building_guid = storey_step_to_building_guid.get(int(sid))
 
@@ -307,20 +952,54 @@ def _index_native(p: Path, hdr: IFCHeader, started: float) -> Model:
     product_step_to_guid = {
         int(sid): guid for sid, guid in zip(prod["step_id"], prod["guid"])
     }
+    # Step-id → (guid, kind). Build with deliberate precedence so the
+    # "most specific" kind wins if a step id appears in multiple sources
+    # (shouldn't happen in valid IFC but be defensive).
     parent_step_to_guid: dict[int, str] = {}
-    parent_step_to_guid.update(product_step_to_guid)
-    parent_step_to_guid.update(storey_step_to_guid)
-    parent_step_to_guid.update(bldg_step_to_guid)
-    parent_step_to_guid.update(site_step_to_guid)
-    parent_step_to_guid.update(project_step_to_guid)
-    parent_step_to_guid.update(space_step_to_guid)
+    parent_kind_by_step: dict[int, str] = {}
+    for sid, g in space_step_to_guid.items():
+        parent_step_to_guid[sid] = g
+        parent_kind_by_step[sid] = "space"
+    for sid, g in site_step_to_guid.items():
+        parent_step_to_guid[sid] = g
+        parent_kind_by_step[sid] = "site"
+    for sid, g in project_step_to_guid.items():
+        parent_step_to_guid[sid] = g
+        parent_kind_by_step[sid] = "project"
+    for sid, g in bldg_step_to_guid.items():
+        parent_step_to_guid[sid] = g
+        parent_kind_by_step[sid] = "building"
+    for sid, g in storey_step_to_guid.items():
+        parent_step_to_guid[sid] = g
+        parent_kind_by_step[sid] = "storey"
+    for sid, g in product_step_to_guid.items():
+        parent_step_to_guid[sid] = g
+        parent_kind_by_step[sid] = "product"
 
     parent_lookup: dict[int, str] = {}
+    aggregates_rows: list[tuple[str, str, str]] = []
     agg = raw["aggregates"]
     for child, parent in zip(agg["child"], agg["parent"]):
-        g = parent_step_to_guid.get(int(parent))
-        if g is not None:
-            parent_lookup[int(child)] = g
+        parent_sid = int(parent)
+        child_sid = int(child)
+        pguid = parent_step_to_guid.get(parent_sid)
+        cguid = parent_step_to_guid.get(child_sid)
+        if pguid is None or cguid is None:
+            continue
+        parent_lookup[child_sid] = pguid
+        aggregates_rows.append(
+            (cguid, pguid, parent_kind_by_step.get(parent_sid, "unknown"))
+        )
+
+    # Build the long-format containment table. Use product-step-to-guid
+    # to filter out the rare case where a contained child isn't in our
+    # product table (e.g. an IfcSpace that ifcfast doesn't index).
+    contained_in_rows: list[tuple[str, str]] = []
+    for child, struct in zip(contained_raw["child"], contained_raw["structure"]):
+        s_guid = storey_step_to_guid.get(int(struct))
+        c_guid = product_step_to_guid.get(int(child))
+        if s_guid is not None and c_guid is not None:
+            contained_in_rows.append((c_guid, s_guid))
 
     # Storey name lookup (small list, linear scan is fine).
     storey_name_by_guid = {sr.guid: sr.name for sr in storeys}
@@ -353,6 +1032,18 @@ def _index_native(p: Path, hdr: IFCHeader, started: float) -> Model:
             )
         )
 
+    import pandas as pd
+
+    contained_in_df = pd.DataFrame(
+        contained_in_rows, columns=["product_guid", "storey_guid"]
+    )
+    aggregates_df = pd.DataFrame(
+        aggregates_rows, columns=["child_guid", "parent_guid", "parent_kind"]
+    )
+    storey_building_df = pd.DataFrame(
+        storey_building_pairs, columns=["storey_guid", "building_guid"]
+    )
+
     return Model(
         header=hdr,
         schema=schema or "",
@@ -363,6 +1054,9 @@ def _index_native(p: Path, hdr: IFCHeader, started: float) -> Model:
         products=products,
         type_counts=type_counts,
         parse_seconds=time.time() - started,
+        _contained_in_df=contained_in_df,
+        _aggregates_df=aggregates_df,
+        _storey_building_df=storey_building_df,
     )
 
 
@@ -398,3 +1092,118 @@ def _row_to_product(row) -> ProductRow:
         mode=_v("mode"),
         step_id=int(_v("step_id") or 0),
     )
+
+
+# ---- Introspection helpers (used by Model.summary/schemas/preview) ----
+
+
+def _df_meta(df) -> dict:
+    """Shape + column list of a relationship DataFrame (never None — empty
+    DataFrames are returned as ``{rows: 0, columns: [...], loaded: True}``)."""
+    if df is None:
+        return {"rows": 0, "columns": [], "loaded": False}
+    return {
+        "rows": int(len(df)),
+        "columns": list(df.columns),
+        "loaded": True,
+    }
+
+
+def _df_schema(df, loaded: Optional[bool] = None) -> dict:
+    """Shape + column dtypes of a DataFrame, or a not-loaded stub."""
+    if df is None:
+        return {
+            "rows": 0,
+            "columns": [],
+            "dtypes": {},
+            "loaded": False if loaded is None else loaded,
+        }
+    return {
+        "rows": int(len(df)),
+        "columns": list(df.columns),
+        "dtypes": {col: str(dtype) for col, dtype in df.dtypes.items()},
+        "loaded": True if loaded is None else loaded,
+    }
+
+
+def _df_schema_from_dataclass(cls, rows: int = 0) -> dict:
+    """Schema entry for a dataclass-backed row collection (products/storeys)."""
+    columns: list[str] = []
+    dtypes: dict[str, str] = {}
+    for f in cls.__dataclass_fields__.values():
+        columns.append(f.name)
+        dtypes[f.name] = str(f.type)
+    return {
+        "rows": rows,
+        "columns": columns,
+        "dtypes": dtypes,
+        "loaded": True,
+    }
+
+
+def _data_layer_meta(data_layers, name: str) -> dict:
+    """Shape of a lazy data layer without forcing an extract."""
+    df = getattr(data_layers, name, None) if data_layers is not None else None
+    if df is None:
+        return {"rows": 0, "columns": [], "loaded": False}
+    return {
+        "rows": int(len(df)),
+        "columns": list(df.columns),
+        "loaded": True,
+    }
+
+
+def _index_products_by_guid(m) -> dict[str, dict]:
+    """Build ``{guid: {field: value, ...}}`` lookup over a Model's products.
+
+    Works on both eager (cold-parse) and lazy (cache-hit) Models.
+    """
+    out: dict[str, dict] = {}
+    if getattr(m, "_products_df", None) is not None:
+        cols = list(m._products_df.columns)
+        for row in m._products_df.itertuples(index=False):
+            rec = dict(zip(cols, row))
+            guid = rec.get("guid")
+            if guid:
+                out[guid] = rec
+    else:
+        from dataclasses import asdict
+
+        for p in m.products:
+            out[p.guid] = asdict(p)
+    return out
+
+
+def _accumulate_type(per_type: dict, rec: dict, sample_guids: int) -> None:
+    """Fold one product row into the type-summary accumulator."""
+    entity = rec.get("entity") or ""
+    if not entity:
+        return
+    agg = per_type[entity]
+    agg["count"] += 1
+    storey = rec.get("storey_name")
+    if storey is not None and not (isinstance(storey, float) and storey != storey):
+        agg["storeys"].add(storey)
+    pt = rec.get("predefined_type")
+    if pt is not None and not (isinstance(pt, float) and pt != pt):
+        agg["predefined_types"].add(pt)
+    ot = rec.get("object_type")
+    if ot is not None and not (isinstance(ot, float) and ot != ot):
+        agg["object_types"].add(ot)
+    if len(agg["sample_guids"]) < sample_guids:
+        guid = rec.get("guid")
+        if guid:
+            agg["sample_guids"].append(guid)
+
+
+def _none_if_nan_simple(v):
+    """NaN-aware ``None`` coercion for serialising preview rows."""
+    if v is None:
+        return None
+    try:
+        import math
+        if isinstance(v, float) and math.isnan(v):
+            return None
+    except Exception:
+        pass
+    return v

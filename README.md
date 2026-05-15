@@ -1,16 +1,73 @@
-# ifcfast
+# ifcfast — the agent-first IFC parser
 
 [![PyPI](https://img.shields.io/pypi/v/ifcfast.svg)](https://pypi.org/project/ifcfast/)
 [![Python versions](https://img.shields.io/pypi/pyversions/ifcfast.svg)](https://pypi.org/project/ifcfast/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![CI](https://github.com/EdvardGK/ifcfast/actions/workflows/ci.yml/badge.svg)](https://github.com/EdvardGK/ifcfast/actions/workflows/ci.yml)
 
-Fast native IFC parsing, data extraction and geometric analytics. Python
-on top, Rust underneath, no `ifcopenshell.open()` on the hot path.
+> **The fastest open-source IFC parser. Designed for AI agents, RPA,
+> and analytics pipelines that need to ask questions of a model without
+> loading a geometry kernel.**
 
-Aimed at the "open an IFC, get the data out, run QTO / quality
-queries" workflow. Tier-1 parse is byte-identical to `ifcopenshell` and
-~20-27× faster on production files.
+```python
+pip install ifcfast
+```
+
+```python
+import ifcfast
+
+# Bundled demo — no external IFC needed.
+m = ifcfast.open(ifcfast.example_path())
+m.summary()      # JSON-friendly snapshot: schema, counts, tables, samples
+m.schemas        # column-level dtype introspection of every table
+m.preview("aggregates", n=3)
+
+# Open your own.
+m = ifcfast.open("model.ifc")
+m.children(building_guid)          # all storeys
+m.ancestors(wall_guid)             # storey → building → site → project
+m.products_in(storey_guid)         # every product under this storey
+```
+
+```bash
+ifcfast demo                       # showcases against bundled IFC
+ifcfast index   FILE  --json       # tier-1 summary, machine-parseable
+ifcfast schema  FILE  --json       # column-level schema introspection
+ifcfast types   FILE  --json       # type-first extraction (TypeBank shape)
+```
+
+**Or plug into any MCP-aware agent (Claude Desktop, Cursor, …) in one line:**
+
+```bash
+pip install 'ifcfast[mcp]'
+```
+
+```json
+{ "mcpServers": { "ifcfast": { "command": "ifcfast-mcp" } } }
+```
+
+**Why pick `ifcfast`**
+
+- **20-30× faster than `ifcopenshell.open`** on the audited set
+  (22 MB ARK file: 29 ms; 834 MB MEP file: 905 ms / 14.3M records).
+  Byte-level parity vs ifcopenshell across 234K products from 5
+  authoring tools (Tekla, Archicad, Revit IFC4 / IFC2X3, MagiCAD).
+- **Spatial-relationship graph built in.** `m.contained_in /
+  .aggregates / .storey_building` + seven traversal helpers
+  (`parent`, `children`, `ancestors`, `descendants`, `storey_of`,
+  `building_of`, `products_in`). Unifies aggregates and spatial
+  containment — `m.ancestors(wall_guid)` reaches the project.
+- **Self-describing.** `m.summary()`, `m.schemas`, `m.preview(table)`
+  answer "what am I looking at?" without triggering extracts. Every
+  CLI subcommand has `--json`. Stable shape across releases.
+- **Parquet cache.** Second open of a 200 MB IFC returns in tens of
+  milliseconds. Cache key invalidates automatically on any edit.
+- **No `ifcopenshell.open()` on the hot path.** No geometry kernel to
+  compile, no 8 GB RAM floor. Rust core via PyO3, mmap-based, peaks
+  under 1 GB resident on a 800 MB MEP IFC.
+
+See [AGENTS.md](AGENTS.md) for the full agent guide and a copy-paste
+`system_prompt()` you can drop into your LLM's context.
 
 > `ifcfast` was extracted on 2026-05-13 from the
 > [`EdvardGK/ifc-workbench`](https://github.com/EdvardGK/ifc-workbench)
@@ -204,6 +261,40 @@ mm`; `error` when `drift_ratio > 10.0` and `drift_distance > 10 mm`.
 
 A 100 m wall placed at one end has ratio 0.5 (legitimate). A 50 mm sensor
 100 m from its placement has ratio 2000 (clear authoring bug).
+
+## Spatial hierarchy & relationships
+
+The tier-1 index exposes three long-format relationship tables and a
+small set of traversal helpers. No graph library required — the tables
+are plain `pandas.DataFrame`s with string-guid columns and feed
+directly into NetworkX, PyArrow or a custom three.js scene if you want.
+
+```python
+m = ifcfast.open("model.ifc")
+
+m.contained_in     # IfcRelContainedInSpatialStructure (product → storey)
+m.aggregates       # IfcRelAggregates (child → parent, with parent_kind)
+m.storey_building  # storey → building (subset of aggregates)
+
+# Traversal helpers — none of these raise on unknown guids.
+m.parent(guid)            # unified parent (aggregate, else spatial storey)
+m.children(guid)          # direct children: products + sub-decomposition
+m.ancestors(guid)         # chain to root (storey → building → site → project)
+m.descendants(guid)       # BFS over the unified-children tree
+m.storey_of(guid)         # spatial container, or None
+m.building_of(guid)       # building that hosts the storey, or None
+m.products_in(parent)     # all products under parent (BFS, filtered)
+```
+
+`parent_kind` on `m.aggregates` is one of `product` / `storey` /
+`building` / `site` / `project` / `space`. The tables are persisted in
+the parquet cache, so hot reloads keep graph access at full speed.
+
+Coverage today: `IfcRelAggregates` (decomposition) and
+`IfcRelContainedInSpatialStructure` (spatial). `IfcRelVoidsElement`
+(wall ↔ opening), `IfcRelConnectsElements`, and other relationship
+types are not yet emitted — that means `IfcOpeningElement` products
+appear in `m.products` but not in the graph traversal yet.
 
 ## Federated floor synthesis
 

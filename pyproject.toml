@@ -33,9 +33,13 @@ dev = [
     "openpyxl>=3.1.0",          # used by validate.py for Solibri ITO reads
     "ifcopenshell>=0.8.0",      # only required if you want to cross-check against ifcopenshell
 ]
+mcp = [
+    "mcp[cli]>=1.0",            # ifcfast-mcp server (Claude Desktop / Cursor / etc.)
+]
 
 [project.scripts]
 ifcfast = "ifcfast.cli:main"
+ifcfast-mcp = "ifcfast.mcp_server:main"
 
 [project.urls]
 Homepage = "https://github.com/EdvardGK/ifcfast"
@@ -47,4 +51,10 @@ module-name = "ifcfast._core"
 features = ["python", "mesh"]
 strip = true
 python-source = "python"
-include = [{ path = "LICENSE", format = "sdist" }]
+# LICENSE / AGENTS.md live outside python-source, so they need an explicit
+# entry to land in the sdist. Files under python-source (data/minimal.ifc,
+# py.typed, etc.) are auto-packaged into both wheel and sdist by maturin.
+include = [
+    { path = "LICENSE", format = "sdist" },
+    { path = "AGENTS.md", format = "sdist" },
+]

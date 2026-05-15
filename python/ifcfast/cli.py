@@ -2,38 +2,154 @@
 
 Subcommands::
 
+    ifcfast demo                 # showcase against the bundled IFC
     ifcfast index   FILE         # tier-1 parse + print counts
-    ifcfast extract FILE         # extract psets / quantities / materials / classifications
+    ifcfast schema  FILE         # full schema introspection (JSON-friendly)
+    ifcfast extract FILE         # extract data layers
     ifcfast drift   FILE         # placement-vs-mesh drift report
     ifcfast cache   FILE [...]   # inspect / clear cache for a file
 
-This is a thin wrapper around the library API — programmatic use should
-call :func:`ifcfast.open` directly.
+All subcommands accept ``--json`` to print machine-parseable output for
+agents and pipelines (pipe through ``jq`` etc). This wraps the library
+API — programmatic use should call :func:`ifcfast.open` directly.
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
+from typing import Any
+
+
+# ----------------------------------------------------------------------
+# Output formatting
+# ----------------------------------------------------------------------
+
+
+def _emit(payload: dict, args: argparse.Namespace, *, pretty_lines: list[str]) -> None:
+    """Print ``payload`` as JSON (--json mode) or the pre-built text lines."""
+    if getattr(args, "json", False):
+        print(json.dumps(payload, indent=2, default=_json_default))
+        return
+    for line in pretty_lines:
+        print(line)
+
+
+def _json_default(o: Any) -> Any:
+    from pathlib import Path as _P
+
+    if isinstance(o, _P):
+        return str(o)
+    if hasattr(o, "isoformat"):
+        return o.isoformat()
+    raise TypeError(f"not JSON-serialisable: {type(o).__name__}")
+
+
+# ----------------------------------------------------------------------
+# Subcommands
+# ----------------------------------------------------------------------
+
+
+def _cmd_demo(args: argparse.Namespace) -> int:
+    import ifcfast
+
+    m = ifcfast.open(ifcfast.example_path(), use_cache=False, write_cache=False)
+    summary = m.summary()
+    summary["sample_products"] = m.preview("products", n=2)
+    summary["sample_aggregates"] = m.preview("aggregates", n=3)
+    summary["agent_helpers"] = [
+        "ifcfast.example_path()", "ifcfast.system_prompt()",
+        "m.summary()", "m.schemas", "m.preview(table, n=5)",
+        "m.parent(g) / .children(g) / .ancestors(g) / .descendants(g)",
+        "m.storey_of(g) / .building_of(g) / .products_in(parent_g)",
+    ]
+    pretty = [
+        "ifcfast demo — bundled minimal IFC4 fixture",
+        "-" * 50,
+        f"path:          {summary['path']}",
+        f"schema:        {summary['schema']}",
+        f"products:      {summary['products']}",
+        f"storeys:       {summary['storeys']}",
+        f"parse time:    {summary['parse_seconds']*1000:.2f} ms",
+        f"top types:     {summary['top_types']}",
+        "",
+        "Tables on this model:",
+    ]
+    for name, meta in summary["tables"].items():
+        loaded = "yes" if meta["loaded"] else "lazy"
+        pretty.append(f"  {name:<16} rows={meta['rows']:<6} loaded={loaded}")
+    pretty.append("")
+    pretty.append("Agent ramp-up: ifcfast.system_prompt() → paste into your prompt.")
+    _emit(summary, args, pretty_lines=pretty)
+    return 0
 
 
 def _cmd_index(args: argparse.Namespace) -> int:
     import ifcfast
 
     m = ifcfast.open(args.file, use_cache=not args.no_cache, write_cache=not args.no_cache)
-    print(f"path:          {m.header.path}")
-    print(f"schema:        {m.schema}")
-    print(f"authoring app: {m.authoring_app}")
-    print(f"project:       {m.project_name}")
-    print(f"products:      {len(m)}")
-    print(f"storeys:       {len(m.storeys)}")
-    print(f"parse time:    {m.parse_seconds:.3f}s")
-    top = sorted(m.types().items(), key=lambda kv: -kv[1])[:10]
+    summary = m.summary()
+    top = list(summary["top_types"].items())[:10]
+    pretty = [
+        f"path:          {summary['path']}",
+        f"schema:        {summary['schema']}",
+        f"authoring app: {summary['authoring_app']}",
+        f"project:       {summary['project_name']}",
+        f"products:      {summary['products']}",
+        f"storeys:       {summary['storeys']}",
+        f"parse time:    {summary['parse_seconds']:.3f}s",
+    ]
     if top:
-        print("top types:")
+        pretty.append("top types:")
         for entity, count in top:
-            print(f"  {entity:<32} {count}")
+            pretty.append(f"  {entity:<32} {count}")
+    _emit(summary, args, pretty_lines=pretty)
+    return 0
+
+
+def _cmd_schema(args: argparse.Namespace) -> int:
+    import ifcfast
+
+    m = ifcfast.open(args.file, use_cache=not args.no_cache, write_cache=not args.no_cache)
+    payload = {"path": str(m.header.path), "schemas": m.schemas}
+    pretty = [f"path: {payload['path']}", ""]
+    for name, info in payload["schemas"].items():
+        loaded = "yes" if info["loaded"] else "lazy"
+        pretty.append(f"{name}  ({info['rows']} rows, loaded={loaded})")
+        for col in info["columns"]:
+            pretty.append(f"  {col:<24} {info['dtypes'].get(col, '')}")
+        pretty.append("")
+    _emit(payload, args, pretty_lines=pretty)
+    return 0
+
+
+def _cmd_types(args: argparse.Namespace) -> int:
+    """Type-first extraction — sprucelab-shaped TypeBank seed."""
+    import ifcfast
+
+    m = ifcfast.open(args.file, use_cache=not args.no_cache, write_cache=not args.no_cache)
+    rows = m.type_bank(sample_guids=args.samples) if args.with_data else m.type_summary(
+        sample_guids=args.samples
+    )
+    payload = {
+        "path": str(args.file),
+        "schema": m.schema,
+        "types": rows,
+        "total_types": len(rows),
+        "total_products": len(m),
+    }
+    pretty = [f"{payload['total_types']} unique types in {payload['total_products']} products"]
+    pretty.append("")
+    for r in rows[: args.top]:
+        line = f"  {r['entity']:<32} count={r['count']:<6}"
+        if r["storeys"]:
+            line += f"  storeys={len(r['storeys'])}"
+        if r["predefined_types"]:
+            line += f"  predef={r['predefined_types']}"
+        pretty.append(line)
+    _emit(payload, args, pretty_lines=pretty)
     return 0
 
 
@@ -41,17 +157,25 @@ def _cmd_extract(args: argparse.Namespace) -> int:
     from ifcfast.cache import extract_data_layers
 
     layers = extract_data_layers(args.file, include_drift=False)
-    rows = {
-        "psets":           0 if layers.psets is None else len(layers.psets),
-        "quantities":      0 if layers.quantities is None else len(layers.quantities),
-        "materials":       0 if layers.materials is None else len(layers.materials),
-        "classifications": 0 if layers.classifications is None else len(layers.classifications),
+    counts = {
+        "psets":           0 if layers.psets is None else int(len(layers.psets)),
+        "quantities":      0 if layers.quantities is None else int(len(layers.quantities)),
+        "materials":       0 if layers.materials is None else int(len(layers.materials)),
+        "classifications": 0 if layers.classifications is None else int(len(layers.classifications)),
     }
-    cold = layers.timing_ms.get("cold_parse", False)
-    total = layers.timing_ms.get("total_ms", 0)
-    print(f"{'cold parse' if cold else 'cache hit'}: {total:.0f} ms")
-    for name, n in rows.items():
-        print(f"  {name:<16} {n}")
+    cold = bool(layers.timing_ms.get("cold_parse", False))
+    total_ms = float(layers.timing_ms.get("total_ms", 0))
+    payload = {
+        "path": str(args.file),
+        "cold_parse": cold,
+        "total_ms": total_ms,
+        "row_counts": counts,
+        "timings_ms": {k: float(v) for k, v in layers.timing_ms.items()},
+    }
+    pretty = [f"{'cold parse' if cold else 'cache hit'}: {total_ms:.0f} ms"]
+    for name, n in counts.items():
+        pretty.append(f"  {name:<16} {n}")
+    _emit(payload, args, pretty_lines=pretty)
     return 0
 
 
@@ -61,18 +185,37 @@ def _cmd_drift(args: argparse.Namespace) -> int:
     layers = extract_data_layers(args.file, include_drift=True)
     df = layers.drift
     if df is None:
-        print("drift unavailable: _core built without `mesh` feature")
+        msg = "drift unavailable: _core built without `mesh` feature"
+        if getattr(args, "json", False):
+            print(json.dumps({"error": msg}))
+        else:
+            print(msg)
         return 1
-    print(f"products with geometry: {len(df)}")
-    counts = df["drift_severity"].value_counts().to_dict()
-    for sev in ("ok", "info", "warn", "error"):
-        print(f"  {sev:<6} {counts.get(sev, 0)}")
+    counts = {k: int(v) for k, v in df["drift_severity"].value_counts().to_dict().items()}
+    payload = {
+        "path": str(args.file),
+        "products_with_geometry": int(len(df)),
+        "severity_counts": {sev: counts.get(sev, 0) for sev in ("ok", "info", "warn", "error")},
+    }
     if args.top and counts.get("error", 0):
-        print()
-        print(df[df["drift_severity"] == "error"]
-              .nlargest(args.top, "drift_distance")
-              [["guid", "entity", "drift_distance", "max_extent", "drift_ratio"]]
-              .to_string(index=False))
+        top_errs = (
+            df[df["drift_severity"] == "error"]
+            .nlargest(args.top, "drift_distance")
+            [["guid", "entity", "drift_distance", "max_extent", "drift_ratio"]]
+        )
+        payload["top_errors"] = top_errs.to_dict(orient="records")
+    pretty = [f"products with geometry: {payload['products_with_geometry']}"]
+    for sev in ("ok", "info", "warn", "error"):
+        pretty.append(f"  {sev:<6} {payload['severity_counts'][sev]}")
+    if "top_errors" in payload:
+        pretty.append("")
+        pretty.append(
+            df[df["drift_severity"] == "error"]
+            .nlargest(args.top, "drift_distance")
+            [["guid", "entity", "drift_distance", "max_extent", "drift_ratio"]]
+            .to_string(index=False)
+        )
+    _emit(payload, args, pretty_lines=pretty)
     return 0
 
 
@@ -82,41 +225,103 @@ def _cmd_cache(args: argparse.Namespace) -> int:
 
     hdr = _hdr(args.file)
     d = cache_dir_for(hdr)
-    print(f"cache dir:       {d}")
-    print(f"exists:          {d.exists()}")
-    print(f"index cached:    {is_index_cached(hdr)}")
     cached = has_data_cached(hdr)
-    for k, v in cached.items():
-        print(f"  {k:<16} {v}")
+    payload = {
+        "path": str(args.file),
+        "cache_dir": str(d),
+        "exists": d.exists(),
+        "index_cached": is_index_cached(hdr),
+        "data_cached": {k: bool(v) for k, v in cached.items()},
+    }
     if args.clear and d.exists():
         import shutil
 
         shutil.rmtree(d)
-        print(f"cleared {d}")
+        payload["cleared"] = str(d)
+    pretty = [
+        f"cache dir:       {payload['cache_dir']}",
+        f"exists:          {payload['exists']}",
+        f"index cached:    {payload['index_cached']}",
+    ]
+    for k, v in payload["data_cached"].items():
+        pretty.append(f"  {k:<16} {v}")
+    if "cleared" in payload:
+        pretty.append(f"cleared {payload['cleared']}")
+    _emit(payload, args, pretty_lines=pretty)
     return 0
 
 
+# ----------------------------------------------------------------------
+# Entry point
+# ----------------------------------------------------------------------
+
+
 def main(argv: list[str] | None = None) -> int:
-    p = argparse.ArgumentParser(prog="ifcfast", description="Fast IFC parser CLI")
+    p = argparse.ArgumentParser(
+        prog="ifcfast",
+        description="Fast IFC parser CLI — agent-first, JSON-friendly.",
+    )
     sub = p.add_subparsers(dest="cmd", required=True)
+
+    def _add_json(parser):
+        parser.add_argument(
+            "--json", action="store_true",
+            help="emit machine-parseable JSON instead of text",
+        )
+
+    pd0 = sub.add_parser("demo", help="run against bundled minimal IFC")
+    _add_json(pd0)
+    pd0.set_defaults(func=_cmd_demo)
 
     pi = sub.add_parser("index", help="tier-1 index + counts")
     pi.add_argument("file", type=Path)
     pi.add_argument("--no-cache", action="store_true")
+    _add_json(pi)
     pi.set_defaults(func=_cmd_index)
+
+    ps = sub.add_parser("schema", help="dump full schema for every table")
+    ps.add_argument("file", type=Path)
+    ps.add_argument("--no-cache", action="store_true")
+    _add_json(ps)
+    ps.set_defaults(func=_cmd_schema)
+
+    pt = sub.add_parser(
+        "types",
+        help="type-first extraction (TypeBank-shaped)",
+    )
+    pt.add_argument("file", type=Path)
+    pt.add_argument("--no-cache", action="store_true")
+    pt.add_argument(
+        "--with-data",
+        action="store_true",
+        help="also extract materials + classifications per type (slower)",
+    )
+    pt.add_argument(
+        "--top", type=int, default=20,
+        help="show top-N types in pretty mode (no effect in --json)",
+    )
+    pt.add_argument(
+        "--samples", type=int, default=3,
+        help="sample GUIDs per type",
+    )
+    _add_json(pt)
+    pt.set_defaults(func=_cmd_types)
 
     pe = sub.add_parser("extract", help="extract data layers")
     pe.add_argument("file", type=Path)
+    _add_json(pe)
     pe.set_defaults(func=_cmd_extract)
 
-    pd = sub.add_parser("drift", help="placement / mesh drift report")
-    pd.add_argument("file", type=Path)
-    pd.add_argument("--top", type=int, default=10, help="show top-N errors")
-    pd.set_defaults(func=_cmd_drift)
+    pdc = sub.add_parser("drift", help="placement / mesh drift report")
+    pdc.add_argument("file", type=Path)
+    pdc.add_argument("--top", type=int, default=10, help="show top-N errors")
+    _add_json(pdc)
+    pdc.set_defaults(func=_cmd_drift)
 
     pc = sub.add_parser("cache", help="inspect / clear cache")
     pc.add_argument("file", type=Path)
     pc.add_argument("--clear", action="store_true")
+    _add_json(pc)
     pc.set_defaults(func=_cmd_cache)
 
     args = p.parse_args(argv)
