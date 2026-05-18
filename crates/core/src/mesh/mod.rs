@@ -3,18 +3,19 @@
 //! Feature-gated behind `mesh` so the default `ifcfast` builds (Python
 //! extension, bench binary) don't pull in `earcutr` and `glam`.
 //!
-//! Phase 1A scope (this commit):
-//!   * `IfcExtrudedAreaSolid` with parametric profiles (Rectangle,
-//!     Circle, Ellipse, I/L/U/T/Z shapes) + arbitrary closed +
-//!     arbitrary-with-voids.
-//!   * `IfcLocalPlacement` recursive chain → world matrix.
-//!   * `IfcShapeRepresentation` walk — body / facetation / reference
-//!     contexts.
-//!   * Output: Wavefront `.obj` for visual verification.
+//! Design stance: **reveal what the file says.** Every representation
+//! item is dispatched to a handler that returns either real geometry
+//! (tagged by source) or an explicit `Unhandled { ifc_type }` fragment
+//! so the consumer knows exactly what the file contained and what we
+//! couldn't tessellate yet. We never silently drop a representation.
 //!
-//! Phase 1B / 2 / 3 add IfcMappedItem expansion, faceted/face-set BREP,
-//! boolean clipping for openings, and Fragments binary serialisation.
+//! Composite solids (`IfcBooleanResult`, `IfcCsgSolid`) emit BOTH
+//! operands as their own visible mesh segments. We don't perform the
+//! boolean — that would erase the structural information ("this volume
+//! is the host", "this volume is the cut") that downstream tools and
+//! human readers need to make decisions and surgically edit the model.
 
+pub mod boolean;
 pub mod brep;
 pub mod extrusion;
 pub mod faceset;
@@ -35,6 +36,68 @@ use crate::lexer::{parse_field, split_top_level_args, Field};
 use crate::mesh::extrusion::LocalMesh;
 use crate::mesh::placement::PlacementResolver;
 
+/// One contiguous slice of a `ProductMesh`'s triangle list that came
+/// from a single representation item or operand. Lets the consumer
+/// know which triangles are "the host wall" vs "the door opening
+/// volume" inside a `ProductMesh` built from an `IfcBooleanResult`.
+#[derive(Debug, Clone)]
+pub struct MeshSegment {
+    /// First index in `ProductMesh.indices` that belongs to this segment.
+    pub index_start: u32,
+    /// Number of indices (always a multiple of 3) in this segment.
+    pub index_count: u32,
+    /// Provenance tag — see [`MeshFragment::source_tags`] for the set
+    /// of known values, plus `"unhandled:IFCXXX"` for items we saw
+    /// but couldn't tessellate.
+    pub source: String,
+}
+
+/// What `mesh_item` returns per representation item it walks. Either a
+/// real triangle mesh with its source tag, or an explicit "we saw a
+/// representation of this type but don't have a handler for it" marker
+/// so the caller can bucket it into stats. Never a silent drop.
+///
+/// `role` is set by composite handlers (`boolean::boolean_result`,
+/// `boolean::csg_solid`) to record the structural position of this
+/// fragment inside the parent tree (e.g. `Some("boolean_first_operand")`
+/// for the host side of an `IfcBooleanClippingResult`). The leaf
+/// `source` keeps the underlying representation type, so a halfspace
+/// used as a clip target appears with `source="halfspace_bounded"` AND
+/// `role=Some("boolean_second_operand")` — both facts preserved.
+#[derive(Debug)]
+pub enum MeshFragment {
+    Mesh {
+        mesh: LocalMesh,
+        source: &'static str,
+        role: Option<&'static str>,
+    },
+    Unhandled {
+        ifc_type: String,
+    },
+}
+
+impl MeshFragment {
+    /// Known source tags emitted by the dispatch tree. Useful for
+    /// downstream consumers that want to validate the set.
+    pub fn source_tags() -> &'static [&'static str] {
+        &[
+            "extrusion",
+            "mapped",
+            "polygonal_faceset",
+            "triangulated_faceset",
+            "brep",
+            "advanced_brep_approx",
+            "faceset_fbsm",
+            "faceset_sbsm",
+            "boolean_first_operand",
+            "boolean_second_operand",
+            "csg_branch",
+            "halfspace_bounded",
+            "halfspace_plane",
+        ]
+    }
+}
+
 /// A finished mesh in world coordinates, keyed back to its IfcProduct.
 #[derive(Debug, Clone)]
 pub struct ProductMesh {
@@ -44,9 +107,18 @@ pub struct ProductMesh {
     pub vertices: Vec<f32>,
     /// Triangle indices into `vertices` (every 3 = one triangle).
     pub indices: Vec<u32>,
-    /// Source representation tag — `"extrusion"`, `"mapped"`, `"faceset"`,
-    /// `"brep"`, `"deferred"`.
+    /// Dominant source tag — the first segment's tag, kept for back-
+    /// compat with consumers that don't read `segments`. For composite
+    /// representations (`IfcBooleanResult` etc.), prefer iterating
+    /// `segments` to see all operands.
     pub source: &'static str,
+    /// Per-item provenance — one entry per representation item that
+    /// contributed triangles. For an `IfcWall` whose representation is
+    /// a single `IfcExtrudedAreaSolid`, this is one segment. For one
+    /// whose representation is `IfcBooleanClippingResult(wall, door)`,
+    /// this is two segments tagged `"boolean_first_operand"` and
+    /// `"boolean_second_operand"`.
+    pub segments: Vec<MeshSegment>,
     /// World-space position of the product's IfcLocalPlacement origin —
     /// i.e. where the authoring tool thinks the element "is". Used by
     /// the drift analyser to detect placement-vs-geometry mismatches
@@ -67,6 +139,12 @@ pub struct MeshStats {
 }
 
 /// Mesh every product in the IFC and return them keyed by GUID order.
+///
+/// Reveal-all stance: opening elements, void volumes, intersecting
+/// halfspaces, both operands of a boolean tree — all of it is emitted
+/// as visible geometry. Anything we can't tessellate yet is reported
+/// as `stats.by_source["unhandled:IFCXXX"]` so the consumer knows
+/// exactly what's in the file that we haven't surfaced.
 pub fn mesh_ifc(buf: &[u8]) -> (Vec<ProductMesh>, MeshStats) {
     let mut stats = MeshStats::default();
 
@@ -83,17 +161,6 @@ pub fn mesh_ifc(buf: &[u8]) -> (Vec<ProductMesh>, MeshStats) {
     for (step_id, type_name, args) in table.iter() {
         // Skip anything we know isn't a product (rels, primitives, etc.).
         if !is_product_type(type_name) {
-            continue;
-        }
-        // IfcOpeningElement is a void definition — its volume is meant to
-        // be *subtracted* from the host wall/slab via IfcRelVoidsElement,
-        // not rendered as its own solid. Real boolean subtraction is
-        // tracked in ifcfast#4; until then, skipping it removes the
-        // duplicate translucent volume that overlapped walls + doors.
-        if type_name.eq_ignore_ascii_case(b"IFCOPENINGELEMENT") {
-            stats.products_seen += 1;
-            stats.products_deferred += 1;
-            *stats.by_source.entry("opening_skipped".into()).or_insert(0) += 1;
             continue;
         }
         stats.products_seen += 1;
@@ -122,26 +189,6 @@ pub fn mesh_ifc(buf: &[u8]) -> (Vec<ProductMesh>, MeshStats) {
             .map(|pid| resolver.world(pid))
             .unwrap_or(Mat4::IDENTITY);
 
-        // Door / window z-fight workaround: scale the product's local
-        // frame by a hair so it wins the depth test against the host
-        // wall's gross geometry. This is a temporary hack until real
-        // IfcRelVoidsElement → boolean subtraction lands (ifcfast#4);
-        // once openings are actually carved out of walls, this can go.
-        // Scale is applied about the placement origin, not the world
-        // origin, so the product doesn't translate.
-        let world = if type_name.eq_ignore_ascii_case(b"IFCDOOR")
-            || type_name.eq_ignore_ascii_case(b"IFCWINDOW")
-        {
-            const K: f32 = 1.003;
-            let origin = world * Vec4::new(0.0, 0.0, 0.0, 1.0);
-            let translate_to_origin = Mat4::from_translation(Vec3::new(-origin.x, -origin.y, -origin.z));
-            let scale = Mat4::from_scale(Vec3::splat(K));
-            let translate_back = Mat4::from_translation(Vec3::new(origin.x, origin.y, origin.z));
-            translate_back * scale * translate_to_origin * world
-        } else {
-            world
-        };
-
         // Find a body/facetation Items list.
         let items = body_items(&table, repr_id);
         if items.is_empty() {
@@ -150,33 +197,67 @@ pub fn mesh_ifc(buf: &[u8]) -> (Vec<ProductMesh>, MeshStats) {
             continue;
         }
 
-        // Mesh each item, union into the product mesh.
+        // Mesh each item, union into the product mesh. We keep a
+        // segment record per item so the consumer can color / filter /
+        // edit by operand role.
         let entity_name = type_name_titlecase(type_name);
         let mut combined_v: Vec<f32> = Vec::new();
         let mut combined_i: Vec<u32> = Vec::new();
-        let mut source_tag: &'static str = "deferred";
+        let mut segments: Vec<MeshSegment> = Vec::new();
 
         for item_id in items {
-            let item_meshes = mesh_item(&table, item_id, &mut shape_cache);
-            for (local, src) in item_meshes {
-                let base = (combined_v.len() / 3) as u32;
-                // Apply the product's world transform to every vertex.
-                for chunk in local.vertices.chunks_exact(3) {
-                    let p = Vec3::new(chunk[0], chunk[1], chunk[2]);
-                    let w = world * Vec4::new(p.x, p.y, p.z, 1.0);
-                    combined_v.push(w.x);
-                    combined_v.push(w.y);
-                    combined_v.push(w.z);
+            let fragments = mesh_item(&table, item_id, &mut shape_cache);
+            for frag in fragments {
+                match frag {
+                    MeshFragment::Mesh { mesh: local, source, role } => {
+                        let seg_index_start = combined_i.len() as u32;
+                        let base = (combined_v.len() / 3) as u32;
+                        // Apply the product's world transform to every vertex.
+                        for chunk in local.vertices.chunks_exact(3) {
+                            let p = Vec3::new(chunk[0], chunk[1], chunk[2]);
+                            let w = world * Vec4::new(p.x, p.y, p.z, 1.0);
+                            combined_v.push(w.x);
+                            combined_v.push(w.y);
+                            combined_v.push(w.z);
+                        }
+                        for &idx in &local.indices {
+                            combined_i.push(base + idx);
+                        }
+                        let seg_index_count = combined_i.len() as u32 - seg_index_start;
+                        if seg_index_count > 0 {
+                            // Compound tag preserves BOTH the structural
+                            // role (if any) and the leaf representation
+                            // type, so a polygonal halfspace used as a
+                            // boolean cut reads as
+                            // "boolean_second_operand|halfspace_bounded".
+                            let tag = match role {
+                                Some(r) => format!("{}|{}", r, source),
+                                None => source.to_string(),
+                            };
+                            segments.push(MeshSegment {
+                                index_start: seg_index_start,
+                                index_count: seg_index_count,
+                                source: tag,
+                            });
+                        }
+                    }
+                    MeshFragment::Unhandled { ifc_type } => {
+                        // Explicit "we saw this representation but
+                        // don't tessellate it yet" — the whole point
+                        // of the reveal-all stance.
+                        *stats
+                            .by_source
+                            .entry(format!("unhandled:{}", ifc_type))
+                            .or_insert(0) += 1;
+                    }
                 }
-                for &idx in &local.indices {
-                    combined_i.push(base + idx);
-                }
-                source_tag = src;
             }
         }
 
         if combined_i.is_empty() {
             stats.products_deferred += 1;
+            // Already credited to unhandled:IFCXXX above; record the
+            // outer-level miss too so the consumer can correlate.
             *stats.by_source.entry("item_unhandled".into()).or_insert(0) += 1;
             continue;
         }
@@ -189,15 +270,31 @@ pub fn mesh_ifc(buf: &[u8]) -> (Vec<ProductMesh>, MeshStats) {
             [p.x, p.y, p.z]
         };
 
+        // Dominant source = leaf tag of the first segment. Compound
+        // tags ("boolean_first_operand|extrusion") collapse to their
+        // leaf (`"extrusion"`) for the legacy `.source` field — full
+        // detail still available via `.segments`. Keeps back-compat for
+        // consumers (stats.rs, gltf.rs) that read `.source` directly.
+        let source_tag: &'static str = segments
+            .first()
+            .and_then(|s| {
+                let leaf = s.source.rsplit('|').next().unwrap_or(s.source.as_str());
+                MeshFragment::source_tags().iter().find(|t| **t == leaf).copied()
+            })
+            .unwrap_or("composite");
+
         stats.products_meshed += 1;
         stats.triangles += combined_i.len() / 3;
-        *stats.by_source.entry(source_tag.to_string()).or_insert(0) += 1;
+        for seg in &segments {
+            *stats.by_source.entry(seg.source.clone()).or_insert(0) += 1;
+        }
         out.push(ProductMesh {
             guid,
             entity: entity_name,
             vertices: combined_v,
             indices: combined_i,
             source: source_tag,
+            segments,
             placement_origin,
         });
         let _ = step_id;
@@ -207,16 +304,24 @@ pub fn mesh_ifc(buf: &[u8]) -> (Vec<ProductMesh>, MeshStats) {
     (out, stats)
 }
 
-/// Mesh a single `IfcRepresentationItem` (or recurse via `IfcMappedItem`).
+/// Mesh a single `IfcRepresentationItem`. Returns one or more fragments
+/// — each either a real mesh tagged with its source, or an explicit
+/// `Unhandled` marker carrying the IFC type name so the caller can
+/// bucket it into stats. Recurses for `IfcMappedItem`, `IfcBooleanResult`,
+/// `IfcCsgSolid`.
 pub(crate) fn mesh_item(
     table: &EntityTable,
     item_id: u64,
     shape_cache: &mut HashMap<u64, Vec<(LocalMesh, &'static str)>>,
-) -> Vec<(LocalMesh, &'static str)> {
+) -> Vec<MeshFragment> {
     if let Some(cached) = shape_cache.get(&item_id) {
         return cached
             .iter()
-            .map(|(m, s)| (clone_local(m), *s))
+            .map(|(m, s)| MeshFragment::Mesh {
+                mesh: clone_local(m),
+                source: *s,
+                role: None,
+            })
             .collect();
     }
 
@@ -225,47 +330,80 @@ pub(crate) fn mesh_item(
         None => return Vec::new(),
     };
 
-    let result: Vec<(LocalMesh, &'static str)> =
+    let single = |maybe: Option<LocalMesh>, tag: &'static str| -> Vec<MeshFragment> {
+        match maybe {
+            Some(m) => vec![MeshFragment::Mesh {
+                mesh: m,
+                source: tag,
+                role: None,
+            }],
+            None => Vec::new(),
+        }
+    };
+
+    let result: Vec<MeshFragment> =
         if type_name.eq_ignore_ascii_case(b"IFCEXTRUDEDAREASOLID") {
-            extrusion::extrude(table, item_id)
-                .map(|m| vec![(m, "extrusion")])
-                .unwrap_or_default()
+            single(extrusion::extrude(table, item_id), "extrusion")
         } else if type_name.eq_ignore_ascii_case(b"IFCMAPPEDITEM") {
             mapped::expand(table, item_id, shape_cache)
         } else if type_name.eq_ignore_ascii_case(b"IFCPOLYGONALFACESET") {
-            faceset::polygonal_face_set(table, item_id)
-                .map(|m| vec![(m, "polygonal_faceset")])
-                .unwrap_or_default()
+            single(faceset::polygonal_face_set(table, item_id), "polygonal_faceset")
         } else if type_name.eq_ignore_ascii_case(b"IFCTRIANGULATEDFACESET") {
-            faceset::triangulated_face_set(table, item_id)
-                .map(|m| vec![(m, "triangulated_faceset")])
-                .unwrap_or_default()
+            single(
+                faceset::triangulated_face_set(table, item_id),
+                "triangulated_faceset",
+            )
         } else if type_name.eq_ignore_ascii_case(b"IFCFACETEDBREP")
             || type_name.eq_ignore_ascii_case(b"IFCMANIFOLDSOLIDBREP")
         {
-            brep::faceted_brep(table, item_id)
-                .map(|m| vec![(m, "brep")])
-                .unwrap_or_default()
+            single(brep::faceted_brep(table, item_id), "brep")
+        } else if type_name.eq_ignore_ascii_case(b"IFCADVANCEDBREP") {
+            single(brep::faceted_brep(table, item_id), "advanced_brep_approx")
         } else if type_name.eq_ignore_ascii_case(b"IFCFACEBASEDSURFACEMODEL") {
-            brep::face_based_surface_model(table, item_id)
-                .map(|m| vec![(m, "faceset_fbsm")])
-                .unwrap_or_default()
+            single(brep::face_based_surface_model(table, item_id), "faceset_fbsm")
         } else if type_name.eq_ignore_ascii_case(b"IFCSHELLBASEDSURFACEMODEL") {
-            brep::shell_based_surface_model(table, item_id)
-                .map(|m| vec![(m, "faceset_sbsm")])
-                .unwrap_or_default()
+            single(brep::shell_based_surface_model(table, item_id), "faceset_sbsm")
+        } else if type_name.eq_ignore_ascii_case(b"IFCBOOLEANRESULT")
+            || type_name.eq_ignore_ascii_case(b"IFCBOOLEANCLIPPINGRESULT")
+        {
+            // Recurse into operands. We must avoid borrow-checker pain
+            // when passing &mut shape_cache through a callback closure;
+            // boolean::boolean_result takes a function pointer to
+            // `mesh_item` so the recursion happens on this exact frame.
+            boolean::boolean_result(table, item_id, shape_cache, &mesh_item)
+        } else if type_name.eq_ignore_ascii_case(b"IFCCSGSOLID") {
+            boolean::csg_solid(table, item_id, shape_cache, &mesh_item)
+        } else if type_name.eq_ignore_ascii_case(b"IFCPOLYGONALBOUNDEDHALFSPACE") {
+            single(boolean::polygonal_bounded_halfspace(table, item_id), "halfspace_bounded")
+        } else if type_name.eq_ignore_ascii_case(b"IFCHALFSPACESOLID") {
+            single(boolean::halfspace_solid(table, item_id), "halfspace_plane")
         } else {
-            // IfcBooleanClippingResult / advanced BREPs — Phase 2.
-            Vec::new()
+            // Reveal-all stance: name the type explicitly so the
+            // consumer sees exactly what's in the file we can't yet
+            // tessellate, instead of a silent black hole.
+            vec![MeshFragment::Unhandled {
+                ifc_type: bytes_to_string(type_name),
+            }]
         };
 
-    // Cache only the extrusion / direct-mesh case; mapped items recurse
-    // via the cache on their inner shape.
-    if !type_name.eq_ignore_ascii_case(b"IFCMAPPEDITEM") {
-        shape_cache.insert(
-            item_id,
-            result.iter().map(|(m, s)| (clone_local(m), *s)).collect(),
-        );
+    // Cache only the real mesh fragments — unhandled markers are cheap
+    // to re-derive. Composite handlers (boolean / csg) don't cache the
+    // outer node either; their operand caches do the work.
+    let is_composite = type_name.eq_ignore_ascii_case(b"IFCMAPPEDITEM")
+        || type_name.eq_ignore_ascii_case(b"IFCBOOLEANRESULT")
+        || type_name.eq_ignore_ascii_case(b"IFCBOOLEANCLIPPINGRESULT")
+        || type_name.eq_ignore_ascii_case(b"IFCCSGSOLID");
+    if !is_composite {
+        let cacheable: Vec<(LocalMesh, &'static str)> = result
+            .iter()
+            .filter_map(|f| match f {
+                MeshFragment::Mesh { mesh, source, role: _ } => {
+                    Some((clone_local(mesh), *source))
+                }
+                MeshFragment::Unhandled { .. } => None,
+            })
+            .collect();
+        shape_cache.insert(item_id, cacheable);
     }
     result
 }
@@ -429,6 +567,12 @@ fn string_at(fields: &[&[u8]], idx: usize) -> Option<String> {
         Field::String(s) => Some(s),
         _ => None,
     }
+}
+
+fn bytes_to_string(b: &[u8]) -> String {
+    std::str::from_utf8(b)
+        .map(|s| s.to_ascii_uppercase())
+        .unwrap_or_else(|_| String::from_utf8_lossy(b).into_owned())
 }
 
 fn type_name_titlecase(t: &[u8]) -> String {

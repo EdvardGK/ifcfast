@@ -21,13 +21,14 @@ use crate::entity_table::EntityTable;
 use crate::lexer::{parse_field, split_top_level_args, Field};
 use crate::mesh::extrusion::LocalMesh;
 use crate::mesh::placement::axis_placement_3d_from_id;
+use crate::mesh::MeshFragment;
 
 /// Resolve an `IfcMappedItem`, recursing into its source's items.
 pub fn expand(
     table: &EntityTable,
     item_id: u64,
     shape_cache: &mut HashMap<u64, Vec<(LocalMesh, &'static str)>>,
-) -> Vec<(LocalMesh, &'static str)> {
+) -> Vec<MeshFragment> {
     let (type_name, args) = match table.get(item_id) {
         Some(x) => x,
         None => return Vec::new(),
@@ -74,10 +75,23 @@ pub fn expand(
 
     // Walk the source representation's Items (it's an IfcShapeRepresentation).
     let item_ids = super::representation_items(table, mapped_repr_id);
-    let mut out: Vec<(LocalMesh, &'static str)> = Vec::new();
+    let mut out: Vec<MeshFragment> = Vec::new();
     for inner in item_ids {
-        for (mesh, src) in super::mesh_item(table, inner, shape_cache) {
-            out.push((transform_mesh(&mesh, composed), if src == "extrusion" { "mapped" } else { src }));
+        for frag in super::mesh_item(table, inner, shape_cache) {
+            match frag {
+                MeshFragment::Mesh { mesh, source: src, role } => {
+                    out.push(MeshFragment::Mesh {
+                        mesh: transform_mesh(&mesh, composed),
+                        source: if src == "extrusion" { "mapped" } else { src },
+                        role,
+                    });
+                }
+                u @ MeshFragment::Unhandled { .. } => {
+                    // Pass through — the consumer needs to see what's
+                    // inside the mapping that we couldn't tessellate.
+                    out.push(u);
+                }
+            }
         }
     }
     out

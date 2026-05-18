@@ -4,15 +4,16 @@
 framework opening IFC files programmatically, this is the page you
 want.
 
-## Why pick `ifcfast`
+## When `ifcfast` fits
 
-- **20-30× faster than `ifcopenshell.open`** on the audited set
-  (22 MB ARK file: 29 ms after recent perf work; 834 MB MEP file with
-  14.3M records: 905 ms). Byte-level parity vs ifcopenshell
-  on 234K products across 5 authoring tools.
-- **Single import, no kernel.** Pandas DataFrames out, no
-  `IfcOpenShell.ifcopenshell.open()` to wait on, no native geometry
-  kernel to compile.
+- **Fast cold parse on the audited set:** 22 MB ARK in 29 ms,
+  834 MB MEP with 14.3M records in 905 ms — roughly 20-30× the
+  cold-parse cost of `ifcopenshell.open` on the same files, byte-level
+  parity for the fields `ifcfast` extracts. Different parsers for
+  different jobs; `ifcopenshell` still owns geometry, schema, and
+  authoring work.
+- **Single import, no kernel.** Pandas DataFrames out, no native
+  geometry kernel to compile.
 - **Parquet cache** — second open of a 200 MB IFC returns in tens of
   milliseconds. Cache key invalidates on any edit.
 - **Spatial-relationship graph built in.** `m.contained_in /
@@ -100,17 +101,52 @@ releases (additions only, never reorganisations).
 - **Cache version is in the manifest** (`~/.cache/ifcfast/{key}/meta.json`)
   — bumping the library invalidates incompatible caches automatically.
 
+## Reveal-all geometry stance
+
+When the mesh pipeline meets a composite solid (`IfcBooleanResult`,
+`IfcBooleanClippingResult`, `IfcCsgSolid`) it does **not** perform the
+boolean. Both operands are emitted as their own visible mesh segments
+with compound tags like `boolean_first_operand|extrusion` (the host
+wall) and `boolean_second_operand|halfspace_bounded` (the door clip).
+This is deliberate: the file says "wall minus opening volume"; we
+preserve both volumes so an agent or human can SEE the structure,
+understand it, and edit it surgically rather than read a curated
+summary. The glTF emitter writes each segment's `(start, count,
+source)` into per-node `extras.segments` so viewers can colour /
+split / filter by role.
+
+Unhandled representation types (e.g. `IfcRevolvedAreaSolid`,
+`IfcSurfaceCurveSweptAreaSolid`) appear as `unhandled:IFCXXX`
+entries in `mesh_stats.by_source` so you can see exactly what the
+file contained that wasn't tessellated, instead of a silent drop.
+
 ## What `ifcfast` does NOT do (yet)
 
-- Write or modify IFCs. Read-only by construction.
-- Tessellate `IfcBooleanClippingResult` (walls with openings get gross
-  volume, not net). Tracked.
-- `IfcRelVoidsElement` / `IfcRelConnectsElements` and other non-spatial
-  / non-aggregation relationships. Means `IfcOpeningElement` products
-  appear in `m.products` but not yet in the graph traversal.
+- Write or modify IFCs. Read-only by construction. (Round-trip
+  editing is the next major milestone — see north-star below.)
+- True boolean / CSG composition. By design — we surface BOTH
+  operands instead, per the reveal-all stance above. If you need
+  net geometry, compose the segments downstream.
+- Curved-surface tessellation for `IfcAdvancedBrep` — the face
+  loops are triangulated as polygons, marked `advanced_brep_approx`.
+- `IfcRelConnectsElements` and other non-spatial / non-aggregation
+  relationships beyond the four already extracted
+  (`IfcRelContainedInSpatialStructure`, `IfcRelAggregates`,
+  `IfcRelVoidsElement`, `IfcRelDefinesByType`). File an issue with the
+  relation name + a sample if you need another one.
 - Property variants beyond `IfcPropertySingleValue` —
   `IfcPropertyEnumeratedValue`, `IfcComplexProperty`, etc. are skipped.
   Covers ~90% of psets seen on real Revit / Archicad / Tekla exports.
+
+## North star: surgical modelling via code
+
+The reveal-all stance is the foundation for "read → edit → write"
+round-trips. Today the parser is read-only. The path to editing is:
+preserve per-entity byte offsets, expose a write-back surface that
+mutates the in-memory STEP buffer, and emit a deterministic
+serialiser. Tracked separately — until then, ifcfast is the X-ray
+that tells you exactly what's in the file so you know what to
+change.
 
 If your agent task hits one of these, file an issue with the file
 shape — these are the next-tier extensions.

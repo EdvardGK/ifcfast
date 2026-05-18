@@ -21,6 +21,7 @@ use crate::mesh::placement::axis_placement_3d_from_id;
 use crate::mesh::profile::{self, Polygon2D};
 
 /// Triangle-list mesh in local 3D coordinates.
+#[derive(Debug, Clone, Default)]
 pub struct LocalMesh {
     pub vertices: Vec<f32>, // [x, y, z, ...]
     pub indices: Vec<u32>,  // triangle indices into vertices

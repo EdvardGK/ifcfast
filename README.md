@@ -5,9 +5,10 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![CI](https://github.com/EdvardGK/ifcfast/actions/workflows/ci.yml/badge.svg)](https://github.com/EdvardGK/ifcfast/actions/workflows/ci.yml)
 
-> **The fastest open-source IFC parser. Designed for AI agents, RPA,
-> and analytics pipelines that need to ask questions of a model without
-> loading a geometry kernel.**
+> **An agent-first IFC parser. Built for AI agents, RPA, and analytics
+> pipelines that need to ask questions of a model without loading a
+> geometry kernel. Complements `ifcopenshell` — different tradeoffs,
+> different jobs.**
 
 ```python
 pip install ifcfast
@@ -46,12 +47,16 @@ pip install 'ifcfast[mcp]'
 { "mcpServers": { "ifcfast": { "command": "ifcfast-mcp" } } }
 ```
 
-**Why pick `ifcfast`**
+**When `ifcfast` fits**
 
-- **20-30× faster than `ifcopenshell.open`** on the audited set
-  (22 MB ARK file: 29 ms; 834 MB MEP file: 905 ms / 14.3M records).
-  Byte-level parity vs ifcopenshell across 234K products from 5
-  authoring tools (Tekla, Archicad, Revit IFC4 / IFC2X3, MagiCAD).
+- **Fast cold parse on the audited set:** 22 MB ARK in 29 ms,
+  834 MB MEP in 905 ms (14.3M records). Roughly 20-30× the cold-parse
+  cost of `ifcopenshell.open` on the same files, with byte-level parity
+  on 234K products across Tekla, Archicad, Revit IFC4 / IFC2X3, and
+  MagiCAD. Numbers and methodology in
+  [`docs/history/audit/`](docs/history/audit/) — different parsers
+  for different jobs; `ifcopenshell` still handles geometry kernels,
+  authoring, and schema work that `ifcfast` doesn't touch.
 - **Spatial-relationship graph built in.** `m.contained_in /
   .aggregates / .storey_building` + seven traversal helpers
   (`parent`, `children`, `ancestors`, `descendants`, `storey_of`,
@@ -62,9 +67,9 @@ pip install 'ifcfast[mcp]'
   CLI subcommand has `--json`. Stable shape across releases.
 - **Parquet cache.** Second open of a 200 MB IFC returns in tens of
   milliseconds. Cache key invalidates automatically on any edit.
-- **No `ifcopenshell.open()` on the hot path.** No geometry kernel to
-  compile, no 8 GB RAM floor. Rust core via PyO3, mmap-based, peaks
-  under 1 GB resident on a 800 MB MEP IFC.
+- **No geometry kernel on the hot path.** Rust core via PyO3,
+  mmap-based, peaks under 1 GB resident on an 800 MB MEP IFC. That's
+  a deliberate scope cut — kernels live elsewhere when you need them.
 
 See [AGENTS.md](AGENTS.md) for the full agent guide and a copy-paste
 `system_prompt()` you can drop into your LLM's context.
@@ -93,7 +98,7 @@ under 100 ms. Memory peak: under 1 GB resident (mmap-based).
 
 Audited at **234,144 products across 5 authoring tools** (Tekla,
 Archicad, Revit IFC4, Revit IFC2X3, MagiCAD, BSProLib) with byte-level
-parity vs `ifcopenshell`. See
+parity against `ifcopenshell` for the fields ifcfast extracts. See
 [`docs/history/audit/`](docs/history/audit/).
 
 ## Install
@@ -290,11 +295,15 @@ m.products_in(parent)     # all products under parent (BFS, filtered)
 `building` / `site` / `project` / `space`. The tables are persisted in
 the parquet cache, so hot reloads keep graph access at full speed.
 
-Coverage today: `IfcRelAggregates` (decomposition) and
-`IfcRelContainedInSpatialStructure` (spatial). `IfcRelVoidsElement`
-(wall ↔ opening), `IfcRelConnectsElements`, and other relationship
-types are not yet emitted — that means `IfcOpeningElement` products
-appear in `m.products` but not in the graph traversal yet.
+Coverage today: `IfcRelAggregates` (decomposition),
+`IfcRelContainedInSpatialStructure` (spatial), `IfcRelVoidsElement`
+(opening ↔ host — `m.voids` DataFrame), and `IfcRelDefinesByType`
+(product ↔ type — populates `type_guid` / `type_name` /
+`type_source` on each product, plus `m.type_objects` as the
+catalogue). `IfcRelConnectsElements` and other relationship types
+are still on the next-tier list — file an issue with a sample if
+you need one. `IfcSpace` is surfaced as `m.spaces` (rooms / zones
+kept separate from "things you build").
 
 ## Federated floor synthesis
 
@@ -331,14 +340,34 @@ pandas / pyarrow — no Rust call needed. There is no `ifcopenshell.open()`
 anywhere in the data path; `ifcopenshell` is an *optional* dev dep used
 only for cross-checking parity in tests.
 
+## Reveal-all geometry stance
+
+When the mesh pipeline meets a composite solid (`IfcBooleanResult`,
+`IfcBooleanClippingResult`, `IfcCsgSolid`) it does **not** perform the
+boolean. Both operands are emitted as their own visible mesh segments
+with compound tags like `boolean_first_operand|extrusion` (the host
+wall) and `boolean_second_operand|halfspace_bounded` (the door clip).
+You see the file as authored — the host volume AND the clip volume,
+not a curated "wall minus opening" summary. The glTF emitter writes
+each segment's `(start, count, source)` into per-node
+`extras.segments` so the viewer can colour, split, or filter by role.
+
+Representation types we don't tessellate yet (e.g.
+`IfcRevolvedAreaSolid`, `IfcSurfaceCurveSweptAreaSolid`,
+`IfcCsgPrimitive3D` leaves) surface in `mesh_stats.by_source` as
+`unhandled:IFCXXX` entries so you can see exactly what the file
+contained that we couldn't reveal — never a silent drop.
+
 ## What it doesn't do
 
-- Write or modify IFCs. Read-only by construction.
+- Write or modify IFCs. Read-only by construction. (Round-trip
+  editing is the next major milestone — see AGENTS.md "North star".)
+- True boolean / CSG composition. By design — we reveal BOTH
+  operands instead.
 - Schema validation. Trusts the file's syntax. Use
   [bsi-validator](https://github.com/buildingSMART/IFC) for conformance.
-- Tessellate `IfcBooleanClippingResult` (walls with openings render
-  without cutouts — gross volume correct, net volume not).
-- NURBS / advanced BREP geometry. ~0.5% of elements in typical exports.
+- Curved-surface tessellation for `IfcAdvancedBrep` — face loops are
+  triangulated as polygons (tagged `advanced_brep_approx`).
 - Property variants beyond `IfcPropertySingleValue` —
   `IfcPropertyEnumeratedValue`, `IfcPropertyListValue`,
   `IfcPropertyBoundedValue`, `IfcComplexProperty` are skipped. Covers

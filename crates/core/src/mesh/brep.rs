@@ -16,11 +16,21 @@ use crate::entity_table::EntityTable;
 use crate::lexer::{parse_field, split_top_level_args, Field};
 use crate::mesh::extrusion::LocalMesh;
 
-/// Mesh an `IfcFacetedBrep` or `IfcManifoldSolidBrep`.
+/// Mesh an `IfcFacetedBrep` / `IfcManifoldSolidBrep` / `IfcAdvancedBrep`.
+///
+/// All three share the same first attribute (`Outer: IfcClosedShell`)
+/// and the underlying face / loop / point traversal. `IfcAdvancedBrep`
+/// uses curved surfaces (`IfcAdvancedFace` + `IfcBSplineSurface` etc.)
+/// for its faces — at this stage we tessellate by treating the face's
+/// outer poly-loop as-is, which is a planar approximation. The fragment
+/// caller tags the source as `"advanced_brep_approx"` so the consumer
+/// knows curvature was discarded; real curved-surface tessellation lives
+/// in a future pass.
 pub fn faceted_brep(table: &EntityTable, id: u64) -> Option<LocalMesh> {
     let (type_name, args) = table.get(id)?;
     if !type_name.eq_ignore_ascii_case(b"IFCFACETEDBREP")
         && !type_name.eq_ignore_ascii_case(b"IFCMANIFOLDSOLIDBREP")
+        && !type_name.eq_ignore_ascii_case(b"IFCADVANCEDBREP")
     {
         return None;
     }

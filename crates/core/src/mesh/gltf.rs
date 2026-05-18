@@ -341,7 +341,24 @@ fn build_json(meshes: &[ProductMesh], views: &BufferViews, binary_len: u32) -> S
         push_json_string(&mut s, &mesh.entity);
         s.push_str(r#"","source":""#);
         push_json_string(&mut s, mesh.source);
-        s.push_str(r#""}}"#);
+        s.push_str(r#"","segments":["#);
+        // Per-segment provenance — lets the viewer split, colour, or
+        // filter a product's triangles by representation role. A wall
+        // built from IfcBooleanClippingResult will have two entries
+        // here, e.g. one tagged "boolean_first_operand|extrusion"
+        // (the host bulk) and one "boolean_second_operand|halfspace_bounded"
+        // (the clip volume) — both visible.
+        for (si, seg) in mesh.segments.iter().enumerate() {
+            if si > 0 { s.push(','); }
+            s.push_str(r#"{"start":"#);
+            s.push_str(&seg.index_start.to_string());
+            s.push_str(r#","count":"#);
+            s.push_str(&seg.index_count.to_string());
+            s.push_str(r#","source":""#);
+            push_json_string(&mut s, &seg.source);
+            s.push_str(r#""}"#);
+        }
+        s.push_str(r#"]}}"#);
     }
     // Root rotator at the end: rotation quat (x, y, z, w) for −90° about X
     //   = (sin(-π/4), 0, 0, cos(-π/4)) ≈ (-0.7071068, 0, 0, 0.7071068).
