@@ -182,3 +182,101 @@ def test_cache_roundtrip_preserves_graph(tmp_path, monkeypatch):
     walls = [p.guid for p in cold.products if p.entity == "IfcWallStandardCase"][:5]
     for w in walls:
         assert cold.ancestors(w) == hot.ancestors(w)
+
+
+# ----------------------------------------------------------------------
+# Tier-1 spaces / voids / type linkage (added when the Rust core closed
+# the IfcSpace / IfcRelVoidsElement / IfcRelDefinesByType gaps).
+# ----------------------------------------------------------------------
+
+
+def test_spaces_collection_present_on_empty_model(minimal):
+    """``m.spaces`` is a list (possibly empty), not missing."""
+    assert isinstance(minimal.spaces, list)
+    df = minimal.spaces_df
+    assert list(df.columns) == ["guid", "step_id"]
+
+
+def test_voids_dataframe_present_on_empty_model(minimal):
+    """``m.voids`` is an empty DataFrame with the documented columns even
+    when no IfcRelVoidsElement is declared in the source IFC."""
+    df = minimal.voids
+    assert list(df.columns) == ["opening_guid", "host_guid"]
+    assert len(df) == 0
+
+
+def test_voids_resolves_on_real_model(sannergata):
+    """Sannergata has 492 IfcRelVoidsElement relations. Each row should
+    resolve both sides to product GUIDs the indexer also knows about."""
+    voids = sannergata.voids
+    assert len(voids) > 0
+    product_guids = {p.guid for p in sannergata.products}
+    assert set(voids["host_guid"].values).issubset(product_guids)
+    assert set(voids["opening_guid"].values).issubset(product_guids)
+    assert len(voids) == len(voids.drop_duplicates())
+
+
+def test_reldefinesbytype_populates_product_type_fields(sannergata):
+    """``IfcRelDefinesByType`` is the strongest signal — anything with a
+    formal type link should land in ``type_source == 'ifctype'`` with a
+    non-null ``type_guid`` and ``type_name``."""
+    by_source: dict[str, int] = {"ifctype": 0, "objecttype": 0, "none": 0}
+    for p in sannergata.products:
+        by_source[p.type_source] = by_source.get(p.type_source, 0) + 1
+        if p.type_source == "ifctype":
+            assert p.type_guid is not None, f"ifctype product missing type_guid: {p.guid}"
+            assert p.type_name, f"ifctype product missing type_name: {p.guid}"
+        elif p.type_source == "objecttype":
+            assert p.type_guid is None
+            assert p.type_name == p.object_type
+        else:  # "none"
+            assert p.type_guid is None
+            assert p.type_name is None
+    # On a Revit-export-grade model the dominant bucket should be ifctype.
+    assert by_source["ifctype"] > by_source["objecttype"]
+    assert by_source["ifctype"] > by_source["none"]
+
+
+def test_type_objects_table_captures_ifctype_catalogue(sannergata):
+    """Every ``type_guid`` referenced from a product should also appear
+    in ``m.type_objects_df`` — the catalogue is round-trip consistent."""
+    catalogue_guids = set(sannergata.type_objects_df["guid"].values)
+    assert len(catalogue_guids) > 0
+    product_type_guids = {
+        p.type_guid for p in sannergata.products if p.type_source == "ifctype"
+    }
+    missing = product_type_guids - catalogue_guids
+    assert not missing, f"products reference {len(missing)} unknown type guids"
+
+
+def test_cache_roundtrip_preserves_new_tables(tmp_path, monkeypatch):
+    """Spaces, voids, type_objects and per-product type_* survive a
+    cache write/read cycle."""
+    if not SANNERGATA.exists():
+        pytest.skip(f"missing fixture: {SANNERGATA}")
+    monkeypatch.setenv("IFCFAST_CACHE", str(tmp_path / "cache"))
+    cold = ifcfast.open(str(SANNERGATA))
+    hot = ifcfast.open(str(SANNERGATA))
+
+    assert len(cold.spaces) == len(hot.spaces)
+    assert len(cold.type_objects) == len(hot.type_objects)
+
+    import pandas as pd
+    pd.testing.assert_frame_equal(
+        cold.voids.reset_index(drop=True),
+        hot.voids.reset_index(drop=True),
+        check_dtype=False,
+    )
+
+    # Per-product type linkage survives the cache hit.
+    cold_types = {
+        p.guid: (p.type_guid, p.type_name, p.type_source)
+        for p in cold.products if p.type_source == "ifctype"
+    }
+    df = hot.products_df  # cache hit: products[] is empty
+    hot_typed = df[df["type_source"] == "ifctype"]
+    assert len(hot_typed) == len(cold_types)
+    for _, row in hot_typed.head(20).iterrows():
+        assert cold_types[row["guid"]] == (
+            row["type_guid"], row["type_name"], row["type_source"]
+        )

@@ -27,7 +27,20 @@ from .header import IFCHeader, header as _header
 
 @dataclass
 class ProductRow:
-    """One IfcProduct, indexed."""
+    """One IfcProduct, indexed.
+
+    Type linkage (``type_guid`` / ``type_name`` / ``type_source``) comes
+    from one of three sources, in order of preference:
+
+    * ``"ifctype"``    — formal ``IfcRelDefinesByType`` link to an
+                         ``IfcTypeObject``. Strongest.
+    * ``"objecttype"`` — only ``IfcRoot.ObjectType`` is populated (no
+                         formal type relation). Common Revit export
+                         pattern. Use ``type_name`` for display, but
+                         downstream consumers expecting an
+                         ``IfcTypeObject`` GUID will see ``None``.
+    * ``"none"``       — neither.
+    """
 
     guid: str
     entity: str
@@ -40,6 +53,9 @@ class ProductRow:
     parent_guid: Optional[str]
     mode: str  # 'count' / 'measure' / 'linear' / 'skip'
     step_id: int
+    type_guid: Optional[str] = None
+    type_name: Optional[str] = None
+    type_source: str = "none"  # 'ifctype' / 'objecttype' / 'none'
 
 
 @dataclass
@@ -48,6 +64,35 @@ class StoreyRow:
     name: Optional[str]
     elevation: Optional[float]
     building_guid: Optional[str]
+
+
+@dataclass
+class SpaceRow:
+    """One IfcSpace, indexed.
+
+    Spaces are kept in their own collection rather than as IfcProduct
+    subclasses so that ``m.products`` stays "things you build" and
+    ``m.spaces`` stays "rooms / zones". Both extracted by the Rust
+    indexer in a single pass.
+    """
+
+    guid: str
+    step_id: int
+
+
+@dataclass
+class TypeObjectRow:
+    """One ``IfcTypeObject`` (or any ``IfcXxxType`` subclass).
+
+    Captured so ``IfcRelDefinesByType`` can be fully resolved by the
+    parser without an ifcopenshell sidecar. The Rust indexer picks these
+    up via a byte-suffix match on ``IFC*TYPE``.
+    """
+
+    guid: str
+    entity: str
+    name: Optional[str]
+    step_id: int
 
 
 @dataclass
@@ -75,6 +120,8 @@ class Model:
     authoring_app: Optional[str]
     storeys: list[StoreyRow]
     products: list[ProductRow]
+    spaces: list[SpaceRow]
+    type_objects: list[TypeObjectRow]
     type_counts: dict[str, int]
     parse_seconds: float
 
@@ -87,6 +134,9 @@ class Model:
     _contained_in_df: Optional["object"] = field(repr=False, default=None)
     _aggregates_df: Optional["object"] = field(repr=False, default=None)
     _storey_building_df: Optional["object"] = field(repr=False, default=None)
+    _voids_df: Optional["object"] = field(repr=False, default=None)
+    _spaces_df: Optional["object"] = field(repr=False, default=None)
+    _type_objects_df: Optional["object"] = field(repr=False, default=None)
     _graph: Optional["object"] = field(repr=False, default=None)
 
     # ------------------------------------------------------------------
@@ -258,6 +308,75 @@ class Model:
             )
         return self._storey_building_df
 
+    @property
+    def voids(self):
+        """Long-format ``IfcRelVoidsElement`` edges.
+
+        DataFrame with columns ``opening_guid`` and ``host_guid`` —
+        one row per (opening, host) relation. Openings are typically
+        ``IfcOpeningElement`` instances; hosts are walls, slabs, doors,
+        windows etc. Empty DataFrame if the source IFC declared no
+        voids.
+
+        Use this to put openings back in the spatial tree: an opening
+        belongs to its host, not to any storey directly.
+        """
+        import pandas as pd
+
+        if self._voids_df is None:
+            self._voids_df = pd.DataFrame(
+                columns=["opening_guid", "host_guid"]
+            )
+        return self._voids_df
+
+    @property
+    def spaces_df(self):
+        """Tier-1 space index as a pandas DataFrame.
+
+        Columns: ``guid``, ``step_id``. Built from ``self.spaces`` on
+        first access. Mirrors ``products_df`` for spaces.
+        """
+        import pandas as pd
+        from dataclasses import asdict
+
+        if self._spaces_df is not None:
+            return self._spaces_df
+        if self.spaces:
+            self._spaces_df = pd.DataFrame([asdict(s) for s in self.spaces])
+        else:
+            self._spaces_df = pd.DataFrame(
+                columns=[
+                    f.name for f in SpaceRow.__dataclass_fields__.values()
+                ]
+            )
+        return self._spaces_df
+
+    @property
+    def type_objects_df(self):
+        """``IfcTypeObject`` table as a pandas DataFrame.
+
+        Columns: ``guid``, ``entity``, ``name``, ``step_id``. One row per
+        ``IfcXxxType`` instance in the file. Used by the indexer to
+        resolve ``IfcRelDefinesByType`` per-product; exposed here so QA
+        scripts can audit the type catalogue directly.
+        """
+        import pandas as pd
+        from dataclasses import asdict
+
+        if self._type_objects_df is not None:
+            return self._type_objects_df
+        if self.type_objects:
+            self._type_objects_df = pd.DataFrame(
+                [asdict(t) for t in self.type_objects]
+            )
+        else:
+            self._type_objects_df = pd.DataFrame(
+                columns=[
+                    f.name for f in TypeObjectRow.__dataclass_fields__.values()
+                ]
+            )
+        return self._type_objects_df
+
     def _graph_index(self) -> "_GraphIndex":
         if self._graph is None:
             if self._products_df is not None:
@@ -427,9 +546,24 @@ class Model:
                 ],
                 "loaded": True,
             },
+            "spaces": {
+                "rows": len(self.spaces),
+                "columns": [
+                    f.name for f in SpaceRow.__dataclass_fields__.values()
+                ],
+                "loaded": True,
+            },
+            "type_objects": {
+                "rows": len(self.type_objects),
+                "columns": [
+                    f.name for f in TypeObjectRow.__dataclass_fields__.values()
+                ],
+                "loaded": True,
+            },
             "contained_in": _df_meta(self._contained_in_df),
             "aggregates": _df_meta(self._aggregates_df),
             "storey_building": _df_meta(self._storey_building_df),
+            "voids": _df_meta(self._voids_df),
         }
         for name in ("psets", "quantities", "materials", "classifications", "drift"):
             tables[name] = _data_layer_meta(self._data_layers, name)
@@ -462,9 +596,14 @@ class Model:
         out: dict[str, dict] = {
             "products": _df_schema_from_dataclass(ProductRow, rows=len(self)),
             "storeys": _df_schema_from_dataclass(StoreyRow, rows=len(self.storeys)),
+            "spaces": _df_schema_from_dataclass(SpaceRow, rows=len(self.spaces)),
+            "type_objects": _df_schema_from_dataclass(
+                TypeObjectRow, rows=len(self.type_objects)
+            ),
             "contained_in": _df_schema(self._contained_in_df),
             "aggregates": _df_schema(self._aggregates_df),
             "storey_building": _df_schema(self._storey_building_df),
+            "voids": _df_schema(self._voids_df),
         }
         for name in ("psets", "quantities", "materials", "classifications", "drift"):
             df = (
@@ -744,16 +883,30 @@ class Model:
             return rows
         if table == "storeys":
             return [asdict(s) for s in self.storeys[:n]]
+        if table == "spaces":
+            return [asdict(s) for s in self.spaces[:n]]
+        if table == "type_objects":
+            return [asdict(t) for t in self.type_objects[:n]]
         df_attr = {
             "contained_in": "_contained_in_df",
             "aggregates": "_aggregates_df",
             "storey_building": "_storey_building_df",
+            "voids": "_voids_df",
         }.get(table)
         if df_attr is not None:
             df = getattr(self, df_attr)
             if df is None or len(df) == 0:
                 return []
             return df.head(n).to_dict(orient="records")
+        # Lazy fall-through for the materialised properties that may not
+        # have been touched yet (voids/spaces_df). Letting the property
+        # build them on demand keeps preview() honest about emptiness.
+        if table in {"voids"} and df_attr is not None and getattr(self, df_attr) is None:
+            self.voids  # trigger build
+            df = getattr(self, df_attr)
+            if df is not None and len(df) > 0:
+                return df.head(n).to_dict(orient="records")
+            return []
         if table in {"psets", "quantities", "materials", "classifications", "drift"}:
             df = getattr(self, table)  # triggers extract for data layers
             if df is None or len(df) == 0:
@@ -1004,6 +1157,26 @@ def _index_native(p: Path, hdr: IFCHeader, started: float) -> Model:
     # Storey name lookup (small list, linear scan is fine).
     storey_name_by_guid = {sr.guid: sr.name for sr in storeys}
 
+    # Type linkage from IfcRelDefinesByType. Build two lookups: type
+    # step_id → (type_guid, type_name) and product step_id → that pair.
+    type_meta_by_step: dict[int, tuple[str, Optional[str]]] = {}
+    type_objects_raw = raw.get("type_objects") or {}
+    for tsid, tguid, tname in zip(
+        type_objects_raw.get("step_id", []),
+        type_objects_raw.get("guid", []),
+        type_objects_raw.get("name", []),
+    ):
+        type_meta_by_step[int(tsid)] = (tguid, tname)
+
+    product_type_by_step: dict[int, tuple[str, Optional[str]]] = {}
+    dbt_raw = raw.get("defines_by_type") or {}
+    for psid, tsid in zip(
+        dbt_raw.get("product", []), dbt_raw.get("type", [])
+    ):
+        meta = type_meta_by_step.get(int(tsid))
+        if meta is not None:
+            product_type_by_step[int(psid)] = meta
+
     products: list[ProductRow] = []
     pdata = raw["products"]
     n = len(pdata["step_id"])
@@ -1012,13 +1185,24 @@ def _index_native(p: Path, hdr: IFCHeader, started: float) -> Model:
         entity = pdata["entity"][i]
         mode = classify_by_name(entity, schema or "IFC4")
         storey_guid = contained_in.get(sid)
+        object_type = pdata["object_type"][i]
+        # Three-tier resolution: IfcRelDefinesByType wins, then
+        # IfcRoot.ObjectType as the Revit-export fallback, then nothing.
+        ifc_type = product_type_by_step.get(sid)
+        if ifc_type is not None:
+            type_guid, type_name = ifc_type
+            type_source = "ifctype"
+        elif object_type:
+            type_guid, type_name, type_source = None, object_type, "objecttype"
+        else:
+            type_guid, type_name, type_source = None, None, "none"
         products.append(
             ProductRow(
                 guid=pdata["guid"][i],
                 entity=entity,
                 name=pdata["name"][i],
                 predefined_type=pdata["predefined_type"][i],
-                object_type=pdata["object_type"][i],
+                object_type=object_type,
                 tag=pdata["tag"][i],
                 storey_guid=storey_guid,
                 storey_name=(
@@ -1029,8 +1213,47 @@ def _index_native(p: Path, hdr: IFCHeader, started: float) -> Model:
                 parent_guid=parent_lookup.get(sid),
                 mode=mode.value if isinstance(mode, ElementMode) else str(mode),
                 step_id=sid,
+                type_guid=type_guid,
+                type_name=type_name,
+                type_source=type_source,
             )
         )
+
+    # Spaces — Rust core emits step_id + guid only; richer fields (name,
+    # elevation, long_name) land later as the indexer learns them.
+    spaces: list[SpaceRow] = []
+    raw_spaces = raw.get("spaces", {})
+    for sid, sguid in zip(
+        raw_spaces.get("step_id", []), raw_spaces.get("guid", [])
+    ):
+        spaces.append(SpaceRow(guid=sguid, step_id=int(sid)))
+
+    # Type objects (IfcWallType, IfcDoorType, …) — caught by the Rust
+    # byte-suffix fallback. Schema mirrors SpaceRow plus entity + name.
+    type_objects: list[TypeObjectRow] = []
+    raw_types = raw.get("type_objects", {})
+    for tsid, tent, tguid, tname in zip(
+        raw_types.get("step_id", []),
+        raw_types.get("entity", []),
+        raw_types.get("guid", []),
+        raw_types.get("name", []),
+    ):
+        type_objects.append(
+            TypeObjectRow(guid=tguid, entity=tent, name=tname, step_id=int(tsid))
+        )
+
+    # Voids — IfcRelVoidsElement (opening_step_id, host_step_id) marshalled
+    # from Rust. Resolve to guids via the product step→guid lookup; openings
+    # are products too, so the same map works for both sides.
+    voids_rows: list[tuple[str, str]] = []
+    voids_raw = raw.get("voids") or {}
+    for opening, host in zip(
+        voids_raw.get("opening", []), voids_raw.get("host", [])
+    ):
+        og = product_step_to_guid.get(int(opening))
+        hg = product_step_to_guid.get(int(host))
+        if og is not None and hg is not None:
+            voids_rows.append((og, hg))
 
     import pandas as pd
 
@@ -1043,6 +1266,9 @@ def _index_native(p: Path, hdr: IFCHeader, started: float) -> Model:
     storey_building_df = pd.DataFrame(
         storey_building_pairs, columns=["storey_guid", "building_guid"]
     )
+    voids_df = pd.DataFrame(
+        voids_rows, columns=["opening_guid", "host_guid"]
+    )
 
     return Model(
         header=hdr,
@@ -1052,11 +1278,14 @@ def _index_native(p: Path, hdr: IFCHeader, started: float) -> Model:
         authoring_app=raw.get("authoring_app"),
         storeys=storeys,
         products=products,
+        spaces=spaces,
+        type_objects=type_objects,
         type_counts=type_counts,
         parse_seconds=time.time() - started,
         _contained_in_df=contained_in_df,
         _aggregates_df=aggregates_df,
         _storey_building_df=storey_building_df,
+        _voids_df=voids_df,
     )
 
 
@@ -1091,6 +1320,9 @@ def _row_to_product(row) -> ProductRow:
         parent_guid=_v("parent_guid"),
         mode=_v("mode"),
         step_id=int(_v("step_id") or 0),
+        type_guid=_v("type_guid"),
+        type_name=_v("type_name"),
+        type_source=_v("type_source") or "none",
     )
 
 

@@ -112,6 +112,26 @@ mod python {
         sb.set_item("building", PyList::new_bound(py, &idx.storey_building_building))?;
         dict.set_item("storey_building", sb)?;
 
+        let voids = PyDict::new_bound(py);
+        voids.set_item("opening", PyList::new_bound(py, &idx.voids_opening))?;
+        voids.set_item("host", PyList::new_bound(py, &idx.voids_host))?;
+        dict.set_item("voids", voids)?;
+
+        // IfcRelDefinesByType: (product_step_id, type_step_id) pairs, plus
+        // the IfcTypeObject table that lets Python resolve type_step_id to
+        // (type_guid, type_name, type_entity).
+        let dbt = PyDict::new_bound(py);
+        dbt.set_item("product", PyList::new_bound(py, &idx.defines_by_type_product))?;
+        dbt.set_item("type", PyList::new_bound(py, &idx.defines_by_type_type))?;
+        dict.set_item("defines_by_type", dbt)?;
+
+        let types = PyDict::new_bound(py);
+        types.set_item("step_id", PyList::new_bound(py, &idx.type_object_step_id))?;
+        types.set_item("entity", PyList::new_bound(py, &idx.type_object_entity))?;
+        types.set_item("guid", PyList::new_bound(py, &idx.type_object_guid))?;
+        types.set_item("name", PyList::new_bound(py, &idx.type_object_name))?;
+        dict.set_item("type_objects", types)?;
+
         let site_ids: Vec<u64> = idx.site_step_id_to_guid.keys().copied().collect();
         let site_guids: Vec<&str> = site_ids
             .iter()

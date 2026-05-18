@@ -34,11 +34,17 @@ from .header import IFCHeader
 
 # Bumped whenever on-disk layout changes incompatibly.
 # v2 (2026-05-15): added contained_in / aggregates / storey_building parquets.
-CACHE_VERSION = 2
+# v3 (2026-05-18): added spaces.parquet + voids.parquet; SpaceRow surfaces
+#                  IfcSpace as a first-class table, voids_df surfaces
+#                  IfcRelVoidsElement edges.
+CACHE_VERSION = 3
 
 CONTAINED_IN_FILE = "contained_in.parquet"
 AGGREGATES_FILE = "aggregates.parquet"
 STOREY_BUILDING_FILE = "storey_building.parquet"
+VOIDS_FILE = "voids.parquet"
+SPACES_FILE = "spaces.parquet"
+TYPE_OBJECTS_FILE = "type_objects.parquet"
 
 PARQUET_COMPRESSION = "zstd"
 PARQUET_COMPRESSION_LEVEL = 3
@@ -335,7 +341,7 @@ def write_index(model) -> Path:
     """Write tier-1 index + storeys + manifest. Returns the cache dir."""
     import pandas as pd
 
-    from .model import ProductRow, StoreyRow
+    from .model import ProductRow, SpaceRow, StoreyRow, TypeObjectRow
 
     d = cache_dir_for(model.header)
     d.mkdir(parents=True, exist_ok=True)
@@ -372,6 +378,7 @@ def write_index(model) -> Path:
         (model._contained_in_df, CONTAINED_IN_FILE),
         (model._aggregates_df, AGGREGATES_FILE),
         (model._storey_building_df, STOREY_BUILDING_FILE),
+        (model._voids_df, VOIDS_FILE),
     ):
         if df is None:
             continue
@@ -381,6 +388,37 @@ def write_index(model) -> Path:
             compression_level=PARQUET_COMPRESSION_LEVEL,
             index=False,
         )
+
+    # Spaces — tier-1 entities, written even when empty so the manifest
+    # accurately reflects "the parser saw zero IfcSpace" vs "the cache is
+    # too old to have a spaces table".
+    if model.spaces:
+        spdf = pd.DataFrame([asdict(s) for s in model.spaces])
+    else:
+        spdf = pd.DataFrame(
+            columns=[f.name for f in SpaceRow.__dataclass_fields__.values()]
+        )
+    spdf.to_parquet(
+        d / SPACES_FILE,
+        compression=PARQUET_COMPRESSION,
+        compression_level=PARQUET_COMPRESSION_LEVEL,
+        index=False,
+    )
+
+    if model.type_objects:
+        todf = pd.DataFrame([asdict(t) for t in model.type_objects])
+    else:
+        todf = pd.DataFrame(
+            columns=[
+                f.name for f in TypeObjectRow.__dataclass_fields__.values()
+            ]
+        )
+    todf.to_parquet(
+        d / TYPE_OBJECTS_FILE,
+        compression=PARQUET_COMPRESSION,
+        compression_level=PARQUET_COMPRESSION_LEVEL,
+        index=False,
+    )
 
     m = _read_manifest(d) or {}
     m.update({
@@ -403,6 +441,9 @@ def write_index(model) -> Path:
         "has_contained_in": model._contained_in_df is not None,
         "has_aggregates": model._aggregates_df is not None,
         "has_storey_building": model._storey_building_df is not None,
+        "has_voids": model._voids_df is not None,
+        "has_spaces": True,
+        "space_count": len(model.spaces),
         "contained_in_count": (
             int(len(model._contained_in_df))
             if model._contained_in_df is not None else 0
@@ -410,6 +451,10 @@ def write_index(model) -> Path:
         "aggregates_count": (
             int(len(model._aggregates_df))
             if model._aggregates_df is not None else 0
+        ),
+        "voids_count": (
+            int(len(model._voids_df))
+            if model._voids_df is not None else 0
         ),
     })
     _write_manifest(d, m)
@@ -420,7 +465,7 @@ def read_index(hdr: IFCHeader):
     """Reconstruct a Model from cached parquet. Returns None on miss."""
     import pandas as pd
 
-    from .model import Model, StoreyRow
+    from .model import Model, SpaceRow, StoreyRow, TypeObjectRow
 
     d = cache_dir_for(hdr)
     m = _read_manifest(d)
@@ -449,12 +494,33 @@ def read_index(hdr: IFCHeader):
     contained_in_df = None
     aggregates_df = None
     storey_building_df = None
+    voids_df = None
     if (d / CONTAINED_IN_FILE).exists():
         contained_in_df = pd.read_parquet(d / CONTAINED_IN_FILE)
     if (d / AGGREGATES_FILE).exists():
         aggregates_df = pd.read_parquet(d / AGGREGATES_FILE)
     if (d / STOREY_BUILDING_FILE).exists():
         storey_building_df = pd.read_parquet(d / STOREY_BUILDING_FILE)
+    if (d / VOIDS_FILE).exists():
+        voids_df = pd.read_parquet(d / VOIDS_FILE)
+
+    spaces: list[SpaceRow] = []
+    sp_path = d / SPACES_FILE
+    if sp_path.exists():
+        spdf = pd.read_parquet(sp_path)
+        for row in spdf.to_dict(orient="records"):
+            spaces.append(
+                SpaceRow(**{k: _none_if_nan(v) for k, v in row.items()})
+            )
+
+    type_objects: list[TypeObjectRow] = []
+    to_path = d / TYPE_OBJECTS_FILE
+    if to_path.exists():
+        todf = pd.read_parquet(to_path)
+        for row in todf.to_dict(orient="records"):
+            type_objects.append(
+                TypeObjectRow(**{k: _none_if_nan(v) for k, v in row.items()})
+            )
 
     return Model(
         header=hdr,
@@ -464,12 +530,15 @@ def read_index(hdr: IFCHeader):
         authoring_app=m.get("authoring_app"),
         storeys=storeys,
         products=[],
+        spaces=spaces,
+        type_objects=type_objects,
         type_counts=dict(m.get("type_counts", {})),
         parse_seconds=time.time() - started,
         _products_df=df,
         _contained_in_df=contained_in_df,
         _aggregates_df=aggregates_df,
         _storey_building_df=storey_building_df,
+        _voids_df=voids_df,
     )
 
 

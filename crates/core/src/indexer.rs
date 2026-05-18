@@ -96,6 +96,8 @@ const CONTAINED_TYPE: &[u8] = b"IFCRELCONTAINEDINSPATIALSTRUCTURE";
 const AGGREGATES_TYPE: &[u8] = b"IFCRELAGGREGATES";
 const SI_UNIT_TYPE: &[u8] = b"IFCSIUNIT";
 const UNIT_ASSIGN_TYPE: &[u8] = b"IFCUNITASSIGNMENT";
+const VOIDS_ELEMENT_TYPE: &[u8] = b"IFCRELVOIDSELEMENT";
+const DEFINES_BY_TYPE_TYPE: &[u8] = b"IFCRELDEFINESBYTYPE";
 
 // ----------------------------------------------------------------------
 // Dispatch
@@ -120,6 +122,12 @@ enum EntityKind {
     SiUnit,
     UnitAssignment,
     Aggregates,
+    VoidsElement,
+    DefinesByType,
+    /// Any IfcXxxType (IfcWallType, IfcDoorType, IfcSensorType, …)
+    /// — matched by a byte-suffix fallback rather than dispatch-map
+    /// enumeration so new IFC schema additions don't drop silently.
+    TypeObject,
 }
 
 fn dispatch_map() -> &'static HashMap<&'static [u8], EntityKind> {
@@ -142,6 +150,8 @@ fn dispatch_map() -> &'static HashMap<&'static [u8], EntityKind> {
         m.insert(SI_UNIT_TYPE, EntityKind::SiUnit);
         m.insert(UNIT_ASSIGN_TYPE, EntityKind::UnitAssignment);
         m.insert(AGGREGATES_TYPE, EntityKind::Aggregates);
+        m.insert(VOIDS_ELEMENT_TYPE, EntityKind::VoidsElement);
+        m.insert(DEFINES_BY_TYPE_TYPE, EntityKind::DefinesByType);
         m
     })
 }
@@ -204,6 +214,29 @@ pub struct IndexedFile {
     /// `(storey_step_id[i], building_step_id[i])`.
     pub storey_building_storey: Vec<u64>,
     pub storey_building_building: Vec<u64>,
+
+    /// IfcRelVoidsElement: parallel arrays of
+    /// `(opening_step_id[i], host_step_id[i])`. One row per relation;
+    /// each relation links exactly one opening to exactly one host
+    /// (unlike RelAggregates / RelContainedInSpatialStructure which fan
+    /// out N relateds per row).
+    pub voids_opening: Vec<u64>,
+    pub voids_host: Vec<u64>,
+
+    /// IfcRelDefinesByType: parallel arrays of
+    /// `(product_step_id[i], type_step_id[i])`. RelatedObjects is a list,
+    /// so we fan out N product rows per relation.
+    pub defines_by_type_product: Vec<u64>,
+    pub defines_by_type_type: Vec<u64>,
+
+    /// IfcTypeObject (and its subclasses — IfcWallType, IfcDoorType,
+    /// IfcSensorType, …): parallel column arrays. Captures the GUID and
+    /// Name of every IfcXxxType in the file so the RelDefinesByType
+    /// relation can be resolved to (type_guid, type_name) per product.
+    pub type_object_step_id: Vec<u64>,
+    pub type_object_entity: Vec<String>,
+    pub type_object_guid: Vec<String>,
+    pub type_object_name: Vec<Option<String>>,
 
     // ----- Length unit (metres per model unit). None means undetermined. -----
     pub unit_scale: Option<f64>,
@@ -348,7 +381,19 @@ pub fn index(buf: &[u8]) -> IndexedFile {
         // two HashSets and ~8 byte-slice equality checks.
         let kind = match dispatch.get(t) {
             Some(k) => *k,
-            None => return,
+            None => {
+                // Fallback: any IfcXxxType entity (IfcWallType,
+                // IfcSensorType, …) is the target of IfcRelDefinesByType.
+                // Enumerating every subclass in the dispatch map ages
+                // poorly across schema versions; a 7-char suffix check
+                // costs ~one memcmp per un-dispatched record and lets
+                // new schema additions surface automatically.
+                if t.len() > 7 && t.starts_with(b"IFC") && t.ends_with(b"TYPE") {
+                    EntityKind::TypeObject
+                } else {
+                    return;
+                }
+            }
         };
         match kind {
             EntityKind::Product => {
@@ -442,6 +487,54 @@ pub fn index(buf: &[u8]) -> IndexedFile {
                             }
                         }
                     }
+                }
+            }
+            EntityKind::VoidsElement => {
+                // IfcRelVoidsElement(GlobalId, OwnerHistory, Name, Description,
+                //                    RelatingBuildingElement, RelatedOpeningElement).
+                // Same field positions in IFC2X3 and IFC4. Both refs are
+                // singletons (not lists) — one opening voids one host.
+                split_top_level_args_into(rec.args, &mut fields_buf);
+                if fields_buf.len() >= 6 {
+                    if let (Field::Ref(host), Field::Ref(opening)) = (
+                        parse_field(fields_buf[4]),
+                        parse_field(fields_buf[5]),
+                    ) {
+                        out.voids_opening.push(opening);
+                        out.voids_host.push(host);
+                    }
+                }
+            }
+            EntityKind::DefinesByType => {
+                // IfcRelDefinesByType(GlobalId, OwnerHistory, Name, Description,
+                //                     RelatedObjects, RelatingType).
+                // RelatedObjects is a list of refs (typically many product
+                // step ids); RelatingType is a single ref to an IfcTypeObject.
+                split_top_level_args_into(rec.args, &mut fields_buf);
+                if fields_buf.len() >= 6 {
+                    if let Field::List(body) = parse_field(fields_buf[4]) {
+                        if let Field::Ref(type_id) = parse_field(fields_buf[5]) {
+                            for child in parse_ref_list(body) {
+                                out.defines_by_type_product.push(child);
+                                out.defines_by_type_type.push(type_id);
+                            }
+                        }
+                    }
+                }
+            }
+            EntityKind::TypeObject => {
+                // IfcTypeObject / IfcTypeProduct / IfcXxxType all inherit
+                // from IfcRoot: arg[0] GlobalId, arg[1] OwnerHistory,
+                // arg[2] Name. Capture the entity name too so consumers
+                // can tell IfcWallType from IfcSensorType.
+                split_top_level_args_into(rec.args, &mut fields_buf);
+                if let Some(guid) = string_at(&fields_buf, 0) {
+                    let name = string_at(&fields_buf, 2);
+                    out.type_object_step_id.push(rec.id);
+                    out.type_object_entity
+                        .push(type_name_uppercase_with_proper_case(t));
+                    out.type_object_guid.push(guid);
+                    out.type_object_name.push(name);
                 }
             }
         }
