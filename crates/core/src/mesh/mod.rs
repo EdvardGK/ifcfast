@@ -17,6 +17,7 @@
 
 pub mod boolean;
 pub mod brep;
+pub mod curveset;
 pub mod extrusion;
 pub mod faceset;
 pub mod gltf;
@@ -94,6 +95,7 @@ impl MeshFragment {
             "csg_branch",
             "halfspace_bounded",
             "halfspace_plane",
+            "curve_set",
         ]
     }
 }
@@ -377,6 +379,10 @@ pub(crate) fn mesh_item(
             single(boolean::polygonal_bounded_halfspace(table, item_id), "halfspace_bounded")
         } else if type_name.eq_ignore_ascii_case(b"IFCHALFSPACESOLID") {
             single(boolean::halfspace_solid(table, item_id), "halfspace_plane")
+        } else if type_name.eq_ignore_ascii_case(b"IFCGEOMETRICCURVESET")
+            || type_name.eq_ignore_ascii_case(b"IFCGEOMETRICSET")
+        {
+            single(curveset::geometric_curve_set(table, item_id), "curve_set")
         } else {
             // Reveal-all stance: name the type explicitly so the
             // consumer sees exactly what's in the file we can't yet

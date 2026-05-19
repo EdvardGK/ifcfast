@@ -232,10 +232,120 @@ fn source_tags_set_is_documented() {
         "halfspace_bounded",
         "halfspace_plane",
         "advanced_brep_approx",
+        "curve_set",
     ] {
         assert!(
             documented.contains(&required),
             "MeshFragment::source_tags() missing {:?}", required
         );
     }
+}
+
+/// Annotation product whose body representation is an
+/// `IfcGeometricCurveSet` containing a 3D `IfcPolyline`. Surveying
+/// real Norwegian Revit/Magicad ARK + RIB exports surfaced this as
+/// the only `unhandled:*` bucket left in the dispatcher — common in
+/// structural axis grids and dimension witness lines. The handler
+/// must (a) surface a `curve_set` segment, (b) leave no
+/// `unhandled:IFCGEOMETRICCURVESET` bucket, and (c) produce zero
+/// triangle area so QTO doesn't double-count curve geometry as
+/// surface.
+const CURVE_SET_IFC: &str = r#"ISO-10303-21;
+HEADER;
+FILE_DESCRIPTION(('ViewDefinition [ReferenceView]'),'2;1');
+FILE_NAME('reveal_curveset.ifc','2026-05-19T00:00:00',('test'),('skiplum'),'ifcfast','ifcfast','');
+FILE_SCHEMA(('IFC4'));
+ENDSEC;
+DATA;
+#1=IFCPROJECT('0Test000000000000000001',$,'p',$,$,$,$,(#5),#2);
+#2=IFCUNITASSIGNMENT((#3,#4));
+#3=IFCSIUNIT(*,.LENGTHUNIT.,.MILLI.,.METRE.);
+#4=IFCSIUNIT(*,.PLANEANGLEUNIT.,$,.RADIAN.);
+#5=IFCGEOMETRICREPRESENTATIONCONTEXT($,'Model',3,1.0E-5,#6,$);
+#6=IFCAXIS2PLACEMENT3D(#7,$,$);
+#7=IFCCARTESIANPOINT((0.,0.,0.));
+#15=IFCLOCALPLACEMENT($,#6);
+#16=IFCLOCALPLACEMENT(#15,#6);
+#40=IFCCARTESIANPOINT((0.,0.,0.));
+#41=IFCCARTESIANPOINT((1000.,0.,0.));
+#42=IFCCARTESIANPOINT((1000.,1000.,0.));
+#43=IFCCARTESIANPOINT((0.,1000.,0.));
+#44=IFCPOLYLINE((#40,#41,#42,#43,#40));
+#50=IFCGEOMETRICCURVESET((#44));
+#60=IFCSHAPEREPRESENTATION(#5,'Body','GeometricCurveSet',(#50));
+#61=IFCPRODUCTDEFINITIONSHAPE($,$,(#60));
+#70=IFCANNOTATION('7Ann000000000000000001',$,'AxisGrid',$,$,#16,#61);
+ENDSEC;
+END-ISO-10303-21;
+"#;
+
+#[test]
+fn geometric_curve_set_surfaces_as_curve_set_not_unhandled() {
+    let (meshes, stats) = mesh_ifc(CURVE_SET_IFC.as_bytes());
+
+    // The curve-set product must mesh — not get bucketed as deferred.
+    assert_eq!(
+        meshes.len(),
+        1,
+        "expected one product mesh for the IfcAnnotation, got {}",
+        meshes.len()
+    );
+    let ann = &meshes[0];
+
+    // Source tag on the (only) segment must be `curve_set`. No
+    // `unhandled:IFCGEOMETRICCURVESET` bucket may exist.
+    let tags: Vec<&str> = ann.segments.iter().map(|s| s.source.as_str()).collect();
+    assert!(
+        tags.contains(&"curve_set"),
+        "expected a 'curve_set' segment, got {:?}",
+        tags
+    );
+    assert!(
+        !stats.by_source.contains_key("unhandled:IFCGEOMETRICCURVESET"),
+        "curve_set handler did not consume IFCGEOMETRICCURVESET; stats: {:?}",
+        stats.by_source
+    );
+
+    // Vertices must be populated (the polyline points came through)
+    // and indices must form complete triangles, even though every
+    // triangle is degenerate.
+    assert!(!ann.vertices.is_empty(), "curve set produced no vertices");
+    assert!(!ann.indices.is_empty(), "curve set produced no indices");
+    assert_eq!(
+        ann.indices.len() % 3,
+        0,
+        "indices buffer is not triangle-aligned"
+    );
+
+    // Every emitted triangle is `(a, b, b)` — zero area. Verify via
+    // the cross-product magnitude. A real surface would produce a
+    // non-trivial sum here.
+    let mut area_x2: f32 = 0.0;
+    for tri in ann.indices.chunks_exact(3) {
+        let (a, b, c) = (tri[0] as usize, tri[1] as usize, tri[2] as usize);
+        let ax = ann.vertices[a * 3];
+        let ay = ann.vertices[a * 3 + 1];
+        let az = ann.vertices[a * 3 + 2];
+        let bx = ann.vertices[b * 3];
+        let by = ann.vertices[b * 3 + 1];
+        let bz = ann.vertices[b * 3 + 2];
+        let cx = ann.vertices[c * 3];
+        let cy = ann.vertices[c * 3 + 1];
+        let cz = ann.vertices[c * 3 + 2];
+        let ux = bx - ax;
+        let uy = by - ay;
+        let uz = bz - az;
+        let vx = cx - ax;
+        let vy = cy - ay;
+        let vz = cz - az;
+        let nx = uy * vz - uz * vy;
+        let ny = uz * vx - ux * vz;
+        let nz = ux * vy - uy * vx;
+        area_x2 += (nx * nx + ny * ny + nz * nz).sqrt();
+    }
+    assert!(
+        area_x2 < 1e-3,
+        "curve_set triangles should be degenerate (zero area), got 2*area={}",
+        area_x2
+    );
 }
