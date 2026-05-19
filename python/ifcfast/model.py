@@ -256,6 +256,23 @@ class Model:
     def drift(self):
         return self._ensure_data().drift
 
+    @property
+    def segments(self):
+        """Long-format per-mesh-segment table — one row per representation
+        item that contributed triangles. For an ``IfcWall`` whose body is
+        a single extrusion this is one row; for an ``IfcBooleanResult``
+        each operand contributes its own row, so the consumer can colour,
+        filter, or split by structural role.
+
+        Columns: ``guid`` (parent product), ``product_index`` (row index
+        in ``drift``), ``segment_index`` (segment ordinal within the
+        product), ``source`` (compound ``role|leaf`` tag such as
+        ``boolean_second_operand|halfspace_bounded``), ``triangle_count``,
+        ``index_start`` (first index into the product's triangle list
+        belonging to this segment).
+        """
+        return self._ensure_data().segments
+
     # ------------------------------------------------------------------
     # Spatial hierarchy & relationships
     # ------------------------------------------------------------------
@@ -565,7 +582,7 @@ class Model:
             "storey_building": _df_meta(self._storey_building_df),
             "voids": _df_meta(self._voids_df),
         }
-        for name in ("psets", "quantities", "materials", "classifications", "drift"):
+        for name in ("psets", "quantities", "materials", "classifications", "drift", "segments"):
             tables[name] = _data_layer_meta(self._data_layers, name)
 
         return {
@@ -605,7 +622,7 @@ class Model:
             "storey_building": _df_schema(self._storey_building_df),
             "voids": _df_schema(self._voids_df),
         }
-        for name in ("psets", "quantities", "materials", "classifications", "drift"):
+        for name in ("psets", "quantities", "materials", "classifications", "drift", "segments"):
             df = (
                 getattr(self._data_layers, name, None)
                 if self._data_layers is not None
@@ -866,9 +883,10 @@ class Model:
         Supported tables: ``products`` / ``storeys`` / ``contained_in``
         / ``aggregates`` / ``storey_building`` / ``psets`` /
         ``quantities`` / ``materials`` / ``classifications`` /
-        ``drift``. Triggers lazy extraction for the four data layers
-        and drift; pure DataFrame slice for the rest. Returns ``[]``
-        for an unknown table or one that's empty.
+        ``drift`` / ``segments``. Triggers lazy extraction for the four
+        data layers, drift, and the per-product mesh segments table;
+        pure DataFrame slice for the rest. Returns ``[]`` for an
+        unknown table or one that's empty.
         """
         from dataclasses import asdict
 
@@ -907,7 +925,7 @@ class Model:
             if df is not None and len(df) > 0:
                 return df.head(n).to_dict(orient="records")
             return []
-        if table in {"psets", "quantities", "materials", "classifications", "drift"}:
+        if table in {"psets", "quantities", "materials", "classifications", "drift", "segments"}:
             df = getattr(self, table)  # triggers extract for data layers
             if df is None or len(df) == 0:
                 return []

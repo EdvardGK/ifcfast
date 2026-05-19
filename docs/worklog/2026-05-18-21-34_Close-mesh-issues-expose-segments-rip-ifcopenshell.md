@@ -1,0 +1,46 @@
+## Agent signature
+- **Agent**: `claude-opus-4-7[1m]`
+- **Working tree**: `/home/edkjo/workspace/inbox/ifcfast`
+- **Branch**: `main` @ `28382ac` → `28382ac` (no commits made this session — all changes remain in working tree)
+- **Session scope**: Close `28382ac` follow-ups — GH issues #4/#5, expose mesh segments to Python `analyse_drift`, rip ifcopenshell fallback out of the sample-sidecar generator.
+- **Touched paths**: `crates/core/src/lib.rs`, `python/ifcfast/cache.py`, `python/ifcfast/model.py`, `tests/test_agent_surface.py`, `scripts/generate_sample_sidecars.py`, `../ifcfast-site/public/sample/duplex.{glb,bundle,graph,qto,summary,types}.json` (artifact copies)
+- **Parallel sessions observed**: none (`git log origin/main --since` empty for the session window)
+- **Supersedes / superseded by**: none
+
+# Session: Close mesh-dispatch follow-ups, expose mesh segments to Python, rip ifcopenshell out of sample generator
+
+## Summary
+Cleared the `28382ac` follow-up queue: closed GH #4 (WONTFIX, reveal-all over CSG-subtract) and #5 (representation coverage), filed #17 as the narrower tracker for remaining `unhandled:` representation leaves. Surfaced per-mesh-segment provenance through the Python API so the compound `role|leaf` tags (`boolean_first_operand|extrusion`, `boolean_second_operand|halfspace_bounded`) that `28382ac` ships in glTF extras are now also queryable as a long-format `m.segments` DataFrame. Ripped the `_typing_via_ifcopenshell()` / `_voids_via_ifcopenshell()` fallbacks out of `scripts/generate_sample_sidecars.py` — and that rip exposed a real indexer bug (#18) where ifcfast's `IfcRelDefinesByType` extractor misses IFC2x3-flavoured typing via `IfcDoorStyle` / `IfcWindowStyle`. Per the no-silent-drops principle, that under-count is now honestly visible in the regenerated sample bundle rather than being masked by the fallback.
+
+## Changes
+- **`crates/core/src/lib.rs`** — `analyse_drift` now emits parallel `seg_guid` / `seg_product_index` / `seg_index` / `seg_source` / `seg_triangle_count` / `seg_index_start` flat columns alongside the existing per-product columns. One row per `MeshSegment` across all products. `seg_source` carries the compound `role|leaf` tag verbatim so Python consumers can filter or colour by either half.
+- **`python/ifcfast/cache.py`** — `DataLayers` gained an `Optional[pd.DataFrame] segments` field; new `SEGMENTS_FILE = "segments.parquet"` parqueted alongside `drift.parquet`; cache invalidation considers segments alongside drift; manifest gets `has_segments` + `segment_count`.
+- **`python/ifcfast/model.py`** — new `Model.segments` property mirroring `Model.drift`; `"segments"` added to the iteration lists for `summary()` / `schemas()` / `preview()` so the agent surface treats it as a first-class table.
+- **`tests/test_agent_surface.py`** — schemas-completeness test extended to require `"segments"`. Suite stays at 60/60 green.
+- **`scripts/generate_sample_sidecars.py`** — deleted `_voids_via_ifcopenshell()` and `_typing_via_ifcopenshell()`; `_build_graph()` signature shrank (dropped `typing` and `voids` params); typedness now reads `type_source` / `type_name` directly off `model.products_df`; voids reads `model.voids`; bundle `provenance.typedness_source` simplified to `"ifcfast"` (no more "ifcopenshell unavailable" disclaimer).
+- **`../ifcfast-site/public/sample/duplex.*`** — regenerated against `Duplex_A_20110907.ifc` with the post-`28382ac` parser + reveal-all mesher. Site repo working tree now has the updated bundle, graph, qto, summary, types, and glb. Not committed.
+- **GitHub** — closed #4 (WONTFIX with full reasoning), closed #5 (with summary of `28382ac` coverage), filed #17 (remaining `unhandled:` representation leaves — `IfcRevolvedAreaSolid`, `IfcSurfaceCurveSweptAreaSolid`, `IfcCsgPrimitive3D` leaves), filed #18 (IfcDoorStyle / IfcWindowStyle indexer gap surfaced by the rip-out).
+
+## Technical Details
+**Segment plumbing shape.** Two natural options existed: a list-of-dicts column on the drift DataFrame, or a separate long-format table joinable by guid. Picked the second — drift stays wide (one row per product) and segments are long (one row per segment), same pattern as psets/quantities/materials/classifications. Parquets cleanly without needing pyarrow nested schemas. The `product_index` column on the segments table is the row index into `drift`, so the consumer can do a positional join when guid lookups would be wasteful.
+
+**Why the typedness count dropped from 99 to 61.** The old `_typing_via_ifcopenshell()` pass walked `IfcRelDefinesByType` directly and counted any `RelatingType` instance as a "typed" link. ifcfast's native indexer (added in `787afe8`) appears to filter `RelatingType` by the `IfcXxxType` naming convention — so IFC4-flavoured typing works but IFC2x3 `IfcDoorStyle` / `IfcWindowStyle` (which inherit from `IfcTypeProduct` → `IfcTypeObject` but don't follow the suffix convention) drop on the floor. The 38 missing entries on the Duplex sample are exactly the doors and windows. Confirmed by direct ifcopenshell spot-check: `1aj$VJZFn2TxepZUBcKpac` is an `IfcDoor` with `IfcRelDefinesByType -> IfcDoorStyle (Name='0762 x 2032mm')`. Filed as #18; the fix is to dispatch on the schema-level supertype rather than the name suffix.
+
+**Pre-flight on #17.** The prior session's next-steps memo claimed the `unhandled:` types had been observed on a "live run", and I wrote that into the first draft of issue #17. A fresh `ifcfast-mesh` run on the same Duplex sample showed zero `unhandled:*` entries — every representation flavour on that ARCH file is now covered. Amended the issue body before completing the task to make the provenance honest ("pre-emptive coverage, not 'broken on Duplex'") and pointed at the MEP / Plumbing Duplex variants as the right place to surface concrete evidence.
+
+**Cache-staleness gotcha during verification.** First end-to-end check of `m.segments` showed correct row count but a `str.contains('|', regex=False)` filter returned an empty DataFrame — wasn't a parser bug, was a heredoc escape glitch (the `\|` got mangled). The data was correct all along; verified by re-running with a plain `.py` file via heredoc rather than a `-c` string, and by reading the cached parquet directly with `value_counts()`.
+
+**Build hygiene.** maturin develop resolved to `/home/edkjo/miniconda3/bin/python` rather than the in-tree `.venv`, but the editable install pattern + the script's `sys.path.insert(0, ROOT / "python")` means `.venv/bin/python -c "from ifcfast import _core"` correctly loads the freshly-built `_core.abi3.so` from `python/ifcfast/`. The `.so` mtime updated even though byte size stayed the same — the linker emits identical-length objects when the only changes are within the existing function bodies.
+
+## Next
+- **Site catch-up still deferred.** Earlier session's WIP in `~/workspace/inbox/ifcfast-site/` (workbench changes + Findings fixes) is still uncommitted. The updated `public/sample/duplex.*` files now live alongside it. A future session should bundle the WIP + fresh samples into one commit, `vercel deploy`, then close site-side #11–#14.
+- **ifcfast working tree has uncommitted changes** across `crates/core/src/lib.rs`, `python/ifcfast/{cache,model}.py`, `tests/test_agent_surface.py`, and `scripts/generate_sample_sidecars.py`. Plus untracked worklog `.md` files. Pre-existing untracked `node_modules/`, `package.json`, `scripts/` (other than the edited one) — those predate this session.
+- **#18 (IfcDoorStyle indexer gap)** is the natural next ifcfast indexer fix. Acceptance criteria are in the issue; expected outcome is 99/268 `ifctype` on the Duplex bundle, capability-gap row shrinks to the genuinely-untyped subset.
+- **#17 (unhandled types)** should be re-validated on `Duplex_MEP_20110907.ifc` / `Duplex_Plumbing_20121113.ifc` (same LFS path family) to surface concrete `unhandled:*` evidence before sizing the handler work.
+- **`analyse_drift` always emits segments** now — no opt-out flag. Cheap on Duplex (493 rows), but worth a knob on multi-GB MEP files. Low priority.
+
+## Notes
+- The buildingSMART Community sample IFC is stored via Git LFS — `raw.githubusercontent.com/.../Duplex_A_20110907.ifc` returns the LFS pointer (132 bytes); the actual file comes from `media.githubusercontent.com/media/.../Duplex_A_20110907.ifc` (2.3 MB). Stashed locally at `~/workspace/inbox/ifcfast/.local-samples/Duplex_A_20110907.ifc` for reuse.
+- `~/workspace/inbox/ifcfast/.local-samples/` is gitignored implicitly (not in repo); the regenerated outputs live in `.local-samples/out/` before being copied into the site's `public/sample/`. Safe to delete if disk pressure matters.
+- Filed-issue pattern that worked well this session: file the tracker FIRST when a close-comment needs to reference it, never write "see #N" in a comment if #N doesn't yet exist. Got blocked by a content-integrity guardrail trying to do it in the wrong order — the reorder was right.
+- Live `by_source` on Duplex post-`28382ac`: `extrusion: 223 · mapped: 192 · faceset_fbsm: 67 · boolean_second_operand|halfspace_bounded: 7 · boolean_first_operand|extrusion: 4`. Zero `unhandled:*`. Useful baseline if a future ARCH-side regression introduces a leak.

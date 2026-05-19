@@ -134,6 +134,7 @@ QUANTITIES_FILE = "quantities.parquet"
 MATERIALS_FILE = "materials.parquet"
 CLASSIFICATIONS_FILE = "classifications.parquet"
 DRIFT_FILE = "drift.parquet"
+SEGMENTS_FILE = "segments.parquet"
 
 
 @dataclass
@@ -151,6 +152,7 @@ class DataLayers:
     materials: Optional[object] = None
     classifications: Optional[object] = None
     drift: Optional[object] = None
+    segments: Optional[object] = None
     timing_ms: dict = field(default_factory=dict)
 
 
@@ -166,6 +168,7 @@ def has_data_cached(hdr: IFCHeader) -> dict[str, bool]:
         "materials": _data_file_present(d, MATERIALS_FILE),
         "classifications": _data_file_present(d, CLASSIFICATIONS_FILE),
         "drift": _data_file_present(d, DRIFT_FILE),
+        "segments": _data_file_present(d, SEGMENTS_FILE),
     }
 
 
@@ -206,6 +209,8 @@ def extract_data_layers(
             out.classifications = pd.read_parquet(cache_dir / CLASSIFICATIONS_FILE)
         if include_drift and _data_file_present(cache_dir, DRIFT_FILE):
             out.drift = pd.read_parquet(cache_dir / DRIFT_FILE)
+        if include_drift and _data_file_present(cache_dir, SEGMENTS_FILE):
+            out.segments = pd.read_parquet(cache_dir / SEGMENTS_FILE)
         out.timing_ms["cache_read_ms"] = (time.perf_counter() - t0) * 1000
 
         all_cached = (
@@ -213,7 +218,7 @@ def extract_data_layers(
             and out.quantities is not None
             and out.materials is not None
             and out.classifications is not None
-            and (not include_drift or out.drift is not None)
+            and (not include_drift or (out.drift is not None and out.segments is not None))
         )
         if all_cached:
             out.timing_ms["total_ms"] = (time.perf_counter() - t_total) * 1000
@@ -260,10 +265,20 @@ def extract_data_layers(
                 )
             }
             out.drift = pd.DataFrame(df_cols)
+            seg_cols = {
+                "guid": drift_raw["seg_guid"],
+                "product_index": drift_raw["seg_product_index"],
+                "segment_index": drift_raw["seg_index"],
+                "source": drift_raw["seg_source"],
+                "triangle_count": drift_raw["seg_triangle_count"],
+                "index_start": drift_raw["seg_index_start"],
+            }
+            out.segments = pd.DataFrame(seg_cols)
             out.timing_ms["drift_ms"] = (time.perf_counter() - t0) * 1000
         except AttributeError:
             # Built without the `mesh` Cargo feature.
             out.drift = None
+            out.segments = None
 
     if write_cache:
         t0 = time.perf_counter()
@@ -282,6 +297,7 @@ def _write_data_parquets(cache_dir: Path, out: DataLayers) -> None:
         (out.materials, MATERIALS_FILE),
         (out.classifications, CLASSIFICATIONS_FILE),
         (out.drift, DRIFT_FILE),
+        (out.segments, SEGMENTS_FILE),
     ):
         if df is None:
             continue
@@ -329,6 +345,9 @@ def _patch_data_manifest(
         m["drift_warn_count"] = int(
             (out.drift["drift_severity"] == "warn").sum()
         )
+    if include_drift and out.segments is not None:
+        m["has_segments"] = True
+        m["segment_count"] = int(len(out.segments))
     _write_manifest(cache_dir, m)
 
 

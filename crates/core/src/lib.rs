@@ -503,6 +503,38 @@ mod python {
         out.set_item("drift_ok", file_stats.drift_ok)?;
         out.set_item("drift_warn", file_stats.drift_warn)?;
         out.set_item("drift_error", file_stats.drift_error)?;
+
+        // Per-segment provenance — flat long-format columns, one row
+        // per MeshSegment across all products. A product with a single
+        // representation item contributes one row; an IfcBooleanResult
+        // contributes one row per operand. The compound `role|leaf`
+        // tag (e.g. "boolean_second_operand|halfspace_bounded") is
+        // preserved verbatim in `seg_source` so consumers can split or
+        // colour by either half.
+        let total_segments: usize = meshes.iter().map(|m| m.segments.len()).sum();
+        let mut seg_guid: Vec<String> = Vec::with_capacity(total_segments);
+        let mut seg_product_index: Vec<u32> = Vec::with_capacity(total_segments);
+        let mut seg_index: Vec<u32> = Vec::with_capacity(total_segments);
+        let mut seg_source: Vec<String> = Vec::with_capacity(total_segments);
+        let mut seg_triangle_count: Vec<u32> = Vec::with_capacity(total_segments);
+        let mut seg_index_start: Vec<u32> = Vec::with_capacity(total_segments);
+        for (pi, mesh) in meshes.iter().enumerate() {
+            for (si, seg) in mesh.segments.iter().enumerate() {
+                seg_guid.push(mesh.guid.clone());
+                seg_product_index.push(pi as u32);
+                seg_index.push(si as u32);
+                seg_source.push(seg.source.clone());
+                seg_triangle_count.push(seg.index_count / 3);
+                seg_index_start.push(seg.index_start);
+            }
+        }
+        out.set_item("seg_guid", PyList::new_bound(py, seg_guid))?;
+        out.set_item("seg_product_index", PyList::new_bound(py, seg_product_index))?;
+        out.set_item("seg_index", PyList::new_bound(py, seg_index))?;
+        out.set_item("seg_source", PyList::new_bound(py, seg_source))?;
+        out.set_item("seg_triangle_count", PyList::new_bound(py, seg_triangle_count))?;
+        out.set_item("seg_index_start", PyList::new_bound(py, seg_index_start))?;
+
         out.set_item("mesh_emission_ms", mesh_stats.elapsed_ms)?;
         out.set_item("entity_table_ms", mesh_stats.entity_table_build_ms)?;
         out.set_item("total_ms", t_total.elapsed().as_secs_f64() * 1000.0)?;

@@ -54,7 +54,7 @@ def test_schemas_has_dtypes_per_column(tmp_path, monkeypatch):
     for name in (
         "products", "storeys",
         "contained_in", "aggregates", "storey_building",
-        "psets", "quantities", "materials", "classifications", "drift",
+        "psets", "quantities", "materials", "classifications", "drift", "segments",
     ):
         assert name in sch, f"schemas missing: {name}"
         entry = sch[name]

@@ -3,7 +3,7 @@
 ## Agent signature
 - **Agent**: `claude-opus-4-7[1m]`
 - **Working tree**: `/home/edkjo/workspace/inbox/ifcfast`
-- **Branch**: `main` @ `787afe8` → (pending) (1 commit prepared, not yet pushed)
+- **Branch**: `main` @ `787afe8` → `28382ac` (1 commit, pushed to origin)
 - **Session scope**: Close the silent `Vec::new()` dispatch fall-through in `mesh/mod.rs::mesh_item` by adding real handlers for the composite / halfspace representation types and bucketing anything still unhandled with its IFC type name. No subtraction, no curation — reveal-all stance.
 - **Touched paths**: `crates/core/src/mesh/mod.rs`, `crates/core/src/mesh/boolean.rs` (new), `crates/core/src/mesh/brep.rs`, `crates/core/src/mesh/extrusion.rs`, `crates/core/src/mesh/mapped.rs`, `crates/core/src/mesh/gltf.rs`, `crates/core/tests/mesh_reveal.rs` (new), `AGENTS.md`, `README.md`
 - **Parallel sessions observed**: `none` (`git log origin/main --since='2026-05-18'` returned empty during the window)
@@ -55,7 +55,7 @@ Session opened intending to fix opening-vs-host visual overlap via boolean subtr
 
 ## Next
 
-- **Push the commit.** Pending user OK (per CLAUDE.md "always confirm push").
+- ~~**Push the commit.**~~ Done — `28382ac` on `EdvardGK/ifcfast` main.
 - **Close issues #4 and #5** on `EdvardGK/ifcfast` once pushed, with the reveal-all stance explained — `#4` (boolean subtract) becomes "WONTFIX, by design: we reveal both operands instead"; `#5` (expand representation coverage) is partially closed (`IfcAdvancedBrep`, `IfcPolygonalBoundedHalfSpace`, `IfcHalfSpaceSolid`, `IfcBooleanResult`, `IfcCsgSolid` now handled) but the primitive leaves (`IfcBlock`, `IfcSphere`, `IfcRightCircularCylinder`, `IfcRectangularPyramid`, `IfcRightCircularCone`) and swept-area variants (`IfcRevolvedAreaSolid`, `IfcSurfaceCurveSweptAreaSolid`) remain → file a follow-up tracking issue listing each from the live `unhandled:` buckets.
 - **Site update**: the demo's "openings overlap walls" warning row should now self-disable once the new parser version is published and the site regenerates sidecars / re-renders meshes. Site-side polish (issues #11-#14) from the prior session is still uncommitted in `~/workspace/inbox/ifcfast-site/`.
 - **Expose `segments` through the Python `analyse_drift` surface** so Python consumers (not just glTF viewers) can read the per-segment role. Small follow-up.
