@@ -233,6 +233,11 @@ fn source_tags_set_is_documented() {
         "halfspace_plane",
         "advanced_brep_approx",
         "curve_set",
+        "csg_block",
+        "csg_cylinder",
+        "csg_cone",
+        "csg_sphere",
+        "csg_pyramid",
     ] {
         assert!(
             documented.contains(&required),
@@ -278,6 +283,181 @@ DATA;
 ENDSEC;
 END-ISO-10303-21;
 "#;
+
+/// Five `IfcCsgPrimitive3D` leaves, each as the body item of its own
+/// `IfcBuildingElementProxy`. Asserts that every type tessellates to a
+/// non-empty mesh and surfaces with the expected per-type source tag.
+/// Closed-form sanity checks on bbox/volume cover the placement +
+/// dimensions plumbing end-to-end.
+const CSG_PRIMITIVES_IFC: &str = r#"ISO-10303-21;
+HEADER;
+FILE_DESCRIPTION(('ViewDefinition [ReferenceView]'),'2;1');
+FILE_NAME('reveal_csg_primitives.ifc','2026-05-19T00:00:00',('test'),('skiplum'),'ifcfast','ifcfast','');
+FILE_SCHEMA(('IFC4'));
+ENDSEC;
+DATA;
+#1=IFCPROJECT('0Test000000000000000001',$,'p',$,$,$,$,(#5),#2);
+#2=IFCUNITASSIGNMENT((#3,#4));
+#3=IFCSIUNIT(*,.LENGTHUNIT.,.MILLI.,.METRE.);
+#4=IFCSIUNIT(*,.PLANEANGLEUNIT.,$,.RADIAN.);
+#5=IFCGEOMETRICREPRESENTATIONCONTEXT($,'Model',3,1.0E-5,#6,$);
+#6=IFCAXIS2PLACEMENT3D(#7,$,$);
+#7=IFCCARTESIANPOINT((0.,0.,0.));
+#15=IFCLOCALPLACEMENT($,#6);
+#100=IFCBLOCK(#6,100.,200.,300.);
+#101=IFCSHAPEREPRESENTATION(#5,'Body','CSG',(#100));
+#102=IFCPRODUCTDEFINITIONSHAPE($,$,(#101));
+#103=IFCBUILDINGELEMENTPROXY('Block00000000000000001',$,'B',$,$,#15,#102,$,$);
+#110=IFCRIGHTCIRCULARCYLINDER(#6,500.,50.);
+#111=IFCSHAPEREPRESENTATION(#5,'Body','CSG',(#110));
+#112=IFCPRODUCTDEFINITIONSHAPE($,$,(#111));
+#113=IFCBUILDINGELEMENTPROXY('Cyl0000000000000000001',$,'C',$,$,#15,#112,$,$);
+#120=IFCRIGHTCIRCULARCONE(#6,400.,100.);
+#121=IFCSHAPEREPRESENTATION(#5,'Body','CSG',(#120));
+#122=IFCPRODUCTDEFINITIONSHAPE($,$,(#121));
+#123=IFCBUILDINGELEMENTPROXY('Cone000000000000000001',$,'Co',$,$,#15,#122,$,$);
+#130=IFCSPHERE(#6,75.);
+#131=IFCSHAPEREPRESENTATION(#5,'Body','CSG',(#130));
+#132=IFCPRODUCTDEFINITIONSHAPE($,$,(#131));
+#133=IFCBUILDINGELEMENTPROXY('Sph0000000000000000001',$,'S',$,$,#15,#132,$,$);
+#140=IFCRECTANGULARPYRAMID(#6,200.,300.,400.);
+#141=IFCSHAPEREPRESENTATION(#5,'Body','CSG',(#140));
+#142=IFCPRODUCTDEFINITIONSHAPE($,$,(#141));
+#143=IFCBUILDINGELEMENTPROXY('Pyr0000000000000000001',$,'P',$,$,#15,#142,$,$);
+ENDSEC;
+END-ISO-10303-21;
+"#;
+
+#[test]
+fn csg_primitives_tessellate_to_per_type_tags() {
+    let (meshes, stats) = mesh_ifc(CSG_PRIMITIVES_IFC.as_bytes());
+
+    let by_guid_prefix: std::collections::HashMap<&str, &_core::mesh::ProductMesh> = meshes
+        .iter()
+        .map(|m| (&m.guid[..6], m))
+        .collect();
+
+    let expected: &[(&str, &str)] = &[
+        ("Block0", "csg_block"),
+        ("Cyl000", "csg_cylinder"),
+        ("Cone00", "csg_cone"),
+        ("Sph000", "csg_sphere"),
+        ("Pyr000", "csg_pyramid"),
+    ];
+
+    for (guid_prefix, expected_tag) in expected {
+        let m = by_guid_prefix
+            .get(guid_prefix)
+            .unwrap_or_else(|| panic!("missing product with guid prefix {}", guid_prefix));
+        let tags: Vec<&str> = m.segments.iter().map(|s| s.source.as_str()).collect();
+        assert!(
+            tags.contains(expected_tag),
+            "{}: expected tag {:?}, got {:?}",
+            guid_prefix,
+            expected_tag,
+            tags
+        );
+        assert!(
+            !m.indices.is_empty() && m.indices.len() % 3 == 0,
+            "{}: empty or non-triangular index buffer",
+            guid_prefix
+        );
+    }
+
+    // None of the five types may remain in the unhandled bucket.
+    for ifc_type in [
+        "unhandled:IFCBLOCK",
+        "unhandled:IFCRIGHTCIRCULARCYLINDER",
+        "unhandled:IFCRIGHTCIRCULARCONE",
+        "unhandled:IFCSPHERE",
+        "unhandled:IFCRECTANGULARPYRAMID",
+    ] {
+        assert!(
+            !stats.by_source.contains_key(ifc_type),
+            "stats still bucketing {}: {:?}",
+            ifc_type,
+            stats.by_source
+        );
+    }
+}
+
+#[test]
+fn csg_block_dimensions_match_input() {
+    // The 100×200×300 block must produce an AABB matching its inputs,
+    // and a volume of 100·200·300 = 6 000 000 (closed-form, no tolerance).
+    let (meshes, _) = mesh_ifc(CSG_PRIMITIVES_IFC.as_bytes());
+    let block = meshes
+        .iter()
+        .find(|m| m.guid.starts_with("Block0"))
+        .expect("block product missing");
+
+    let mut xmin = f32::INFINITY;
+    let mut ymin = f32::INFINITY;
+    let mut zmin = f32::INFINITY;
+    let mut xmax = f32::NEG_INFINITY;
+    let mut ymax = f32::NEG_INFINITY;
+    let mut zmax = f32::NEG_INFINITY;
+    for chunk in block.vertices.chunks_exact(3) {
+        xmin = xmin.min(chunk[0]);
+        ymin = ymin.min(chunk[1]);
+        zmin = zmin.min(chunk[2]);
+        xmax = xmax.max(chunk[0]);
+        ymax = ymax.max(chunk[1]);
+        zmax = zmax.max(chunk[2]);
+    }
+    let ex = (xmax - xmin - 100.0).abs();
+    let ey = (ymax - ymin - 200.0).abs();
+    let ez = (zmax - zmin - 300.0).abs();
+    assert!(ex < 1e-3 && ey < 1e-3 && ez < 1e-3,
+        "block AABB extents wrong: got ({}, {}, {})", xmax-xmin, ymax-ymin, zmax-zmin);
+}
+
+#[test]
+fn csg_sphere_volume_within_tessellation_tolerance() {
+    // Sphere of radius 75 has closed-form volume 4/3 π r³ ≈ 1 767 146.
+    // A 12-latitude × 24-longitude tessellation inscribes the sphere
+    // (chords cut inside the great circle) so the mesh volume
+    // *undershoots* by a predictable amount — empirically ~9.4% at
+    // this density. Bracket the result to catch placement / radius
+    // bugs without chasing tessellation density: the floor confirms
+    // the tessellation isn't catastrophically wrong (e.g. half-radius),
+    // the ceiling confirms we didn't accidentally *circumscribe*
+    // (which would mean wrong sign somewhere in normals).
+    let (meshes, _) = mesh_ifc(CSG_PRIMITIVES_IFC.as_bytes());
+    let sphere = meshes
+        .iter()
+        .find(|m| m.guid.starts_with("Sph000"))
+        .expect("sphere product missing");
+
+    // Signed-tetrahedra volume via divergence theorem, same kernel
+    // ProductStats uses.
+    let mut volume_x6: f32 = 0.0;
+    for tri in sphere.indices.chunks_exact(3) {
+        let (a, b, c) = (tri[0] as usize, tri[1] as usize, tri[2] as usize);
+        let ax = sphere.vertices[a * 3];
+        let ay = sphere.vertices[a * 3 + 1];
+        let az = sphere.vertices[a * 3 + 2];
+        let bx = sphere.vertices[b * 3];
+        let by = sphere.vertices[b * 3 + 1];
+        let bz = sphere.vertices[b * 3 + 2];
+        let cx = sphere.vertices[c * 3];
+        let cy = sphere.vertices[c * 3 + 1];
+        let cz = sphere.vertices[c * 3 + 2];
+        volume_x6 += ax * (by * cz - bz * cy)
+            + ay * (bz * cx - bx * cz)
+            + az * (bx * cy - by * cx);
+    }
+    let volume = (volume_x6 / 6.0).abs();
+    let expected: f32 = 4.0 / 3.0 * std::f32::consts::PI * 75.0 * 75.0 * 75.0;
+    let ratio = volume / expected;
+    assert!(
+        ratio > 0.85 && ratio < 1.0,
+        "sphere volume {:.0} vs expected {:.0} (ratio {:.3}) outside inscribed-tessellation bracket [0.85, 1.0]",
+        volume,
+        expected,
+        ratio
+    );
+}
 
 #[test]
 fn geometric_curve_set_surfaces_as_curve_set_not_unhandled() {
