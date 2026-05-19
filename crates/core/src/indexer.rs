@@ -127,6 +127,8 @@ enum EntityKind {
     /// Any IfcXxxType (IfcWallType, IfcDoorType, IfcSensorType, …)
     /// — matched by a byte-suffix fallback rather than dispatch-map
     /// enumeration so new IFC schema additions don't drop silently.
+    /// Also covers IFC2x3-only IfcDoorStyle / IfcWindowStyle, which are
+    /// IfcTypeProduct subtypes without the `*Type` suffix (see #18).
     TypeObject,
 }
 
@@ -388,7 +390,18 @@ pub fn index(buf: &[u8]) -> IndexedFile {
                 // poorly across schema versions; a 7-char suffix check
                 // costs ~one memcmp per un-dispatched record and lets
                 // new schema additions surface automatically.
-                if t.len() > 7 && t.starts_with(b"IFC") && t.ends_with(b"TYPE") {
+                //
+                // IFC2x3 exception: `IfcDoorStyle` / `IfcWindowStyle` are
+                // IfcTypeProduct subtypes that don't follow the `*Type`
+                // naming convention (collapsed into IfcDoorType /
+                // IfcWindowType in IFC4). They still appear as the
+                // `RelatingType` of `IfcRelDefinesByType` on IFC2x3 files,
+                // so they must be classified as TypeObject here or 100% of
+                // door/window typing leaks silently on IFC2x3. See #18.
+                let suffix_ok =
+                    t.len() > 7 && t.starts_with(b"IFC") && t.ends_with(b"TYPE");
+                let ifc2x3_style = t == b"IFCDOORSTYLE" || t == b"IFCWINDOWSTYLE";
+                if suffix_ok || ifc2x3_style {
                     EntityKind::TypeObject
                 } else {
                     return;
@@ -770,8 +783,10 @@ const ENTITY_NAME_PAIRS: &[(&[u8], &str)] = &[
         // Fenestration
         (b"IFCDOOR", "IfcDoor"),
         (b"IFCDOORSTANDARDCASE", "IfcDoorStandardCase"),
+        (b"IFCDOORSTYLE", "IfcDoorStyle"),
         (b"IFCWINDOW", "IfcWindow"),
         (b"IFCWINDOWSTANDARDCASE", "IfcWindowStandardCase"),
+        (b"IFCWINDOWSTYLE", "IfcWindowStyle"),
         (b"IFCOPENINGELEMENT", "IfcOpeningElement"),
         (b"IFCVOIDINGFEATURE", "IfcVoidingFeature"),
         (b"IFCSURFACEFEATURE", "IfcSurfaceFeature"),

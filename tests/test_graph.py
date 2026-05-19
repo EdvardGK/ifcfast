@@ -21,6 +21,7 @@ SANNERGATA = Path(
     "/home/edkjo/workspace/inbox/ifc-workbench/data/samples/_big/"
     "Sannergata_bygg_ARK_E.ifc"
 )
+DUPLEX = Path(__file__).parent.parent / ".local-samples" / "Duplex_A_20110907.ifc"
 
 
 # ----------------------------------------------------------------------
@@ -45,6 +46,13 @@ def sannergata(fresh_cache):
     if not SANNERGATA.exists():
         pytest.skip(f"missing fixture: {SANNERGATA}")
     return ifcfast.open(str(SANNERGATA), use_cache=False, write_cache=False)
+
+
+@pytest.fixture
+def duplex(fresh_cache):
+    if not DUPLEX.exists():
+        pytest.skip(f"missing fixture: {DUPLEX}")
+    return ifcfast.open(str(DUPLEX), use_cache=False, write_cache=False)
 
 
 # ----------------------------------------------------------------------
@@ -235,6 +243,32 @@ def test_reldefinesbytype_populates_product_type_fields(sannergata):
     # On a Revit-export-grade model the dominant bucket should be ifctype.
     assert by_source["ifctype"] > by_source["objecttype"]
     assert by_source["ifctype"] > by_source["none"]
+
+
+def test_ifc2x3_doorstyle_windowstyle_are_classified_as_ifctype(duplex):
+    """Regression for #18 — IFC2x3 IfcDoorStyle / IfcWindowStyle are
+    IfcTypeProduct subtypes that don't carry the ``*Type`` suffix. The
+    indexer must still treat them as the RelatingType of
+    IfcRelDefinesByType, or 100% of door/window typing leaks silently on
+    IFC2x3 files. Acceptance ties to the ifcopenshell walk on the
+    bundled buildingSMART Duplex sample: 99/268 ifctype products."""
+    df = duplex.products_df
+    assert (df["type_source"] == "ifctype").sum() == 99, (
+        "expected 99 ifctype products on Duplex_A_20110907.ifc — "
+        "regression of #18 (IfcDoorStyle/IfcWindowStyle dropped by name suffix)"
+    )
+    doors = df[df["entity"] == "IfcDoor"]
+    windows = df[df["entity"] == "IfcWindow"]
+    assert len(doors) > 0 and (doors["type_source"] == "ifctype").all()
+    assert len(windows) > 0 and (windows["type_source"] == "ifctype").all()
+
+    catalogue = duplex.type_objects_df
+    style_rows = catalogue[catalogue["entity"].isin(["IfcDoorStyle", "IfcWindowStyle"])]
+    assert len(style_rows) > 0, "type_objects must surface IfcDoorStyle / IfcWindowStyle"
+    door_type_guids = set(doors["type_guid"].dropna())
+    window_type_guids = set(windows["type_guid"].dropna())
+    assert door_type_guids.issubset(set(catalogue["guid"].values))
+    assert window_type_guids.issubset(set(catalogue["guid"].values))
 
 
 def test_type_objects_table_captures_ifctype_catalogue(sannergata):
