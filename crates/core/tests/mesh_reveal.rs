@@ -51,9 +51,12 @@ ENDSEC;
 END-ISO-10303-21;
 "#;
 
-/// A second wall using `IfcRevolvedAreaSolid` — we don't handle this
-/// representation type yet, so it MUST appear as an `unhandled:` bucket
-/// in stats rather than disappearing.
+/// A second wall using `IfcSurfaceCurveSweptAreaSolid` — the one
+/// remaining latent representation type from issue #17 we don't
+/// handle yet (profile swept along a curve on a reference surface
+/// is substantially harder than axis-revolution and is parked as
+/// a follow-up). MUST surface as an `unhandled:` bucket — silent
+/// drops are forbidden.
 const UNHANDLED_REPR_IFC: &str = r#"ISO-10303-21;
 HEADER;
 FILE_DESCRIPTION(('ViewDefinition [ReferenceView]'),'2;1');
@@ -73,11 +76,16 @@ DATA;
 #30=IFCRECTANGLEPROFILEDEF(.AREA.,'P',#31,100.,100.);
 #31=IFCAXIS2PLACEMENT2D(#7,$);
 #32=IFCDIRECTION((1.,0.,0.));
-#33=IFCAXIS1PLACEMENT(#7,#32);
-#34=IFCREVOLVEDAREASOLID(#30,#6,#33,1.5708);
-#60=IFCSHAPEREPRESENTATION(#5,'Body','SweptSolid',(#34));
+#33=IFCDIRECTION((0.,0.,1.));
+#34=IFCAXIS2PLACEMENT3D(#7,#33,#32);
+#40=IFCCARTESIANPOINT((0.,0.,0.));
+#41=IFCCARTESIANPOINT((1000.,0.,0.));
+#42=IFCPOLYLINE((#40,#41));
+#43=IFCPLANE(#34);
+#44=IFCSURFACECURVESWEPTAREASOLID(#30,#6,#42,$,$,#43);
+#60=IFCSHAPEREPRESENTATION(#5,'Body','AdvancedSweptSolid',(#44));
 #61=IFCPRODUCTDEFINITIONSHAPE($,$,(#60));
-#70=IFCBUILDINGELEMENTPROXY('7Prox00000000000000001',$,'Spinner',$,$,#16,#61,'tag',$);
+#70=IFCBUILDINGELEMENTPROXY('7Prox00000000000000001',$,'Sweep',$,$,#16,#61,'tag',$);
 ENDSEC;
 END-ISO-10303-21;
 "#;
@@ -147,7 +155,7 @@ fn unhandled_representation_appears_as_labeled_bucket() {
     // The product is seen but produces no geometry because we don't
     // handle IfcRevolvedAreaSolid yet. The stats bucket MUST name the
     // missing type explicitly — the whole point of reveal-all.
-    let unhandled_key = "unhandled:IFCREVOLVEDAREASOLID";
+    let unhandled_key = "unhandled:IFCSURFACECURVESWEPTAREASOLID";
     let count = stats.by_source.get(unhandled_key).copied().unwrap_or(0);
     assert!(
         count >= 1,
@@ -327,6 +335,95 @@ DATA;
 ENDSEC;
 END-ISO-10303-21;
 "#;
+
+/// `IfcRevolvedAreaSolid`: a 100×500 rectangular profile placed 200 units
+/// out from the Z-axis, swept a full 2π. Closed-form result is a hollow
+/// cylindrical ring (a "washer extruded vertically") whose volume can be
+/// computed exactly as `π · (R_outer² − R_inner²) · Height` where
+/// R_inner = 200, R_outer = 300, Height = 500.
+const REVOLVED_RING_IFC: &str = r#"ISO-10303-21;
+HEADER;
+FILE_DESCRIPTION(('ViewDefinition [ReferenceView]'),'2;1');
+FILE_NAME('reveal_revolved.ifc','2026-05-19T00:00:00',('test'),('skiplum'),'ifcfast','ifcfast','');
+FILE_SCHEMA(('IFC4'));
+ENDSEC;
+DATA;
+#1=IFCPROJECT('0Test000000000000000001',$,'p',$,$,$,$,(#5),#2);
+#2=IFCUNITASSIGNMENT((#3,#4));
+#3=IFCSIUNIT(*,.LENGTHUNIT.,.MILLI.,.METRE.);
+#4=IFCSIUNIT(*,.PLANEANGLEUNIT.,$,.RADIAN.);
+#5=IFCGEOMETRICREPRESENTATIONCONTEXT($,'Model',3,1.0E-5,#6,$);
+#6=IFCAXIS2PLACEMENT3D(#7,$,$);
+#7=IFCCARTESIANPOINT((0.,0.,0.));
+#15=IFCLOCALPLACEMENT($,#6);
+#20=IFCCARTESIANPOINT((250.,250.,0.));
+#21=IFCAXIS2PLACEMENT2D(#20,$);
+#22=IFCRECTANGLEPROFILEDEF(.AREA.,'RingSection',#21,100.,500.);
+#30=IFCDIRECTION((0.,1.,0.));
+#31=IFCAXIS1PLACEMENT(#7,#30);
+#32=IFCREVOLVEDAREASOLID(#22,#6,#31,6.283185307);
+#60=IFCSHAPEREPRESENTATION(#5,'Body','SweptSolid',(#32));
+#61=IFCPRODUCTDEFINITIONSHAPE($,$,(#60));
+#70=IFCBUILDINGELEMENTPROXY('Ring000000000000000001',$,'R',$,$,#15,#61,$,$);
+ENDSEC;
+END-ISO-10303-21;
+"#;
+
+#[test]
+fn revolved_area_solid_full_revolution_volume_within_tolerance() {
+    // Profile is a 100×500 rectangle centred at (250, 250) in the
+    // profile-local XY plane. With Position = identity and rotation
+    // axis = Y-axis through origin, the rectangle's local X spans
+    // 200..300 (radial distance from Y-axis), its local Y spans
+    // 0..500 (height along Y). Rotated 2π around Y gives a cylindrical
+    // ring with R_inner=200, R_outer=300, height=500.
+    let (meshes, stats) = mesh_ifc(REVOLVED_RING_IFC.as_bytes());
+
+    let ring = meshes
+        .iter()
+        .find(|m| m.guid.starts_with("Ring00"))
+        .expect("revolved product missing");
+
+    let tags: Vec<&str> = ring.segments.iter().map(|s| s.source.as_str()).collect();
+    assert!(
+        tags.contains(&"revolved"),
+        "expected a 'revolved' segment, got {:?}",
+        tags
+    );
+    assert!(
+        !stats.by_source.contains_key("unhandled:IFCREVOLVEDAREASOLID"),
+        "revolved handler did not consume IFCREVOLVEDAREASOLID; stats: {:?}",
+        stats.by_source
+    );
+
+    let mut volume_x6: f32 = 0.0;
+    for tri in ring.indices.chunks_exact(3) {
+        let (a, b, c) = (tri[0] as usize, tri[1] as usize, tri[2] as usize);
+        let ax = ring.vertices[a * 3];
+        let ay = ring.vertices[a * 3 + 1];
+        let az = ring.vertices[a * 3 + 2];
+        let bx = ring.vertices[b * 3];
+        let by = ring.vertices[b * 3 + 1];
+        let bz = ring.vertices[b * 3 + 2];
+        let cx = ring.vertices[c * 3];
+        let cy = ring.vertices[c * 3 + 1];
+        let cz = ring.vertices[c * 3 + 2];
+        volume_x6 += ax * (by * cz - bz * cy)
+            + ay * (bz * cx - bx * cz)
+            + az * (bx * cy - by * cx);
+    }
+    let volume = (volume_x6 / 6.0).abs();
+    let expected =
+        std::f32::consts::PI * (300.0_f32.powi(2) - 200.0_f32.powi(2)) * 500.0;
+    let ratio = volume / expected;
+    assert!(
+        ratio > 0.85 && ratio < 1.05,
+        "revolved ring volume {:.0} vs expected {:.0} (ratio {:.3}) outside [0.85, 1.05]",
+        volume,
+        expected,
+        ratio
+    );
+}
 
 #[test]
 fn csg_primitives_tessellate_to_per_type_tags() {

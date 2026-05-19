@@ -26,6 +26,7 @@ pub mod mapped;
 pub mod obj;
 pub mod placement;
 pub mod profile;
+pub mod revolved;
 pub mod stats;
 
 use std::collections::HashMap;
@@ -102,6 +103,7 @@ impl MeshFragment {
             "csg_cone",
             "csg_sphere",
             "csg_pyramid",
+            "revolved",
         ]
     }
 }
@@ -399,6 +401,8 @@ pub(crate) fn mesh_item(
             single(csg_primitive::sphere(table, item_id), "csg_sphere")
         } else if type_name.eq_ignore_ascii_case(b"IFCRECTANGULARPYRAMID") {
             single(csg_primitive::rectangular_pyramid(table, item_id), "csg_pyramid")
+        } else if type_name.eq_ignore_ascii_case(b"IFCREVOLVEDAREASOLID") {
+            single(revolved::revolved_area_solid(table, item_id), "revolved")
         } else {
             // Reveal-all stance: name the type explicitly so the
             // consumer sees exactly what's in the file we can't yet
