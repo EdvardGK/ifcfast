@@ -1,0 +1,457 @@
+//! Streaming substrate writer — IFC → GeoParquet-of-products.
+//!
+//! **Why this exists.** The mesh pipeline accumulates every product
+//! into a `Vec<ProductMesh>` before writing OBJ/glTF. Working-set RAM
+//! tracks file size at ~2-3×; the pipeline OOM-killed a 1 GB IFC on a
+//! 15 GB host. Worse: OBJ strips every IFC semantic the downstream
+//! analyser needs (psets, materials, storey, type), so anyone doing
+//! real analysis has to re-parse the IFC alongside the OBJ.
+//!
+//! Both failures collapse into one: convert as a *streaming per-product
+//! emit*, pairing geometry with the IFC semantic fingerprint, into a
+//! format that's natively analyzable. The cross-industry precedent is
+//! GeoParquet (GIS) + USD (film/games) — both solved equivalent
+//! problems in their domains. We adopt the GeoParquet pattern here for
+//! the analysis lane.
+//!
+//! Architecture:
+//!
+//!   1. **Pre-pass (`Bundle::build`).** Walk the EntityTable once,
+//!      build IndexedFile + four extractors (psets, materials,
+//!      quantities, classifications). Bounded by entity count, not
+//!      geometry size.
+//!   2. **GUID-keyed regrouping.** Pre-group the long-format extractor
+//!      output into `guid -> Vec<...>` maps, plus product→storey,
+//!      product→type, product→aggregate-parent lookups.
+//!   3. **Streaming mesh pass.** [`crate::mesh::mesh_ifc_streaming`]
+//!      hands each `ProductMesh` to a `ProductSink`. The sink looks up
+//!      semantics via the `Bundle`, builds one substrate `ProductRecord`,
+//!      writes it, drops the mesh. RAM working-set ≈ one product +
+//!      one Parquet row-group buffer.
+//!
+//! The substrate record schema is *source-format-agnostic* — class
+//! names are normalized ("Wall" not "IfcWallStandardCase"), and the
+//! raw source class is kept alongside for round-trip / traceability.
+//! That's deliberate: IFC5 abandons STEP entirely, so the substrate
+//! has to outlive any one input dialect.
+
+pub mod parquet_sink;
+pub mod record;
+
+use std::collections::HashMap;
+
+use crate::entity_table::EntityTable;
+use crate::extractors::{classifications, materials, psets, quantities};
+use crate::indexer;
+use crate::lexer::{parse_field, split_top_level_args, Field};
+
+/// One pset key-value as it appears on a product.
+#[derive(Debug, Clone)]
+pub struct PsetValue {
+    pub set_name: String,
+    pub name: String,
+    pub value: Option<String>,
+    pub value_type: Option<String>,
+}
+
+/// One material layer or material assignment on a product.
+#[derive(Debug, Clone)]
+pub struct MaterialEntry {
+    pub role: &'static str,
+    pub layer_index: i32,
+    pub name: Option<String>,
+    pub thickness_mm: Option<f64>,
+    pub category: Option<String>,
+}
+
+/// One quantity (length/area/volume/count) on a product.
+#[derive(Debug, Clone)]
+pub struct QuantityEntry {
+    pub set_name: String,
+    pub name: String,
+    pub value: Option<String>,
+    pub quantity_type: String,
+    pub unit_step_id: Option<u64>,
+}
+
+/// One classification reference on a product.
+#[derive(Debug, Clone)]
+pub struct ClassificationEntry {
+    pub system_name: Option<String>,
+    pub edition: Option<String>,
+    pub identification: Option<String>,
+    pub name: Option<String>,
+    pub location: Option<String>,
+    pub source: Option<String>,
+}
+
+/// Per-product semantic snapshot, paired with geometry by the sink.
+#[derive(Debug, Default, Clone)]
+pub struct ProductSemantics {
+    pub ifc_id: u64,
+    pub class: String,
+    pub source_class: String,
+    pub name: Option<String>,
+    pub predefined_type: Option<String>,
+    pub object_type: Option<String>,
+    pub tag: Option<String>,
+    pub storey_guid: Option<String>,
+    pub storey_name: Option<String>,
+    pub aggregates_parent_guid: Option<String>,
+    pub type_guid: Option<String>,
+    pub type_name: Option<String>,
+    pub materials: Vec<MaterialEntry>,
+    pub psets: Vec<PsetValue>,
+    pub quantities: Vec<QuantityEntry>,
+    pub classifications: Vec<ClassificationEntry>,
+}
+
+/// All semantic data the streaming converter needs, pre-built once and
+/// looked up by product GUID during the mesh pass.
+pub struct Bundle {
+    pub schema: String,
+    pub project_name: Option<String>,
+    pub authoring_app: Option<String>,
+    pub unit_scale: Option<f64>,
+    pub product_count: usize,
+
+    // Per-product lookups — keyed by GUID. Populated once during
+    // `build`, then read-only during the streaming pass.
+    by_guid: HashMap<String, ProductCore>,
+    psets_by_guid: HashMap<String, Vec<PsetValue>>,
+    materials_by_guid: HashMap<String, Vec<MaterialEntry>>,
+    quantities_by_guid: HashMap<String, Vec<QuantityEntry>>,
+    classifications_by_guid: HashMap<String, Vec<ClassificationEntry>>,
+}
+
+#[derive(Debug, Clone)]
+struct ProductCore {
+    ifc_id: u64,
+    source_class: String,
+    class: String,
+    name: Option<String>,
+    predefined_type: Option<String>,
+    object_type: Option<String>,
+    tag: Option<String>,
+    storey_guid: Option<String>,
+    storey_name: Option<String>,
+    aggregates_parent_guid: Option<String>,
+    type_guid: Option<String>,
+    type_name: Option<String>,
+}
+
+impl Bundle {
+    /// Build the bundle from a memory-mapped IFC buffer. Does all the
+    /// up-front work the streaming pass relies on. Cost is bounded by
+    /// entity count (not geometry size) — fits in modest RAM even on
+    /// 1 GB+ files.
+    pub fn build(buf: &[u8]) -> Self {
+        let table = EntityTable::build(buf);
+        let idx = indexer::index(buf);
+
+        // Step-id -> guid for every IfcRoot-derived entity, used by
+        // every extractor and by the storey/type lookups below.
+        let mut step_to_guid: HashMap<u64, String> =
+            HashMap::with_capacity(idx.product_step_id.len() + idx.type_object_step_id.len() + 64);
+        for (sid, _t, args) in table.iter() {
+            let fields = split_top_level_args(args);
+            if let Some(first) = fields.first() {
+                if let Field::String(s) = parse_field(first) {
+                    // IfcRoot.GlobalId is always 22 chars (Base64-encoded
+                    // 128-bit GUID). Anything else is a different first
+                    // field (label, descriptor) and would corrupt the map.
+                    if s.len() == 22 {
+                        step_to_guid.insert(sid, s);
+                    }
+                }
+            }
+        }
+
+        // Storey-id -> name (also covers building/site so aggregates can
+        // resolve any spatial parent's name without re-walking the file).
+        let mut storey_name_by_id: HashMap<u64, String> = HashMap::new();
+        for (i, sid) in idx.storey_step_id.iter().enumerate() {
+            if let Some(Some(n)) = idx.storey_name.get(i) {
+                storey_name_by_id.insert(*sid, n.clone());
+            }
+        }
+
+        // Product step_id -> containing storey step_id, from
+        // IfcRelContainedInSpatialStructure. Many products fall into the
+        // building or site directly rather than a storey — we record
+        // whichever spatial parent the file declared (those `structure`
+        // ids may not be storeys, and that's fine; the GUID + name still
+        // resolve through `step_to_guid` + `storey_name_by_id`).
+        let mut contained_in: HashMap<u64, u64> =
+            HashMap::with_capacity(idx.contained_in_child.len());
+        for (child, structure) in idx
+            .contained_in_child
+            .iter()
+            .zip(idx.contained_in_structure.iter())
+        {
+            contained_in.insert(*child, *structure);
+        }
+
+        // Product step_id -> aggregate parent step_id. IfcRelAggregates
+        // child->parent (e.g. an assembly's parts -> the assembly).
+        let mut agg_parent: HashMap<u64, u64> =
+            HashMap::with_capacity(idx.aggregates_child.len());
+        for (child, parent) in idx
+            .aggregates_child
+            .iter()
+            .zip(idx.aggregates_parent.iter())
+        {
+            agg_parent.insert(*child, *parent);
+        }
+
+        // Product step_id -> type_object step_id, from
+        // IfcRelDefinesByType. One type per product (the relation fans
+        // out N products per type; we record the type each product
+        // belongs to).
+        let mut product_type: HashMap<u64, u64> =
+            HashMap::with_capacity(idx.defines_by_type_product.len());
+        for (prod, ty) in idx
+            .defines_by_type_product
+            .iter()
+            .zip(idx.defines_by_type_type.iter())
+        {
+            product_type.insert(*prod, *ty);
+        }
+
+        // Type-object step_id -> (guid, name) for resolution above.
+        let mut type_info: HashMap<u64, (String, Option<String>)> =
+            HashMap::with_capacity(idx.type_object_step_id.len());
+        for i in 0..idx.type_object_step_id.len() {
+            let sid = idx.type_object_step_id[i];
+            let guid = idx.type_object_guid[i].clone();
+            let name = idx.type_object_name[i].clone();
+            type_info.insert(sid, (guid, name));
+        }
+
+        // Assemble per-product core records.
+        let mut by_guid: HashMap<String, ProductCore> =
+            HashMap::with_capacity(idx.product_step_id.len());
+        for i in 0..idx.product_step_id.len() {
+            let sid = idx.product_step_id[i];
+            let guid = idx.product_guid[i].clone();
+            let source_class = idx.product_entity[i].clone();
+            let class = normalize_class(&source_class);
+
+            let storey_sid = contained_in.get(&sid).copied();
+            let storey_guid = storey_sid.and_then(|s| step_to_guid.get(&s).cloned());
+            let storey_name = storey_sid.and_then(|s| storey_name_by_id.get(&s).cloned());
+
+            let agg_parent_sid = agg_parent.get(&sid).copied();
+            let aggregates_parent_guid =
+                agg_parent_sid.and_then(|s| step_to_guid.get(&s).cloned());
+
+            let type_sid = product_type.get(&sid).copied();
+            let (type_guid, type_name) = match type_sid.and_then(|s| type_info.get(&s).cloned()) {
+                Some((g, n)) => (Some(g), n),
+                None => (None, None),
+            };
+
+            by_guid.insert(
+                guid,
+                ProductCore {
+                    ifc_id: sid,
+                    source_class,
+                    class,
+                    name: idx.product_name[i].clone(),
+                    predefined_type: idx.product_predefined_type[i].clone(),
+                    object_type: idx.product_object_type[i].clone(),
+                    tag: idx.product_tag[i].clone(),
+                    storey_guid,
+                    storey_name,
+                    aggregates_parent_guid,
+                    type_guid,
+                    type_name,
+                },
+            );
+        }
+
+        // Extractors emit long-format columnar tables; regroup into
+        // per-product Vecs so the streaming sink can look one up in
+        // O(1) per product.
+        let psets_table = psets::build(&table, &step_to_guid);
+        let mat_table = materials::build(&table, &step_to_guid);
+        let qty_table = quantities::build(&table, &step_to_guid);
+        let cls_table = classifications::build(&table, &step_to_guid);
+
+        let mut psets_by_guid: HashMap<String, Vec<PsetValue>> = HashMap::new();
+        for i in 0..psets_table.guid.len() {
+            psets_by_guid
+                .entry(psets_table.guid[i].clone())
+                .or_default()
+                .push(PsetValue {
+                    set_name: psets_table.pset_name[i].clone(),
+                    name: psets_table.prop_name[i].clone(),
+                    value: psets_table.value[i].clone(),
+                    value_type: psets_table.value_type[i].clone(),
+                });
+        }
+
+        let mut materials_by_guid: HashMap<String, Vec<MaterialEntry>> = HashMap::new();
+        for i in 0..mat_table.guid.len() {
+            materials_by_guid
+                .entry(mat_table.guid[i].clone())
+                .or_default()
+                .push(MaterialEntry {
+                    role: mat_table.role[i],
+                    layer_index: mat_table.layer_index[i],
+                    name: mat_table.material_name[i].clone(),
+                    thickness_mm: mat_table.layer_thickness_mm[i],
+                    category: mat_table.category[i].clone(),
+                });
+        }
+
+        let mut quantities_by_guid: HashMap<String, Vec<QuantityEntry>> = HashMap::new();
+        for i in 0..qty_table.guid.len() {
+            quantities_by_guid
+                .entry(qty_table.guid[i].clone())
+                .or_default()
+                .push(QuantityEntry {
+                    set_name: qty_table.qto_name[i].clone(),
+                    name: qty_table.quantity_name[i].clone(),
+                    value: qty_table.value[i].clone(),
+                    quantity_type: qty_table.quantity_type[i].clone(),
+                    unit_step_id: qty_table.unit_step_id[i],
+                });
+        }
+
+        let mut classifications_by_guid: HashMap<String, Vec<ClassificationEntry>> =
+            HashMap::new();
+        for i in 0..cls_table.guid.len() {
+            classifications_by_guid
+                .entry(cls_table.guid[i].clone())
+                .or_default()
+                .push(ClassificationEntry {
+                    system_name: cls_table.system_name[i].clone(),
+                    edition: cls_table.edition[i].clone(),
+                    identification: cls_table.identification[i].clone(),
+                    name: cls_table.name[i].clone(),
+                    location: cls_table.location[i].clone(),
+                    source: cls_table.source[i].clone(),
+                });
+        }
+
+        Self {
+            schema: idx.schema,
+            project_name: idx.project_name,
+            authoring_app: idx.authoring_app,
+            unit_scale: idx.unit_scale,
+            product_count: by_guid.len(),
+            by_guid,
+            psets_by_guid,
+            materials_by_guid,
+            quantities_by_guid,
+            classifications_by_guid,
+        }
+    }
+
+    /// Look up everything we know about a product by its IFC GUID.
+    /// Returns an empty-ish snapshot if the GUID is unknown — the mesh
+    /// pipeline may surface products the indexer doesn't classify
+    /// (proxy elements, schema versions we don't enumerate). We don't
+    /// drop them; we emit the geometry with whatever semantics we have.
+    pub fn semantics_for(&self, guid: &str) -> ProductSemantics {
+        let core = self.by_guid.get(guid);
+        ProductSemantics {
+            ifc_id: core.map(|c| c.ifc_id).unwrap_or(0),
+            class: core.map(|c| c.class.clone()).unwrap_or_default(),
+            source_class: core.map(|c| c.source_class.clone()).unwrap_or_default(),
+            name: core.and_then(|c| c.name.clone()),
+            predefined_type: core.and_then(|c| c.predefined_type.clone()),
+            object_type: core.and_then(|c| c.object_type.clone()),
+            tag: core.and_then(|c| c.tag.clone()),
+            storey_guid: core.and_then(|c| c.storey_guid.clone()),
+            storey_name: core.and_then(|c| c.storey_name.clone()),
+            aggregates_parent_guid: core.and_then(|c| c.aggregates_parent_guid.clone()),
+            type_guid: core.and_then(|c| c.type_guid.clone()),
+            type_name: core.and_then(|c| c.type_name.clone()),
+            materials: self
+                .materials_by_guid
+                .get(guid)
+                .cloned()
+                .unwrap_or_default(),
+            psets: self.psets_by_guid.get(guid).cloned().unwrap_or_default(),
+            quantities: self
+                .quantities_by_guid
+                .get(guid)
+                .cloned()
+                .unwrap_or_default(),
+            classifications: self
+                .classifications_by_guid
+                .get(guid)
+                .cloned()
+                .unwrap_or_default(),
+        }
+    }
+
+    pub fn product_count(&self) -> usize {
+        self.product_count
+    }
+
+    /// Lift the four extractor table sizes for diagnostic output.
+    pub fn semantic_stats(&self) -> SemanticStats {
+        SemanticStats {
+            products_indexed: self.by_guid.len(),
+            pset_rows: self.psets_by_guid.values().map(|v| v.len()).sum(),
+            material_rows: self.materials_by_guid.values().map(|v| v.len()).sum(),
+            quantity_rows: self.quantities_by_guid.values().map(|v| v.len()).sum(),
+            classification_rows: self.classifications_by_guid.values().map(|v| v.len()).sum(),
+        }
+    }
+}
+
+pub struct SemanticStats {
+    pub products_indexed: usize,
+    pub pset_rows: usize,
+    pub material_rows: usize,
+    pub quantity_rows: usize,
+    pub classification_rows: usize,
+}
+
+/// Map an IFC type name to a domain-level class. The substrate is
+/// source-format-agnostic: downstream users filter on "Wall", not
+/// "IfcWallStandardCase". Source class stays on the record for round-
+/// trip and for users who need the raw IFC type.
+///
+/// The mapping is deliberately conservative — strip the `Ifc` prefix
+/// and the StandardCase/ElementedCase suffixes, leave the rest. A
+/// richer normalization (folding IfcCurtainWall + IfcWall* into "Wall",
+/// IfcPipeFitting + IfcPipeSegment into "Pipe", etc.) is a follow-on
+/// when a downstream query actually wants it.
+fn normalize_class(source: &str) -> String {
+    let trimmed = source
+        .strip_prefix("Ifc")
+        .or_else(|| source.strip_prefix("IFC"))
+        .unwrap_or(source);
+    let trimmed = trimmed
+        .strip_suffix("StandardCase")
+        .or_else(|| trimmed.strip_suffix("ElementedCase"))
+        .unwrap_or(trimmed);
+    trimmed.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_class;
+
+    #[test]
+    fn normalize_strips_ifc_prefix() {
+        assert_eq!(normalize_class("IfcWall"), "Wall");
+        assert_eq!(normalize_class("IfcSlab"), "Slab");
+    }
+
+    #[test]
+    fn normalize_strips_case_suffixes() {
+        assert_eq!(normalize_class("IfcWallStandardCase"), "Wall");
+        assert_eq!(normalize_class("IfcSlabElementedCase"), "Slab");
+    }
+
+    #[test]
+    fn normalize_passes_through_unknown() {
+        assert_eq!(normalize_class("IfcCustomThing"), "CustomThing");
+    }
+}

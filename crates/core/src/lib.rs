@@ -27,6 +27,9 @@ pub mod lexer;
 #[cfg(feature = "mesh")]
 pub mod mesh;
 
+#[cfg(feature = "bundle")]
+pub mod bundle;
+
 #[cfg(feature = "python")]
 mod python {
     use std::fs::File;

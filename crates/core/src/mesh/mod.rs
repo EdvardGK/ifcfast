@@ -148,6 +148,32 @@ pub struct MeshStats {
     pub entity_table_build_ms: f64,
 }
 
+/// Streaming sink for product meshes. Implementors decide whether to
+/// accumulate (legacy glTF/OBJ batch writers) or emit + drop (the
+/// streaming Parquet/bundle writer that bounds RAM at one product).
+///
+/// Bounded-RAM analysis lives or dies on the sink end consuming and
+/// releasing each `ProductMesh` immediately — otherwise the per-product
+/// `Vec<f32>` vertex buffers accumulate exactly like the old global
+/// `Vec<ProductMesh>` did, and we're back at OOM on 1 GB files.
+pub trait ProductSink {
+    fn on_product(&mut self, mesh: ProductMesh);
+}
+
+/// In-memory sink — used by callers that genuinely need every product
+/// in a `Vec` (the batch glTF writer, the drift analyser). For new
+/// pipelines prefer a streaming sink.
+#[derive(Default)]
+pub struct VecSink {
+    pub products: Vec<ProductMesh>,
+}
+
+impl ProductSink for VecSink {
+    fn on_product(&mut self, mesh: ProductMesh) {
+        self.products.push(mesh);
+    }
+}
+
 /// Mesh every product in the IFC and return them keyed by GUID order.
 ///
 /// Reveal-all stance: opening elements, void volumes, intersecting
@@ -155,7 +181,23 @@ pub struct MeshStats {
 /// as visible geometry. Anything we can't tessellate yet is reported
 /// as `stats.by_source["unhandled:IFCXXX"]` so the consumer knows
 /// exactly what's in the file that we haven't surfaced.
+///
+/// Batch entry point — accumulates every product into a `Vec`. Scales
+/// linearly in host RAM with file size (~2-3× working-set ratio); OOMs
+/// around 1 GB IFC on 16 GB hosts. For bounded-RAM analysis use
+/// [`mesh_ifc_streaming`] with a streaming sink (e.g. Parquet writer).
 pub fn mesh_ifc(buf: &[u8]) -> (Vec<ProductMesh>, MeshStats) {
+    let mut sink = VecSink::default();
+    let stats = mesh_ifc_streaming(buf, &mut sink);
+    (sink.products, stats)
+}
+
+/// Streaming entry point. Walks every product once, hands each finished
+/// `ProductMesh` to `sink`, then drops it. Working-set RAM is bounded
+/// by the topology caches (`PlacementResolver`, `shape_cache` for
+/// `IfcMappedItem` dedup) — both keyed by reusable subgraph ids, not
+/// by product count.
+pub fn mesh_ifc_streaming<S: ProductSink>(buf: &[u8], sink: &mut S) -> MeshStats {
     let mut stats = MeshStats::default();
 
     let t0 = Instant::now();
@@ -166,7 +208,6 @@ pub fn mesh_ifc(buf: &[u8]) -> (Vec<ProductMesh>, MeshStats) {
     let t_mesh = Instant::now();
     let mut resolver = PlacementResolver::new(&table);
     let mut shape_cache: HashMap<u64, Vec<(LocalMesh, &'static str)>> = HashMap::new();
-    let mut out: Vec<ProductMesh> = Vec::new();
 
     for (step_id, type_name, args) in table.iter() {
         // Skip anything we know isn't a product (rels, primitives, etc.).
@@ -298,7 +339,7 @@ pub fn mesh_ifc(buf: &[u8]) -> (Vec<ProductMesh>, MeshStats) {
         for seg in &segments {
             *stats.by_source.entry(seg.source.clone()).or_insert(0) += 1;
         }
-        out.push(ProductMesh {
+        sink.on_product(ProductMesh {
             guid,
             entity: entity_name,
             vertices: combined_v,
@@ -311,7 +352,7 @@ pub fn mesh_ifc(buf: &[u8]) -> (Vec<ProductMesh>, MeshStats) {
     }
 
     stats.elapsed_ms = t_mesh.elapsed().as_secs_f64() * 1000.0;
-    (out, stats)
+    stats
 }
 
 /// Mesh a single `IfcRepresentationItem`. Returns one or more fragments
