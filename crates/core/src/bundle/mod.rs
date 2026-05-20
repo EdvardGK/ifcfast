@@ -39,67 +39,81 @@ pub mod parquet_sink;
 pub mod record;
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::entity_table::EntityTable;
 use crate::extractors::{classifications, materials, psets, quantities};
 use crate::indexer;
 use crate::lexer::{parse_field, split_top_level_args, Field};
 
-/// One pset key-value as it appears on a product.
+/// One pset key-value as it appears on a product. The two name fields
+/// repeat heavily across products (a 100K-product file typically has
+/// <10K distinct prop_name + <2K distinct set_name), so they're stored
+/// behind `Arc<str>` and interned by `Bundle::build`. The literal
+/// `value` stays an owned `String` — values are mostly unique and
+/// interning would just add a HashMap probe with no payoff.
 #[derive(Debug, Clone)]
 pub struct PsetValue {
-    pub set_name: String,
-    pub name: String,
+    pub set_name: Arc<str>,
+    pub name: Arc<str>,
     pub value: Option<String>,
-    pub value_type: Option<String>,
+    pub value_type: Option<Arc<str>>,
 }
 
-/// One material layer or material assignment on a product.
+/// One material layer or material assignment on a product. `name` and
+/// `category` are interned — material catalogues are tiny (10s-100s of
+/// unique strings) but referenced O(layers) times.
 #[derive(Debug, Clone)]
 pub struct MaterialEntry {
     pub role: &'static str,
     pub layer_index: i32,
-    pub name: Option<String>,
+    pub name: Option<Arc<str>>,
     pub thickness_mm: Option<f64>,
-    pub category: Option<String>,
+    pub category: Option<Arc<str>>,
 }
 
 /// One quantity (length/area/volume/count) on a product.
 #[derive(Debug, Clone)]
 pub struct QuantityEntry {
-    pub set_name: String,
-    pub name: String,
+    pub set_name: Arc<str>,
+    pub name: Arc<str>,
     pub value: Option<String>,
-    pub quantity_type: String,
+    pub quantity_type: Arc<str>,
     pub unit_step_id: Option<u64>,
 }
 
-/// One classification reference on a product.
+/// One classification reference on a product. Every field is low-
+/// cardinality except `identification` (one classification code per
+/// element-class typically), so all six string fields are interned.
 #[derive(Debug, Clone)]
 pub struct ClassificationEntry {
-    pub system_name: Option<String>,
-    pub edition: Option<String>,
-    pub identification: Option<String>,
-    pub name: Option<String>,
-    pub location: Option<String>,
-    pub source: Option<String>,
+    pub system_name: Option<Arc<str>>,
+    pub edition: Option<Arc<str>>,
+    pub identification: Option<Arc<str>>,
+    pub name: Option<Arc<str>>,
+    pub location: Option<Arc<str>>,
+    pub source: Option<Arc<str>>,
 }
 
 /// Per-product semantic snapshot, paired with geometry by the sink.
-#[derive(Debug, Default, Clone)]
+/// Class/source_class/storey_name/type_name come from low-cardinality
+/// vocabularies (entity names, storey labels, type catalogue) so
+/// they're held as `Arc<str>` to dedupe across the 10K-100K instances
+/// pointing at the same value.
+#[derive(Debug, Clone)]
 pub struct ProductSemantics {
     pub ifc_id: u64,
-    pub class: String,
-    pub source_class: String,
+    pub class: Arc<str>,
+    pub source_class: Arc<str>,
     pub name: Option<String>,
     pub predefined_type: Option<String>,
     pub object_type: Option<String>,
     pub tag: Option<String>,
     pub storey_guid: Option<String>,
-    pub storey_name: Option<String>,
+    pub storey_name: Option<Arc<str>>,
     pub aggregates_parent_guid: Option<String>,
     pub type_guid: Option<String>,
-    pub type_name: Option<String>,
+    pub type_name: Option<Arc<str>>,
     pub materials: Vec<MaterialEntry>,
     pub psets: Vec<PsetValue>,
     pub quantities: Vec<QuantityEntry>,
@@ -127,17 +141,43 @@ pub struct Bundle {
 #[derive(Debug, Clone)]
 struct ProductCore {
     ifc_id: u64,
-    source_class: String,
-    class: String,
+    source_class: Arc<str>,
+    class: Arc<str>,
     name: Option<String>,
     predefined_type: Option<String>,
     object_type: Option<String>,
     tag: Option<String>,
     storey_guid: Option<String>,
-    storey_name: Option<String>,
+    storey_name: Option<Arc<str>>,
     aggregates_parent_guid: Option<String>,
     type_guid: Option<String>,
-    type_name: Option<String>,
+    type_name: Option<Arc<str>>,
+}
+
+/// Tiny string-interning helper used by `Bundle::build` so the
+/// regrouped maps share one `Arc<str>` per unique value rather than
+/// holding N copies. The cache is dropped at the end of `build` — the
+/// `Arc<str>` references it returned now live in the bundle's maps.
+fn intern(cache: &mut HashMap<String, Arc<str>>, s: String) -> Arc<str> {
+    if let Some(a) = cache.get(&s) {
+        return Arc::clone(a);
+    }
+    let a: Arc<str> = Arc::from(s.as_str());
+    cache.insert(s, Arc::clone(&a));
+    a
+}
+
+fn intern_opt(
+    cache: &mut HashMap<String, Arc<str>>,
+    s: Option<String>,
+) -> Option<Arc<str>> {
+    s.map(|v| intern(cache, v))
+}
+
+/// Fallback `Arc<str>` for the rare semantics_for() lookup that misses
+/// the by_guid map. Equivalent to `String::new()` but for `Arc<str>`.
+fn empty_arc_str() -> Arc<str> {
+    Arc::from("")
 }
 
 impl Bundle {
@@ -147,7 +187,7 @@ impl Bundle {
     /// 1 GB+ files.
     pub fn build(buf: &[u8]) -> Self {
         let table = EntityTable::build(buf);
-        let idx = indexer::index(buf);
+        let mut idx = indexer::index(buf);
 
         // Step-id -> guid for every IfcRoot-derived entity, used by
         // every extractor and by the storey/type lookups below.
@@ -228,18 +268,47 @@ impl Bundle {
             type_info.insert(sid, (guid, name));
         }
 
-        // Assemble per-product core records.
+        // String-intern cache shared across the per-product assembly
+        // AND all four regrouping loops below. Dropped at the end of
+        // `build` — every `Arc<str>` it returned is owned by the
+        // bundle's maps by then. Single-threaded, no locking.
+        let mut str_cache: HashMap<String, Arc<str>> = HashMap::new();
+
+        // Assemble per-product core records. Consume the indexer's
+        // parallel Vecs by-move so we don't double-allocate the
+        // owned-String columns: `mem::take` snatches the backing buffer
+        // and replaces the indexer's vec with an empty one we don't
+        // touch again.
+        let product_step_id = std::mem::take(&mut idx.product_step_id);
+        let product_guid = std::mem::take(&mut idx.product_guid);
+        let product_entity = std::mem::take(&mut idx.product_entity);
+        let product_name = std::mem::take(&mut idx.product_name);
+        let product_predefined_type = std::mem::take(&mut idx.product_predefined_type);
+        let product_object_type = std::mem::take(&mut idx.product_object_type);
+        let product_tag = std::mem::take(&mut idx.product_tag);
+
         let mut by_guid: HashMap<String, ProductCore> =
-            HashMap::with_capacity(idx.product_step_id.len());
-        for i in 0..idx.product_step_id.len() {
-            let sid = idx.product_step_id[i];
-            let guid = idx.product_guid[i].clone();
-            let source_class = idx.product_entity[i].clone();
-            let class = normalize_class(&source_class);
+            HashMap::with_capacity(product_step_id.len());
+
+        let product_iter = product_step_id
+            .into_iter()
+            .zip(product_guid.into_iter())
+            .zip(product_entity.into_iter())
+            .zip(product_name.into_iter())
+            .zip(product_predefined_type.into_iter())
+            .zip(product_object_type.into_iter())
+            .zip(product_tag.into_iter())
+            .map(|((((((a, b), c), d), e), f), g)| (a, b, c, d, e, f, g));
+
+        for (sid, guid, entity, name, predef, obj_ty, tag) in product_iter {
+            let source_class = intern(&mut str_cache, entity);
+            let class = intern(&mut str_cache, normalize_class(&source_class));
 
             let storey_sid = contained_in.get(&sid).copied();
             let storey_guid = storey_sid.and_then(|s| step_to_guid.get(&s).cloned());
-            let storey_name = storey_sid.and_then(|s| storey_name_by_id.get(&s).cloned());
+            let storey_name = storey_sid
+                .and_then(|s| storey_name_by_id.get(&s).cloned())
+                .map(|s| intern(&mut str_cache, s));
 
             let agg_parent_sid = agg_parent.get(&sid).copied();
             let aggregates_parent_guid =
@@ -247,7 +316,7 @@ impl Bundle {
 
             let type_sid = product_type.get(&sid).copied();
             let (type_guid, type_name) = match type_sid.and_then(|s| type_info.get(&s).cloned()) {
-                Some((g, n)) => (Some(g), n),
+                Some((g, n)) => (Some(g), n.map(|s| intern(&mut str_cache, s))),
                 None => (None, None),
             };
 
@@ -257,10 +326,10 @@ impl Bundle {
                     ifc_id: sid,
                     source_class,
                     class,
-                    name: idx.product_name[i].clone(),
-                    predefined_type: idx.product_predefined_type[i].clone(),
-                    object_type: idx.product_object_type[i].clone(),
-                    tag: idx.product_tag[i].clone(),
+                    name,
+                    predefined_type: predef,
+                    object_type: obj_ty,
+                    tag,
                     storey_guid,
                     storey_name,
                     aggregates_parent_guid,
@@ -272,68 +341,105 @@ impl Bundle {
 
         // Extractors emit long-format columnar tables; regroup into
         // per-product Vecs so the streaming sink can look one up in
-        // O(1) per product.
+        // O(1) per product. We consume the extractor `Vec<String>`
+        // columns by `into_iter()` so the row strings are MOVED (not
+        // cloned) into the regrouped maps; the high-repeat fields
+        // (set_name, prop_name, …) pass through `intern` so duplicate
+        // values share one `Arc<str>`.
         let psets_table = psets::build(&table, &step_to_guid);
         let mat_table = materials::build(&table, &step_to_guid);
         let qty_table = quantities::build(&table, &step_to_guid);
         let cls_table = classifications::build(&table, &step_to_guid);
 
         let mut psets_by_guid: HashMap<String, Vec<PsetValue>> = HashMap::new();
-        for i in 0..psets_table.guid.len() {
-            psets_by_guid
-                .entry(psets_table.guid[i].clone())
-                .or_default()
-                .push(PsetValue {
-                    set_name: psets_table.pset_name[i].clone(),
-                    name: psets_table.prop_name[i].clone(),
-                    value: psets_table.value[i].clone(),
-                    value_type: psets_table.value_type[i].clone(),
-                });
+        let pset_iter = psets_table
+            .guid
+            .into_iter()
+            .zip(psets_table.pset_name.into_iter())
+            .zip(psets_table.prop_name.into_iter())
+            .zip(psets_table.value.into_iter())
+            .zip(psets_table.value_type.into_iter());
+        for ((((guid, set_name), prop_name), value), value_type) in pset_iter {
+            psets_by_guid.entry(guid).or_default().push(PsetValue {
+                set_name: intern(&mut str_cache, set_name),
+                name: intern(&mut str_cache, prop_name),
+                value,
+                value_type: intern_opt(&mut str_cache, value_type),
+            });
         }
 
         let mut materials_by_guid: HashMap<String, Vec<MaterialEntry>> = HashMap::new();
-        for i in 0..mat_table.guid.len() {
-            materials_by_guid
-                .entry(mat_table.guid[i].clone())
-                .or_default()
-                .push(MaterialEntry {
-                    role: mat_table.role[i],
-                    layer_index: mat_table.layer_index[i],
-                    name: mat_table.material_name[i].clone(),
-                    thickness_mm: mat_table.layer_thickness_mm[i],
-                    category: mat_table.category[i].clone(),
-                });
+        let mat_iter = mat_table
+            .guid
+            .into_iter()
+            .zip(mat_table.role.into_iter())
+            .zip(mat_table.layer_index.into_iter())
+            .zip(mat_table.material_name.into_iter())
+            .zip(mat_table.layer_thickness_mm.into_iter())
+            .zip(mat_table.category.into_iter());
+        for (((((guid, role), layer_index), material_name), thickness_mm), category) in mat_iter {
+            materials_by_guid.entry(guid).or_default().push(MaterialEntry {
+                role,
+                layer_index,
+                name: intern_opt(&mut str_cache, material_name),
+                thickness_mm,
+                category: intern_opt(&mut str_cache, category),
+            });
         }
 
         let mut quantities_by_guid: HashMap<String, Vec<QuantityEntry>> = HashMap::new();
-        for i in 0..qty_table.guid.len() {
+        let qty_iter = qty_table
+            .guid
+            .into_iter()
+            .zip(qty_table.qto_name.into_iter())
+            .zip(qty_table.quantity_name.into_iter())
+            .zip(qty_table.value.into_iter())
+            .zip(qty_table.quantity_type.into_iter())
+            .zip(qty_table.unit_step_id.into_iter());
+        for (((((guid, qto_name), quantity_name), value), quantity_type), unit_step_id) in qty_iter
+        {
             quantities_by_guid
-                .entry(qty_table.guid[i].clone())
+                .entry(guid)
                 .or_default()
                 .push(QuantityEntry {
-                    set_name: qty_table.qto_name[i].clone(),
-                    name: qty_table.quantity_name[i].clone(),
-                    value: qty_table.value[i].clone(),
-                    quantity_type: qty_table.quantity_type[i].clone(),
-                    unit_step_id: qty_table.unit_step_id[i],
+                    set_name: intern(&mut str_cache, qto_name),
+                    name: intern(&mut str_cache, quantity_name),
+                    value,
+                    quantity_type: intern(&mut str_cache, quantity_type),
+                    unit_step_id,
                 });
         }
 
         let mut classifications_by_guid: HashMap<String, Vec<ClassificationEntry>> =
             HashMap::new();
-        for i in 0..cls_table.guid.len() {
+        let cls_iter = cls_table
+            .guid
+            .into_iter()
+            .zip(cls_table.system_name.into_iter())
+            .zip(cls_table.edition.into_iter())
+            .zip(cls_table.identification.into_iter())
+            .zip(cls_table.name.into_iter())
+            .zip(cls_table.location.into_iter())
+            .zip(cls_table.source.into_iter());
+        for ((((((guid, system_name), edition), identification), name), location), source) in
+            cls_iter
+        {
             classifications_by_guid
-                .entry(cls_table.guid[i].clone())
+                .entry(guid)
                 .or_default()
                 .push(ClassificationEntry {
-                    system_name: cls_table.system_name[i].clone(),
-                    edition: cls_table.edition[i].clone(),
-                    identification: cls_table.identification[i].clone(),
-                    name: cls_table.name[i].clone(),
-                    location: cls_table.location[i].clone(),
-                    source: cls_table.source[i].clone(),
+                    system_name: intern_opt(&mut str_cache, system_name),
+                    edition: intern_opt(&mut str_cache, edition),
+                    identification: intern_opt(&mut str_cache, identification),
+                    name: intern_opt(&mut str_cache, name),
+                    location: intern_opt(&mut str_cache, location),
+                    source: intern_opt(&mut str_cache, source),
                 });
         }
+
+        // str_cache drops here — the bundle's maps now own all the
+        // Arc<str>s outright.
+        drop(str_cache);
 
         Self {
             schema: idx.schema,
@@ -358,17 +464,19 @@ impl Bundle {
         let core = self.by_guid.get(guid);
         ProductSemantics {
             ifc_id: core.map(|c| c.ifc_id).unwrap_or(0),
-            class: core.map(|c| c.class.clone()).unwrap_or_default(),
-            source_class: core.map(|c| c.source_class.clone()).unwrap_or_default(),
+            class: core.map(|c| Arc::clone(&c.class)).unwrap_or_else(empty_arc_str),
+            source_class: core
+                .map(|c| Arc::clone(&c.source_class))
+                .unwrap_or_else(empty_arc_str),
             name: core.and_then(|c| c.name.clone()),
             predefined_type: core.and_then(|c| c.predefined_type.clone()),
             object_type: core.and_then(|c| c.object_type.clone()),
             tag: core.and_then(|c| c.tag.clone()),
             storey_guid: core.and_then(|c| c.storey_guid.clone()),
-            storey_name: core.and_then(|c| c.storey_name.clone()),
+            storey_name: core.and_then(|c| c.storey_name.as_ref().map(Arc::clone)),
             aggregates_parent_guid: core.and_then(|c| c.aggregates_parent_guid.clone()),
             type_guid: core.and_then(|c| c.type_guid.clone()),
-            type_name: core.and_then(|c| c.type_name.clone()),
+            type_name: core.and_then(|c| c.type_name.as_ref().map(Arc::clone)),
             materials: self
                 .materials_by_guid
                 .get(guid)

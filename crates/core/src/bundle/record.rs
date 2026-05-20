@@ -27,6 +27,8 @@
 //!    requires content hashing, which is queued as a follow-on (lands
 //!    a further ~5-20% saving on top of the IfcMappedItem case).
 
+use std::sync::Arc;
+
 use crate::bundle::ProductSemantics;
 use crate::mesh::{MeshSegment, ProductMesh};
 
@@ -121,22 +123,27 @@ pub struct RepresentationRecord {
 /// places that rep into world space.
 #[derive(Debug, Clone)]
 pub struct InstanceRecord {
-    // Identity
+    // Identity. `class` and `source_class` are interned `Arc<str>` —
+    // shared with the bundle's `ProductCore` map, so a 100K-product
+    // file's 50 distinct entity-class strings live as 50 Arc<str>
+    // allocations, not 100K * 2 owned Strings.
     pub ifc_id: u64,
     pub guid: String,
-    pub class: String,
-    pub source_class: String,
+    pub class: Arc<str>,
+    pub source_class: Arc<str>,
     pub name: Option<String>,
     pub predefined_type: Option<String>,
     pub object_type: Option<String>,
     pub tag: Option<String>,
 
-    // Spatial / structural relationships
+    // Spatial / structural relationships. storey_name + type_name are
+    // interned (low-cardinality vocabularies); the GUID fields stay
+    // owned `String` since GUIDs are unique per product.
     pub storey_guid: Option<String>,
-    pub storey_name: Option<String>,
+    pub storey_name: Option<Arc<str>>,
     pub aggregates_parent_guid: Option<String>,
     pub type_guid: Option<String>,
-    pub type_name: Option<String>,
+    pub type_name: Option<Arc<str>>,
 
     // Geometry pointer + transform
     /// Foreign key into `representations.parquet`. `None` only if the
@@ -279,12 +286,15 @@ pub fn pair_split(
         ifc_id: semantics.ifc_id,
         guid: mesh.guid,
         class: if semantics.class.is_empty() {
-            strip_ifc_prefix(&mesh.entity)
+            // Bundle didn't have a normalized class for this product
+            // (proxy element / unknown schema); synth one from the raw
+            // entity. One-off allocation per fallback hit — fine.
+            Arc::from(strip_ifc_prefix(&mesh.entity).as_str())
         } else {
             semantics.class
         },
         source_class: if semantics.source_class.is_empty() {
-            mesh.entity.clone()
+            Arc::from(mesh.entity.as_str())
         } else {
             semantics.source_class
         },
