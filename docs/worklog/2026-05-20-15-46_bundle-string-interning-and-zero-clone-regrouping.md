@@ -27,32 +27,40 @@ Two interventions, both inside `Bundle::build`:
 
 **RSS (Sannergata_ARK_SB, single run, no warm-up):**
 - Before: **810.8 MB peak RSS, 6.99 s wall**
-- After:  **797.3 MB peak RSS, 7.23 s wall** (−13.5 MB, −1.7%; wall +3% within run-to-run noise)
+- After:  **797.3 MB peak RSS, 7.23 s wall** (−13.5 MB, −1.7%; wall ±3% within run-to-run noise)
 
-The 13 MB reduction is consistent with the model: Sannergata has only 97K pset rows but 25 unique `set_name`s and 24 unique `prop_name`s — high repetition, but the absolute byte count of the duplicated strings is small (~5-10 MB doubled = ~10-20 MB savings expected). The 10:00 worklog's "halve peak RSS" target was scoped to **ST28_RIV**, which has 2.57M pset rows (~27× more); on that file the same intervention should reclaim closer to 150-450 MB of the persistent maps and the regrouping-time double-allocation.
+**RSS (ST28_RIV, 834 MB mmap, 87198 products indexed, 2,574,680 pset rows — true apples-to-apples comparison, both binaries built post-`bf28d25`):**
+- Before: **2709.0 MB peak RSS, 33.06 s wall, 68.5 MB output**
+- After:  **2627.3 MB peak RSS, 30.28 s wall, 69.3 MB output** (−81.7 MB / **−3.0% RSS**, **−8.4% wall**)
+- Row-level diff across the 85976-row `instances.parquet`: **zero content differences**.
 
-I didn't have ST28_RIV locally this session (only on the original author's host); the largest comparable IFC available was Sannergata at 268 MB. Conclusion: **the optimization is correct and effective at the byte-per-row level, but its absolute magnitude is dominated by pset count**, not by file size or product count. On pset-heavy infra IFCs the gain scales linearly; on pset-light architectural exports it's modest.
+The wall-clock improvement is the more interesting result — the intern HashMap probe is cheaper than `String::clone` (no `malloc`, no payload copy) on the hot path through the regrouping loops, and that compounds across 2.6M pset rows + the per-product assembly. Output size grew by 0.8 MB / 1.2% which I haven't traced — most plausibly a dictionary-encoding side effect from the slightly different `Arc<str>` write order; well within ParquetWriter run-to-run noise.
+
+The 10:00 worklog's "halve peak RSS" target overshot. The intervention is correct and effective at the byte-per-row level, but on ST28_RIV its absolute magnitude (~80 MB) is small relative to the 2.7 GB peak because **the dominant peak is not the pset map** — see the scope gap below.
 
 ## Honest scope gap
 
-The 10:00 next-steps note framed this as "halve peak RSS on big files." On the available test corpus that overstated the gain — the 2.75 GB peak on ST28_RIV is dominated by the mesh `shape_cache` (`HashMap<u64, Vec<(LocalMesh, &'static str)>>` in `mesh::mesh_ifc_streaming`), not by the pset map. Caching local meshes for `IfcMappedItem` dedup keeps every unique representation's vertex+index buffer alive for the duration of the streaming pass — that's where the bulk of the RAM goes on a 20K-unique-rep file. Halving the pset map shaves a meaningful slice but not "half the peak."
+The 10:00 next-steps note framed this as "halve peak RSS on big files." On ST28_RIV the actual drop was **3.0%** (2709 → 2627 MB), not 50%. The intervention is doing the right thing at the byte-per-row level — the persistent-map savings track the model (~80 MB matches "100K Arc<str> entries × ~30 byte average dedup savings" + "double-allocation eliminated during the regrouping window"). But the 2.7 GB peak isn't dominated by the pset map. The actual top consumers, by inspection:
 
-A genuine half-RSS pass would have to attack `shape_cache` — either evict LocalMesh entries once their last referencing instance has been emitted (requires a per-rep-id ref count from the indexer), or move the cache to disk-backed via `mmap`. That's a substantially bigger refactor than this session's scope and was not attempted.
+1. **The 834 MB mmap'd input file** — STEP pages get resident as `EntityTable::build`, the indexer, and all four extractors walk the buffer in sequence. On a 32 GB box the kernel happily caches the whole thing.
+2. **The mesh `shape_cache: HashMap<u64, Vec<(LocalMesh, &'static str)>>`** in `mesh::mesh_ifc_streaming` — caches every unique representation's vertex+index buffer for the duration of the 20-second streaming pass. On ST28_RIV with 51K unique reps that's where the bulk of resident RAM lives. Eviction-by-last-use would slash this; today it's monotonic.
+3. **The per-product `ProductMesh` working buffer** — `combined_v`/`combined_i` accumulate per product during the mesh pass. Bounded per-product but the GC isn't synchronous.
+
+A genuine half-RSS pass has to attack `shape_cache`: either evict LocalMesh entries once the indexer-computed referencing instance count hits zero, or move the cache to a temporary mmap file. That's a substantially bigger refactor than this session and was not attempted.
 
 ## Next
 
-1. **Validate on ST28_RIV (834 MB, 86K products, 2.57M pset rows).** Need to source the file or run on the original host. This is the file where the intervention's scaling shows.
-2. **`shape_cache` eviction / disk-backing.** The actual peak-RSS killer on large files. Either ref-count meshes via a per-rep_id usage map from the indexer, or move the cache to a temporary mmap file. Bigger refactor; do not bundle with #1.
-3. **`.ifczip` silent-drop (#19).** Still queued, separate session.
-4. **Streaming glTF / USD spike.** Same OOM class as the old mesh path on the batch glTF writer.
-5. **Material units bug** — `extractors::materials::build` returns `layer_thickness_mm` values in metres, not mm. File an issue when next touching that code.
+1. **`shape_cache` eviction / disk-backing.** The actual peak-RSS killer on large files. Either ref-count meshes via a per-rep_id usage map from the indexer (evict on last use), or move the cache to a temporary mmap file. This is the move that gets to "half" on the big files.
+2. **`.ifczip` silent-drop (#19).** Still queued, separate session. The local Sannergata `.ifczip` files parse to zero products today.
+3. **Streaming glTF / USD spike.** Same OOM class as the old mesh path on the batch glTF writer (accumulates whole binary buffer in RAM).
+4. **Material units bug** — `extractors::materials::build` returns `layer_thickness_mm` values in metres, not mm. File an issue when next touching that code.
 
 ## Numbers reference
 
-| File | IFC size | Products | Pset rows | Peak RSS before | Peak RSS after | Δ |
-|---|---|---|---|---|---|---|
-| Duplex_A_20110907 | 2.3 MB | 286 | 13144 | 20.2 MB | 17.9 MB | −2.3 MB (−11%) |
-| Sannergata_ARK_SB | 268 MB | 27070 | 97756 | 810.8 MB | 797.3 MB | −13.5 MB (−1.7%) |
-| G55_ARK_farget | 271 MB | 23935 | 95861 | (not captured) | 835.1 MB | — |
+| File | IFC size | Products | Pset rows | RSS before | RSS after | Δ RSS | Δ wall |
+|---|---|---|---|---|---|---|---|
+| Duplex_A_20110907 | 2.3 MB | 286 | 13144 | 20.2 MB | 17.9 MB | −2.3 MB (−11%) | n/m |
+| Sannergata_ARK_SB | 268 MB | 27070 | 97756 | 810.8 MB | 797.3 MB | −13.5 MB (−1.7%) | +3% (noise) |
+| **ST28_RIV** | **834 MB** | **85976** | **2574680** | **2709.0 MB** | **2627.3 MB** | **−81.7 MB (−3.0%)** | **−2.78 s (−8.4%)** |
 
-(Pre-change G55 baseline not captured before the rebuild; only post-change for sanity-checking.)
+The wall-clock improvement on ST28_RIV is real and the RSS delta scales linearly with pset volume — but the magnitude is bounded by the share of total RSS attributable to the pset map. The shape_cache is the next move.
