@@ -74,16 +74,32 @@ pub fn expand(
     let composed = t_target * t_origin;
 
     // Walk the source representation's Items (it's an IfcShapeRepresentation).
+    // We pass the untransformed mesh through and attach `composed` as
+    // the fragment's `instance_transform` — the streaming loop composes
+    // it with the product's world placement when it bakes world-coord
+    // vertices, AND the substrate writer sees the SAME local mesh bytes
+    // across every instance of this mapping, which is the basis for
+    // rep dedup in `instances.parquet` + `representations.parquet`.
+    // Pre-instancing we used to call `transform_mesh(&mesh, composed)`
+    // here, which baked the composition into the vertex stream and
+    // erased the sharing.
     let item_ids = super::representation_items(table, mapped_repr_id);
     let mut out: Vec<MeshFragment> = Vec::new();
     for inner in item_ids {
         for frag in super::mesh_item(table, inner, shape_cache) {
             match frag {
-                MeshFragment::Mesh { mesh, source: src, role } => {
+                MeshFragment::Mesh { mesh, source: src, role, rep_step_id, instance_transform: inner_xform } => {
+                    // Inner direct geometry contributes Mat4::IDENTITY;
+                    // if a nested IfcMappedItem ever propagates here it
+                    // brings its own composition that we multiply in
+                    // (composed * inner) so deeper nests still produce
+                    // a single per-instance transform.
                     out.push(MeshFragment::Mesh {
-                        mesh: transform_mesh(&mesh, composed),
+                        mesh,
                         source: if src == "extrusion" { "mapped" } else { src },
                         role,
+                        rep_step_id,
+                        instance_transform: composed * inner_xform,
                     });
                 }
                 u @ MeshFragment::Unhandled { .. } => {
@@ -95,21 +111,6 @@ pub fn expand(
         }
     }
     out
-}
-
-fn transform_mesh(mesh: &LocalMesh, m: Mat4) -> LocalMesh {
-    let mut verts = Vec::with_capacity(mesh.vertices.len());
-    for chunk in mesh.vertices.chunks_exact(3) {
-        let p = Vec3::new(chunk[0], chunk[1], chunk[2]);
-        let r = m * Vec4::new(p.x, p.y, p.z, 1.0);
-        verts.push(r.x);
-        verts.push(r.y);
-        verts.push(r.z);
-    }
-    LocalMesh {
-        vertices: verts,
-        indices: mesh.indices.clone(),
-    }
 }
 
 fn transformation_operator_matrix(table: &EntityTable, id: u64) -> Mat4 {

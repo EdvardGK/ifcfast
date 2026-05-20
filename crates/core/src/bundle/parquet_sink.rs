@@ -1,15 +1,25 @@
-//! Streaming Parquet sink — consumes `ProductMesh` from the mesh
-//! pipeline, pairs each with semantics from the [`Bundle`], buffers
-//! `row_group_size` records into Arrow builders, then flushes one
-//! row group to Parquet and frees the builders.
+//! Streaming Parquet sinks — two files emitted in one pass:
 //!
-//! **RAM bound.** Working-set ≈ one row-group worth of records. With
-//! the default `row_group_size = 1024`, that's at most ~1024 product
-//! meshes plus their semantic payload in flight at once — independent
-//! of the source IFC's size. The Sannergata OOM scenario (144k
-//! products, 1 GB IFC) writes ~141 row groups sequentially with the
-//! same peak footprint as writing one.
+//! - `representations.parquet` — one row per unique mesh shape, keyed
+//!   by `rep_id`. The geometry payload (`vertices_le`, `indices_le`,
+//!   `segments`) lives ONLY here. Subsequent instances pointing to
+//!   the same rep_id are detected by an in-memory `HashSet<u64>` and
+//!   the row write is elided.
+//!
+//! - `instances.parquet` — one row per `IfcProduct`. Geometry-free
+//!   except for a `rep_id` foreign key, a 4x4 world transform, the
+//!   world-coord AABB, and the per-instance semantic payload (psets,
+//!   materials, quantities, classifications).
+//!
+//! Working-set RAM is bounded by:
+//! - the rep-id dedup HashSet (≤ unique rep count — small for AEC
+//!   files: 10s to low-thousands of unique shapes typical),
+//! - one row-group buffer per file (default 1024 rows each).
+//!
+//! Joins via DuckDB are one-liners:
+//!   `SELECT * FROM instances i LEFT JOIN representations r USING (rep_id);`
 
+use std::collections::HashSet;
 use std::fs::File;
 use std::path::Path;
 use std::sync::Arc;
@@ -23,53 +33,91 @@ use parquet::arrow::ArrowWriter;
 use parquet::basic::{Compression, ZstdLevel};
 use parquet::file::properties::WriterProperties;
 
-use crate::bundle::record::ProductRecord;
+use crate::bundle::record::{pair_split, InstanceRecord, RepresentationRecord};
 use crate::bundle::Bundle;
 use crate::mesh::{ProductMesh, ProductSink};
 
 const DEFAULT_ROW_GROUP_SIZE: usize = 1024;
 
-/// Streaming Parquet writer for the per-product substrate. Implements
-/// [`ProductSink`] so the standard `mesh_ifc_streaming` pipeline drives
-/// it directly.
+/// Streaming substrate writer — fans each `ProductMesh` out into the
+/// representations + instances Parquet files. Implements `ProductSink`
+/// so the standard `mesh_ifc_streaming` pipeline drives it directly.
 pub struct ParquetSink<'a> {
     bundle: &'a Bundle,
-    schema: SchemaRef,
-    writer: ArrowWriter<File>,
+    rep_schema: SchemaRef,
+    inst_schema: SchemaRef,
+    rep_writer: ArrowWriter<File>,
+    inst_writer: ArrowWriter<File>,
+    /// `rep_id`s already written to `representations.parquet`. Once a
+    /// rep_id is here, subsequent products referencing it skip the rep
+    /// write and only emit an instance row. Bounded by unique rep
+    /// count → small even on huge files.
+    seen_reps: HashSet<u64>,
     row_group_size: usize,
-    pending: Vec<ProductRecord>,
+    pending_reps: Vec<RepresentationRecord>,
+    pending_insts: Vec<InstanceRecord>,
     products_written: usize,
+    reps_written: usize,
 }
 
 impl<'a> ParquetSink<'a> {
-    /// Open a Parquet file at `path` for streaming write. Picks zstd
-    /// compression by default — IFC semantic strings (pset names,
-    /// material names, GUIDs) dictionary-encode extremely well, and
-    /// zstd gives ~3-5× better ratio than snappy on geometry blobs at
-    /// negligible CPU cost.
-    pub fn create<P: AsRef<Path>>(path: P, bundle: &'a Bundle) -> parquet::errors::Result<Self> {
-        let schema = Arc::new(build_schema());
-        let file = File::create(path).map_err(|e| {
-            parquet::errors::ParquetError::General(format!("create parquet: {e}"))
+    /// Open both Parquet files in `out_dir` for streaming write.
+    /// Layout: `{out_dir}/representations.parquet` +
+    /// `{out_dir}/instances.parquet`. The directory must already exist.
+    pub fn create_in_dir<P: AsRef<Path>>(
+        out_dir: P,
+        bundle: &'a Bundle,
+    ) -> parquet::errors::Result<Self> {
+        let rep_path = out_dir.as_ref().join("representations.parquet");
+        let inst_path = out_dir.as_ref().join("instances.parquet");
+
+        let rep_schema = Arc::new(build_representation_schema());
+        let inst_schema = Arc::new(build_instance_schema());
+
+        let rep_file = File::create(&rep_path).map_err(|e| {
+            parquet::errors::ParquetError::General(format!(
+                "create {}: {e}",
+                rep_path.display()
+            ))
         })?;
+        let inst_file = File::create(&inst_path).map_err(|e| {
+            parquet::errors::ParquetError::General(format!(
+                "create {}: {e}",
+                inst_path.display()
+            ))
+        })?;
+
+        // Zstd compresses IFC GUIDs and pset strings extremely well via
+        // dictionary encoding; geometry blobs still benefit modestly
+        // over snappy at negligible CPU cost.
         let props = WriterProperties::builder()
             .set_compression(Compression::ZSTD(ZstdLevel::default()))
             .set_dictionary_enabled(true)
             .build();
-        let writer = ArrowWriter::try_new(file, schema.clone(), Some(props))?;
+
+        let rep_writer = ArrowWriter::try_new(rep_file, rep_schema.clone(), Some(props.clone()))?;
+        let inst_writer = ArrowWriter::try_new(inst_file, inst_schema.clone(), Some(props))?;
+
         Ok(Self {
             bundle,
-            schema,
-            writer,
+            rep_schema,
+            inst_schema,
+            rep_writer,
+            inst_writer,
+            seen_reps: HashSet::new(),
             row_group_size: DEFAULT_ROW_GROUP_SIZE,
-            pending: Vec::with_capacity(DEFAULT_ROW_GROUP_SIZE),
+            pending_reps: Vec::with_capacity(DEFAULT_ROW_GROUP_SIZE),
+            pending_insts: Vec::with_capacity(DEFAULT_ROW_GROUP_SIZE),
             products_written: 0,
+            reps_written: 0,
         })
     }
 
     pub fn with_row_group_size(mut self, n: usize) -> Self {
-        self.row_group_size = n.max(1);
-        self.pending = Vec::with_capacity(self.row_group_size);
+        let n = n.max(1);
+        self.row_group_size = n;
+        self.pending_reps = Vec::with_capacity(n);
+        self.pending_insts = Vec::with_capacity(n);
         self
     }
 
@@ -77,21 +125,39 @@ impl<'a> ParquetSink<'a> {
         self.products_written
     }
 
-    /// Drain pending records, write final row group, close the file.
-    pub fn finish(mut self) -> parquet::errors::Result<usize> {
-        if !self.pending.is_empty() {
-            self.flush_row_group()?;
-        }
-        self.writer.close()?;
-        Ok(self.products_written)
+    pub fn unique_reps_written(&self) -> usize {
+        self.reps_written
     }
 
-    fn flush_row_group(&mut self) -> parquet::errors::Result<()> {
-        let batch = build_batch(&self.schema, &self.pending).map_err(|e| {
-            parquet::errors::ParquetError::General(format!("build record batch: {e}"))
+    /// Drain pending records, write final row groups, close both files.
+    /// Returns `(products_written, reps_written)`.
+    pub fn finish(mut self) -> parquet::errors::Result<(usize, usize)> {
+        if !self.pending_reps.is_empty() {
+            self.flush_reps()?;
+        }
+        if !self.pending_insts.is_empty() {
+            self.flush_insts()?;
+        }
+        self.rep_writer.close()?;
+        self.inst_writer.close()?;
+        Ok((self.products_written, self.reps_written))
+    }
+
+    fn flush_reps(&mut self) -> parquet::errors::Result<()> {
+        let batch = build_rep_batch(&self.rep_schema, &self.pending_reps).map_err(|e| {
+            parquet::errors::ParquetError::General(format!("build rep batch: {e}"))
         })?;
-        self.writer.write(&batch)?;
-        self.pending.clear();
+        self.rep_writer.write(&batch)?;
+        self.pending_reps.clear();
+        Ok(())
+    }
+
+    fn flush_insts(&mut self) -> parquet::errors::Result<()> {
+        let batch = build_instance_batch(&self.inst_schema, &self.pending_insts).map_err(|e| {
+            parquet::errors::ParquetError::General(format!("build instance batch: {e}"))
+        })?;
+        self.inst_writer.write(&batch)?;
+        self.pending_insts.clear();
         Ok(())
     }
 }
@@ -99,33 +165,82 @@ impl<'a> ParquetSink<'a> {
 impl ProductSink for ParquetSink<'_> {
     fn on_product(&mut self, mesh: ProductMesh) {
         let semantics = self.bundle.semantics_for(&mesh.guid);
-        let record = ProductRecord::pair(mesh, semantics);
-        self.pending.push(record);
+        let (rep, inst) = pair_split(mesh, semantics);
+
+        if let Some(rep_record) = rep {
+            // Dedup by rep_id — only the first instance of a shared
+            // shape gets its geometry written. The HashSet membership
+            // check is what makes the substrate hierarchical.
+            if self.seen_reps.insert(rep_record.rep_id) {
+                self.pending_reps.push(rep_record);
+                self.reps_written += 1;
+                if self.pending_reps.len() >= self.row_group_size {
+                    if let Err(e) = self.flush_reps() {
+                        panic!("parquet rep row-group flush failed: {e}");
+                    }
+                }
+            }
+        }
+
+        self.pending_insts.push(inst);
         self.products_written += 1;
-        if self.pending.len() >= self.row_group_size {
-            // Sinks can't return errors through the trait — surface as
-            // panic so a write failure halts the pipeline immediately
-            // (better than silently dropping rows once the file is
-            // partially flushed). Callers should catch errors at
-            // `finish()` for clean ones, or wrap in `catch_unwind` if
-            // they want fault tolerance on the streaming side.
-            if let Err(e) = self.flush_row_group() {
-                panic!("parquet row-group flush failed: {e}");
+        if self.pending_insts.len() >= self.row_group_size {
+            if let Err(e) = self.flush_insts() {
+                panic!("parquet instance row-group flush failed: {e}");
             }
         }
     }
 }
 
 // ---------------------------------------------------------------------------
-// Schema
+// Schemas
 // ---------------------------------------------------------------------------
 
-fn build_schema() -> Schema {
+fn xyz_field() -> Arc<Field> {
+    // `FixedSizeListBuilder` materializes its inner item field as
+    // nullable; mirror that here or RecordBatch validation fails.
+    Arc::new(Field::new("item", DataType::Float32, true))
+}
+
+fn build_representation_schema() -> Schema {
     let segment_fields = Fields::from(vec![
         Field::new("source", DataType::Utf8, false),
         Field::new("index_start", DataType::UInt32, false),
         Field::new("triangle_count", DataType::UInt32, false),
     ]);
+    let xyz = xyz_field();
+
+    Schema::new(vec![
+        Field::new("rep_id", DataType::UInt64, false),
+        Field::new("source_kind", DataType::Utf8, false),
+        Field::new("mesh_source", DataType::Utf8, false),
+        Field::new("vertex_count", DataType::UInt32, false),
+        Field::new("triangle_count", DataType::UInt32, false),
+        Field::new("vertices_le", DataType::Binary, false),
+        Field::new("indices_le", DataType::Binary, false),
+        Field::new(
+            "segments",
+            DataType::List(Arc::new(Field::new(
+                "item",
+                DataType::Struct(segment_fields),
+                true,
+            ))),
+            false,
+        ),
+        Field::new(
+            "local_bbox_min_xyz",
+            DataType::FixedSizeList(xyz.clone(), 3),
+            false,
+        ),
+        Field::new(
+            "local_bbox_max_xyz",
+            DataType::FixedSizeList(xyz, 3),
+            false,
+        ),
+    ])
+}
+
+fn build_instance_schema() -> Schema {
     let material_fields = Fields::from(vec![
         Field::new("role", DataType::Utf8, false),
         Field::new("layer_index", DataType::Int32, false),
@@ -154,11 +269,8 @@ fn build_schema() -> Schema {
         Field::new("location", DataType::Utf8, true),
         Field::new("source", DataType::Utf8, true),
     ]);
-
-    // `FixedSizeListBuilder` materializes its inner item field as
-    // nullable by default. Mirror that in the schema or `RecordBatch`
-    // validation rejects the batch with a nullability mismatch.
-    let xyz_field = Arc::new(Field::new("item", DataType::Float32, true));
+    let xyz = xyz_field();
+    let mat4_item = Arc::new(Field::new("item", DataType::Float32, true));
 
     Schema::new(vec![
         Field::new("ifc_id", DataType::UInt64, false),
@@ -174,27 +286,11 @@ fn build_schema() -> Schema {
         Field::new("aggregates_parent_guid", DataType::Utf8, true),
         Field::new("type_guid", DataType::Utf8, true),
         Field::new("type_name", DataType::Utf8, true),
-        Field::new("placement_xyz", DataType::FixedSizeList(xyz_field.clone(), 3), false),
-        Field::new("bbox_min_xyz", DataType::FixedSizeList(xyz_field.clone(), 3), false),
-        Field::new("bbox_max_xyz", DataType::FixedSizeList(xyz_field.clone(), 3), false),
-        Field::new("vertex_count", DataType::UInt32, false),
-        Field::new("triangle_count", DataType::UInt32, false),
-        Field::new("vertices_le", DataType::Binary, false),
-        Field::new("indices_le", DataType::Binary, false),
-        Field::new("mesh_source", DataType::Utf8, false),
-        Field::new(
-            "segments",
-            // `ListBuilder` materializes its inner item field as
-            // nullable; mirror that here so RecordBatch validation
-            // passes. The list itself is non-nullable (every product
-            // gets one, possibly-empty list per column).
-            DataType::List(Arc::new(Field::new(
-                "item",
-                DataType::Struct(segment_fields),
-                true,
-            ))),
-            false,
-        ),
+        Field::new("rep_id", DataType::UInt64, true),
+        Field::new("transform", DataType::FixedSizeList(mat4_item, 16), false),
+        Field::new("bbox_min_xyz", DataType::FixedSizeList(xyz.clone(), 3), false),
+        Field::new("bbox_max_xyz", DataType::FixedSizeList(xyz.clone(), 3), false),
+        Field::new("placement_xyz", DataType::FixedSizeList(xyz, 3), false),
         Field::new(
             "materials",
             DataType::List(Arc::new(Field::new(
@@ -235,10 +331,75 @@ fn build_schema() -> Schema {
 }
 
 // ---------------------------------------------------------------------------
-// Row-group batch builder
+// Row-group batch builders
 // ---------------------------------------------------------------------------
 
-fn build_batch(schema: &SchemaRef, records: &[ProductRecord]) -> arrow::error::Result<RecordBatch> {
+fn build_rep_batch(
+    schema: &SchemaRef,
+    records: &[RepresentationRecord],
+) -> arrow::error::Result<RecordBatch> {
+    let n = records.len();
+
+    let mut rep_id = UInt64Builder::with_capacity(n);
+    let mut source_kind = StringBuilder::with_capacity(n, n * 12);
+    let mut mesh_source = StringBuilder::with_capacity(n, n * 16);
+    let mut vertex_count = UInt32Builder::with_capacity(n);
+    let mut triangle_count = UInt32Builder::with_capacity(n);
+    let mut vertices_le = BinaryBuilder::with_capacity(n, n * 256);
+    let mut indices_le = BinaryBuilder::with_capacity(n, n * 256);
+
+    let segment_struct_fields = list_struct_fields(schema, "segments");
+    let mut segments = ListBuilder::new(StructBuilder::from_fields(segment_struct_fields, 0));
+
+    let bb_min_inner = Float32Builder::with_capacity(n * 3);
+    let mut bb_min = FixedSizeListBuilder::new(bb_min_inner, 3);
+    let bb_max_inner = Float32Builder::with_capacity(n * 3);
+    let mut bb_max = FixedSizeListBuilder::new(bb_max_inner, 3);
+
+    for r in records {
+        rep_id.append_value(r.rep_id);
+        source_kind.append_value(r.source_kind);
+        mesh_source.append_value(&r.mesh_source);
+        vertex_count.append_value(r.vertex_count);
+        triangle_count.append_value(r.triangle_count);
+        vertices_le.append_value(&r.vertices_le);
+        indices_le.append_value(&r.indices_le);
+
+        {
+            let s = segments.values();
+            for seg in &r.segments {
+                s.field_builder::<StringBuilder>(0).unwrap().append_value(&seg.source);
+                s.field_builder::<UInt32Builder>(1).unwrap().append_value(seg.index_start);
+                s.field_builder::<UInt32Builder>(2).unwrap().append_value(seg.triangle_count);
+                s.append(true);
+            }
+            segments.append(true);
+        }
+
+        append_xyz(&mut bb_min, r.local_bbox_min_xyz);
+        append_xyz(&mut bb_max, r.local_bbox_max_xyz);
+    }
+
+    let arrays: Vec<ArrayRef> = vec![
+        Arc::new(rep_id.finish()),
+        Arc::new(source_kind.finish()),
+        Arc::new(mesh_source.finish()),
+        Arc::new(vertex_count.finish()),
+        Arc::new(triangle_count.finish()),
+        Arc::new(vertices_le.finish()),
+        Arc::new(indices_le.finish()),
+        Arc::new(segments.finish()),
+        Arc::new(bb_min.finish()),
+        Arc::new(bb_max.finish()),
+    ];
+
+    RecordBatch::try_new(schema.clone(), arrays)
+}
+
+fn build_instance_batch(
+    schema: &SchemaRef,
+    records: &[InstanceRecord],
+) -> arrow::error::Result<RecordBatch> {
     let n = records.len();
 
     let mut ifc_id = UInt64Builder::with_capacity(n);
@@ -254,31 +415,22 @@ fn build_batch(schema: &SchemaRef, records: &[ProductRecord]) -> arrow::error::R
     let mut agg_parent = StringBuilder::with_capacity(n, n * 22);
     let mut type_guid = StringBuilder::with_capacity(n, n * 22);
     let mut type_name = StringBuilder::with_capacity(n, n * 24);
+    let mut rep_id = UInt64Builder::with_capacity(n);
 
+    let xform_inner = Float32Builder::with_capacity(n * 16);
+    let mut transform = FixedSizeListBuilder::new(xform_inner, 16);
+    let bb_min_inner = Float32Builder::with_capacity(n * 3);
+    let mut bb_min = FixedSizeListBuilder::new(bb_min_inner, 3);
+    let bb_max_inner = Float32Builder::with_capacity(n * 3);
+    let mut bb_max = FixedSizeListBuilder::new(bb_max_inner, 3);
     let placement_inner = Float32Builder::with_capacity(n * 3);
     let mut placement = FixedSizeListBuilder::new(placement_inner, 3);
-    let bbox_min_inner = Float32Builder::with_capacity(n * 3);
-    let mut bbox_min = FixedSizeListBuilder::new(bbox_min_inner, 3);
-    let bbox_max_inner = Float32Builder::with_capacity(n * 3);
-    let mut bbox_max = FixedSizeListBuilder::new(bbox_max_inner, 3);
 
-    let mut vertex_count = UInt32Builder::with_capacity(n);
-    let mut triangle_count = UInt32Builder::with_capacity(n);
-    let mut vertices_le = BinaryBuilder::with_capacity(n, n * 256);
-    let mut indices_le = BinaryBuilder::with_capacity(n, n * 256);
-    let mut mesh_source = StringBuilder::with_capacity(n, n * 16);
-
-    // Pre-built struct field schemas — needed to construct the inner
-    // StructBuilders with the right child columns. Pulling them off
-    // the top-level schema keeps schema+builder in sync if we add a
-    // column later.
-    let segment_struct_fields = list_struct_fields(schema, "segments");
     let material_struct_fields = list_struct_fields(schema, "materials");
     let pset_struct_fields = list_struct_fields(schema, "psets");
     let quantity_struct_fields = list_struct_fields(schema, "quantities");
     let classification_struct_fields = list_struct_fields(schema, "classifications");
 
-    let mut segments = ListBuilder::new(StructBuilder::from_fields(segment_struct_fields, 0));
     let mut materials = ListBuilder::new(StructBuilder::from_fields(material_struct_fields, 0));
     let mut psets = ListBuilder::new(StructBuilder::from_fields(pset_struct_fields, 0));
     let mut quantities = ListBuilder::new(StructBuilder::from_fields(quantity_struct_fields, 0));
@@ -299,30 +451,21 @@ fn build_batch(schema: &SchemaRef, records: &[ProductRecord]) -> arrow::error::R
         append_opt(&mut agg_parent, r.aggregates_parent_guid.as_deref());
         append_opt(&mut type_guid, r.type_guid.as_deref());
         append_opt(&mut type_name, r.type_name.as_deref());
-
-        append_xyz(&mut placement, r.placement_xyz);
-        append_xyz(&mut bbox_min, r.bbox_min_xyz);
-        append_xyz(&mut bbox_max, r.bbox_max_xyz);
-
-        vertex_count.append_value(r.vertex_count);
-        triangle_count.append_value(r.triangle_count);
-        vertices_le.append_value(&r.vertices_le);
-        indices_le.append_value(&r.indices_le);
-        mesh_source.append_value(&r.mesh_source);
-
-        // Segments
-        {
-            let s = segments.values();
-            for seg in &r.segments {
-                s.field_builder::<StringBuilder>(0).unwrap().append_value(&seg.source);
-                s.field_builder::<UInt32Builder>(1).unwrap().append_value(seg.index_start);
-                s.field_builder::<UInt32Builder>(2).unwrap().append_value(seg.triangle_count);
-                s.append(true);
-            }
-            segments.append(true);
+        match r.rep_id {
+            Some(id) => rep_id.append_value(id),
+            None => rep_id.append_null(),
         }
 
-        // Materials
+        // 4x4 transform — col-major, 16 f32s.
+        for v in r.transform.iter() {
+            transform.values().append_value(*v);
+        }
+        transform.append(true);
+
+        append_xyz(&mut bb_min, r.bbox_min_xyz);
+        append_xyz(&mut bb_max, r.bbox_max_xyz);
+        append_xyz(&mut placement, r.placement_xyz);
+
         {
             let m = materials.values();
             for entry in &r.materials {
@@ -346,7 +489,6 @@ fn build_batch(schema: &SchemaRef, records: &[ProductRecord]) -> arrow::error::R
             materials.append(true);
         }
 
-        // Psets
         {
             let p = psets.values();
             for entry in &r.psets {
@@ -365,7 +507,6 @@ fn build_batch(schema: &SchemaRef, records: &[ProductRecord]) -> arrow::error::R
             psets.append(true);
         }
 
-        // Quantities
         {
             let q = quantities.values();
             for entry in &r.quantities {
@@ -386,7 +527,6 @@ fn build_batch(schema: &SchemaRef, records: &[ProductRecord]) -> arrow::error::R
             quantities.append(true);
         }
 
-        // Classifications
         {
             let c = classifications.values();
             for entry in &r.classifications {
@@ -434,15 +574,11 @@ fn build_batch(schema: &SchemaRef, records: &[ProductRecord]) -> arrow::error::R
         Arc::new(agg_parent.finish()),
         Arc::new(type_guid.finish()),
         Arc::new(type_name.finish()),
+        Arc::new(rep_id.finish()),
+        Arc::new(transform.finish()),
+        Arc::new(bb_min.finish()),
+        Arc::new(bb_max.finish()),
         Arc::new(placement.finish()),
-        Arc::new(bbox_min.finish()),
-        Arc::new(bbox_max.finish()),
-        Arc::new(vertex_count.finish()),
-        Arc::new(triangle_count.finish()),
-        Arc::new(vertices_le.finish()),
-        Arc::new(indices_le.finish()),
-        Arc::new(mesh_source.finish()),
-        Arc::new(segments.finish()),
         Arc::new(materials.finish()),
         Arc::new(psets.finish()),
         Arc::new(quantities.finish()),

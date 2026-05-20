@@ -201,10 +201,12 @@ pub fn halfspace_solid(table: &EntityTable, id: u64) -> Option<LocalMesh> {
 /// answer to "what is this fragment?".)
 fn retag(frag: MeshFragment, new_role: &'static str) -> MeshFragment {
     match frag {
-        MeshFragment::Mesh { mesh, source, role } => MeshFragment::Mesh {
+        MeshFragment::Mesh { mesh, source, role, rep_step_id, instance_transform } => MeshFragment::Mesh {
             mesh,
             source,
             role: Some(role.unwrap_or(new_role)),
+            rep_step_id,
+            instance_transform,
         },
         u @ MeshFragment::Unhandled { .. } => u,
     }
