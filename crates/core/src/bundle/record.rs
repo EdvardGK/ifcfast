@@ -30,6 +30,7 @@
 use std::sync::Arc;
 
 use crate::bundle::ProductSemantics;
+use crate::mesh::qto::{self, MeshQto, PlanarSurface};
 use crate::mesh::{MeshSegment, ProductMesh};
 
 /// Provenance entry per mesh fragment, mirrored to the substrate row
@@ -168,6 +169,27 @@ pub struct InstanceRecord {
     pub psets: Vec<crate::bundle::PsetValue>,
     pub quantities: Vec<crate::bundle::QuantityEntry>,
     pub classifications: Vec<crate::bundle::ClassificationEntry>,
+
+    // Geometric QTO — computed in one pass over the world-coord mesh
+    // during `pair_split`. Always in m² / m³ (the IFC project's
+    // linear unit scale is applied at compute time). Authored
+    // IfcElementQuantity values, when present, live in `quantities`
+    // and override these; these are the geometric truth that survives
+    // when the author forgot to export Qto_* sets.
+    pub volume_m3: f32,
+    pub aabb_volume_m3: f32,
+    pub surface_area_m2: f32,
+    pub area_top_m2: f32,
+    pub area_bottom_m2: f32,
+    pub area_side_m2: f32,
+    pub area_inclined_m2: f32,
+    pub largest_surface_m2: f32,
+    pub smallest_surface_m2: f32,
+    pub surface_count: u32,
+    /// Distinct planar surfaces sorted by area descending. DuckDB
+    /// UNNEST gives one row per face — that's how "biggest /
+    /// smallest surface on type X" turns into a single query.
+    pub surfaces: Vec<PlanarSurface>,
 }
 
 /// Compute (rep_id, kind) for a `ProductMesh` per the assignment rules
@@ -196,14 +218,26 @@ fn pick_rep_id(mesh: &ProductMesh) -> (Option<u64>, &'static str) {
 /// Build a `(rep, instance)` pair from a `ProductMesh` + its semantics.
 /// Returns `(maybe_rep, instance)` — the caller's sink decides whether
 /// `maybe_rep` is new (write a row) or already-seen (skip).
+///
+/// `unit_scale` is the IFC project's linear-unit-to-metres factor
+/// (0.001 for millimetre files, 1.0 for metre files). The QTO pass
+/// scales area by `unit_scale²` and volume by `unit_scale³` so the
+/// substrate is always in m² / m³ regardless of source units.
 pub fn pair_split(
     mesh: ProductMesh,
     semantics: ProductSemantics,
+    unit_scale: f32,
 ) -> (Option<RepresentationRecord>, InstanceRecord) {
     let (rep_id_opt, source_kind) = pick_rep_id(&mesh);
 
     // Bbox of the world-baked vertices — what spatial queries want.
     let world_bbox = AaBb::from_vertices(&mesh.vertices);
+
+    // Geometric QTO — one O(triangles) sweep over the same vertices
+    // we just bbox'd. Runs before the rep-record build so the same
+    // cache-warm vertex buffer feeds both. Sub-ms on typical
+    // products, ~30ms on the biggest individual meshes.
+    let qto: MeshQto = qto::compute(&mesh.vertices, &mesh.indices, unit_scale);
 
     // Build the representation record. For single-fragment products
     // the rep carries the LOCAL (untransformed) mesh from
@@ -316,6 +350,17 @@ pub fn pair_split(
         psets: semantics.psets,
         quantities: semantics.quantities,
         classifications: semantics.classifications,
+        volume_m3: qto.volume_m3.abs(),
+        aabb_volume_m3: qto.aabb_volume_m3,
+        surface_area_m2: qto.surface_area_m2,
+        area_top_m2: qto.area_top_m2,
+        area_bottom_m2: qto.area_bottom_m2,
+        area_side_m2: qto.area_side_m2,
+        area_inclined_m2: qto.area_inclined_m2,
+        largest_surface_m2: qto.largest_surface_m2,
+        smallest_surface_m2: qto.smallest_surface_m2,
+        surface_count: qto.surface_count,
+        surfaces: qto.surfaces,
     };
 
     (rep, instance)

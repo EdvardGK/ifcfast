@@ -165,7 +165,13 @@ impl<'a> ParquetSink<'a> {
 impl ProductSink for ParquetSink<'_> {
     fn on_product(&mut self, mesh: ProductMesh) {
         let semantics = self.bundle.semantics_for(&mesh.guid);
-        let (rep, inst) = pair_split(mesh, semantics);
+        // IFC project's linear-unit-to-metres factor (the indexer
+        // resolves this from IfcSIUnit + IfcConversionBasedUnit at
+        // parse time). Missing → assume metres (1.0) so the QTO
+        // numbers are still right when the file genuinely is
+        // authored in metres.
+        let unit_scale = self.bundle.unit_scale.unwrap_or(1.0) as f32;
+        let (rep, inst) = pair_split(mesh, semantics, unit_scale);
 
         if let Some(rep_record) = rep {
             // Dedup by rep_id — only the first instance of a shared
@@ -327,6 +333,35 @@ fn build_instance_schema() -> Schema {
             ))),
             false,
         ),
+        // Geometric QTO — computed from the world-coord mesh in the
+        // streaming pass. Always m² / m³; no conversion at query time.
+        Field::new("volume_m3", DataType::Float32, false),
+        Field::new("aabb_volume_m3", DataType::Float32, false),
+        Field::new("surface_area_m2", DataType::Float32, false),
+        Field::new("area_top_m2", DataType::Float32, false),
+        Field::new("area_bottom_m2", DataType::Float32, false),
+        Field::new("area_side_m2", DataType::Float32, false),
+        Field::new("area_inclined_m2", DataType::Float32, false),
+        Field::new("largest_surface_m2", DataType::Float32, false),
+        Field::new("smallest_surface_m2", DataType::Float32, false),
+        Field::new("surface_count", DataType::UInt32, false),
+        // List<Struct> of every distinct planar surface, sorted by
+        // area descending. DuckDB UNNEST(surfaces) turns it into a
+        // row-per-face stream.
+        Field::new(
+            "surfaces",
+            DataType::List(Arc::new(Field::new(
+                "item",
+                DataType::Struct(Fields::from(vec![
+                    Field::new("area_m2", DataType::Float32, false),
+                    Field::new("nx", DataType::Float32, false),
+                    Field::new("ny", DataType::Float32, false),
+                    Field::new("nz", DataType::Float32, false),
+                ])),
+                true,
+            ))),
+            false,
+        ),
     ])
 }
 
@@ -430,12 +465,27 @@ fn build_instance_batch(
     let pset_struct_fields = list_struct_fields(schema, "psets");
     let quantity_struct_fields = list_struct_fields(schema, "quantities");
     let classification_struct_fields = list_struct_fields(schema, "classifications");
+    let surface_struct_fields = list_struct_fields(schema, "surfaces");
 
     let mut materials = ListBuilder::new(StructBuilder::from_fields(material_struct_fields, 0));
     let mut psets = ListBuilder::new(StructBuilder::from_fields(pset_struct_fields, 0));
     let mut quantities = ListBuilder::new(StructBuilder::from_fields(quantity_struct_fields, 0));
     let mut classifications =
         ListBuilder::new(StructBuilder::from_fields(classification_struct_fields, 0));
+    let mut surfaces = ListBuilder::new(StructBuilder::from_fields(surface_struct_fields, 0));
+
+    // QTO scalar columns. f32 is plenty of dynamic range for QTO
+    // (a 1000 m² façade is 1e3; smallest meaningful surface is 1e-6 m²).
+    let mut volume_m3 = Float32Builder::with_capacity(n);
+    let mut aabb_volume_m3 = Float32Builder::with_capacity(n);
+    let mut surface_area_m2 = Float32Builder::with_capacity(n);
+    let mut area_top_m2 = Float32Builder::with_capacity(n);
+    let mut area_bottom_m2 = Float32Builder::with_capacity(n);
+    let mut area_side_m2 = Float32Builder::with_capacity(n);
+    let mut area_inclined_m2 = Float32Builder::with_capacity(n);
+    let mut largest_surface_m2 = Float32Builder::with_capacity(n);
+    let mut smallest_surface_m2 = Float32Builder::with_capacity(n);
+    let mut surface_count = UInt32Builder::with_capacity(n);
 
     for r in records {
         ifc_id.append_value(r.ifc_id);
@@ -558,6 +608,31 @@ fn build_instance_batch(
             }
             classifications.append(true);
         }
+
+        // QTO scalars.
+        volume_m3.append_value(r.volume_m3);
+        aabb_volume_m3.append_value(r.aabb_volume_m3);
+        surface_area_m2.append_value(r.surface_area_m2);
+        area_top_m2.append_value(r.area_top_m2);
+        area_bottom_m2.append_value(r.area_bottom_m2);
+        area_side_m2.append_value(r.area_side_m2);
+        area_inclined_m2.append_value(r.area_inclined_m2);
+        largest_surface_m2.append_value(r.largest_surface_m2);
+        smallest_surface_m2.append_value(r.smallest_surface_m2);
+        surface_count.append_value(r.surface_count);
+
+        // Per-surface list — one row per distinct planar face.
+        {
+            let s = surfaces.values();
+            for face in &r.surfaces {
+                s.field_builder::<Float32Builder>(0).unwrap().append_value(face.area_m2);
+                s.field_builder::<Float32Builder>(1).unwrap().append_value(face.nx);
+                s.field_builder::<Float32Builder>(2).unwrap().append_value(face.ny);
+                s.field_builder::<Float32Builder>(3).unwrap().append_value(face.nz);
+                s.append(true);
+            }
+            surfaces.append(true);
+        }
     }
 
     let arrays: Vec<ArrayRef> = vec![
@@ -583,6 +658,17 @@ fn build_instance_batch(
         Arc::new(psets.finish()),
         Arc::new(quantities.finish()),
         Arc::new(classifications.finish()),
+        Arc::new(volume_m3.finish()),
+        Arc::new(aabb_volume_m3.finish()),
+        Arc::new(surface_area_m2.finish()),
+        Arc::new(area_top_m2.finish()),
+        Arc::new(area_bottom_m2.finish()),
+        Arc::new(area_side_m2.finish()),
+        Arc::new(area_inclined_m2.finish()),
+        Arc::new(largest_surface_m2.finish()),
+        Arc::new(smallest_surface_m2.finish()),
+        Arc::new(surface_count.finish()),
+        Arc::new(surfaces.finish()),
     ];
 
     RecordBatch::try_new(schema.clone(), arrays)
