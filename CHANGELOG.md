@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-05-21
+
+### Added
+
+- **Per-product geometric QTO engine** in the bundle. One
+  O(triangles) pass over the world-coord mesh during the streaming
+  pass emits volume + surface area decomposed by face orientation +
+  the full list of distinct planar surfaces per product. New columns
+  on `instances.parquet`:
+    * `volume_m3`, `aabb_volume_m3`
+    * `surface_area_m2` total
+    * `area_top_m2` / `area_bottom_m2` (triangles within 20° of ±Z)
+    * `area_side_m2` (within 20° of horizontal plane)
+    * `area_inclined_m2` (everything else)
+    * `largest_surface_m2`, `smallest_surface_m2`, `surface_count`
+    * `surfaces`: `List<Struct<area_m2, nx, ny, nz>>` — every
+      distinct planar surface, normal-bucket aggregated at ~5.7°
+      granularity, sorted by area descending. DuckDB UNNEST gives
+      one row per face for "every surface on type X" queries.
+  All values in m² / m³ regardless of source unit (mm → m via
+  `unit_scale`). Authored `IfcElementQuantity` values stay in
+  `quantities` as the gold-standard override; these geometric values
+  are the truth that survives when authors omit `Qto_*` sets.
+- Bundle output grew ~30 MB on the 27M-triangle ST28_RIV (834 MB
+  IFC, 85,976 instances) for the per-surface list; compute pass +12%
+  over the prior bundle pass; query latency against the materialized
+  parquet is sub-15 ms for typical group-by-entity QTO queries on
+  86K-row substrates.
+
+### Changed
+
+- Bundle `instances.parquet` schema gains 11 non-nullable columns
+  (the QTO columns above). Strict-schema consumers expecting the
+  v0.2.0 shape will need to update; permissive readers (DuckDB,
+  pyarrow with column-projection) are unaffected.
+
 ## [0.2.0] - 2026-05-21
 
 ### Added
@@ -146,5 +182,6 @@ for the trail and rename table.
   IFCs from Skiplum projects (issue #1).
 - Warm-cache speedup vs `ifcopenshell.open()`: 59-678× on production files.
 
+[0.3.0]: https://github.com/EdvardGK/ifcfast/releases/tag/v0.3.0
 [0.2.0]: https://github.com/EdvardGK/ifcfast/releases/tag/v0.2.0
 [0.1.0]: https://github.com/EdvardGK/ifcfast/releases/tag/v0.1.0
