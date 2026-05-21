@@ -7,8 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-05-21
+
 ### Added
 
+- **Streaming GeoParquet substrate writer (`ifcfast-bundle`).** New
+  cargo feature `bundle` + binary `ifcfast-bundle <file.ifc> [out_dir]`
+  emits a two-table substrate (`representations.parquet` +
+  `instances.parquet`) in one streaming pass. Pairs geometry with full
+  IFC semantics (psets, materials, quantities, classifications,
+  storey, type) so the downstream analyser can join geometry to
+  metadata without re-parsing the IFC. Working-set RAM bounded by the
+  Parquet row-group buffer; the old `Vec<ProductMesh>` accumulator's
+  OOM class is gone. DuckDB queries via the emitted `view.sql` join.
+  Cargo feature is opt-in (default off); the Python wheel does not
+  bundle the heavy arrow + parquet crates.
+- **Hierarchical / instanced substrate layout.** The substrate now
+  splits into `representations.parquet` (one row per unique mesh
+  shape, keyed by `rep_id`) and `instances.parquet` (one row per
+  `IfcProduct`, geometry-free except for a `rep_id` foreign key and a
+  4×4 world transform). Cross-product dedup on `IfcMappedItem` /
+  `IfcRepresentationMap` collapses N instances of the same window-
+  facade family to ONE rep row — ST28_RIV (834 MB, 87K products)
+  output dropped from 180 MB single-file to 68.6 MB across the two
+  files (−62%).
+- **Bundle pre-pass: `Arc<str>` interning + zero-clone regrouping.**
+  Pset / material / quantity / classification regrouping now interns
+  repeated semantic strings (set_name, prop_name, source_class,
+  storey_name, type_name, …) and consumes the extractor's
+  `Vec<String>` columns by-move rather than by-clone. On ST28_RIV
+  (2.57M pset rows): peak RSS 2709 → 2627 MB (−3.0%), wall 33.06 →
+  30.28 s (−8.4%), output bit-identical.
 - **MCP server (`ifcfast-mcp`).** Standalone Model Context Protocol
   server exposing 18 tools (open_ifc / summary / schemas / preview /
   types / by_type / parent / children / ancestors / descendants /
@@ -117,4 +146,5 @@ for the trail and rename table.
   IFCs from Skiplum projects (issue #1).
 - Warm-cache speedup vs `ifcopenshell.open()`: 59-678× on production files.
 
+[0.2.0]: https://github.com/EdvardGK/ifcfast/releases/tag/v0.2.0
 [0.1.0]: https://github.com/EdvardGK/ifcfast/releases/tag/v0.1.0
