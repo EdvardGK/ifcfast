@@ -256,6 +256,63 @@ class Model:
     def drift(self):
         return self._ensure_data().drift
 
+    def mesh_qto(self):
+        """Per-product geometric QTO — volume, area, orientation-bucketed
+        area, and the full set of distinct planar surfaces, computed in
+        one O(triangles) pass over the mesh. Output is always in
+        m² / m³ regardless of the source file's linear unit.
+
+        Returns a tuple ``(products_df, surfaces_df)``:
+
+        * ``products_df`` — one row per meshed product. Columns:
+          ``guid``, ``entity``, ``volume_m3``, ``aabb_volume_m3``,
+          ``surface_area_m2``, ``area_top_m2``, ``area_bottom_m2``
+          (triangles within 20° of ±Z), ``area_side_m2`` (within 20°
+          of the horizontal plane), ``area_inclined_m2`` (everything
+          else — ramps, sloped roofs), ``largest_surface_m2``,
+          ``smallest_surface_m2``, ``surface_count``.
+        * ``surfaces_df`` — long-format, one row per distinct planar
+          surface per product (sorted by area within a product).
+          Columns: ``guid``, ``surface_index``, ``area_m2``, ``nx``,
+          ``ny``, ``nz``. Two coplanar but disconnected triangles
+          collapse into one surface (normal-bucket aggregation at
+          ~5.7° granularity); curved geometry resolves to one
+          tessellation-wedge per row.
+
+        Authored ``IfcElementQuantity`` values, when present, live in
+        :attr:`quantities` and remain the gold-standard QTO source.
+        These geometric values are the truth that survives when
+        authors omit ``Qto_*`` sets — e.g. on Revit / Tekla exports
+        with no take-off configured.
+        """
+        from . import _core  # local import keeps top-level fast
+        import pandas as pd
+
+        d = _core.mesh_qto(str(self.header.path))
+        products_df = pd.DataFrame({
+            "guid": d["guid"],
+            "entity": d["entity"],
+            "volume_m3": d["volume_m3"],
+            "aabb_volume_m3": d["aabb_volume_m3"],
+            "surface_area_m2": d["surface_area_m2"],
+            "area_top_m2": d["area_top_m2"],
+            "area_bottom_m2": d["area_bottom_m2"],
+            "area_side_m2": d["area_side_m2"],
+            "area_inclined_m2": d["area_inclined_m2"],
+            "largest_surface_m2": d["largest_surface_m2"],
+            "smallest_surface_m2": d["smallest_surface_m2"],
+            "surface_count": d["surface_count"],
+        })
+        surfaces_df = pd.DataFrame({
+            "guid": d["surface_guid"],
+            "surface_index": d["surface_index"],
+            "area_m2": d["surface_area_m2_long"],
+            "nx": d["surface_nx"],
+            "ny": d["surface_ny"],
+            "nz": d["surface_nz"],
+        })
+        return products_df, surfaces_df
+
     @property
     def segments(self):
         """Long-format per-mesh-segment table — one row per representation

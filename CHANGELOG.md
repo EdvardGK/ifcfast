@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-05-21
+
+### Added
+
+- **`Model.mesh_qto()`** — the geometric QTO engine is now reachable
+  from the PyPI wheel, no cargo build required. Returns a tuple
+  `(products_df, surfaces_df)`:
+    * **products_df** — one row per meshed product. Columns:
+      `guid, entity, volume_m3, aabb_volume_m3, surface_area_m2,
+      area_top_m2, area_bottom_m2, area_side_m2, area_inclined_m2,
+      largest_surface_m2, smallest_surface_m2, surface_count`.
+    * **surfaces_df** — long-format, one row per distinct planar
+      surface per product (sorted by area within a product).
+      Columns: `guid, surface_index, area_m2, nx, ny, nz`. Normal-
+      bucket aggregation at ~5.7° granularity collapses coplanar
+      triangles into one surface; curved geometry resolves to one
+      tessellation-wedge per row.
+  All values are in m² / m³ regardless of source unit. The
+  computation runs `mesh_ifc_streaming` once and emits both
+  DataFrames in a single pass — no second walk, no intermediate
+  Parquet round-trip. Authored `IfcElementQuantity` values stay in
+  `m.quantities` and remain the gold-standard override when present.
+- PyO3 binding `_core.mesh_qto(path)` returns the raw column dict
+  for callers who want to skip the pandas wrapper.
+
+### Changed
+
+- The PyPI wheel now exposes the geometric QTO engine alongside the
+  existing `analyse_drift` mesh path. This closes the gap from 0.3.0
+  where the engine code shipped in the wheel but wasn't reachable
+  from Python (only via the opt-in `ifcfast-bundle` binary).
+
 ## [0.3.0] - 2026-05-21
 
 ### Added
@@ -182,6 +214,7 @@ for the trail and rename table.
   IFCs from Skiplum projects (issue #1).
 - Warm-cache speedup vs `ifcopenshell.open()`: 59-678× on production files.
 
+[0.4.0]: https://github.com/EdvardGK/ifcfast/releases/tag/v0.4.0
 [0.3.0]: https://github.com/EdvardGK/ifcfast/releases/tag/v0.3.0
 [0.2.0]: https://github.com/EdvardGK/ifcfast/releases/tag/v0.2.0
 [0.1.0]: https://github.com/EdvardGK/ifcfast/releases/tag/v0.1.0

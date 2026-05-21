@@ -443,6 +443,150 @@ mod python {
     // ----- analyse_drift (mesh-only) -----------------------------------
 
     #[cfg(feature = "mesh")]
+    /// Per-product geometric QTO — runs the streaming mesh pass and
+    /// computes volume / surface area / orientation-bucketed area /
+    /// distinct planar surfaces for every meshed product in one
+    /// O(triangles) sweep. Output is in m² / m³ (the IFC's
+    /// unit_scale is applied at compute time).
+    ///
+    /// Returns a PyDict with two parallel views:
+    ///   * **Per-product columns** (one row per meshed product):
+    ///     guid, entity, volume_m3, aabb_volume_m3, surface_area_m2,
+    ///     area_top_m2, area_bottom_m2, area_side_m2, area_inclined_m2,
+    ///     largest_surface_m2, smallest_surface_m2, surface_count.
+    ///   * **Per-surface long-format** (one row per (product, distinct
+    ///     planar surface)): surface_guid, surface_index, area_m2,
+    ///     nx, ny, nz. Sort within a product is area-descending.
+    ///
+    /// Author-supplied `IfcElementQuantity` values are NOT consulted
+    /// here — when present they live in `m.quantities` and remain
+    /// the gold-standard QTO source. This function is the geometric
+    /// truth that survives when authors omit Qto_* sets.
+    #[cfg(feature = "mesh")]
+    #[pyfunction]
+    pub fn mesh_qto<'py>(py: Python<'py>, path: &str) -> PyResult<Bound<'py, PyDict>> {
+        use crate::mesh::{
+            mesh_ifc_streaming, qto, ProductMesh, ProductSink,
+        };
+
+        let t_total = Instant::now();
+        let (mmap, _open_ms) = open_mmap(path)?;
+
+        // Project unit-scale (mm files: 0.001; metre files: 1.0).
+        // Pulled from the indexer — same source the bundle pre-pass
+        // uses. None → assume metres so geometry-derived numbers stay
+        // sane on schema-incomplete files.
+        let t_idx = Instant::now();
+        let idx = py.allow_threads(|| indexer::index(&mmap));
+        let idx_ms = t_idx.elapsed().as_secs_f64() * 1000.0;
+        let unit_scale = idx.unit_scale.unwrap_or(1.0) as f32;
+
+        // Per-product accumulator sink. One row per meshed product
+        // landing in `products`; one row per distinct planar surface
+        // landing in `surfaces`. Avoids holding the meshes themselves
+        // — drops each ProductMesh after computing its QTO.
+        struct QtoSink {
+            unit_scale: f32,
+            guid: Vec<String>,
+            entity: Vec<String>,
+            volume_m3: Vec<f32>,
+            aabb_volume_m3: Vec<f32>,
+            surface_area_m2: Vec<f32>,
+            area_top_m2: Vec<f32>,
+            area_bottom_m2: Vec<f32>,
+            area_side_m2: Vec<f32>,
+            area_inclined_m2: Vec<f32>,
+            largest_surface_m2: Vec<f32>,
+            smallest_surface_m2: Vec<f32>,
+            surface_count: Vec<u32>,
+            // Long-format per-surface columns.
+            s_guid: Vec<String>,
+            s_index: Vec<u32>,
+            s_area_m2: Vec<f32>,
+            s_nx: Vec<f32>,
+            s_ny: Vec<f32>,
+            s_nz: Vec<f32>,
+        }
+        impl ProductSink for QtoSink {
+            fn on_product(&mut self, mesh: ProductMesh) {
+                let q = qto::compute(&mesh.vertices, &mesh.indices, self.unit_scale);
+                self.guid.push(mesh.guid.clone());
+                self.entity.push(mesh.entity.clone());
+                self.volume_m3.push(q.volume_m3.abs());
+                self.aabb_volume_m3.push(q.aabb_volume_m3);
+                self.surface_area_m2.push(q.surface_area_m2);
+                self.area_top_m2.push(q.area_top_m2);
+                self.area_bottom_m2.push(q.area_bottom_m2);
+                self.area_side_m2.push(q.area_side_m2);
+                self.area_inclined_m2.push(q.area_inclined_m2);
+                self.largest_surface_m2.push(q.largest_surface_m2);
+                self.smallest_surface_m2.push(q.smallest_surface_m2);
+                self.surface_count.push(q.surface_count);
+                for (i, s) in q.surfaces.iter().enumerate() {
+                    self.s_guid.push(mesh.guid.clone());
+                    self.s_index.push(i as u32);
+                    self.s_area_m2.push(s.area_m2);
+                    self.s_nx.push(s.nx);
+                    self.s_ny.push(s.ny);
+                    self.s_nz.push(s.nz);
+                }
+            }
+        }
+        let mut sink = QtoSink {
+            unit_scale,
+            guid: Vec::with_capacity(idx.product_step_id.len()),
+            entity: Vec::with_capacity(idx.product_step_id.len()),
+            volume_m3: Vec::with_capacity(idx.product_step_id.len()),
+            aabb_volume_m3: Vec::with_capacity(idx.product_step_id.len()),
+            surface_area_m2: Vec::with_capacity(idx.product_step_id.len()),
+            area_top_m2: Vec::with_capacity(idx.product_step_id.len()),
+            area_bottom_m2: Vec::with_capacity(idx.product_step_id.len()),
+            area_side_m2: Vec::with_capacity(idx.product_step_id.len()),
+            area_inclined_m2: Vec::with_capacity(idx.product_step_id.len()),
+            largest_surface_m2: Vec::with_capacity(idx.product_step_id.len()),
+            smallest_surface_m2: Vec::with_capacity(idx.product_step_id.len()),
+            surface_count: Vec::with_capacity(idx.product_step_id.len()),
+            s_guid: Vec::new(),
+            s_index: Vec::new(),
+            s_area_m2: Vec::new(),
+            s_nx: Vec::new(),
+            s_ny: Vec::new(),
+            s_nz: Vec::new(),
+        };
+
+        let t_mesh = Instant::now();
+        let mesh_stats = py.allow_threads(|| mesh_ifc_streaming(&mmap, &mut sink));
+        let mesh_ms = t_mesh.elapsed().as_secs_f64() * 1000.0;
+
+        let out = PyDict::new_bound(py);
+        out.set_item("guid", PyList::new_bound(py, sink.guid))?;
+        out.set_item("entity", PyList::new_bound(py, sink.entity))?;
+        out.set_item("volume_m3", PyList::new_bound(py, sink.volume_m3))?;
+        out.set_item("aabb_volume_m3", PyList::new_bound(py, sink.aabb_volume_m3))?;
+        out.set_item("surface_area_m2", PyList::new_bound(py, sink.surface_area_m2))?;
+        out.set_item("area_top_m2", PyList::new_bound(py, sink.area_top_m2))?;
+        out.set_item("area_bottom_m2", PyList::new_bound(py, sink.area_bottom_m2))?;
+        out.set_item("area_side_m2", PyList::new_bound(py, sink.area_side_m2))?;
+        out.set_item("area_inclined_m2", PyList::new_bound(py, sink.area_inclined_m2))?;
+        out.set_item("largest_surface_m2", PyList::new_bound(py, sink.largest_surface_m2))?;
+        out.set_item("smallest_surface_m2", PyList::new_bound(py, sink.smallest_surface_m2))?;
+        out.set_item("surface_count", PyList::new_bound(py, sink.surface_count))?;
+        out.set_item("surface_guid", PyList::new_bound(py, sink.s_guid))?;
+        out.set_item("surface_index", PyList::new_bound(py, sink.s_index))?;
+        out.set_item("surface_area_m2_long", PyList::new_bound(py, sink.s_area_m2))?;
+        out.set_item("surface_nx", PyList::new_bound(py, sink.s_nx))?;
+        out.set_item("surface_ny", PyList::new_bound(py, sink.s_ny))?;
+        out.set_item("surface_nz", PyList::new_bound(py, sink.s_nz))?;
+        out.set_item("unit_scale", unit_scale as f64)?;
+        out.set_item("indexer_ms", idx_ms)?;
+        out.set_item("mesh_ms", mesh_ms)?;
+        out.set_item("entity_table_ms", mesh_stats.entity_table_build_ms)?;
+        out.set_item("total_ms", t_total.elapsed().as_secs_f64() * 1000.0)?;
+        out.set_item("products_meshed", mesh_stats.products_meshed)?;
+        out.set_item("size_bytes", mmap.len() as u64)?;
+        Ok(out)
+    }
+
     #[pyfunction]
     pub fn analyse_drift<'py>(py: Python<'py>, path: &str) -> PyResult<Bound<'py, PyDict>> {
         let t_total = Instant::now();
@@ -555,6 +699,8 @@ mod python {
         m.add_function(wrap_pyfunction!(extract_all, m)?)?;
         #[cfg(feature = "mesh")]
         m.add_function(wrap_pyfunction!(analyse_drift, m)?)?;
+        #[cfg(feature = "mesh")]
+        m.add_function(wrap_pyfunction!(mesh_qto, m)?)?;
         m.add("__version__", env!("CARGO_PKG_VERSION"))?;
         Ok(())
     }
