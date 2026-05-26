@@ -544,7 +544,16 @@ pub fn index(buf: &[u8]) -> IndexedFile {
                 // resolver entry to avoid silently dropping those rels.
                 split_top_level_args_into(rec.args, &mut fields_buf);
                 if let Some(guid) = string_at(&fields_buf, 0) {
-                    out.space_step_id_to_guid.insert(rec.id, guid);
+                    out.space_step_id_to_guid.insert(rec.id, guid.clone());
+                    // Also extract as a product so the bundle's semantics
+                    // map picks up IfcSpace alongside building elements.
+                    // IfcSpace is an IfcProduct subtype in the IFC schema —
+                    // it lives in a separate `EntityKind` purely so storey
+                    // / aggregate resolution can fast-path it, but dropping
+                    // it from the products table is a reveal-all violation:
+                    // spaces have psets, materials, classifications,
+                    // geometry, and semantic identity just like walls do.
+                    extract_product(&mut out, rec.id, t, &fields_buf, is_ifc2x3);
                 }
             }
             EntityKind::Application => {
