@@ -304,7 +304,28 @@ impl Bundle {
             let source_class = intern(&mut str_cache, entity);
             let class = intern(&mut str_cache, normalize_class(&source_class));
 
-            let storey_sid = contained_in.get(&sid).copied();
+            // Two ways an IFC declares "this product is in storey X":
+            //   1. IfcRelContainedInSpatialStructure (the common case
+            //      for walls, slabs, doors, etc.)
+            //   2. IfcRelAggregates with a storey as the parent (used
+            //      for IfcSpace in many authoring tools — Duplex's
+            //      Revit export aggregates all spaces under storeys).
+            // The contained_in path is checked first; the aggregate
+            // fallback walks up to a depth limit, picking the first
+            // storey ancestor it finds.
+            let storey_sid = contained_in.get(&sid).copied().or_else(|| {
+                let mut cur = sid;
+                for _ in 0..32 {
+                    match agg_parent.get(&cur).copied() {
+                        Some(parent) if storey_name_by_id.contains_key(&parent) => {
+                            return Some(parent);
+                        }
+                        Some(parent) => cur = parent,
+                        None => return None,
+                    }
+                }
+                None
+            });
             let storey_guid = storey_sid.and_then(|s| step_to_guid.get(&s).cloned());
             let storey_name = storey_sid
                 .and_then(|s| storey_name_by_id.get(&s).cloned())
