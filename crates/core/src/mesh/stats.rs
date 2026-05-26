@@ -60,6 +60,12 @@ pub struct ProductStats {
     pub drift_ratio: f32,
     /// `"ok"` / `"warn"` / `"error"` per the drift heuristic below.
     pub drift_severity: &'static str,
+    /// Validity classifier mirroring
+    /// [`crate::mesh::qto::MeshQto::mesh_quality`]: `"closed"` /
+    /// `"open_shell"` / `"degenerate"`. Surfaced on the Python drift
+    /// DataFrame so analysts can filter out garbage volumes before
+    /// any SUM/AVG aggregation.
+    pub mesh_quality: &'static str,
 }
 
 impl ProductStats {
@@ -149,6 +155,19 @@ impl ProductStats {
             "error"
         };
 
+        // Mesh-quality classifier (mirrors `MeshQto::mesh_quality`):
+        // see field docstring for the full taxonomy. Computing it here
+        // keeps the drift DataFrame self-contained — analysts get the
+        // open-shell flag alongside the placement-drift columns without
+        // a separate substrate-bundle pass.
+        let mesh_quality = if aabb_volume <= 0.0 {
+            "degenerate"
+        } else if volume.abs() > aabb_volume * 1.001 {
+            "open_shell"
+        } else {
+            "closed"
+        };
+
         Self {
             guid: mesh.guid.clone(),
             entity: mesh.entity.clone(),
@@ -164,6 +183,7 @@ impl ProductStats {
             max_extent,
             drift_ratio: ratio,
             drift_severity: severity,
+            mesh_quality,
         }
     }
 }
@@ -178,12 +198,13 @@ pub fn write_csv<W: std::io::Write>(stats: &[ProductStats], out: &mut W) -> std:
          xmin,ymin,zmin,xmax,ymax,zmax,\
          surface_area,volume_signed,volume_abs,aabb_volume,\
          placement_x,placement_y,placement_z,\
-         drift_distance,max_extent,drift_ratio,drift_severity"
+         drift_distance,max_extent,drift_ratio,drift_severity,\
+         mesh_quality"
     )?;
     for s in stats {
         writeln!(
             w,
-            "{},{},{},{},{},{},{},{},{},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{}",
+            "{},{},{},{},{},{},{},{},{},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{}",
             s.guid,
             s.entity,
             s.source,
@@ -200,6 +221,7 @@ pub fn write_csv<W: std::io::Write>(stats: &[ProductStats], out: &mut W) -> std:
             s.max_extent,
             s.drift_ratio,
             s.drift_severity,
+            s.mesh_quality,
         )?;
     }
     w.flush()?;

@@ -257,11 +257,17 @@ def extract_data_layers(
                 k: drift_raw[k]
                 for k in (
                     "guid", "entity", "source", "triangle_count",
-                    "surface_area", "volume_abs",
+                    "surface_area", "volume_abs", "aabb_volume",
                     "placement_x", "placement_y", "placement_z",
                     "centroid_x", "centroid_y", "centroid_z",
                     "drift_distance", "max_extent", "drift_ratio",
                     "drift_severity",
+                    # Volume-validity classifier: "closed" / "open_shell"
+                    # / "degenerate". Open-shell volumes are physically
+                    # impossible (mesh isn't a closed manifold) — filter
+                    # with `m.drift[m.drift.mesh_quality == "closed"]`
+                    # before any volume aggregation.
+                    "mesh_quality",
                 )
             }
             out.drift = pd.DataFrame(df_cols)

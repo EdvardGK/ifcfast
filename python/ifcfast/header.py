@@ -44,7 +44,11 @@ _HASH_TAIL_BYTES = 4 * 1024 * 1024
 #       metre-authored files); products table now includes IfcSpace
 #       rows with name/psets; instances substrate emits null-rep rows
 #       for geometryless products.
-_CACHE_SCHEMA_VERSION = 2
+#   3 — v0.4.4: drift.parquet gains `aabb_volume` (Float32) and
+#       `mesh_quality` (Utf8, "closed"/"open_shell"/"degenerate")
+#       columns. Old caches lack these and would KeyError on Python
+#       readers that select them.
+_CACHE_SCHEMA_VERSION = 3
 
 _FIELD_RE = re.compile(r"\(\s*(.*?)\s*\)\s*;", re.DOTALL)
 

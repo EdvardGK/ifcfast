@@ -614,6 +614,8 @@ mod python {
         let mut max_extent = Vec::with_capacity(n);
         let mut drift_ratio = Vec::with_capacity(n);
         let mut drift_severity = Vec::with_capacity(n);
+        let mut aabb_volume = Vec::with_capacity(n);
+        let mut mesh_quality = Vec::with_capacity(n);
         for s in &prod_stats {
             guid.push(s.guid.clone());
             entity.push(s.entity.clone());
@@ -631,6 +633,8 @@ mod python {
             max_extent.push(s.max_extent);
             drift_ratio.push(s.drift_ratio);
             drift_severity.push(s.drift_severity);
+            aabb_volume.push(s.aabb_volume);
+            mesh_quality.push(s.mesh_quality);
         }
         out.set_item("guid", PyList::new_bound(py, guid))?;
         out.set_item("entity", PyList::new_bound(py, entity))?;
@@ -648,6 +652,8 @@ mod python {
         out.set_item("max_extent", PyList::new_bound(py, max_extent))?;
         out.set_item("drift_ratio", PyList::new_bound(py, drift_ratio))?;
         out.set_item("drift_severity", PyList::new_bound(py, drift_severity))?;
+        out.set_item("aabb_volume", PyList::new_bound(py, aabb_volume))?;
+        out.set_item("mesh_quality", PyList::new_bound(py, mesh_quality))?;
         out.set_item("drift_ok", file_stats.drift_ok)?;
         out.set_item("drift_warn", file_stats.drift_warn)?;
         out.set_item("drift_error", file_stats.drift_error)?;
