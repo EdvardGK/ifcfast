@@ -173,3 +173,120 @@ fn parse_ref_list(body: &[u8]) -> Vec<u64> {
         })
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn make_buf(extra_data: &str) -> String {
+        format!(
+            r#"ISO-10303-21;
+HEADER;
+FILE_DESCRIPTION(('ViewDefinition [ReferenceView]'),'2;1');
+FILE_NAME('cls_test.ifc','2026-05-26T00:00:00',('test'),('test'),'ifcfast','ifcfast','');
+FILE_SCHEMA(('IFC4'));
+ENDSEC;
+DATA;
+#1=IFCPROJECT('0Test000000000000000001',$,'p',$,$,$,$,(#5),#2);
+#2=IFCUNITASSIGNMENT((#3));
+#3=IFCSIUNIT(*,.LENGTHUNIT.,.MILLI.,.METRE.);
+#5=IFCGEOMETRICREPRESENTATIONCONTEXT($,'Model',3,1.0E-5,#6,$);
+#6=IFCAXIS2PLACEMENT3D(#7,$,$);
+#7=IFCCARTESIANPOINT((0.,0.,0.));
+#10=IFCWALL('1Wall00000000000000001',$,'W',$,$,$,$,'t',.STANDARD.);
+{extra_data}
+ENDSEC;
+END-ISO-10303-21;
+"#
+        )
+    }
+
+    fn run(buf: &str) -> ClassificationTable {
+        let table = crate::entity_table::EntityTable::build(buf.as_bytes());
+        let mut step_to_guid: HashMap<u64, String> = HashMap::new();
+        for (sid, _t, args) in table.iter() {
+            let fields = split_top_level_args(args);
+            if let Some(first) = fields.first() {
+                if let Field::String(s) = parse_field(first) {
+                    if s.len() == 22 {
+                        step_to_guid.insert(sid, s);
+                    }
+                }
+            }
+        }
+        build(&table, &step_to_guid)
+    }
+
+    #[test]
+    fn ns_3451_chain_resolves_all_six_fields() {
+        // The canonical Norwegian classification chain — verifies the
+        // ClassificationReference → Classification (via ReferencedSource)
+        // walk, which is the trickier part of this extractor.
+        let buf = make_buf(
+            r#"
+#30=IFCCLASSIFICATION('Standard Norge','2022',$,'NS 3451');
+#31=IFCCLASSIFICATIONREFERENCE($,'232.1','Yttervegger',#30);
+#32=IFCRELASSOCIATESCLASSIFICATION('2Cls000000000000000001',$,$,$,(#10),#31);
+"#,
+        );
+        let t = run(&buf);
+        assert_eq!(t.len(), 1);
+        assert_eq!(t.guid[0], "1Wall00000000000000001");
+        assert_eq!(t.system_name[0].as_deref(), Some("NS 3451"));
+        assert_eq!(t.edition[0].as_deref(), Some("2022"));
+        assert_eq!(t.identification[0].as_deref(), Some("232.1"));
+        assert_eq!(t.name[0].as_deref(), Some("Yttervegger"));
+        assert_eq!(t.source[0].as_deref(), Some("Standard Norge"));
+    }
+
+    #[test]
+    fn missing_parent_classification_still_emits_row() {
+        // ClassificationReference with no ReferencedSource — every
+        // system-level field should be None but the identification +
+        // name (carried directly on the reference) must survive. Some
+        // exports do this when they ship a reference URL without
+        // declaring a parent IfcClassification.
+        let buf = make_buf(
+            r#"
+#31=IFCCLASSIFICATIONREFERENCE('https://example/codes/A1','A1','Test class',$);
+#32=IFCRELASSOCIATESCLASSIFICATION('2Cls000000000000000001',$,$,$,(#10),#31);
+"#,
+        );
+        let t = run(&buf);
+        assert_eq!(t.len(), 1);
+        assert_eq!(t.identification[0].as_deref(), Some("A1"));
+        assert_eq!(t.name[0].as_deref(), Some("Test class"));
+        assert_eq!(t.location[0].as_deref(), Some("https://example/codes/A1"));
+        assert!(t.system_name[0].is_none());
+        assert!(t.edition[0].is_none());
+        assert!(t.source[0].is_none());
+    }
+
+    #[test]
+    fn one_product_with_multiple_classifications_emits_a_row_each() {
+        // A wall classified under both NS 3451 and OmniClass — both
+        // refs must appear, properly attributed to their parent system.
+        let buf = make_buf(
+            r#"
+#30=IFCCLASSIFICATION('Standard Norge','2022',$,'NS 3451');
+#31=IFCCLASSIFICATIONREFERENCE($,'232.1','Yttervegger',#30);
+#40=IFCCLASSIFICATION('OmniClass','2015',$,'OmniClass');
+#41=IFCCLASSIFICATIONREFERENCE($,'21-01 10 10','Exterior Wall',#40);
+#50=IFCRELASSOCIATESCLASSIFICATION('2Cls000000000000000001',$,$,$,(#10),#31);
+#51=IFCRELASSOCIATESCLASSIFICATION('3Cls000000000000000001',$,$,$,(#10),#41);
+"#,
+        );
+        let t = run(&buf);
+        assert_eq!(t.len(), 2);
+        let by_system: std::collections::HashMap<&str, &str> = (0..t.len())
+            .filter_map(|i| {
+                let sys = t.system_name[i].as_deref()?;
+                let ident = t.identification[i].as_deref()?;
+                Some((sys, ident))
+            })
+            .collect();
+        assert_eq!(by_system.get("NS 3451"), Some(&"232.1"));
+        assert_eq!(by_system.get("OmniClass"), Some(&"21-01 10 10"));
+    }
+}

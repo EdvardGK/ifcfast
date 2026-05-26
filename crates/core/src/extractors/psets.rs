@@ -248,3 +248,183 @@ fn parse_ref_list(body: &[u8]) -> Vec<u64> {
         .collect()
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    /// Build the bare minimum IFC envelope around a list of extra DATA
+    /// statements. The wall #10 is the only product; `extra_data` is
+    /// expected to declare the pset, properties, and the relation that
+    /// binds them to #10.
+    fn make_buf(extra_data: &str) -> String {
+        format!(
+            r#"ISO-10303-21;
+HEADER;
+FILE_DESCRIPTION(('ViewDefinition [ReferenceView]'),'2;1');
+FILE_NAME('psets_test.ifc','2026-05-26T00:00:00',('test'),('test'),'ifcfast','ifcfast','');
+FILE_SCHEMA(('IFC4'));
+ENDSEC;
+DATA;
+#1=IFCPROJECT('0Test000000000000000001',$,'p',$,$,$,$,(#5),#2);
+#2=IFCUNITASSIGNMENT((#3));
+#3=IFCSIUNIT(*,.LENGTHUNIT.,.MILLI.,.METRE.);
+#5=IFCGEOMETRICREPRESENTATIONCONTEXT($,'Model',3,1.0E-5,#6,$);
+#6=IFCAXIS2PLACEMENT3D(#7,$,$);
+#7=IFCCARTESIANPOINT((0.,0.,0.));
+#10=IFCWALL('1Wall00000000000000001',$,'W',$,$,$,$,'t',.STANDARD.);
+{extra_data}
+ENDSEC;
+END-ISO-10303-21;
+"#
+        )
+    }
+
+    fn run(buf: &str) -> PsetTable {
+        let table = crate::entity_table::EntityTable::build(buf.as_bytes());
+        let mut step_to_guid: HashMap<u64, String> = HashMap::new();
+        for (sid, _t, args) in table.iter() {
+            let fields = split_top_level_args(args);
+            if let Some(first) = fields.first() {
+                if let Field::String(s) = parse_field(first) {
+                    if s.len() == 22 {
+                        step_to_guid.insert(sid, s);
+                    }
+                }
+            }
+        }
+        build(&table, &step_to_guid)
+    }
+
+    #[test]
+    fn text_label_value_unwraps_type_and_string() {
+        // `IFCLABEL('Internal')` should yield value="Internal", type="Label".
+        let buf = make_buf(
+            r#"
+#20=IFCPROPERTYSINGLEVALUE('LoadBearing',$,IFCLABEL('Internal'),$);
+#21=IFCPROPERTYSET('2Pset00000000000000001',$,'Pset_WallCommon',$,(#20));
+#22=IFCRELDEFINESBYPROPERTIES('3Rel000000000000000001',$,$,$,(#10),#21);
+"#,
+        );
+        let t = run(&buf);
+        assert_eq!(t.len(), 1);
+        assert_eq!(t.guid[0], "1Wall00000000000000001");
+        assert_eq!(t.pset_name[0], "Pset_WallCommon");
+        assert_eq!(t.prop_name[0], "LoadBearing");
+        assert_eq!(t.value[0].as_deref(), Some("Internal"));
+        // The type unwrap normalises `IFCLABEL` → `IfcLabel` via the
+        // canonical entity-name table.
+        assert_eq!(t.value_type[0].as_deref(), Some("IfcLabel"));
+    }
+
+    #[test]
+    fn boolean_value_serialises_as_python_truth_string() {
+        // `.T.` → `"True"` (matches ifcopenshell's Python-bool stringify).
+        let buf = make_buf(
+            r#"
+#20=IFCPROPERTYSINGLEVALUE('IsExternal',$,IFCBOOLEAN(.T.),$);
+#21=IFCPROPERTYSET('2Pset00000000000000001',$,'Pset_WallCommon',$,(#20));
+#22=IFCRELDEFINESBYPROPERTIES('3Rel000000000000000001',$,$,$,(#10),#21);
+"#,
+        );
+        let t = run(&buf);
+        assert_eq!(t.value[0].as_deref(), Some("True"));
+        assert_eq!(t.value_type[0].as_deref(), Some("IfcBoolean"));
+    }
+
+    #[test]
+    fn unknown_logical_serialises_as_uppercase_enum() {
+        // IFCLOGICAL.U has no bool counterpart and must surface as
+        // the all-caps schema literal "UNKNOWN" (not Python's "None").
+        let buf = make_buf(
+            r#"
+#20=IFCPROPERTYSINGLEVALUE('Combustible',$,IFCLOGICAL(.U.),$);
+#21=IFCPROPERTYSET('2Pset00000000000000001',$,'Pset_WallCommon',$,(#20));
+#22=IFCRELDEFINESBYPROPERTIES('3Rel000000000000000001',$,$,$,(#10),#21);
+"#,
+        );
+        let t = run(&buf);
+        assert_eq!(t.value[0].as_deref(), Some("UNKNOWN"));
+        assert_eq!(t.value_type[0].as_deref(), Some("IfcLogical"));
+    }
+
+    #[test]
+    fn missing_nominal_value_produces_null_row() {
+        // Property with `$` for NominalValue. The row should still
+        // exist (reveal-all: the prop EXISTS, its value is unknown)
+        // but value and value_type must both be None.
+        let buf = make_buf(
+            r#"
+#20=IFCPROPERTYSINGLEVALUE('Reference',$,$,$);
+#21=IFCPROPERTYSET('2Pset00000000000000001',$,'Pset_WallCommon',$,(#20));
+#22=IFCRELDEFINESBYPROPERTIES('3Rel000000000000000001',$,$,$,(#10),#21);
+"#,
+        );
+        let t = run(&buf);
+        assert_eq!(t.len(), 1);
+        assert_eq!(t.value[0], None);
+        assert_eq!(t.value_type[0], None);
+    }
+
+    #[test]
+    fn pset_with_multiple_properties_produces_one_row_each() {
+        let buf = make_buf(
+            r#"
+#20=IFCPROPERTYSINGLEVALUE('IsExternal',$,IFCBOOLEAN(.T.),$);
+#21=IFCPROPERTYSINGLEVALUE('LoadBearing',$,IFCBOOLEAN(.F.),$);
+#22=IFCPROPERTYSINGLEVALUE('Reference',$,IFCLABEL('W-001'),$);
+#23=IFCPROPERTYSET('2Pset00000000000000001',$,'Pset_WallCommon',$,(#20,#21,#22));
+#24=IFCRELDEFINESBYPROPERTIES('3Rel000000000000000001',$,$,$,(#10),#23);
+"#,
+        );
+        let t = run(&buf);
+        assert_eq!(t.len(), 3);
+        // Every row points back to the same product + same pset.
+        for i in 0..3 {
+            assert_eq!(t.guid[i], "1Wall00000000000000001");
+            assert_eq!(t.pset_name[i], "Pset_WallCommon");
+        }
+        // Each property appears exactly once.
+        let prop_names: std::collections::HashSet<&str> =
+            t.prop_name.iter().map(String::as_str).collect();
+        assert_eq!(prop_names.len(), 3);
+        assert!(prop_names.contains("IsExternal"));
+        assert!(prop_names.contains("LoadBearing"));
+        assert!(prop_names.contains("Reference"));
+    }
+
+    #[test]
+    fn single_ref_related_object_works_like_a_list_of_one() {
+        // Some IFC2X3 authoring tools emit `RelatedObjects = #10`
+        // (bare ref) instead of `(#10)` (list). The extractor must
+        // accept both.
+        let buf = make_buf(
+            r#"
+#20=IFCPROPERTYSINGLEVALUE('LoadBearing',$,IFCBOOLEAN(.T.),$);
+#21=IFCPROPERTYSET('2Pset00000000000000001',$,'Pset_WallCommon',$,(#20));
+#22=IFCRELDEFINESBYPROPERTIES('3Rel000000000000000001',$,$,$,#10,#21);
+"#,
+        );
+        let t = run(&buf);
+        assert_eq!(t.len(), 1);
+        assert_eq!(t.guid[0], "1Wall00000000000000001");
+    }
+
+    #[test]
+    fn property_for_unknown_guid_is_dropped() {
+        // The product ref `#99` doesn't exist; the extractor must NOT
+        // emit a row (guid lookup misses) but also must not panic.
+        let buf = make_buf(
+            r#"
+#20=IFCPROPERTYSINGLEVALUE('LoadBearing',$,IFCBOOLEAN(.T.),$);
+#21=IFCPROPERTYSET('2Pset00000000000000001',$,'Pset_WallCommon',$,(#20));
+#22=IFCRELDEFINESBYPROPERTIES('3Rel000000000000000001',$,$,$,(#99),#21);
+"#,
+        );
+        let t = run(&buf);
+        // Only the wall (#10) is in step_to_guid, and the rel didn't
+        // include it — table should be empty.
+        assert_eq!(t.len(), 0);
+    }
+}
