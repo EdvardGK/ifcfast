@@ -306,7 +306,7 @@ fn placement_from_field(table: &EntityTable, field: Option<&[u8]>) -> Option<Mat
 }
 
 fn number_at(fields: &[&[u8]], idx: usize) -> Option<f32> {
-    match parse_field(*fields.get(idx)?) {
+    match parse_field(fields.get(idx)?) {
         Field::Number(n) => Some(n as f32),
         _ => None,
     }

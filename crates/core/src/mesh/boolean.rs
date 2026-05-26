@@ -220,7 +220,7 @@ fn bounded_curve_points(table: &EntityTable, id: u64) -> Option<Vec<Vec2>> {
     let (type_name, args) = table.get(id)?;
     if type_name.eq_ignore_ascii_case(b"IFCPOLYLINE") {
         let fields = split_top_level_args(args);
-        let body = match parse_field(*fields.first()?) {
+        let body = match parse_field(fields.first()?) {
             Field::List(b) => b,
             _ => return None,
         };
@@ -245,7 +245,7 @@ fn bounded_curve_points(table: &EntityTable, id: u64) -> Option<Vec<Vec2>> {
     if type_name.eq_ignore_ascii_case(b"IFCINDEXEDPOLYCURVE") {
         // IfcIndexedPolyCurve(Points: IfcCartesianPointList2D, Segments, SelfIntersect)
         let fields = split_top_level_args(args);
-        let pts_id = match parse_field(*fields.first()?) {
+        let pts_id = match parse_field(fields.first()?) {
             Field::Ref(pid) => pid,
             _ => return None,
         };
@@ -265,7 +265,7 @@ fn cartesian_point_xy(table: &EntityTable, id: u64) -> Option<Vec2> {
         return None;
     }
     let fields = split_top_level_args(args);
-    let body = match parse_field(*fields.first()?) {
+    let body = match parse_field(fields.first()?) {
         Field::List(b) => b,
         _ => return None,
     };
@@ -289,26 +289,23 @@ fn cartesian_point_list_2d(table: &EntityTable, id: u64) -> Option<Vec<Vec2>> {
     }
     let fields = split_top_level_args(args);
     // CoordList: LIST [1:?] OF LIST [2:2] OF IfcLengthMeasure
-    let body = match parse_field(*fields.first()?) {
+    let body = match parse_field(fields.first()?) {
         Field::List(b) => b,
         _ => return None,
     };
     let mut out: Vec<Vec2> = Vec::new();
     for f in split_top_level_args(body) {
-        match parse_field(f) {
-            Field::List(inner) => {
-                let coords: Vec<f32> = split_top_level_args(inner)
-                    .into_iter()
-                    .filter_map(|g| match parse_field(g) {
-                        Field::Number(n) => Some(n as f32),
-                        _ => None,
-                    })
-                    .collect();
-                if coords.len() >= 2 {
-                    out.push(Vec2::new(coords[0], coords[1]));
-                }
+        if let Field::List(inner) = parse_field(f) {
+            let coords: Vec<f32> = split_top_level_args(inner)
+                .into_iter()
+                .filter_map(|g| match parse_field(g) {
+                    Field::Number(n) => Some(n as f32),
+                    _ => None,
+                })
+                .collect();
+            if coords.len() >= 2 {
+                out.push(Vec2::new(coords[0], coords[1]));
             }
-            _ => {}
         }
     }
     if out.is_empty() {

@@ -21,7 +21,7 @@ pub fn polygonal_face_set(table: &EntityTable, id: u64) -> Option<LocalMesh> {
     }
     let fields = split_top_level_args(args);
     // IfcPolygonalFaceSet(Coordinates, Closed, Faces, PnIndex)
-    let coords_id = match parse_field(*fields.first()?) {
+    let coords_id = match parse_field(fields.first()?) {
         Field::Ref(id) => id,
         _ => return None,
     };
@@ -45,7 +45,7 @@ pub fn polygonal_face_set(table: &EntityTable, id: u64) -> Option<LocalMesh> {
     });
 
     // Faces list.
-    let faces_body = match parse_field(*fields.get(2)?) {
+    let faces_body = match parse_field(fields.get(2)?) {
         Field::List(b) => b,
         _ => return None,
     };
@@ -115,7 +115,7 @@ pub fn triangulated_face_set(table: &EntityTable, id: u64) -> Option<LocalMesh> 
     }
     let fields = split_top_level_args(args);
     // IfcTriangulatedFaceSet(Coordinates, Normals, Closed, CoordIndex, PnIndex)
-    let coords_id = match parse_field(*fields.first()?) {
+    let coords_id = match parse_field(fields.first()?) {
         Field::Ref(id) => id,
         _ => return None,
     };
@@ -124,7 +124,7 @@ pub fn triangulated_face_set(table: &EntityTable, id: u64) -> Option<LocalMesh> 
         return None;
     }
 
-    let coord_index_body = match parse_field(*fields.get(3)?) {
+    let coord_index_body = match parse_field(fields.get(3)?) {
         Field::List(b) => b,
         _ => return None,
     };
@@ -179,7 +179,7 @@ fn cartesian_point_list_3d(table: &EntityTable, id: u64) -> Option<Vec<Vec3>> {
     }
     let fields = split_top_level_args(args);
     // arg[0] = CoordList — list of (x, y, z) triples.
-    let body = match parse_field(*fields.first()?) {
+    let body = match parse_field(fields.first()?) {
         Field::List(b) => b,
         _ => return None,
     };
@@ -213,7 +213,7 @@ fn indexed_polygonal_face(table: &EntityTable, id: u64) -> Option<Vec<u32>> {
     }
     let fields = split_top_level_args(args);
     // arg[0] = CoordIndex
-    let body = match parse_field(*fields.first()?) {
+    let body = match parse_field(fields.first()?) {
         Field::List(b) => b,
         _ => return None,
     };

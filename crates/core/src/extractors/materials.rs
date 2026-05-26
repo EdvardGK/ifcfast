@@ -46,6 +46,10 @@ impl MaterialTable {
     pub fn len(&self) -> usize {
         self.guid.len()
     }
+
+    pub fn is_empty(&self) -> bool {
+        self.guid.is_empty()
+    }
 }
 
 /// Build the material table. `unit_scale` is the IFC project's
@@ -297,8 +301,7 @@ pub fn build(
         let lset_id = layer_set_usages
             .get(&relating_id)
             .copied()
-            .or(Some(relating_id))
-            .unwrap();
+            .unwrap_or(relating_id);
         if let Some(layer_ids) = layer_sets.get(&lset_id) {
             for (i, lid) in layer_ids.iter().enumerate() {
                 if let Some(layer) = layers.get(lid) {
@@ -370,14 +373,14 @@ struct ConstituentRecord {
 }
 
 fn string_at(fields: &[&[u8]], idx: usize) -> Option<String> {
-    match parse_field(*fields.get(idx)?) {
+    match parse_field(fields.get(idx)?) {
         Field::String(s) => Some(s),
         _ => None,
     }
 }
 
 fn number_at(fields: &[&[u8]], idx: usize) -> Option<f64> {
-    match parse_field(*fields.get(idx)?) {
+    match parse_field(fields.get(idx)?) {
         Field::Number(n) => Some(n),
         _ => None,
     }

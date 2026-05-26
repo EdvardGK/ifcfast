@@ -40,7 +40,7 @@ pub fn geometric_curve_set(table: &EntityTable, id: u64) -> Option<LocalMesh> {
     }
 
     let fields = split_top_level_args(args);
-    let body = match parse_field(*fields.first()?) {
+    let body = match parse_field(fields.first()?) {
         Field::List(b) => b,
         _ => return None,
     };
@@ -119,7 +119,7 @@ fn polyline_3d_points(table: &EntityTable, id: u64) -> Option<Vec<Vec3>> {
         return None;
     }
     let fields = split_top_level_args(args);
-    let body = match parse_field(*fields.first()?) {
+    let body = match parse_field(fields.first()?) {
         Field::List(b) => b,
         _ => return None,
     };
@@ -144,7 +144,7 @@ fn indexed_poly_curve_3d_points(table: &EntityTable, id: u64) -> Option<Vec<Vec3
         return None;
     }
     let fields = split_top_level_args(args);
-    let pts_id = match parse_field(*fields.first()?) {
+    let pts_id = match parse_field(fields.first()?) {
         Field::Ref(pid) => pid,
         _ => return None,
     };
@@ -157,7 +157,7 @@ fn cartesian_point_3d(table: &EntityTable, id: u64) -> Option<Vec3> {
         return None;
     }
     let fields = split_top_level_args(args);
-    let body = match parse_field(*fields.first()?) {
+    let body = match parse_field(fields.first()?) {
         Field::List(b) => b,
         _ => return None,
     };
@@ -183,7 +183,7 @@ fn cartesian_point_list_3d(table: &EntityTable, id: u64) -> Option<Vec<Vec3>> {
         return None;
     }
     let fields = split_top_level_args(args);
-    let body = match parse_field(*fields.first()?) {
+    let body = match parse_field(fields.first()?) {
         Field::List(b) => b,
         _ => return None,
     };

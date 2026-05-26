@@ -546,7 +546,7 @@ pub(crate) fn mesh_item(
             .iter()
             .map(|(m, s)| MeshFragment::Mesh {
                 mesh: clone_local(m),
-                source: *s,
+                source: s,
                 role: None,
                 // Cache contents are non-composite direct geometry —
                 // their natural rep_step_id IS the lookup key. No per-
@@ -676,7 +676,7 @@ fn body_items(table: &EntityTable, repr_id: u64) -> Vec<u64> {
     // IfcProductDefinitionShape(Name, Description, Representations: LIST OF IfcRepresentation)
     if type_name.eq_ignore_ascii_case(b"IFCPRODUCTDEFINITIONSHAPE") {
         let fields = split_top_level_args(args);
-        let body = match parse_field(*fields.get(2).unwrap_or(&&[][..])) {
+        let body = match parse_field(fields.get(2).unwrap_or(&&[][..])) {
             Field::List(b) => b,
             _ => return Vec::new(),
         };
@@ -713,7 +713,7 @@ fn is_body_or_facetation(table: &EntityTable, repr_id: u64) -> bool {
     // IfcShapeRepresentation: (ContextOfItems, RepresentationIdentifier,
     //                          RepresentationType, Items)
     // RepresentationIdentifier at arg[1].
-    let ident = match parse_field(*fields.get(1).unwrap_or(&&[][..])) {
+    let ident = match parse_field(fields.get(1).unwrap_or(&&[][..])) {
         Field::String(s) => s.to_lowercase(),
         _ => return false,
     };
@@ -729,7 +729,7 @@ pub(crate) fn representation_items(table: &EntityTable, repr_id: u64) -> Vec<u64
         return Vec::new();
     }
     let fields = split_top_level_args(args);
-    let items = match parse_field(*fields.get(3).unwrap_or(&&[][..])) {
+    let items = match parse_field(fields.get(3).unwrap_or(&&[][..])) {
         Field::List(b) => b,
         _ => return Vec::new(),
     };

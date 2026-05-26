@@ -42,6 +42,10 @@ impl ClassificationTable {
     pub fn len(&self) -> usize {
         self.guid.len()
     }
+
+    pub fn is_empty(&self) -> bool {
+        self.guid.is_empty()
+    }
 }
 
 pub fn build(
@@ -158,7 +162,7 @@ struct RefRecord {
 /// records have `Identification = ''`. Our extractor was returning `Some("")`;
 /// ifcopenshell returns `None`. Both encodings mean "no value" semantically.
 fn string_at(fields: &[&[u8]], idx: usize) -> Option<String> {
-    match parse_field(*fields.get(idx)?) {
+    match parse_field(fields.get(idx)?) {
         Field::String(s) if !s.is_empty() => Some(s),
         _ => None,
     }

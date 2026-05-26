@@ -81,7 +81,7 @@ pub fn extrude(table: &EntityTable, id: u64) -> Option<LocalMesh> {
     let dir = if dir.length_squared() < 1e-12 { Vec3::Z } else { dir };
 
     // Depth (arg[3]).
-    let depth = match parse_field(*fields.get(3)?) {
+    let depth = match parse_field(fields.get(3)?) {
         Field::Number(n) => n as f32,
         _ => return None,
     };
@@ -182,7 +182,7 @@ fn direction(table: &EntityTable, id: u64) -> Option<Vec3> {
         return None;
     }
     let fields = split_top_level_args(args);
-    let body = match parse_field(*fields.first()?) {
+    let body = match parse_field(fields.first()?) {
         Field::List(b) => b,
         _ => return None,
     };

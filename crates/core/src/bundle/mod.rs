@@ -297,12 +297,12 @@ impl Bundle {
 
         let product_iter = product_step_id
             .into_iter()
-            .zip(product_guid.into_iter())
-            .zip(product_entity.into_iter())
-            .zip(product_name.into_iter())
-            .zip(product_predefined_type.into_iter())
-            .zip(product_object_type.into_iter())
-            .zip(product_tag.into_iter())
+            .zip(product_guid)
+            .zip(product_entity)
+            .zip(product_name)
+            .zip(product_predefined_type)
+            .zip(product_object_type)
+            .zip(product_tag)
             .map(|((((((a, b), c), d), e), f), g)| (a, b, c, d, e, f, g));
 
         for (sid, guid, entity, name, predef, obj_ty, tag) in product_iter {
@@ -381,10 +381,10 @@ impl Bundle {
         let pset_iter = psets_table
             .guid
             .into_iter()
-            .zip(psets_table.pset_name.into_iter())
-            .zip(psets_table.prop_name.into_iter())
-            .zip(psets_table.value.into_iter())
-            .zip(psets_table.value_type.into_iter());
+            .zip(psets_table.pset_name)
+            .zip(psets_table.prop_name)
+            .zip(psets_table.value)
+            .zip(psets_table.value_type);
         for ((((guid, set_name), prop_name), value), value_type) in pset_iter {
             psets_by_guid.entry(guid).or_default().push(PsetValue {
                 set_name: intern(&mut str_cache, set_name),
@@ -398,12 +398,12 @@ impl Bundle {
         let mat_iter = mat_table
             .guid
             .into_iter()
-            .zip(mat_table.role.into_iter())
-            .zip(mat_table.layer_index.into_iter())
-            .zip(mat_table.material_name.into_iter())
-            .zip(mat_table.layer_thickness_mm.into_iter())
-            .zip(mat_table.category.into_iter())
-            .zip(mat_table.fraction.into_iter());
+            .zip(mat_table.role)
+            .zip(mat_table.layer_index)
+            .zip(mat_table.material_name)
+            .zip(mat_table.layer_thickness_mm)
+            .zip(mat_table.category)
+            .zip(mat_table.fraction);
         for ((((((guid, role), layer_index), material_name), thickness_mm), category), fraction) in
             mat_iter
         {
@@ -421,11 +421,11 @@ impl Bundle {
         let qty_iter = qty_table
             .guid
             .into_iter()
-            .zip(qty_table.qto_name.into_iter())
-            .zip(qty_table.quantity_name.into_iter())
-            .zip(qty_table.value.into_iter())
-            .zip(qty_table.quantity_type.into_iter())
-            .zip(qty_table.unit_step_id.into_iter());
+            .zip(qty_table.qto_name)
+            .zip(qty_table.quantity_name)
+            .zip(qty_table.value)
+            .zip(qty_table.quantity_type)
+            .zip(qty_table.unit_step_id);
         for (((((guid, qto_name), quantity_name), value), quantity_type), unit_step_id) in qty_iter
         {
             quantities_by_guid
@@ -445,12 +445,12 @@ impl Bundle {
         let cls_iter = cls_table
             .guid
             .into_iter()
-            .zip(cls_table.system_name.into_iter())
-            .zip(cls_table.edition.into_iter())
-            .zip(cls_table.identification.into_iter())
-            .zip(cls_table.name.into_iter())
-            .zip(cls_table.location.into_iter())
-            .zip(cls_table.source.into_iter());
+            .zip(cls_table.system_name)
+            .zip(cls_table.edition)
+            .zip(cls_table.identification)
+            .zip(cls_table.name)
+            .zip(cls_table.location)
+            .zip(cls_table.source);
         for ((((((guid, system_name), edition), identification), name), location), source) in
             cls_iter
         {

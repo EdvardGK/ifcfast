@@ -36,7 +36,7 @@ pub fn faceted_brep(table: &EntityTable, id: u64) -> Option<LocalMesh> {
     }
     let fields = split_top_level_args(args);
     // (Outer: IfcClosedShell)
-    let outer_id = match parse_field(*fields.first()?) {
+    let outer_id = match parse_field(fields.first()?) {
         Field::Ref(id) => id,
         _ => return None,
     };
@@ -59,7 +59,7 @@ pub fn closed_shell(table: &EntityTable, id: u64) -> Option<LocalMesh> {
     }
     let fields = split_top_level_args(args);
     // (CfsFaces: LIST OF IfcFace)
-    let body = match parse_field(*fields.first()?) {
+    let body = match parse_field(fields.first()?) {
         Field::List(b) => b,
         _ => return None,
     };
@@ -91,7 +91,7 @@ pub fn face_based_surface_model(table: &EntityTable, id: u64) -> Option<LocalMes
     }
     let fields = split_top_level_args(args);
     // FbsmFaces: SET OF IfcConnectedFaceSet
-    let body = match parse_field(*fields.first()?) {
+    let body = match parse_field(fields.first()?) {
         Field::List(b) => b,
         _ => return None,
     };
@@ -123,7 +123,7 @@ pub fn shell_based_surface_model(table: &EntityTable, id: u64) -> Option<LocalMe
         return None;
     }
     let fields = split_top_level_args(args);
-    let body = match parse_field(*fields.first()?) {
+    let body = match parse_field(fields.first()?) {
         Field::List(b) => b,
         _ => return None,
     };
@@ -165,7 +165,7 @@ fn mesh_face(
     }
     let fields = split_top_level_args(args);
     // (Bounds: LIST OF IfcFaceBound)
-    let body = match parse_field(*fields.first().unwrap_or(&&[][..])) {
+    let body = match parse_field(fields.first().unwrap_or(&&[][..])) {
         Field::List(b) => b,
         _ => return,
     };
@@ -193,11 +193,11 @@ fn mesh_face(
         }
         let bf = split_top_level_args(b_args);
         // (Bound: IfcLoop, Orientation: BOOL)
-        let loop_id = match parse_field(*bf.first().unwrap_or(&&[][..])) {
+        let loop_id = match parse_field(bf.first().unwrap_or(&&[][..])) {
             Field::Ref(id) => id,
             _ => continue,
         };
-        let orient = match parse_field(*bf.get(1).unwrap_or(&&[][..])) {
+        let orient = match parse_field(bf.get(1).unwrap_or(&&[][..])) {
             // STEP booleans: `.T.` = true, `.F.` = false (enum form)
             Field::Enum(e) => e == b"T",
             _ => true,
@@ -252,7 +252,7 @@ fn poly_loop_vertices(
     }
     let fields = split_top_level_args(args);
     // (Polygon: LIST OF IfcCartesianPoint)
-    let body = match parse_field(*fields.first().unwrap_or(&&[][..])) {
+    let body = match parse_field(fields.first().unwrap_or(&&[][..])) {
         Field::List(b) => b,
         _ => return Vec::new(),
     };
@@ -286,7 +286,7 @@ fn cartesian_point(table: &EntityTable, id: u64) -> Option<Vec3> {
         return None;
     }
     let fields = split_top_level_args(args);
-    let body = match parse_field(*fields.first()?) {
+    let body = match parse_field(fields.first()?) {
         Field::List(b) => b,
         _ => return None,
     };

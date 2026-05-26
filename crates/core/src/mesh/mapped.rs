@@ -38,11 +38,11 @@ pub fn expand(
     }
     let fields = split_top_level_args(args);
     // IfcMappedItem(MappingSource, MappingTarget)
-    let src_id = match parse_field(*fields.first().unwrap_or(&&[][..])) {
+    let src_id = match parse_field(fields.first().unwrap_or(&&[][..])) {
         Field::Ref(id) => id,
         _ => return Vec::new(),
     };
-    let target_id = match parse_field(*fields.get(1).unwrap_or(&&[][..])) {
+    let target_id = match parse_field(fields.get(1).unwrap_or(&&[][..])) {
         Field::Ref(id) => Some(id),
         _ => None,
     };
@@ -56,11 +56,11 @@ pub fn expand(
         return Vec::new();
     }
     let src_fields = split_top_level_args(src_args);
-    let origin_id = match parse_field(*src_fields.first().unwrap_or(&&[][..])) {
+    let origin_id = match parse_field(src_fields.first().unwrap_or(&&[][..])) {
         Field::Ref(id) => Some(id),
         _ => None,
     };
-    let mapped_repr_id = match parse_field(*src_fields.get(1).unwrap_or(&&[][..])) {
+    let mapped_repr_id = match parse_field(src_fields.get(1).unwrap_or(&&[][..])) {
         Field::Ref(id) => id,
         _ => return Vec::new(),
     };
@@ -180,7 +180,7 @@ fn cartesian_point(table: &EntityTable, id: u64) -> Option<Vec3> {
         return None;
     }
     let fields = split_top_level_args(args);
-    let body = match parse_field(*fields.first()?) {
+    let body = match parse_field(fields.first()?) {
         Field::List(b) => b,
         _ => return None,
     };
@@ -204,7 +204,7 @@ fn direction(table: &EntityTable, id: u64) -> Option<Vec3> {
         return None;
     }
     let fields = split_top_level_args(args);
-    let body = match parse_field(*fields.first()?) {
+    let body = match parse_field(fields.first()?) {
         Field::List(b) => b,
         _ => return None,
     };

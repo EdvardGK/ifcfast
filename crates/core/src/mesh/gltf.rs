@@ -162,21 +162,21 @@ fn pack_binary(meshes: &[ProductMesh]) -> (Vec<u8>, BufferViews) {
 }
 
 fn pad4(buf: &mut Vec<u8>) {
-    while buf.len() % 4 != 0 {
+    while !buf.len().is_multiple_of(4) {
         buf.push(0);
     }
 }
 
 fn pad_json(mut json: Vec<u8>) -> Vec<u8> {
     // JSON chunk padded with ASCII spaces per spec.
-    while json.len() % 4 != 0 {
+    while !json.len().is_multiple_of(4) {
         json.push(b' ');
     }
     json
 }
 
 fn pad_bin(mut bin: Vec<u8>) -> Vec<u8> {
-    while bin.len() % 4 != 0 {
+    while !bin.len().is_multiple_of(4) {
         bin.push(0);
     }
     bin

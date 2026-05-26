@@ -526,14 +526,14 @@ fn sample_ellipse(a: f32, b: f32, n: usize) -> Vec<Vec2> {
 }
 
 fn number_at(fields: &[&[u8]], idx: usize) -> Option<f64> {
-    match parse_field(*fields.get(idx)?) {
+    match parse_field(fields.get(idx)?) {
         Field::Number(n) => Some(n),
         _ => None,
     }
 }
 
 fn ref_at(fields: &[&[u8]], idx: usize) -> Option<u64> {
-    match parse_field(*fields.get(idx)?) {
+    match parse_field(fields.get(idx)?) {
         Field::Ref(id) => Some(id),
         _ => None,
     }

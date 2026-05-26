@@ -57,7 +57,7 @@ pub fn revolved_area_solid(table: &EntityTable, id: u64) -> Option<LocalMesh> {
     let fields = split_top_level_args(args);
 
     // arg[0] SweptArea, arg[1] Position, arg[2] Axis (IfcAxis1Placement), arg[3] Angle.
-    let swept_id = match parse_field(*fields.first()?) {
+    let swept_id = match parse_field(fields.first()?) {
         Field::Ref(id) => id,
         _ => return None,
     };
@@ -164,7 +164,7 @@ fn axis_1_placement(table: &EntityTable, id: u64) -> Option<(Vec3, Vec3)> {
         return None;
     }
     let fields = split_top_level_args(args);
-    let loc_id = match parse_field(*fields.first()?) {
+    let loc_id = match parse_field(fields.first()?) {
         Field::Ref(id) => id,
         _ => return None,
     };
@@ -183,7 +183,7 @@ fn cartesian_point_3d(table: &EntityTable, id: u64) -> Option<Vec3> {
         return None;
     }
     let fields = split_top_level_args(args);
-    let body = match parse_field(*fields.first()?) {
+    let body = match parse_field(fields.first()?) {
         Field::List(b) => b,
         _ => return None,
     };
@@ -207,7 +207,7 @@ fn direction_3d(table: &EntityTable, id: u64) -> Option<Vec3> {
         return None;
     }
     let fields = split_top_level_args(args);
-    let body = match parse_field(*fields.first()?) {
+    let body = match parse_field(fields.first()?) {
         Field::List(b) => b,
         _ => return None,
     };

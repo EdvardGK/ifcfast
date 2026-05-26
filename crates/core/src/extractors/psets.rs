@@ -411,7 +411,7 @@ fn trim(s: &[u8]) -> &[u8] {
 }
 
 fn string_at(fields: &[&[u8]], idx: usize) -> Option<String> {
-    match parse_field(*fields.get(idx)?) {
+    match parse_field(fields.get(idx)?) {
         Field::String(s) => Some(s),
         _ => None,
     }
