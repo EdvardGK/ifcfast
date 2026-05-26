@@ -51,6 +51,11 @@ pub fn build(
     //         and IfcPropertySingleValue records (id → Prop).
     let mut psets: HashMap<u64, (String, Vec<u64>)> = HashMap::with_capacity(2048);
     let mut props: HashMap<u64, Prop> = HashMap::with_capacity(8192);
+    // IfcComplexProperty groups inner properties under a named "complex"
+    // wrapper. We flatten in pass 2 via dot-joined names: a complex
+    // "ProfileGeometry" containing "Width" + "Height" produces rows
+    // named "ProfileGeometry.Width" + "ProfileGeometry.Height".
+    let mut complex_props: HashMap<u64, (String, Vec<u64>)> = HashMap::with_capacity(256);
     // Pass 2 input: (related_object_step_ids, pset_step_id) — many rels share
     // a single pset, and many objects share a single rel.
     let mut rel_pairs: Vec<(u64, u64)> = Vec::with_capacity(16_384);
@@ -104,6 +109,14 @@ pub fn build(
             let (setpoint_val, _) = parse_nominal_value(fields.get(5).copied());
             let val_str = format_bounded(lower_val.as_deref(), upper_val.as_deref(), setpoint_val.as_deref());
             props.insert(step_id, Prop { name, value: val_str, value_type: upper_type });
+        } else if type_name.eq_ignore_ascii_case(b"IFCCOMPLEXPROPERTY") {
+            // (Name, Description, UsageName, HasProperties)
+            // Note: IfcComplexProperty does NOT inherit IfcRoot — no
+            // GlobalId here. The leading arg is the property name.
+            let fields = split_top_level_args(args);
+            let name = string_at(&fields, 0).unwrap_or_default();
+            let inner_ids = ref_list_at(&fields, 3);
+            complex_props.insert(step_id, (name, inner_ids));
         } else if type_name.eq_ignore_ascii_case(b"IFCRELDEFINESBYPROPERTIES") {
             // (GlobalId, OwnerHistory, Name, Description, RelatedObjects, RelatingPropertyDefinition)
             let fields = split_top_level_args(args);
@@ -143,16 +156,23 @@ pub fn build(
             Some(x) => x,
             None => continue,
         };
+        // Each top-level property in the pset resolves to one of:
+        //   - A leaf IfcProperty* (single, enumerated, list, bounded)
+        //     → in `props` → one output row.
+        //   - An IfcComplexProperty wrapping more inner property refs
+        //     → in `complex_props` → recurse, prefixing each leaf name
+        //       with the complex's own name joined by `.`.
         for pid in prop_ids {
-            let prop = match props.get(pid) {
-                Some(p) => p,
-                None => continue,
-            };
-            out.guid.push(guid.clone());
-            out.pset_name.push(pset_name.clone());
-            out.prop_name.push(prop.name.clone());
-            out.value.push(prop.value.clone());
-            out.value_type.push(prop.value_type.clone());
+            emit_property(
+                pid,
+                "",
+                guid,
+                pset_name,
+                &props,
+                &complex_props,
+                &mut out,
+                0,
+            );
         }
     }
 
@@ -164,6 +184,64 @@ struct Prop {
     name: String,
     value: Option<String>,
     value_type: Option<String>,
+}
+
+/// Cap on IfcComplexProperty nesting depth. The schema allows
+/// arbitrary recursion; real-world exports rarely go past 2-3 levels.
+/// A bounded walk protects against pathological / cyclic files.
+const COMPLEX_PROP_MAX_DEPTH: usize = 8;
+
+/// Emit one or more rows into `out` for the property at `pid`.
+///
+/// - Leaf property (single / enum / list / bounded) → one row with
+///   `prop_name = "{prefix}{leaf.name}"`. `prefix` is empty for top-
+///   level properties, or `"OuterComplex.InnerComplex."` for nested.
+/// - Complex property → recurse over its inner refs with an extended
+///   prefix `"{prefix}{complex.name}."`.
+/// - Anything else (unknown ref target) → silently dropped, same as
+///   pre-fix behaviour for leaf-only lookups.
+#[allow(clippy::too_many_arguments)]
+fn emit_property(
+    pid: &u64,
+    prefix: &str,
+    guid: &str,
+    pset_name: &str,
+    props: &HashMap<u64, Prop>,
+    complex_props: &HashMap<u64, (String, Vec<u64>)>,
+    out: &mut PsetTable,
+    depth: usize,
+) {
+    if let Some(prop) = props.get(pid) {
+        let name = if prefix.is_empty() {
+            prop.name.clone()
+        } else {
+            format!("{prefix}{}", prop.name)
+        };
+        out.guid.push(guid.to_string());
+        out.pset_name.push(pset_name.to_string());
+        out.prop_name.push(name);
+        out.value.push(prop.value.clone());
+        out.value_type.push(prop.value_type.clone());
+        return;
+    }
+    if let Some((complex_name, inner_ids)) = complex_props.get(pid) {
+        if depth >= COMPLEX_PROP_MAX_DEPTH {
+            return;
+        }
+        let new_prefix = format!("{prefix}{complex_name}.");
+        for inner in inner_ids {
+            emit_property(
+                inner,
+                &new_prefix,
+                guid,
+                pset_name,
+                props,
+                complex_props,
+                out,
+                depth + 1,
+            );
+        }
+    }
 }
 
 /// Parse an `IfcValue` field. STEP wraps these with a type tag:
@@ -621,6 +699,74 @@ END-ISO-10303-21;
         let t = run(&buf);
         assert_eq!(t.len(), 1);
         assert_eq!(t.value[0].as_deref(), Some("..2.5"));
+    }
+
+    #[test]
+    fn complex_property_flattens_to_dot_joined_names() {
+        // A common structural-export pattern: profile geometry as an
+        // IfcComplexProperty wrapping Width + Height single-values.
+        let buf = make_buf(
+            r#"
+#20=IFCPROPERTYSINGLEVALUE('Width',$,IFCLENGTHMEASURE(200.),$);
+#21=IFCPROPERTYSINGLEVALUE('Height',$,IFCLENGTHMEASURE(400.),$);
+#22=IFCCOMPLEXPROPERTY('ProfileGeometry',$,'SIZE',(#20,#21));
+#23=IFCPROPERTYSET('2Pset00000000000000001',$,'Pset_BeamCommon',$,(#22));
+#24=IFCRELDEFINESBYPROPERTIES('3Rel000000000000000001',$,$,$,(#10),#23);
+"#,
+        );
+        let t = run(&buf);
+        assert_eq!(t.len(), 2, "expected 2 leaf rows, got {}", t.len());
+        let by_name: std::collections::HashMap<&str, &str> = (0..t.len())
+            .filter_map(|i| {
+                t.value[i].as_deref().map(|v| (t.prop_name[i].as_str(), v))
+            })
+            .collect();
+        assert_eq!(by_name.get("ProfileGeometry.Width"), Some(&"200"));
+        assert_eq!(by_name.get("ProfileGeometry.Height"), Some(&"400"));
+    }
+
+    #[test]
+    fn nested_complex_properties_chain_their_prefixes() {
+        // Complex → Complex → leaf. Each layer of nesting prepends its
+        // name with a dot separator.
+        let buf = make_buf(
+            r#"
+#20=IFCPROPERTYSINGLEVALUE('Value',$,IFCREAL(0.05),$);
+#21=IFCCOMPLEXPROPERTY('SubGroup',$,'NESTED',(#20));
+#22=IFCCOMPLEXPROPERTY('OuterGroup',$,'GROUP',(#21));
+#23=IFCPROPERTYSET('2Pset00000000000000001',$,'Pset_Custom',$,(#22));
+#24=IFCRELDEFINESBYPROPERTIES('3Rel000000000000000001',$,$,$,(#10),#23);
+"#,
+        );
+        let t = run(&buf);
+        assert_eq!(t.len(), 1);
+        assert_eq!(t.prop_name[0], "OuterGroup.SubGroup.Value");
+        assert_eq!(t.value[0].as_deref(), Some("0.05"));
+    }
+
+    #[test]
+    fn complex_property_alongside_simple_in_same_pset() {
+        // The pset's top-level HasProperties list can mix complex and
+        // non-complex entries.
+        let buf = make_buf(
+            r#"
+#20=IFCPROPERTYSINGLEVALUE('Reference',$,IFCLABEL('REF-001'),$);
+#21=IFCPROPERTYSINGLEVALUE('A',$,IFCREAL(1.),$);
+#22=IFCPROPERTYSINGLEVALUE('B',$,IFCREAL(2.),$);
+#23=IFCCOMPLEXPROPERTY('Group',$,'GROUP',(#21,#22));
+#24=IFCPROPERTYSET('2Pset00000000000000001',$,'Pset_Mixed',$,(#20,#23));
+#25=IFCRELDEFINESBYPROPERTIES('3Rel000000000000000001',$,$,$,(#10),#24);
+"#,
+        );
+        let t = run(&buf);
+        assert_eq!(t.len(), 3);
+        let names: std::collections::HashSet<&str> =
+            t.prop_name.iter().map(String::as_str).collect();
+        // Top-level leaf keeps its plain name.
+        assert!(names.contains("Reference"));
+        // Inner leaves get the group prefix.
+        assert!(names.contains("Group.A"));
+        assert!(names.contains("Group.B"));
     }
 
     #[test]
