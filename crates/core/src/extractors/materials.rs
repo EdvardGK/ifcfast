@@ -33,6 +33,13 @@ pub struct MaterialTable {
     pub material_name: Vec<Option<String>>,
     pub layer_thickness_mm: Vec<Option<f64>>,
     pub category: Vec<Option<String>>,
+    /// Composition fraction for `role = "constituent"` rows — IFC4
+    /// `IfcMaterialConstituent.Fraction`, typically a unit-normalised
+    /// 0..1 value representing the volume / mass contribution of this
+    /// constituent within the parent set. `None` on all other roles
+    /// (layers have `layer_thickness_mm` instead; direct / list /
+    /// profile bindings don't have a per-row weight in the IFC schema).
+    pub fraction: Vec<Option<f64>>,
 }
 
 impl MaterialTable {
@@ -140,17 +147,13 @@ pub fn build(
             constituent_sets.insert(step_id, ref_list_at(&fields, 2));
         } else if type_name.eq_ignore_ascii_case(b"IFCMATERIALCONSTITUENT") {
             // IFC4: (Name, Description, Material, Fraction, Category)
-            // Phase 1 captures the IfcMaterial ref and the optional
-            // name/category overrides — same shape as IfcMaterialLayer
-            // without the thickness. Fraction is intentionally dropped
-            // for now (no schema column yet); it'll resurface when the
-            // table grows a `fraction` field.
             let fields = split_top_level_args(args);
             let name_override = string_at(&fields, 0);
             let material_ref = match fields.get(2).copied().map(parse_field) {
                 Some(Field::Ref(id)) => Some(id),
                 _ => None,
             };
+            let fraction = number_at(&fields, 3);
             let category_override = string_at(&fields, 4);
             constituents.insert(
                 step_id,
@@ -158,6 +161,7 @@ pub fn build(
                     material_ref,
                     name_override,
                     category_override,
+                    fraction,
                 },
             );
         } else if type_name.eq_ignore_ascii_case(b"IFCMATERIALPROFILESET") {
@@ -170,6 +174,9 @@ pub fn build(
             // cross-section shape — parsed by the mesh extruder, not
             // by us. We carry only the material binding plus name and
             // category overrides, same shape as IfcMaterialConstituent.
+            // Priority (arg 4) is intentionally dropped — it's a
+            // stacking order for composite profiles, not a fraction,
+            // and we don't yet have a column for it.
             let fields = split_top_level_args(args);
             let name_override = string_at(&fields, 0);
             let material_ref = match fields.get(2).copied().map(parse_field) {
@@ -183,6 +190,7 @@ pub fn build(
                     material_ref,
                     name_override,
                     category_override,
+                    fraction: None,
                 },
             );
         } else if type_name.eq_ignore_ascii_case(b"IFCMATERIALPROFILESETUSAGE") {
@@ -224,7 +232,7 @@ pub fn build(
 
         // Resolve `relating_id` against each known material container type.
         if let Some(mat) = materials.get(&relating_id) {
-            push_row(&mut out, guid, "direct", -1, mat.name.clone(), None, mat.category.clone());
+            push_row(&mut out, guid, "direct", -1, mat.name.clone(), None, mat.category.clone(), None);
             continue;
         }
         if let Some(list) = material_lists.get(&relating_id) {
@@ -232,7 +240,7 @@ pub fn build(
                 if let Some(mat) = materials.get(mid) {
                     push_row(
                         &mut out, guid, "list", i as i32,
-                        mat.name.clone(), None, mat.category.clone(),
+                        mat.name.clone(), None, mat.category.clone(), None,
                     );
                 }
             }
@@ -252,7 +260,7 @@ pub fn build(
                         .or_else(|| mat.and_then(|m| m.category.clone()));
                     push_row(
                         &mut out, guid, "constituent", i as i32,
-                        name, None, category,
+                        name, None, category, c.fraction,
                     );
                 }
             }
@@ -279,7 +287,7 @@ pub fn build(
                         .or_else(|| mat.and_then(|m| m.category.clone()));
                     push_row(
                         &mut out, guid, "profile", i as i32,
-                        name, None, category,
+                        name, None, category, None,
                     );
                 }
             }
@@ -305,7 +313,7 @@ pub fn build(
                         .or_else(|| mat.and_then(|m| m.category.clone()));
                     push_row(
                         &mut out, guid, "layer", i as i32,
-                        name, layer.thickness_mm, category,
+                        name, layer.thickness_mm, category, None,
                     );
                 }
             }
@@ -313,12 +321,13 @@ pub fn build(
         }
         // Unknown relating type (constituent set, profile set, etc.) — record
         // the GUID with a placeholder so the row count reflects reality.
-        push_row(&mut out, guid, "unknown", -1, None, None, None);
+        push_row(&mut out, guid, "unknown", -1, None, None, None, None);
     }
 
     out
 }
 
+#[allow(clippy::too_many_arguments)]
 fn push_row(
     out: &mut MaterialTable,
     guid: &str,
@@ -327,6 +336,7 @@ fn push_row(
     name: Option<String>,
     thickness: Option<f64>,
     category: Option<String>,
+    fraction: Option<f64>,
 ) {
     out.guid.push(guid.to_string());
     out.role.push(role);
@@ -334,6 +344,7 @@ fn push_row(
     out.material_name.push(name);
     out.layer_thickness_mm.push(thickness);
     out.category.push(category);
+    out.fraction.push(fraction);
 }
 
 struct MaterialRecord {
@@ -352,6 +363,10 @@ struct ConstituentRecord {
     material_ref: Option<u64>,
     name_override: Option<String>,
     category_override: Option<String>,
+    /// IfcMaterialConstituent.Fraction. None on IfcMaterialProfile,
+    /// which reuses this struct but has Priority (an integer 0-100)
+    /// at a different arg index that we don't currently capture.
+    fraction: Option<f64>,
 }
 
 fn string_at(fields: &[&[u8]], idx: usize) -> Option<String> {
@@ -556,6 +571,20 @@ END-ISO-10303-21;
             .collect();
         assert!(cats.contains("Bulk"));
         assert!(cats.contains("Reinforcement"));
+
+        // Fraction column: 0.97 concrete + 0.03 rebar — the whole point
+        // of constituent sets vs. plain material lists. Pre-fix this
+        // information was discarded.
+        let fractions: Vec<f64> = t.fraction.iter().filter_map(|f| *f).collect();
+        assert_eq!(fractions.len(), 2);
+        assert!(fractions.iter().any(|&f| (f - 0.97).abs() < 1e-6));
+        assert!(fractions.iter().any(|&f| (f - 0.03).abs() < 1e-6));
+        // Fractions across a constituent set should sum to ~1.0.
+        let sum: f64 = fractions.iter().sum();
+        assert!(
+            (sum - 1.0).abs() < 1e-6,
+            "constituent fractions should sum to 1.0, got {sum}"
+        );
     }
 
     #[test]

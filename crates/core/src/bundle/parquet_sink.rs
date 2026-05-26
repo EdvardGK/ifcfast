@@ -299,6 +299,9 @@ fn build_instance_schema() -> Schema {
         Field::new("name", DataType::Utf8, true),
         Field::new("thickness_mm", DataType::Float64, true),
         Field::new("category", DataType::Utf8, true),
+        // Composition fraction for constituent rows; null otherwise.
+        // See `crate::extractors::materials::MaterialTable::fraction`.
+        Field::new("fraction", DataType::Float64, true),
     ]);
     let pset_fields = Fields::from(vec![
         Field::new("set_name", DataType::Utf8, false),
@@ -587,6 +590,11 @@ fn build_instance_batch(
                     m.field_builder::<StringBuilder>(4).unwrap(),
                     entry.category.as_deref(),
                 );
+                let fr = m.field_builder::<Float64Builder>(5).unwrap();
+                match entry.fraction {
+                    Some(v) => fr.append_value(v),
+                    None => fr.append_null(),
+                }
                 m.append(true);
             }
             materials.append(true);

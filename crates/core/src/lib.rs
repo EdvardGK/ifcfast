@@ -292,6 +292,7 @@ mod python {
         out.set_item("role", PyList::new_bound(py, &mats.role))?;
         out.set_item("layer_index", PyList::new_bound(py, &mats.layer_index))?;
         out.set_item("material_name", PyList::new_bound(py, &mats.material_name))?;
+        out.set_item("fraction", PyList::new_bound(py, &mats.fraction))?;
         out.set_item(
             "layer_thickness_mm",
             PyList::new_bound(py, &mats.layer_thickness_mm),
@@ -413,6 +414,7 @@ mod python {
                 PyList::new_bound(py, &materials.layer_thickness_mm),
             )?;
             d.set_item("category", PyList::new_bound(py, &materials.category))?;
+            d.set_item("fraction", PyList::new_bound(py, &materials.fraction))?;
             out.set_item("materials", d)?;
         }
         {

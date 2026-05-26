@@ -48,7 +48,12 @@ _HASH_TAIL_BYTES = 4 * 1024 * 1024
 #       `mesh_quality` (Utf8, "closed"/"open_shell"/"degenerate")
 #       columns. Old caches lack these and would KeyError on Python
 #       readers that select them.
-_CACHE_SCHEMA_VERSION = 3
+#   4 — v0.4.6: materials.parquet gains `fraction` (Float64, nullable)
+#       — populated for `role="constituent"` rows with the IFC4
+#       IfcMaterialConstituent.Fraction value. Lets composite-material
+#       analytics ("what % of this RC beam is rebar?") work without a
+#       separate raw-IFC re-parse.
+_CACHE_SCHEMA_VERSION = 4
 
 _FIELD_RE = re.compile(r"\(\s*(.*?)\s*\)\s*;", re.DOTALL)
 

@@ -70,6 +70,11 @@ pub struct MaterialEntry {
     pub name: Option<Arc<str>>,
     pub thickness_mm: Option<f64>,
     pub category: Option<Arc<str>>,
+    /// Composition fraction for `role = "constituent"` rows (IFC4
+    /// `IfcMaterialConstituent.Fraction`, typically a unit-normalised
+    /// 0..1 weight). `None` for all other roles. See
+    /// [`crate::extractors::materials::MaterialTable::fraction`].
+    pub fraction: Option<f64>,
 }
 
 /// One quantity (length/area/volume/count) on a product.
@@ -397,14 +402,18 @@ impl Bundle {
             .zip(mat_table.layer_index.into_iter())
             .zip(mat_table.material_name.into_iter())
             .zip(mat_table.layer_thickness_mm.into_iter())
-            .zip(mat_table.category.into_iter());
-        for (((((guid, role), layer_index), material_name), thickness_mm), category) in mat_iter {
+            .zip(mat_table.category.into_iter())
+            .zip(mat_table.fraction.into_iter());
+        for ((((((guid, role), layer_index), material_name), thickness_mm), category), fraction) in
+            mat_iter
+        {
             materials_by_guid.entry(guid).or_default().push(MaterialEntry {
                 role,
                 layer_index,
                 name: intern_opt(&mut str_cache, material_name),
                 thickness_mm,
                 category: intern_opt(&mut str_cache, category),
+                fraction,
             });
         }
 
