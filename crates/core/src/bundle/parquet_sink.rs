@@ -58,6 +58,14 @@ pub struct ParquetSink<'a> {
     pending_insts: Vec<InstanceRecord>,
     products_written: usize,
     reps_written: usize,
+    /// First error from an `on_product` flush, if any. Set when a
+    /// row-group flush fails mid-stream and surfaced from `finish()`.
+    /// The `ProductSink` trait can't return `Result` from `on_product`,
+    /// so we stash the error here and short-circuit subsequent
+    /// emissions: every following product is dropped and `finish()`
+    /// returns the original error rather than appending more rows
+    /// behind it.
+    first_error: Option<parquet::errors::ParquetError>,
 }
 
 impl<'a> ParquetSink<'a> {
@@ -110,6 +118,7 @@ impl<'a> ParquetSink<'a> {
             pending_insts: Vec::with_capacity(DEFAULT_ROW_GROUP_SIZE),
             products_written: 0,
             reps_written: 0,
+            first_error: None,
         })
     }
 
@@ -131,7 +140,22 @@ impl<'a> ParquetSink<'a> {
 
     /// Drain pending records, write final row groups, close both files.
     /// Returns `(products_written, reps_written)`.
+    ///
+    /// If a row-group flush failed mid-stream during `on_product`, that
+    /// first error is surfaced here — the trait can't return `Result`
+    /// from `on_product` itself, so the sink stashes the error and the
+    /// caller learns about it at close time. Subsequent `on_product`
+    /// calls after the first failure are no-ops so the streaming pass
+    /// terminates cleanly without writing more partial rows.
     pub fn finish(mut self) -> parquet::errors::Result<(usize, usize)> {
+        if let Some(err) = self.first_error.take() {
+            // Best-effort close of the files we've half-written. Drop
+            // these results — the prior streaming error is what the
+            // caller needs to see.
+            let _ = self.rep_writer.close();
+            let _ = self.inst_writer.close();
+            return Err(err);
+        }
         if !self.pending_reps.is_empty() {
             self.flush_reps()?;
         }
@@ -174,6 +198,13 @@ impl ProductSink for ParquetSink<'_> {
     }
 
     fn on_product(&mut self, mesh: ProductMesh) {
+        // Short-circuit if a prior flush failed: the writer is now in
+        // an indeterminate state and pushing more rows just delays the
+        // eventual `finish()` error. Drop everything quietly.
+        if self.first_error.is_some() {
+            return;
+        }
+
         let semantics = self.bundle.semantics_for(&mesh.guid);
         // IFC project's linear-unit-to-metres factor (the indexer
         // resolves this from IfcSIUnit + IfcConversionBasedUnit at
@@ -192,7 +223,10 @@ impl ProductSink for ParquetSink<'_> {
                 self.reps_written += 1;
                 if self.pending_reps.len() >= self.row_group_size {
                     if let Err(e) = self.flush_reps() {
-                        panic!("parquet rep row-group flush failed: {e}");
+                        self.first_error = Some(parquet::errors::ParquetError::General(
+                            format!("rep row-group flush failed: {e}"),
+                        ));
+                        return;
                     }
                 }
             }
@@ -202,7 +236,9 @@ impl ProductSink for ParquetSink<'_> {
         self.products_written += 1;
         if self.pending_insts.len() >= self.row_group_size {
             if let Err(e) = self.flush_insts() {
-                panic!("parquet instance row-group flush failed: {e}");
+                self.first_error = Some(parquet::errors::ParquetError::General(
+                    format!("instance row-group flush failed: {e}"),
+                ));
             }
         }
     }
@@ -694,15 +730,24 @@ fn build_instance_batch(
 }
 
 fn list_struct_fields(schema: &SchemaRef, list_col: &str) -> Fields {
+    // These three `expect`s assert invariants between this file's
+    // `build_*_schema` constructors (which declare the column types)
+    // and `build_*_batch` callers (which read them back). They can
+    // only fire if someone edits one side without the other — i.e.,
+    // a programmer error in this module, not a runtime data error.
+    // Panicking is the right behaviour: the writer is internally
+    // inconsistent and continuing would corrupt the Parquet output.
     let field = schema
         .field_with_name(list_col)
-        .unwrap_or_else(|_| panic!("schema missing list column {list_col}"));
+        .unwrap_or_else(|_| panic!("internal: schema missing list column {list_col}"));
     match field.data_type() {
         DataType::List(inner) => match inner.data_type() {
             DataType::Struct(fields) => fields.clone(),
-            other => panic!("{list_col} list item is not a struct: {other:?}"),
+            other => panic!(
+                "internal: {list_col} list item is not a struct: {other:?}"
+            ),
         },
-        other => panic!("{list_col} is not a List: {other:?}"),
+        other => panic!("internal: {list_col} is not a List: {other:?}"),
     }
 }
 
