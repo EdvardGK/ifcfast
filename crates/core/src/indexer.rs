@@ -103,6 +103,74 @@ const UNIT_ASSIGN_TYPE: &[u8] = b"IFCUNITASSIGNMENT";
 const VOIDS_ELEMENT_TYPE: &[u8] = b"IFCRELVOIDSELEMENT";
 const DEFINES_BY_TYPE_TYPE: &[u8] = b"IFCRELDEFINESBYTYPE";
 
+/// Extract the IFC project's linear-unit-to-metres scale by walking
+/// the entity table for `IfcUnitAssignment` + `IfcSIUnit`. Returns
+/// `None` when no SI LENGTHUNIT is declared — caller should default to
+/// `1.0` (metres) in that case.
+///
+/// Mirrors the unit-scale resolution already done inside [`index`],
+/// extracted here so callers that build only the extractor tables
+/// (e.g. `extract_all` in the Python wheel) can pay for one cheap unit
+/// walk instead of an entire indexer pass.
+pub(crate) fn extract_unit_scale(table: &crate::entity_table::EntityTable) -> Option<f64> {
+    use crate::lexer::{parse_field, parse_ref_list, split_top_level_args, Field};
+
+    let mut si_units: HashMap<u64, (String, String, String)> = HashMap::new();
+    let mut unit_assignment_refs: Vec<u64> = Vec::new();
+
+    for (step_id, type_name, args) in table.iter() {
+        if type_name == SI_UNIT_TYPE {
+            let fields = split_top_level_args(args);
+            let ut = enum_at(&fields, 1).unwrap_or_default();
+            let prefix = enum_at(&fields, 2).unwrap_or_default();
+            let name = enum_at(&fields, 3).unwrap_or_default();
+            si_units.insert(step_id, (ut, prefix, name));
+        } else if type_name == UNIT_ASSIGN_TYPE && unit_assignment_refs.is_empty() {
+            let fields = split_top_level_args(args);
+            if let Some(f) = fields.first() {
+                if let Field::List(body) = parse_field(f) {
+                    unit_assignment_refs = parse_ref_list(body);
+                }
+            }
+        }
+    }
+
+    for unit_ref in &unit_assignment_refs {
+        if let Some((ut, prefix, name)) = si_units.get(unit_ref) {
+            if ut.eq_ignore_ascii_case("LENGTHUNIT") {
+                let base = match name.as_str() {
+                    "METRE" | "METER" => 1.0,
+                    "FOOT" => 0.3048,
+                    "INCH" => 0.0254,
+                    _ => continue,
+                };
+                let scale = match prefix.as_str() {
+                    "" => base,
+                    "EXA" => base * 1e18,
+                    "PETA" => base * 1e15,
+                    "TERA" => base * 1e12,
+                    "GIGA" => base * 1e9,
+                    "MEGA" => base * 1e6,
+                    "KILO" => base * 1e3,
+                    "HECTO" => base * 1e2,
+                    "DECA" => base * 10.0,
+                    "DECI" => base * 1e-1,
+                    "CENTI" => base * 1e-2,
+                    "MILLI" => base * 1e-3,
+                    "MICRO" => base * 1e-6,
+                    "NANO" => base * 1e-9,
+                    "PICO" => base * 1e-12,
+                    "FEMTO" => base * 1e-15,
+                    "ATTO" => base * 1e-18,
+                    _ => base,
+                };
+                return Some(scale);
+            }
+        }
+    }
+    None
+}
+
 /// Canonical "should the mesher walk this entity as a product?" check.
 /// Union of [`PRODUCT_TYPES`] + IFCSPACE. Spaces are *not* in
 /// `PRODUCT_TYPES` (the indexer dispatches them as a separate

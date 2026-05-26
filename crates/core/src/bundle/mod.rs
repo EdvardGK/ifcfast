@@ -347,7 +347,7 @@ impl Bundle {
         // (set_name, prop_name, …) pass through `intern` so duplicate
         // values share one `Arc<str>`.
         let psets_table = psets::build(&table, &step_to_guid);
-        let mat_table = materials::build(&table, &step_to_guid);
+        let mat_table = materials::build(&table, &step_to_guid, idx.unit_scale.unwrap_or(1.0));
         let qty_table = quantities::build(&table, &step_to_guid);
         let cls_table = classifications::build(&table, &step_to_guid);
 

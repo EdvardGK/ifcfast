@@ -288,7 +288,10 @@ mod python {
         let step_to_guid = build_guid_index(&table);
         let guid_ms = t_guids.elapsed().as_secs_f64() * 1000.0;
         let t_mat = Instant::now();
-        let mats = py.allow_threads(|| crate::extractors::materials::build(&table, &step_to_guid));
+        let mats = py.allow_threads(|| {
+            let unit_scale = crate::indexer::extract_unit_scale(&table).unwrap_or(1.0);
+            crate::extractors::materials::build(&table, &step_to_guid, unit_scale)
+        });
         let mat_ms = t_mat.elapsed().as_secs_f64() * 1000.0;
 
         let t_marshal = Instant::now();
@@ -365,6 +368,12 @@ mod python {
         let (psets, quantities, materials, classifications,
              pset_ms, qto_ms, mat_ms, cls_ms) =
             py.allow_threads(|| {
+                // Materials needs the project's linear-unit scale to
+                // normalize LayerThickness to mm. Cheap walk over the
+                // table for IfcUnitAssignment + IfcSIUnit only — much
+                // less work than a full indexer pass.
+                let unit_scale =
+                    crate::indexer::extract_unit_scale(&table).unwrap_or(1.0);
                 let t = Instant::now();
                 let p = crate::extractors::psets::build(&table, &step_to_guid);
                 let pt = t.elapsed().as_secs_f64() * 1000.0;
@@ -372,7 +381,7 @@ mod python {
                 let q = crate::extractors::quantities::build(&table, &step_to_guid);
                 let qt = t.elapsed().as_secs_f64() * 1000.0;
                 let t = Instant::now();
-                let m = crate::extractors::materials::build(&table, &step_to_guid);
+                let m = crate::extractors::materials::build(&table, &step_to_guid, unit_scale);
                 let mt = t.elapsed().as_secs_f64() * 1000.0;
                 let t = Instant::now();
                 let c = crate::extractors::classifications::build(&table, &step_to_guid);

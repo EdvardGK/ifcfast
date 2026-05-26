@@ -41,9 +41,24 @@ impl MaterialTable {
     }
 }
 
+/// Build the material table. `unit_scale` is the IFC project's
+/// linear-unit-to-metres factor as reported by the indexer (0.001 for
+/// millimetre files, 1.0 for metre files); pass `1.0` when no value is
+/// available — that's correct for the common case of an authored mm
+/// file with the SI unit declaration missing, and merely wrong by a
+/// fixed factor in the rare alternative.
+///
+/// The `LayerThickness` IFC field carries a raw value in the project's
+/// linear unit. The output column is named `layer_thickness_mm` so we
+/// scale at parse time: `raw * unit_scale * 1000` gives millimetres
+/// regardless of the source unit. Pre-fix this column held the raw
+/// value (e.g. `0.003` for a 3 mm layer on a metres-authored file like
+/// Duplex), making downstream code that trusted the name silently
+/// wrong by 1000×.
 pub fn build(
     table: &EntityTable,
     product_step_to_guid: &HashMap<u64, String>,
+    unit_scale: f64,
 ) -> MaterialTable {
     // Pass 1: index every material-related entity by step_id so we can
     //         resolve refs cheaply during the second pass.
@@ -72,7 +87,10 @@ pub fn build(
                 Some(Field::Ref(id)) => Some(id),
                 _ => None,
             };
-            let thickness = number_at(&fields, 1);
+            // IFC stores LayerThickness in the project's linear unit;
+            // normalize to mm via the indexer-derived `unit_scale`
+            // (raw-to-metres factor) so the output column matches its name.
+            let thickness = number_at(&fields, 1).map(|t| t * unit_scale * 1000.0);
             // IFC4 layer-name overrides Material.Name when present.
             let name_override = string_at(&fields, 3);
             let category_override = string_at(&fields, 5);
@@ -233,4 +251,105 @@ fn parse_ref_list(body: &[u8]) -> Vec<u64> {
             _ => None,
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    /// Build a tiny IFC4 buffer with one wall whose material assignment
+    /// is a single-layer IfcMaterialLayerSet. The IFC project's
+    /// LENGTHUNIT is parameterised so we can verify the same raw
+    /// `LayerThickness` token (`200.`) lands as 200 mm on a mm-authored
+    /// file and 200 000 mm on a metre-authored file. The "200" reads
+    /// as 200 mm in a mm file and as 200 m in a metre file, so the
+    /// 1000× difference is the unit normalisation working correctly.
+    fn build_buf(prefix: &str, raw_thickness: f32) -> String {
+        format!(
+            r#"ISO-10303-21;
+HEADER;
+FILE_DESCRIPTION(('ViewDefinition [ReferenceView]'),'2;1');
+FILE_NAME('mat_unit.ifc','2026-05-26T00:00:00',('test'),('test'),'ifcfast','ifcfast','');
+FILE_SCHEMA(('IFC4'));
+ENDSEC;
+DATA;
+#1=IFCPROJECT('0Test000000000000000001',$,'p',$,$,$,$,(#5),#2);
+#2=IFCUNITASSIGNMENT((#3));
+#3=IFCSIUNIT(*,.LENGTHUNIT.,{prefix},.METRE.);
+#5=IFCGEOMETRICREPRESENTATIONCONTEXT($,'Model',3,1.0E-5,#6,$);
+#6=IFCAXIS2PLACEMENT3D(#7,$,$);
+#7=IFCCARTESIANPOINT((0.,0.,0.));
+#10=IFCWALL('1Wall00000000000000001',$,'W',$,$,$,$,'t',.STANDARD.);
+#20=IFCMATERIAL('Concrete');
+#21=IFCMATERIALLAYER(#20,{raw_thickness},$);
+#22=IFCMATERIALLAYERSET((#21),'WallSet');
+#30=IFCRELASSOCIATESMATERIAL('2Rel00000000000000001',$,$,$,(#10),#22);
+ENDSEC;
+END-ISO-10303-21;
+"#
+        )
+    }
+
+    fn run(buf: &str, unit_scale: f64) -> Vec<f64> {
+        let table = crate::entity_table::EntityTable::build(buf.as_bytes());
+        let mut step_to_guid: HashMap<u64, String> = HashMap::new();
+        for (sid, _t, args) in table.iter() {
+            let fields = split_top_level_args(args);
+            if let Some(first) = fields.first() {
+                if let Field::String(s) = parse_field(first) {
+                    if s.len() == 22 {
+                        step_to_guid.insert(sid, s);
+                    }
+                }
+            }
+        }
+        let mat = build(&table, &step_to_guid, unit_scale);
+        mat.layer_thickness_mm.iter().flatten().copied().collect()
+    }
+
+    #[test]
+    fn layer_thickness_normalised_to_mm_for_mm_file() {
+        // Millimetre file: unit_scale = 0.001 m/unit. Raw "200" reads
+        // as 200 mm. After scaling, output should be 200 mm.
+        let buf = build_buf(".MILLI.", 200.0);
+        let v = run(&buf, 0.001);
+        assert_eq!(v.len(), 1, "expected one material layer, got {}", v.len());
+        assert!(
+            (v[0] - 200.0).abs() < 1e-6,
+            "expected 200 mm for mm file, got {}",
+            v[0]
+        );
+    }
+
+    #[test]
+    fn layer_thickness_normalised_to_mm_for_metres_file() {
+        // Metres file: unit_scale = 1.0 m/unit. Raw "0.2" reads as
+        // 0.2 m = 200 mm. After scaling, output should be 200 mm.
+        let buf = build_buf("$", 0.2);
+        let v = run(&buf, 1.0);
+        assert_eq!(v.len(), 1);
+        assert!(
+            (v[0] - 200.0).abs() < 1e-6,
+            "expected 200 mm for metres file with 0.2 m raw, got {}",
+            v[0]
+        );
+    }
+
+    #[test]
+    fn pre_fix_metres_file_would_have_returned_raw_value() {
+        // Sanity check on the test setup: feeding unit_scale = 1.0
+        // with raw = 200 (a metres file naming the raw value 200)
+        // gives 200 * 1.0 * 1000 = 200 000 mm = 200 m. Reasonable
+        // for a typical "huge length" misread in metre files. Pre-fix
+        // the column would have stored raw (200) — silently a 1000x
+        // off for 0.001 / 1000 unit_scales.
+        let buf = build_buf("$", 200.0);
+        let v = run(&buf, 1.0);
+        assert!(
+            (v[0] - 200_000.0).abs() < 1e-3,
+            "raw 200 in a metre file scales to 200 000 mm, got {}",
+            v[0]
+        );
+    }
 }
