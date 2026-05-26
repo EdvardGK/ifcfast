@@ -163,6 +163,16 @@ impl<'a> ParquetSink<'a> {
 }
 
 impl ProductSink for ParquetSink<'_> {
+    fn wants_geometryless(&self) -> bool {
+        // Substrate consumers need every IfcProduct as an instance row —
+        // identity, placement, psets, materials, classifications — even
+        // when the file has no body geometry for it. `pair_split` already
+        // returns `rep_id = None` for empty meshes, and the instance
+        // schema's `rep_id` column is nullable, so this just flips the
+        // upstream filter so those products reach us.
+        true
+    }
+
     fn on_product(&mut self, mesh: ProductMesh) {
         let semantics = self.bundle.semantics_for(&mesh.guid);
         // IFC project's linear-unit-to-metres factor (the indexer

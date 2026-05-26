@@ -22,7 +22,11 @@ use crate::lexer::{
 /// IFC4 building elements. Unknown types simply don't appear in the
 /// product table — they're still counted in `all_entity_counts` so the
 /// caller can spot a missing type.
-const PRODUCT_TYPES: &[&[u8]] = &[
+///
+/// `pub(crate)` so the mesh dispatcher can ask the canonical question
+/// "is this entity a meshable product?" instead of carrying its own
+/// permissive blacklist. See [`is_meshable_product`].
+pub(crate) const PRODUCT_TYPES: &[&[u8]] = &[
     // Walls
     b"IFCWALL", b"IFCWALLSTANDARDCASE", b"IFCWALLELEMENTEDCASE", b"IFCCURTAINWALL",
     // Slabs / plates
@@ -90,7 +94,7 @@ const STOREY_TYPES: &[&[u8]] = &[b"IFCBUILDINGSTOREY"];
 const SITE_TYPE: &[u8] = b"IFCSITE";
 const BUILDING_TYPE: &[u8] = b"IFCBUILDING";
 const PROJECT_TYPE: &[u8] = b"IFCPROJECT";
-const SPACE_TYPE: &[u8] = b"IFCSPACE";
+pub(crate) const SPACE_TYPE: &[u8] = b"IFCSPACE";
 const APPLICATION_TYPE: &[u8] = b"IFCAPPLICATION";
 const CONTAINED_TYPE: &[u8] = b"IFCRELCONTAINEDINSPATIALSTRUCTURE";
 const AGGREGATES_TYPE: &[u8] = b"IFCRELAGGREGATES";
@@ -98,6 +102,34 @@ const SI_UNIT_TYPE: &[u8] = b"IFCSIUNIT";
 const UNIT_ASSIGN_TYPE: &[u8] = b"IFCUNITASSIGNMENT";
 const VOIDS_ELEMENT_TYPE: &[u8] = b"IFCRELVOIDSELEMENT";
 const DEFINES_BY_TYPE_TYPE: &[u8] = b"IFCRELDEFINESBYTYPE";
+
+/// Canonical "should the mesher walk this entity as a product?" check.
+/// Union of [`PRODUCT_TYPES`] + IFCSPACE. Spaces are *not* in
+/// `PRODUCT_TYPES` (the indexer dispatches them as a separate
+/// `EntityKind::Space` for storey-of tracking) but they DO have body
+/// geometry and need to appear in the substrate's instance table — so
+/// the mesher's notion of "product" is a strict superset of the
+/// indexer's.
+///
+/// Replaces the mesh module's prior permissive "starts with IFC and not
+/// in this blacklist" filter, which leaked representation primitives
+/// like IfcPolyloop, IfcFaceOuterBound, IfcSphericalSurface, etc. into
+/// the streaming product loop. Those were silently dropped pre-fix
+/// (because they had no Representation reference); the silent-drop fix
+/// would have written them as junk instance rows without this filter
+/// tightening.
+pub(crate) fn is_meshable_product(type_name: &[u8]) -> bool {
+    static SET: OnceLock<HashSet<&'static [u8]>> = OnceLock::new();
+    SET.get_or_init(|| {
+        let mut s: HashSet<&'static [u8]> = HashSet::with_capacity(PRODUCT_TYPES.len() + 1);
+        for t in PRODUCT_TYPES {
+            s.insert(t);
+        }
+        s.insert(SPACE_TYPE);
+        s
+    })
+    .contains(type_name)
+}
 
 // ----------------------------------------------------------------------
 // Dispatch

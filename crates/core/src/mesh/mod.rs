@@ -216,6 +216,13 @@ pub struct MeshStats {
     pub products_seen: usize,
     pub products_meshed: usize,
     pub products_deferred: usize,
+    /// Products emitted to the sink with an empty geometry buffer
+    /// (`vertices.is_empty()`) because they have no `Representation`,
+    /// no body items, or every item was unhandled. Only nonzero when
+    /// the sink returns `wants_geometryless()` == `true`; for legacy
+    /// sinks (OBJ/glTF/drift) this stays 0 and the products are silently
+    /// deferred as before.
+    pub products_emitted_geometryless: usize,
     pub triangles: usize,
     pub by_source: HashMap<String, usize>,
     pub elapsed_ms: f64,
@@ -232,6 +239,22 @@ pub struct MeshStats {
 /// `Vec<ProductMesh>` did, and we're back at OOM on 1 GB files.
 pub trait ProductSink {
     fn on_product(&mut self, mesh: ProductMesh);
+
+    /// Whether this sink also wants emissions for products that produce
+    /// no body geometry (no `Representation`, no body items, or every
+    /// item was unhandled). Default: `false` — preserves the legacy
+    /// contract for batch OBJ/glTF/drift consumers that assume every
+    /// `ProductMesh` carries real triangles.
+    ///
+    /// The substrate [`crate::bundle::parquet_sink::ParquetSink`]
+    /// overrides this to `true`: products without geometry still carry
+    /// identity, placement, psets, materials, classifications, and a
+    /// type binding — dropping them violates the reveal-all stance and
+    /// hides 10–20% of the products in a typical AEC file from
+    /// substrate consumers.
+    fn wants_geometryless(&self) -> bool {
+        false
+    }
 }
 
 /// In-memory sink — used by callers that genuinely need every product
@@ -297,35 +320,56 @@ pub fn mesh_ifc_streaming<S: ProductSink>(buf: &[u8], sink: &mut S) -> MeshStats
             Some(Field::Ref(id)) => Some(id),
             _ => None,
         };
-        let repr_id = match fields.get(6).copied().map(parse_field) {
+        let repr_id_opt = match fields.get(6).copied().map(parse_field) {
             Some(Field::Ref(id)) => Some(id),
             _ => None,
         };
-        let repr_id = match repr_id {
+
+        // World placement is computable independent of geometry — we
+        // need it hoisted so geometryless emits still carry the
+        // authoring tool's `placement_origin` (where the element "is"
+        // even when it has no body).
+        let world = placement_id
+            .map(|pid| resolver.world(pid))
+            .unwrap_or(Mat4::IDENTITY);
+        let placement_origin = {
+            let p = world * Vec4::new(0.0, 0.0, 0.0, 1.0);
+            [p.x, p.y, p.z]
+        };
+        let entity_name = crate::indexer::type_name_uppercase_with_proper_case(type_name);
+
+        let repr_id = match repr_id_opt {
             Some(id) => id,
             None => {
-                stats.products_deferred += 1;
-                *stats.by_source.entry("no_representation".into()).or_insert(0) += 1;
+                emit_geometryless(
+                    sink,
+                    &mut stats,
+                    "no_representation",
+                    guid,
+                    entity_name,
+                    step_id,
+                    placement_origin,
+                    world,
+                );
                 continue;
             }
         };
 
-        let world = placement_id
-            .map(|pid| resolver.world(pid))
-            .unwrap_or(Mat4::IDENTITY);
-
         // Find a body/facetation Items list.
         let items = body_items(&table, repr_id);
         if items.is_empty() {
-            stats.products_deferred += 1;
-            *stats.by_source.entry("no_body_items".into()).or_insert(0) += 1;
+            emit_geometryless(
+                sink,
+                &mut stats,
+                "no_body_items",
+                guid,
+                entity_name,
+                step_id,
+                placement_origin,
+                world,
+            );
             continue;
         }
-
-        // Mesh each item, union into the product mesh. We keep a
-        // segment record per item so the consumer can color / filter /
-        // edit by operand role.
-        let entity_name = crate::indexer::type_name_uppercase_with_proper_case(type_name);
         let mut combined_v: Vec<f32> = Vec::new();
         let mut combined_i: Vec<u32> = Vec::new();
         let mut segments: Vec<MeshSegment> = Vec::new();
@@ -395,20 +439,25 @@ pub fn mesh_ifc_streaming<S: ProductSink>(buf: &[u8], sink: &mut S) -> MeshStats
         }
 
         if combined_i.is_empty() {
-            stats.products_deferred += 1;
             // Already credited to unhandled:IFCXXX above; record the
             // outer-level miss too so the consumer can correlate.
-            *stats.by_source.entry("item_unhandled".into()).or_insert(0) += 1;
+            emit_geometryless(
+                sink,
+                &mut stats,
+                "item_unhandled",
+                guid,
+                entity_name,
+                step_id,
+                placement_origin,
+                world,
+            );
             continue;
         }
 
-        // Capture placement origin in world space — what the authoring
-        // tool considers the "location" of this product. Compare against
+        // `placement_origin` was computed above; reused here so substrate
+        // consumers and the drift analyser see the same value regardless
+        // of which code path emitted the product. Compare against the
         // mesh centroid downstream to detect placement-vs-geometry drift.
-        let placement_origin = {
-            let p = world * Vec4::new(0.0, 0.0, 0.0, 1.0);
-            [p.x, p.y, p.z]
-        };
 
         // Dominant source = leaf tag of the first segment. Compound
         // tags ("boolean_first_operand|extrusion") collapse to their
@@ -444,6 +493,42 @@ pub fn mesh_ifc_streaming<S: ProductSink>(buf: &[u8], sink: &mut S) -> MeshStats
 
     stats.elapsed_ms = t_mesh.elapsed().as_secs_f64() * 1000.0;
     stats
+}
+
+/// Emit a `ProductMesh` with an empty geometry buffer when the sink
+/// opted in via [`ProductSink::wants_geometryless`]. Always bumps
+/// `products_deferred` and the per-reason `by_source` counter so the
+/// reveal-all stats stay accurate whether or not the sink wanted the
+/// emission. `reason` is one of `"no_representation"`, `"no_body_items"`,
+/// or `"item_unhandled"`.
+#[allow(clippy::too_many_arguments)]
+fn emit_geometryless<S: ProductSink>(
+    sink: &mut S,
+    stats: &mut MeshStats,
+    reason: &str,
+    guid: String,
+    entity_name: String,
+    ifc_id: u64,
+    placement_origin: [f32; 3],
+    world: Mat4,
+) {
+    stats.products_deferred += 1;
+    *stats.by_source.entry(reason.to_string()).or_insert(0) += 1;
+    if sink.wants_geometryless() {
+        stats.products_emitted_geometryless += 1;
+        sink.on_product(ProductMesh {
+            guid,
+            entity: entity_name,
+            ifc_id,
+            vertices: Vec::new(),
+            indices: Vec::new(),
+            source: "none",
+            segments: Vec::new(),
+            placement_origin,
+            parts: Vec::new(),
+            world_transform: world.to_cols_array(),
+        });
+    }
 }
 
 /// Mesh a single `IfcRepresentationItem`. Returns one or more fragments
@@ -657,74 +742,15 @@ pub(crate) fn representation_items(table: &EntityTable, repr_id: u64) -> Vec<u64
         .collect()
 }
 
+/// Delegate to the indexer's canonical product-type set
+/// ([`crate::indexer::is_meshable_product`]). Pre-fix this module
+/// maintained its own permissive "starts with IFC and not in this
+/// blacklist" filter — a leaky proxy that let representation primitives
+/// (IfcPolyloop, IfcFaceOuterBound, IfcSphericalSurface, ...) through
+/// to the streaming loop. With the silent-drop fix, that leakage would
+/// have written every such primitive as a junk instance row.
 fn is_product_type(type_name: &[u8]) -> bool {
-    // Reuse the indexer's PRODUCT_TYPES list — but exposing it cross-module
-    // would require pub-marking it. For now, a cheap "starts with IFC and is
-    // not in a known non-product set" check. We'll mesh anything that has a
-    // Representation; the body_items walk skips entities without one.
-    type_name.starts_with(b"IFC")
-        && !matches!(
-            type_name,
-            b"IFCCARTESIANPOINT"
-                | b"IFCDIRECTION"
-                | b"IFCAXIS2PLACEMENT2D"
-                | b"IFCAXIS2PLACEMENT3D"
-                | b"IFCLOCALPLACEMENT"
-                | b"IFCSHAPEREPRESENTATION"
-                | b"IFCPRODUCTDEFINITIONSHAPE"
-                | b"IFCREPRESENTATIONMAP"
-                | b"IFCMAPPEDITEM"
-                | b"IFCEXTRUDEDAREASOLID"
-                | b"IFCRECTANGLEPROFILEDEF"
-                | b"IFCROUNDEDRECTANGLEPROFILEDEF"
-                | b"IFCCIRCLEPROFILEDEF"
-                | b"IFCCIRCLEHOLLOWPROFILEDEF"
-                | b"IFCELLIPSEPROFILEDEF"
-                | b"IFCISHAPEPROFILEDEF"
-                | b"IFCLSHAPEPROFILEDEF"
-                | b"IFCUSHAPEPROFILEDEF"
-                | b"IFCTSHAPEPROFILEDEF"
-                | b"IFCZSHAPEPROFILEDEF"
-                | b"IFCARBITRARYCLOSEDPROFILEDEF"
-                | b"IFCARBITRARYPROFILEDEFWITHVOIDS"
-                | b"IFCCOMPOSITEPROFILEDEF"
-                | b"IFCPOLYLINE"
-                | b"IFCINDEXEDPOLYCURVE"
-                | b"IFCCARTESIANPOINTLIST2D"
-                | b"IFCCARTESIANPOINTLIST3D"
-                | b"IFCRELCONTAINEDINSPATIALSTRUCTURE"
-                | b"IFCRELAGGREGATES"
-                | b"IFCRELDEFINESBYPROPERTIES"
-                | b"IFCRELDEFINESBYTYPE"
-                | b"IFCRELASSOCIATESMATERIAL"
-                | b"IFCRELASSOCIATESCLASSIFICATION"
-                | b"IFCSIUNIT"
-                | b"IFCUNITASSIGNMENT"
-                | b"IFCOWNERHISTORY"
-                | b"IFCAPPLICATION"
-                | b"IFCPERSON"
-                | b"IFCORGANIZATION"
-                | b"IFCPERSONANDORGANIZATION"
-                | b"IFCGEOMETRICREPRESENTATIONCONTEXT"
-                | b"IFCGEOMETRICREPRESENTATIONSUBCONTEXT"
-                | b"IFCPROJECT"
-                | b"IFCSITE"
-                | b"IFCBUILDING"
-                | b"IFCBUILDINGSTOREY"
-                | b"IFCMATERIAL"
-                | b"IFCMATERIALLAYER"
-                | b"IFCMATERIALLAYERSET"
-                | b"IFCMATERIALLAYERSETUSAGE"
-                | b"IFCPROPERTYSET"
-                | b"IFCPROPERTYSINGLEVALUE"
-                | b"IFCQUANTITYAREA"
-                | b"IFCQUANTITYLENGTH"
-                | b"IFCQUANTITYVOLUME"
-                | b"IFCQUANTITYCOUNT"
-                | b"IFCELEMENTQUANTITY"
-                | b"IFCCARTESIANTRANSFORMATIONOPERATOR3D"
-                | b"IFCCARTESIANTRANSFORMATIONOPERATOR3DNONUNIFORM"
-        )
+    crate::indexer::is_meshable_product(type_name)
 }
 
 fn string_at(fields: &[&[u8]], idx: usize) -> Option<String> {

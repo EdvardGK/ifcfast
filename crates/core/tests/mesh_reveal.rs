@@ -7,7 +7,7 @@
 
 #![cfg(feature = "mesh")]
 
-use _core::mesh::{mesh_ifc, MeshFragment};
+use _core::mesh::{mesh_ifc, mesh_ifc_streaming, MeshFragment, ProductMesh, ProductSink};
 
 /// Synthetic IFC4 file with one IfcWall whose representation is an
 /// `IfcBooleanClippingResult(wall_extrusion, door_extrusion)`. After
@@ -625,4 +625,152 @@ fn geometric_curve_set_surfaces_as_curve_set_not_unhandled() {
         "curve_set triangles should be degenerate (zero area), got 2*area={}",
         area_x2
     );
+}
+
+/// Synthetic IFC4 file with three IfcSpace products that each exercise
+/// one of the three "no geometry" code paths in `mesh_ifc_streaming`:
+///
+/// - `#10` has `Representation = $` (no representation reference at all).
+/// - `#20` has a `IfcShapeRepresentation` whose `Items` list is empty.
+/// - `#30` has an `Items` list containing only a single
+///   `IfcSphericalSurface` — a representation item we don't tessellate,
+///   so it surfaces as `unhandled:IFCSPHERICALSURFACE` and `combined_i`
+///   ends empty.
+///
+/// Pre-fix all three were silently `continue`'d in the streaming loop
+/// — they never reached the sink, and `instances.parquet` never recorded
+/// their identity / psets / materials. The substrate sink opts in via
+/// `ProductSink::wants_geometryless() == true` to receive them as
+/// empty-geometry `ProductMesh` rows; legacy sinks (`VecSink`,
+/// OBJ/glTF/drift) keep the default `false` and stay unchanged.
+const GEOMETRYLESS_PRODUCTS_IFC: &str = r#"ISO-10303-21;
+HEADER;
+FILE_DESCRIPTION(('ViewDefinition [ReferenceView]'),'2;1');
+FILE_NAME('reveal_geometryless.ifc','2026-05-26T00:00:00',('test'),('skiplum'),'ifcfast','ifcfast','');
+FILE_SCHEMA(('IFC4'));
+ENDSEC;
+DATA;
+#1=IFCPROJECT('0Test000000000000000001',$,'p',$,$,$,$,(#5),#2);
+#2=IFCUNITASSIGNMENT((#3,#4));
+#3=IFCSIUNIT(*,.LENGTHUNIT.,.MILLI.,.METRE.);
+#4=IFCSIUNIT(*,.PLANEANGLEUNIT.,$,.RADIAN.);
+#5=IFCGEOMETRICREPRESENTATIONCONTEXT($,'Model',3,1.0E-5,#6,$);
+#6=IFCAXIS2PLACEMENT3D(#7,$,$);
+#7=IFCCARTESIANPOINT((0.,0.,0.));
+#15=IFCLOCALPLACEMENT($,#6);
+#10=IFCSPACE('1Spc0000000000000000001',$,'NoRep',$,$,#15,$,$,.ELEMENT.,.SPACE.,$);
+#21=IFCSHAPEREPRESENTATION(#5,'Body','Brep',());
+#22=IFCPRODUCTDEFINITIONSHAPE($,$,(#21));
+#20=IFCSPACE('2Spc0000000000000000001',$,'EmptyItems',$,$,#15,#22,$,.ELEMENT.,.SPACE.,$);
+#31=IFCSPHERICALSURFACE(#6,500.);
+#32=IFCSHAPEREPRESENTATION(#5,'Body','SurfaceModel',(#31));
+#33=IFCPRODUCTDEFINITIONSHAPE($,$,(#32));
+#30=IFCSPACE('3Spc0000000000000000001',$,'AllUnhandled',$,$,#15,#33,$,.ELEMENT.,.SPACE.,$);
+ENDSEC;
+END-ISO-10303-21;
+"#;
+
+/// Capturing sink that opts in to geometryless emissions — mirrors what
+/// `ParquetSink` does. Used to assert the three silent-drop sites all
+/// reach the sink when opt-in is on.
+#[derive(Default)]
+struct OptInSink {
+    products: Vec<ProductMesh>,
+}
+
+impl ProductSink for OptInSink {
+    fn on_product(&mut self, mesh: ProductMesh) {
+        self.products.push(mesh);
+    }
+    fn wants_geometryless(&self) -> bool {
+        true
+    }
+}
+
+#[test]
+fn geometryless_products_silent_drop_unless_sink_opts_in() {
+    // `is_product_type()` is a permissive "starts with IFC and not in
+    // the non-product blacklist" filter — it also lets through some
+    // representation items that the fixture happens to declare at the
+    // top level (e.g. the IfcSphericalSurface, which has no GUID and
+    // no Representation reference, so it lands in the same
+    // "no_representation" bucket as IfcSpace #10). That noise is a
+    // pre-existing scope cut, tracked separately; this test focuses on
+    // the silent-drop fix.
+    let (legacy_meshes, legacy_stats) =
+        mesh_ifc(GEOMETRYLESS_PRODUCTS_IFC.as_bytes());
+    assert_eq!(
+        legacy_meshes.len(),
+        0,
+        "legacy VecSink (wants_geometryless=false) must drop every \
+         geometryless product, got {} meshes",
+        legacy_meshes.len()
+    );
+    assert_eq!(legacy_stats.products_meshed, 0);
+    assert_eq!(legacy_stats.products_emitted_geometryless, 0);
+    assert_eq!(
+        legacy_stats.products_seen,
+        legacy_stats.products_deferred,
+        "every product seen must be accounted for in deferred"
+    );
+    // Reveal-all stance: each silent-drop reason is credited to its own
+    // bucket. IfcSpace #20 and #30 each hit exactly one of these.
+    assert_eq!(legacy_stats.by_source.get("no_body_items"), Some(&1));
+    assert_eq!(legacy_stats.by_source.get("item_unhandled"), Some(&1));
+    // IfcSpace #10 (no Representation) plus any top-level rep items
+    // the permissive filter let through — at least 1.
+    assert!(
+        *legacy_stats.by_source.get("no_representation").unwrap_or(&0) >= 1,
+        "no_representation bucket must include IfcSpace #10"
+    );
+
+    // Opt-in sink: every deferred product reaches the sink with empty
+    // vertex and index buffers. Identity and entity name survive.
+    let mut sink = OptInSink::default();
+    let opt_in_stats = mesh_ifc_streaming(GEOMETRYLESS_PRODUCTS_IFC.as_bytes(), &mut sink);
+    assert_eq!(opt_in_stats.products_meshed, 0);
+    assert_eq!(
+        opt_in_stats.products_emitted_geometryless,
+        opt_in_stats.products_deferred,
+        "opt-in sink must receive every deferred product"
+    );
+    assert_eq!(sink.products.len(), opt_in_stats.products_deferred);
+
+    for mesh in &sink.products {
+        assert!(
+            mesh.vertices.is_empty() && mesh.indices.is_empty(),
+            "geometryless emit must have empty vertex/index buffers, \
+             got {} verts / {} indices",
+            mesh.vertices.len(),
+            mesh.indices.len()
+        );
+        assert!(mesh.segments.is_empty());
+        assert!(mesh.parts.is_empty());
+        assert_eq!(mesh.source, "none");
+    }
+
+    // All three IfcSpace fixtures must reach the sink with their GUIDs
+    // and canonical entity name intact — that's the core fix.
+    let spaces_by_guid: std::collections::HashMap<&str, &ProductMesh> = sink
+        .products
+        .iter()
+        .filter(|m| m.entity == "IfcSpace")
+        .map(|m| (m.guid.as_str(), m))
+        .collect();
+    assert_eq!(
+        spaces_by_guid.len(),
+        3,
+        "expected 3 IfcSpace emissions, got {}",
+        spaces_by_guid.len()
+    );
+    for guid in [
+        "1Spc0000000000000000001",
+        "2Spc0000000000000000001",
+        "3Spc0000000000000000001",
+    ] {
+        assert!(
+            spaces_by_guid.contains_key(guid),
+            "missing IfcSpace GUID {guid}"
+        );
+    }
 }

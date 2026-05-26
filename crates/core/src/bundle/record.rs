@@ -317,7 +317,17 @@ pub fn pair_split(
     };
 
     let instance = InstanceRecord {
-        ifc_id: semantics.ifc_id,
+        // The Bundle's semantics map is keyed on the indexer's PRODUCT
+        // dispatch — entities that the indexer routes to other kinds
+        // (e.g. IfcSpace → `EntityKind::Space`) won't have a populated
+        // `semantics.ifc_id`. Fall back to the mesh's `ifc_id`, which
+        // is the STEP id captured directly from the entity-table walk
+        // and is always correct. Mirrors the `class` fallback below.
+        ifc_id: if semantics.ifc_id == 0 {
+            mesh.ifc_id
+        } else {
+            semantics.ifc_id
+        },
         guid: mesh.guid,
         class: if semantics.class.is_empty() {
             // Bundle didn't have a normalized class for this product
