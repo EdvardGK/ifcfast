@@ -75,6 +75,13 @@ pub fn build(
     // queued behind a `_CACHE_SCHEMA_VERSION` bump.
     let mut constituent_sets: HashMap<u64, Vec<u64>> = HashMap::with_capacity(256);
     let mut constituents: HashMap<u64, ConstituentRecord> = HashMap::with_capacity(2048);
+    // IFC4: IfcMaterialProfileSet → list of IfcMaterialProfile. Used
+    // for structural elements (steel beam with HEA200 profile +
+    // material grade). The profile shape itself (IfcIShapeProfileDef
+    // etc.) is parsed by the mesh module, not here — we only carry
+    // the material binding.
+    let mut profile_sets: HashMap<u64, Vec<u64>> = HashMap::with_capacity(256);
+    let mut profiles: HashMap<u64, ConstituentRecord> = HashMap::with_capacity(1024);
 
     // Collect rel-pairs: (related_object_step_ids, relating_material_ref)
     let mut rel_pairs: Vec<(u64, u64)> = Vec::with_capacity(8192);
@@ -153,6 +160,42 @@ pub fn build(
                     category_override,
                 },
             );
+        } else if type_name.eq_ignore_ascii_case(b"IFCMATERIALPROFILESET") {
+            // IFC4: (Name, Description, MaterialProfiles, CompositeProfile)
+            let fields = split_top_level_args(args);
+            profile_sets.insert(step_id, ref_list_at(&fields, 2));
+        } else if type_name.eq_ignore_ascii_case(b"IFCMATERIALPROFILE") {
+            // IFC4: (Name, Description, Material, Profile, Priority, Category)
+            // The Profile (arg 3) is an IfcProfileDef ref carrying the
+            // cross-section shape — parsed by the mesh extruder, not
+            // by us. We carry only the material binding plus name and
+            // category overrides, same shape as IfcMaterialConstituent.
+            let fields = split_top_level_args(args);
+            let name_override = string_at(&fields, 0);
+            let material_ref = match fields.get(2).copied().map(parse_field) {
+                Some(Field::Ref(id)) => Some(id),
+                _ => None,
+            };
+            let category_override = string_at(&fields, 5);
+            profiles.insert(
+                step_id,
+                ConstituentRecord {
+                    material_ref,
+                    name_override,
+                    category_override,
+                },
+            );
+        } else if type_name.eq_ignore_ascii_case(b"IFCMATERIALPROFILESETUSAGE") {
+            // IFC4: (ForProfileSet, CardinalPoint, ReferenceExtent)
+            // Same indirection pattern as IfcMaterialLayerSetUsage —
+            // the actual profile set lives at arg 0. Reuse the
+            // layer-set-usage map so the second pass's redirect logic
+            // doesn't need to special-case this; the usage→set wrap
+            // is identical.
+            let fields = split_top_level_args(args);
+            if let Some(Field::Ref(id)) = fields.first().copied().map(parse_field) {
+                layer_set_usages.insert(step_id, id);
+            }
         } else if type_name.eq_ignore_ascii_case(b"IFCRELASSOCIATESMATERIAL") {
             // (GlobalId, OwnerHistory, Name, Description, RelatedObjects, RelatingMaterial)
             let fields = split_top_level_args(args);
@@ -209,6 +252,33 @@ pub fn build(
                         .or_else(|| mat.and_then(|m| m.category.clone()));
                     push_row(
                         &mut out, guid, "constituent", i as i32,
+                        name, None, category,
+                    );
+                }
+            }
+            continue;
+        }
+        // Profile-set lookup. The relating ref may point at an
+        // IfcMaterialProfileSetUsage; the layer_set_usages map (now
+        // doubling as "any *_Usage indirection") resolves through.
+        let pset_id = layer_set_usages
+            .get(&relating_id)
+            .copied()
+            .unwrap_or(relating_id);
+        if let Some(profile_ids) = profile_sets.get(&pset_id) {
+            for (i, pid) in profile_ids.iter().enumerate() {
+                if let Some(p) = profiles.get(pid) {
+                    let mat = p.material_ref.and_then(|mid| materials.get(&mid));
+                    let name = p
+                        .name_override
+                        .clone()
+                        .or_else(|| mat.and_then(|m| m.name.clone()));
+                    let category = p
+                        .category_override
+                        .clone()
+                        .or_else(|| mat.and_then(|m| m.category.clone()));
+                    push_row(
+                        &mut out, guid, "profile", i as i32,
                         name, None, category,
                     );
                 }
@@ -517,6 +587,80 @@ END-ISO-10303-21;
         let t = run_full_table(buf);
         assert_eq!(t.len(), 1);
         assert_eq!(t.material_name[0].as_deref(), Some("Steel S355"));
+        assert_eq!(t.category[0].as_deref(), Some("Structural"));
+    }
+
+    #[test]
+    fn profile_set_resolves_via_usage_indirection() {
+        // Steel beam with an IfcMaterialProfileSetUsage → IfcMaterialProfileSet
+        // → IfcMaterialProfile chain. The most common structural-export
+        // pattern (one profile = one material on a structural member).
+        let buf = r#"ISO-10303-21;
+HEADER;
+FILE_DESCRIPTION(('ViewDefinition [ReferenceView]'),'2;1');
+FILE_NAME('profile.ifc','2026-05-26T00:00:00',('test'),('test'),'ifcfast','ifcfast','');
+FILE_SCHEMA(('IFC4'));
+ENDSEC;
+DATA;
+#1=IFCPROJECT('0Test000000000000000001',$,'p',$,$,$,$,(#5),#2);
+#2=IFCUNITASSIGNMENT((#3));
+#3=IFCSIUNIT(*,.LENGTHUNIT.,$,.METRE.);
+#5=IFCGEOMETRICREPRESENTATIONCONTEXT($,'Model',3,1.0E-5,#6,$);
+#6=IFCAXIS2PLACEMENT3D(#7,$,$);
+#7=IFCCARTESIANPOINT((0.,0.,0.));
+#10=IFCBEAM('1Beam00000000000000001',$,'B',$,$,$,$,'t',.STANDARD.);
+#20=IFCMATERIAL('Steel S355','Hot-rolled','Structural');
+#21=IFCISHAPEPROFILEDEF(.AREA.,'HEA200',$,200.,200.,6.5,10.0,18.0);
+#22=IFCMATERIALPROFILE('Web+Flanges',$,#20,#21,$,'Section');
+#23=IFCMATERIALPROFILESET('HEA200-S355',$,(#22),$);
+#24=IFCMATERIALPROFILESETUSAGE(#23,1,$);
+#25=IFCRELASSOCIATESMATERIAL('2Rel000000000000000001',$,$,$,(#10),#24);
+ENDSEC;
+END-ISO-10303-21;
+"#;
+        let t = run_full_table(buf);
+        assert_eq!(t.len(), 1, "expected 1 profile row, got {}", t.len());
+        assert_eq!(t.role[0], "profile");
+        assert_eq!(t.guid[0], "1Beam00000000000000001");
+        // Constituent's `Name` ("Web+Flanges") overrides the material's
+        // name, same precedence rule as layers / constituents.
+        assert_eq!(t.material_name[0].as_deref(), Some("Web+Flanges"));
+        assert_eq!(t.category[0].as_deref(), Some("Section"));
+    }
+
+    #[test]
+    fn profile_set_resolves_without_usage_indirection() {
+        // Some exports skip IfcMaterialProfileSetUsage and reference
+        // the profile set directly from IfcRelAssociatesMaterial. Both
+        // paths must work.
+        let buf = r#"ISO-10303-21;
+HEADER;
+FILE_DESCRIPTION(('ViewDefinition [ReferenceView]'),'2;1');
+FILE_NAME('profile2.ifc','2026-05-26T00:00:00',('test'),('test'),'ifcfast','ifcfast','');
+FILE_SCHEMA(('IFC4'));
+ENDSEC;
+DATA;
+#1=IFCPROJECT('0Test000000000000000001',$,'p',$,$,$,$,(#5),#2);
+#2=IFCUNITASSIGNMENT((#3));
+#3=IFCSIUNIT(*,.LENGTHUNIT.,$,.METRE.);
+#5=IFCGEOMETRICREPRESENTATIONCONTEXT($,'Model',3,1.0E-5,#6,$);
+#6=IFCAXIS2PLACEMENT3D(#7,$,$);
+#7=IFCCARTESIANPOINT((0.,0.,0.));
+#10=IFCCOLUMN('1Col000000000000000001',$,'C',$,$,$,$,'t',.STANDARD.);
+#20=IFCMATERIAL('Concrete C40/50',$,'Structural');
+#21=IFCCIRCLEPROFILEDEF(.AREA.,'Round-400',$,200.);
+#22=IFCMATERIALPROFILE($,$,#20,#21,$,$);
+#23=IFCMATERIALPROFILESET('Round Column',$,(#22),$);
+#24=IFCRELASSOCIATESMATERIAL('2Rel000000000000000001',$,$,$,(#10),#23);
+ENDSEC;
+END-ISO-10303-21;
+"#;
+        let t = run_full_table(buf);
+        assert_eq!(t.len(), 1);
+        assert_eq!(t.role[0], "profile");
+        // No override on the IfcMaterialProfile → falls through to the
+        // referenced IfcMaterial's Name + Category.
+        assert_eq!(t.material_name[0].as_deref(), Some("Concrete C40/50"));
         assert_eq!(t.category[0].as_deref(), Some("Structural"));
     }
 }
