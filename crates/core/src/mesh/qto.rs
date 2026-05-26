@@ -218,26 +218,30 @@ pub fn compute(vertices: &[f32], indices: &[u32], unit_scale: f32) -> MeshQto {
         }
 
         // Planar-surface bucket — quantize normal direction, accumulate area.
+        // Once we've migrated to overflow_buckets, it is the only source of
+        // truth — small_buckets stays empty thereafter.
         let key = quantize_normal(nx, ny, nz);
-        let mut placed = false;
-        for entry in small_buckets.iter_mut() {
-            if entry.0 == key {
-                entry.1 += area_raw;
-                placed = true;
-                break;
+        if !overflow_buckets.is_empty() {
+            *overflow_buckets.entry(key).or_insert(0.0) += area_raw;
+        } else {
+            let mut placed = false;
+            for entry in small_buckets.iter_mut() {
+                if entry.0 == key {
+                    entry.1 += area_raw;
+                    placed = true;
+                    break;
+                }
             }
-        }
-        if !placed {
-            if small_buckets.len() < 64 {
-                small_buckets.push((key, area_raw));
-            } else {
-                // Migrate to HashMap once the linear scan gets expensive.
-                if overflow_buckets.is_empty() {
+            if !placed {
+                if small_buckets.len() < 64 {
+                    small_buckets.push((key, area_raw));
+                } else {
+                    // Migrate to HashMap once the linear scan gets expensive.
                     for (k, v) in small_buckets.drain(..) {
                         overflow_buckets.insert(k, v);
                     }
+                    *overflow_buckets.entry(key).or_insert(0.0) += area_raw;
                 }
-                *overflow_buckets.entry(key).or_insert(0.0) += area_raw;
             }
         }
     }
@@ -387,5 +391,109 @@ mod tests {
         let q = compute(&[], &[], 1.0);
         assert_eq!(q.volume_m3, 0.0);
         assert_eq!(q.surface_count, 0);
+    }
+
+    /// 70 triangles, each with a unique face normal (third vertex rotated
+    /// slightly in the XY plane). Each triangle has the same area so the
+    /// bucket totals are all equal. Tests that surface_count is correct
+    /// and that per-surface areas sum to total surface_area_m2.
+    ///
+    /// If the overflow-bucket post-drain bug is present, keys pushed back
+    /// into small_buckets after the drain are silently dropped from the
+    /// assembled surface list, so surface_count will be < 70 and the
+    /// area sums will not match.
+    #[test]
+    fn many_unique_normals_overflow_buckets() {
+        // Build triangles whose face normals are spread across a 3D grid so
+        // that the quantizer (NORMAL_QUANT_SCALE=10) yields >64 distinct
+        // bucket keys. Iterate over a coarse (nx, ny, nz) lattice on the
+        // unit sphere; for each, synthesize a triangle whose normal equals
+        // that direction. Keep going until we have collected enough unique
+        // quantized keys to force overflow_buckets migration.
+        let mut directions: Vec<(f32, f32, f32)> = Vec::new();
+        let mut seen: std::collections::HashSet<(i32, i32, i32)> =
+            std::collections::HashSet::new();
+        // 0.15 step on each axis gives a grid coarse enough that every cell
+        // quantizes distinctly under the 0.1 scale, but fine enough to fill
+        // a hemisphere with >64 entries.
+        let step: f32 = 0.15;
+        let mut x = -1.0_f32;
+        while x <= 1.0 {
+            let mut y = -1.0_f32;
+            while y <= 1.0 {
+                let r2 = x * x + y * y;
+                if r2 <= 0.95 {
+                    let z = (1.0 - r2).sqrt();
+                    let inv = 1.0 / (x * x + y * y + z * z).sqrt();
+                    let n = (x * inv, y * inv, z * inv);
+                    let key = (
+                        (n.0 * NORMAL_QUANT_SCALE).round() as i32,
+                        (n.1 * NORMAL_QUANT_SCALE).round() as i32,
+                        (n.2 * NORMAL_QUANT_SCALE).round() as i32,
+                    );
+                    if seen.insert(key) {
+                        directions.push(n);
+                    }
+                }
+                y += step;
+            }
+            x += step;
+        }
+        // We need strictly more than 64 distinct quantized normals to force
+        // the migration. The grid above yields ~120 in practice.
+        assert!(
+            directions.len() > 64,
+            "test setup error: only {} distinct quantized normals; need >64 \
+             to trigger overflow_buckets migration",
+            directions.len()
+        );
+
+        // Build a triangle for each normal direction. Pick two orthogonal
+        // in-plane axes (u, v) for each n; the triangle (0, u, v) has
+        // face normal n.
+        let mut vertices: Vec<f32> = Vec::with_capacity(directions.len() * 9);
+        let mut indices: Vec<u32> = Vec::with_capacity(directions.len() * 3);
+        for (i, &(nx, ny, nz)) in directions.iter().enumerate() {
+            // Choose any axis not parallel to n, cross to get u, then v = n × u.
+            let helper = if nx.abs() < 0.9 {
+                (1.0, 0.0, 0.0)
+            } else {
+                (0.0, 1.0, 0.0)
+            };
+            let ux = ny * helper.2 - nz * helper.1;
+            let uy = nz * helper.0 - nx * helper.2;
+            let uz = nx * helper.1 - ny * helper.0;
+            let um = (ux * ux + uy * uy + uz * uz).sqrt();
+            let (ux, uy, uz) = (ux / um, uy / um, uz / um);
+            let vx = ny * uz - nz * uy;
+            let vy = nz * ux - nx * uz;
+            let vz = nx * uy - ny * ux;
+
+            let base = (i * 3) as u32;
+            vertices.extend_from_slice(&[0.0, 0.0, 0.0]);
+            vertices.extend_from_slice(&[ux, uy, uz]);
+            vertices.extend_from_slice(&[vx, vy, vz]);
+            indices.extend_from_slice(&[base, base + 1, base + 2]);
+        }
+
+        let q = compute(&vertices, &indices, 1.0);
+
+        // Every triangle's normal quantizes to a distinct key by
+        // construction, so surface_count must equal the input count.
+        assert_eq!(
+            q.surface_count, directions.len() as u32,
+            "surface_count: expected {}, got {}",
+            directions.len(),
+            q.surface_count
+        );
+
+        // The per-surface areas must sum to total surface_area_m2.
+        let surface_sum: f32 = q.surfaces.iter().map(|s| s.area_m2).sum();
+        assert!(
+            (surface_sum - q.surface_area_m2).abs() < 1e-3,
+            "surface area sum mismatch: surfaces sum to {surface_sum:.6}, \
+             total is {:.6}",
+            q.surface_area_m2
+        );
     }
 }
