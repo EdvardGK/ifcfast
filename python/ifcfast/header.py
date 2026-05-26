@@ -23,6 +23,29 @@ _HEADER_READ_BYTES = 64 * 1024
 _HASH_HEAD_BYTES = 4 * 1024 * 1024
 _HASH_TAIL_BYTES = 4 * 1024 * 1024
 
+# Bump this whenever the *meaning* of a cached parquet column changes —
+# i.e. when the same input IFC, run through a new parser version, would
+# yield different output bytes in any of the cached tables (products,
+# psets, materials, quantities, classifications, drift, ...).
+#
+# This is independent of the package `__version__`: a bugfix release
+# that only touches docs or non-cached code shouldn't invalidate user
+# caches, while a release that changes a numeric scaling (like the
+# v0.4.1 materials.thickness_mm metres→mm fix) MUST.
+#
+# When you bump, mention which observable cache field changed in the
+# release notes so users with large file caches understand the cost of
+# the re-extract.
+#
+# History:
+#   1 — implicit baseline through v0.4.0
+#   2 — v0.4.1: materials.layer_thickness_mm now scaled to mm via
+#       unit_scale (was raw IFC value, silently in metres for
+#       metre-authored files); products table now includes IfcSpace
+#       rows with name/psets; instances substrate emits null-rep rows
+#       for geometryless products.
+_CACHE_SCHEMA_VERSION = 2
+
 _FIELD_RE = re.compile(r"\(\s*(.*?)\s*\)\s*;", re.DOTALL)
 
 
@@ -194,8 +217,16 @@ def _split_top_level(body: str) -> list[str]:
 
 
 def _compute_cache_key(p: Path, size: int) -> str:
-    """sha256 of size + head 4MB + tail 4MB. Short and deterministic."""
+    """sha256 of (schema_version, size, head 4MB, tail 4MB).
+
+    Including the schema version means a parser change that alters the
+    *meaning* of any cached column (e.g. v0.4.1 normalising
+    `layer_thickness_mm` to actual millimetres) gets a different cache
+    directory, and old caches become inert rather than serving stale
+    numbers. See [`_CACHE_SCHEMA_VERSION`] for the bump policy.
+    """
     h = hashlib.sha256()
+    h.update(_CACHE_SCHEMA_VERSION.to_bytes(4, "little"))
     h.update(size.to_bytes(8, "little"))
     head_n = min(_HASH_HEAD_BYTES, size)
     tail_n = min(_HASH_TAIL_BYTES, max(0, size - head_n))

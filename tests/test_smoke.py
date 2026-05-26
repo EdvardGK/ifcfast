@@ -122,3 +122,33 @@ def test_cli_index(capfd):
     assert "project:       Minimal Project" in out
     assert "products:      1" in out
     assert "IfcWall" in out
+
+
+def test_cache_key_includes_schema_version():
+    """Bumping `_CACHE_SCHEMA_VERSION` must change the cache_key for the
+    same file. Without this, an upgrade that changes the *meaning* of a
+    cached column (e.g. v0.4.1's materials.thickness_mm metres→mm fix)
+    silently serves stale numbers from the old cache directory.
+    """
+    # `ifcfast.__init__` does `from .header import header`, which shadows
+    # the `header` submodule attribute on the package with the `header()`
+    # function — and pytest's `monkeypatch.setattr("ifcfast.header.X", ...)`
+    # walks the same shadowed namespace. Pull the module from `sys.modules`
+    # and swap the constant by hand.
+    import sys
+    hdr_mod = sys.modules["ifcfast.header"]
+
+    baseline = hdr_mod._compute_cache_key(FIXTURE, FIXTURE.stat().st_size)
+    original = hdr_mod._CACHE_SCHEMA_VERSION
+    try:
+        hdr_mod._CACHE_SCHEMA_VERSION = original + 1
+        bumped = hdr_mod._compute_cache_key(FIXTURE, FIXTURE.stat().st_size)
+    finally:
+        hdr_mod._CACHE_SCHEMA_VERSION = original
+
+    assert baseline != bumped, (
+        "cache_key must change when _CACHE_SCHEMA_VERSION bumps — "
+        f"both gave {baseline}; stale caches won't invalidate on upgrade"
+    )
+    assert len(baseline) == 16
+    assert len(bumped) == 16
