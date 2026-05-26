@@ -921,7 +921,7 @@ fn entity_name_map() -> &'static HashMap<&'static [u8], &'static str> {
 /// the rest of fastparse): the STEP file has `IFCWALLSTANDARDCASE` but
 /// downstream code expects `IfcWallStandardCase`. Unknown types get
 /// `IfcXxxxx` with first-letter-only capitalisation of the suffix.
-fn type_name_uppercase_with_proper_case(t: &[u8]) -> String {
+pub(crate) fn type_name_uppercase_with_proper_case(t: &[u8]) -> String {
     if let Some(canonical) = entity_name_map().get(t) {
         return (*canonical).to_string();
     }

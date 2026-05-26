@@ -152,7 +152,7 @@ fn parse_nominal_value(raw: Option<&[u8]>) -> (Option<String>, Option<String>) {
     if let Some((type_name, inner)) = split_type_wrapper(trimmed) {
         let inner_field = trim(inner);
         let raw_value = scalar_to_string(inner_field);
-        let type_str = type_name_to_titlecase(type_name);
+        let type_str = crate::indexer::type_name_uppercase_with_proper_case(type_name);
         // ifcopenshell stringifies IfcBoolean.T/.F via Python bool → str
         // (-> "True"/"False"), but IfcLogical.U has no bool representation
         // and falls back to the all-caps schema enum literal "UNKNOWN".
@@ -248,23 +248,3 @@ fn parse_ref_list(body: &[u8]) -> Vec<u64> {
         .collect()
 }
 
-fn type_name_to_titlecase(t: &[u8]) -> String {
-    if t.len() < 3 || !t[..3].eq_ignore_ascii_case(b"IFC") {
-        return std::str::from_utf8(t).unwrap_or("").to_string();
-    }
-    let mut s = String::with_capacity(t.len());
-    s.push('I');
-    s.push('f');
-    s.push('c');
-    let mut upper_next = true;
-    for &c in &t[3..] {
-        let ch = c as char;
-        if upper_next {
-            s.push(ch.to_ascii_uppercase());
-            upper_next = false;
-        } else {
-            s.push(ch.to_ascii_lowercase());
-        }
-    }
-    s
-}

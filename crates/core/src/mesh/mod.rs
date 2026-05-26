@@ -325,7 +325,7 @@ pub fn mesh_ifc_streaming<S: ProductSink>(buf: &[u8], sink: &mut S) -> MeshStats
         // Mesh each item, union into the product mesh. We keep a
         // segment record per item so the consumer can color / filter /
         // edit by operand role.
-        let entity_name = type_name_titlecase(type_name);
+        let entity_name = crate::indexer::type_name_uppercase_with_proper_case(type_name);
         let mut combined_v: Vec<f32> = Vec::new();
         let mut combined_i: Vec<u32> = Vec::new();
         let mut segments: Vec<MeshSegment> = Vec::new();
@@ -741,23 +741,3 @@ fn bytes_to_string(b: &[u8]) -> String {
         .unwrap_or_else(|_| String::from_utf8_lossy(b).into_owned())
 }
 
-fn type_name_titlecase(t: &[u8]) -> String {
-    if t.len() < 3 || !t[..3].eq_ignore_ascii_case(b"IFC") {
-        return std::str::from_utf8(t).unwrap_or("").to_string();
-    }
-    let mut s = String::with_capacity(t.len());
-    s.push('I');
-    s.push('f');
-    s.push('c');
-    let mut upper_next = true;
-    for &c in &t[3..] {
-        let ch = c as char;
-        if upper_next {
-            s.push(ch.to_ascii_uppercase());
-            upper_next = false;
-        } else {
-            s.push(ch.to_ascii_lowercase());
-        }
-    }
-    s
-}
