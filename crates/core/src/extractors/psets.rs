@@ -68,6 +68,42 @@ pub fn build(
             let name = string_at(&fields, 0).unwrap_or_default();
             let (val_str, val_type) = parse_nominal_value(fields.get(2).copied());
             props.insert(step_id, Prop { name, value: val_str, value_type: val_type });
+        } else if type_name.eq_ignore_ascii_case(b"IFCPROPERTYENUMERATEDVALUE")
+            || type_name.eq_ignore_ascii_case(b"IFCPROPERTYLISTVALUE")
+        {
+            // IfcPropertyEnumeratedValue: (Name, Description, EnumerationValues, EnumerationReference)
+            // IfcPropertyListValue:       (Name, Description, ListValues, Unit)
+            // Both carry a LIST of IfcValue at arg 2. Joined with `, `
+            // for the row's value string; value_type follows the first
+            // member's type since enumerated/list values must be
+            // homogeneous in the IFC schema.
+            //
+            // A common Norwegian-export pattern: fire ratings declared
+            // as IfcPropertyEnumeratedValue with a single member like
+            // IFCLABEL('R60'). Pre-fix these were silently dropped; now
+            // they surface alongside IfcPropertySingleValue properties.
+            let fields = split_top_level_args(args);
+            let name = string_at(&fields, 0).unwrap_or_default();
+            let (val_str, val_type) =
+                parse_value_list(fields.get(2).copied());
+            props.insert(step_id, Prop { name, value: val_str, value_type: val_type });
+        } else if type_name.eq_ignore_ascii_case(b"IFCPROPERTYBOUNDEDVALUE") {
+            // (Name, Description, UpperBoundValue, LowerBoundValue, Unit, SetPointValue)
+            // Three optional IfcValues. Format: "lower..upper" if both
+            // bounds present, or "..upper" / "lower.." if one-sided.
+            // SetPointValue (IFC4) appended as "@setpoint" when present.
+            //
+            // MEP exports use this for temperature ranges, pressure
+            // tolerances, flow rate windows. Pre-fix all of these were
+            // silently dropped from psets.
+            let fields = split_top_level_args(args);
+            let name = string_at(&fields, 0).unwrap_or_default();
+            let (upper_val, upper_type) =
+                parse_nominal_value(fields.get(2).copied());
+            let (lower_val, _) = parse_nominal_value(fields.get(3).copied());
+            let (setpoint_val, _) = parse_nominal_value(fields.get(5).copied());
+            let val_str = format_bounded(lower_val.as_deref(), upper_val.as_deref(), setpoint_val.as_deref());
+            props.insert(step_id, Prop { name, value: val_str, value_type: upper_type });
         } else if type_name.eq_ignore_ascii_case(b"IFCRELDEFINESBYPROPERTIES") {
             // (GlobalId, OwnerHistory, Name, Description, RelatedObjects, RelatingPropertyDefinition)
             let fields = split_top_level_args(args);
@@ -166,6 +202,78 @@ fn parse_nominal_value(raw: Option<&[u8]>) -> (Option<String>, Option<String>) {
     }
     // Bare value (rare for IfcValue but possible).
     (scalar_to_string(trimmed), None)
+}
+
+/// Parse a `LIST OF IfcValue` field. Splits the list, runs each element
+/// through `parse_nominal_value`, joins the resulting value strings with
+/// `", "`. Type comes from the first member (the IFC schema requires
+/// homogeneous element types within a property's value list).
+///
+/// Returns `(None, None)` for `$`, `*`, empty list, or a list whose
+/// members all parse to None.
+fn parse_value_list(raw: Option<&[u8]>) -> (Option<String>, Option<String>) {
+    let raw = match raw {
+        Some(r) => r,
+        None => return (None, None),
+    };
+    let trimmed = trim(raw);
+    if trimmed.is_empty() || trimmed == b"$" || trimmed == b"*" {
+        return (None, None);
+    }
+    // The list body sits between '(' and ')'.
+    let inner = match (trimmed.first(), trimmed.last()) {
+        (Some(&b'('), Some(&b')')) if trimmed.len() >= 2 => &trimmed[1..trimmed.len() - 1],
+        _ => return (None, None),
+    };
+    let mut values: Vec<String> = Vec::new();
+    let mut value_type: Option<String> = None;
+    for item in split_top_level_args(inner) {
+        let (v, t) = parse_nominal_value(Some(item));
+        if value_type.is_none() {
+            value_type = t;
+        }
+        if let Some(s) = v {
+            values.push(s);
+        }
+    }
+    if values.is_empty() {
+        (None, value_type)
+    } else {
+        (Some(values.join(", ")), value_type)
+    }
+}
+
+/// Format an `IfcPropertyBoundedValue`'s (lower, upper, setpoint) tuple
+/// into a single string. Conventions:
+///   both bounds      → `"lower..upper"`
+///   upper only       → `"..upper"`
+///   lower only       → `"lower.."`
+///   setpoint only    → `"@setpoint"`
+///   bounds + setpt   → `"lower..upper@setpoint"`
+///   nothing          → `None`
+fn format_bounded(
+    lower: Option<&str>,
+    upper: Option<&str>,
+    setpoint: Option<&str>,
+) -> Option<String> {
+    if lower.is_none() && upper.is_none() && setpoint.is_none() {
+        return None;
+    }
+    let mut out = String::new();
+    if lower.is_some() || upper.is_some() {
+        if let Some(l) = lower {
+            out.push_str(l);
+        }
+        out.push_str("..");
+        if let Some(u) = upper {
+            out.push_str(u);
+        }
+    }
+    if let Some(s) = setpoint {
+        out.push('@');
+        out.push_str(s);
+    }
+    Some(out)
 }
 
 /// `TYPENAME(inner)` → (TYPENAME bytes, inner bytes). Returns None if
@@ -426,5 +534,107 @@ END-ISO-10303-21;
         // Only the wall (#10) is in step_to_guid, and the rel didn't
         // include it — table should be empty.
         assert_eq!(t.len(), 0);
+    }
+
+    #[test]
+    fn enumerated_value_single_member_surfaces_like_single_value() {
+        // The common pattern: Norwegian fire-rating exports declare
+        // FireRating as IfcPropertyEnumeratedValue with one chosen
+        // member like IFCLABEL('R60'). Pre-fix this was silently
+        // dropped from psets.
+        let buf = make_buf(
+            r#"
+#20=IFCPROPERTYENUMERATEDVALUE('FireRating',$,(IFCLABEL('R60')),$);
+#21=IFCPROPERTYSET('2Pset00000000000000001',$,'Pset_WallCommon',$,(#20));
+#22=IFCRELDEFINESBYPROPERTIES('3Rel000000000000000001',$,$,$,(#10),#21);
+"#,
+        );
+        let t = run(&buf);
+        assert_eq!(t.len(), 1);
+        assert_eq!(t.prop_name[0], "FireRating");
+        assert_eq!(t.value[0].as_deref(), Some("R60"));
+        assert_eq!(t.value_type[0].as_deref(), Some("IfcLabel"));
+    }
+
+    #[test]
+    fn enumerated_value_multi_member_joins_with_comma() {
+        // Some exports list every allowable enum member (rare but
+        // legal). All values get joined with ", " — the consumer can
+        // split if needed.
+        let buf = make_buf(
+            r#"
+#20=IFCPROPERTYENUMERATEDVALUE('Categories',$,(IFCLABEL('Residential'),IFCLABEL('Office')),$);
+#21=IFCPROPERTYSET('2Pset00000000000000001',$,'Pset_BuildingCommon',$,(#20));
+#22=IFCRELDEFINESBYPROPERTIES('3Rel000000000000000001',$,$,$,(#10),#21);
+"#,
+        );
+        let t = run(&buf);
+        assert_eq!(t.len(), 1);
+        assert_eq!(t.value[0].as_deref(), Some("Residential, Office"));
+        assert_eq!(t.value_type[0].as_deref(), Some("IfcLabel"));
+    }
+
+    #[test]
+    fn list_value_same_treatment_as_enumerated() {
+        let buf = make_buf(
+            r#"
+#20=IFCPROPERTYLISTVALUE('AllowedTemperatures',$,(IFCREAL(18.),IFCREAL(20.),IFCREAL(22.)),$);
+#21=IFCPROPERTYSET('2Pset00000000000000001',$,'Pset_SpaceThermalLoad',$,(#20));
+#22=IFCRELDEFINESBYPROPERTIES('3Rel000000000000000001',$,$,$,(#10),#21);
+"#,
+        );
+        let t = run(&buf);
+        assert_eq!(t.len(), 1);
+        // Whole-number IfcReal scalars normalise to integer-string form
+        // ("22.0" → "22") per `format_number`. The join order matches
+        // the IFC list order.
+        assert_eq!(t.value[0].as_deref(), Some("18, 20, 22"));
+        assert_eq!(t.value_type[0].as_deref(), Some("IfcReal"));
+    }
+
+    #[test]
+    fn bounded_value_both_bounds_format() {
+        // MEP comfort range: room temperature 18-22°C.
+        let buf = make_buf(
+            r#"
+#20=IFCPROPERTYBOUNDEDVALUE('TempRange',$,IFCREAL(22.),IFCREAL(18.),$,$);
+#21=IFCPROPERTYSET('2Pset00000000000000001',$,'Pset_SpaceThermalLoad',$,(#20));
+#22=IFCRELDEFINESBYPROPERTIES('3Rel000000000000000001',$,$,$,(#10),#21);
+"#,
+        );
+        let t = run(&buf);
+        assert_eq!(t.len(), 1);
+        assert_eq!(t.value[0].as_deref(), Some("18..22"));
+        assert_eq!(t.value_type[0].as_deref(), Some("IfcReal"));
+    }
+
+    #[test]
+    fn bounded_value_one_sided_format() {
+        // Upper-only bound — common for "max pressure" properties.
+        let buf = make_buf(
+            r#"
+#20=IFCPROPERTYBOUNDEDVALUE('MaxPressure',$,IFCREAL(2.5),$,$,$);
+#21=IFCPROPERTYSET('2Pset00000000000000001',$,'Pset_Custom',$,(#20));
+#22=IFCRELDEFINESBYPROPERTIES('3Rel000000000000000001',$,$,$,(#10),#21);
+"#,
+        );
+        let t = run(&buf);
+        assert_eq!(t.len(), 1);
+        assert_eq!(t.value[0].as_deref(), Some("..2.5"));
+    }
+
+    #[test]
+    fn bounded_value_with_setpoint() {
+        // IFC4 SetPointValue: target with tolerance bounds around it.
+        let buf = make_buf(
+            r#"
+#20=IFCPROPERTYBOUNDEDVALUE('SetpointTemp',$,IFCREAL(22.),IFCREAL(18.),$,IFCREAL(20.));
+#21=IFCPROPERTYSET('2Pset00000000000000001',$,'Pset_SpaceThermalLoad',$,(#20));
+#22=IFCRELDEFINESBYPROPERTIES('3Rel000000000000000001',$,$,$,(#10),#21);
+"#,
+        );
+        let t = run(&buf);
+        assert_eq!(t.len(), 1);
+        assert_eq!(t.value[0].as_deref(), Some("18..22@20"));
     }
 }
