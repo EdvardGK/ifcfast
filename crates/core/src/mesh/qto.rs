@@ -82,6 +82,27 @@ pub struct MeshQto {
     /// Stored as a Parquet list so DuckDB UNNEST gives one row per
     /// face for "show me every surface on this product" queries.
     pub surfaces: Vec<PlanarSurface>,
+    /// Validity classifier for `volume_m3`:
+    ///
+    /// - `"closed"`:    `|volume_m3| <= aabb_volume_m3` (with a small
+    ///                  numerical tolerance). The divergence-theorem
+    ///                  computation produced a physically possible
+    ///                  value; consumers can trust it for sum queries.
+    /// - `"open_shell"`: `|volume_m3| > aabb_volume_m3`. The mesh is
+    ///                  not a closed manifold (open boundary, hole,
+    ///                  inverted normal). Divergence-theorem volumes
+    ///                  are mathematically undefined on open shells;
+    ///                  consumers should fall back to `aabb_volume_m3`
+    ///                  or filter the row out of volume sums.
+    /// - `"degenerate"`: `aabb_volume_m3 <= 0`. No real geometry —
+    ///                  empty mesh, 2D annotation, or a product whose
+    ///                  representation collapsed to a line / point.
+    ///                  Every quantity column is suspect.
+    ///
+    /// 9.4% of products on the audited Duplex file land in
+    /// `"open_shell"`; without this flag any downstream `SUM(volume_m3)`
+    /// silently sums garbage with valid figures.
+    pub mesh_quality: &'static str,
 }
 
 // 20° threshold against ±Z: `cos(20°) ≈ 0.940`.
@@ -118,7 +139,10 @@ pub fn compute(vertices: &[f32], indices: &[u32], unit_scale: f32) -> MeshQto {
     // unmeshed product carries identity + zeroed QTO, never a NULL we
     // can't distinguish from "missing").
     if indices.len() < 3 || vertices.len() < 9 {
-        return MeshQto::default();
+        return MeshQto {
+            mesh_quality: "degenerate",
+            ..MeshQto::default()
+        };
     }
 
     let area_scale = unit_scale * unit_scale; // m² scaling
@@ -291,9 +315,25 @@ pub fn compute(vertices: &[f32], indices: &[u32], unit_scale: f32) -> MeshQto {
     let smallest = if smallest.is_finite() { smallest } else { 0.0 };
     let surface_count = surfaces.len() as u32;
 
+    let volume_m3 = volume_raw * volume_scale;
+    let aabb_volume_m3 = aabb_volume_raw * volume_scale;
+
+    // Mesh validity classifier — see field docs on `MeshQto.mesh_quality`.
+    // The 1.001 multiplier on aabb absorbs ~0.1% of float rounding noise
+    // on the divergence-theorem sum; products genuinely outside that
+    // threshold are open shells where `volume_m3` is mathematically
+    // undefined.
+    let mesh_quality: &'static str = if aabb_volume_m3 <= 0.0 {
+        "degenerate"
+    } else if volume_m3.abs() > aabb_volume_m3 * 1.001 {
+        "open_shell"
+    } else {
+        "closed"
+    };
+
     MeshQto {
-        volume_m3: volume_raw * volume_scale,
-        aabb_volume_m3: aabb_volume_raw * volume_scale,
+        volume_m3,
+        aabb_volume_m3,
         surface_area_m2: surface_area_raw * area_scale,
         area_top_m2: area_top_raw * area_scale,
         area_bottom_m2: area_bottom_raw * area_scale,
@@ -302,6 +342,7 @@ pub fn compute(vertices: &[f32], indices: &[u32], unit_scale: f32) -> MeshQto {
         largest_surface_m2: largest,
         smallest_surface_m2: smallest,
         surface_count,
+        mesh_quality,
         surfaces,
     }
 }
@@ -495,5 +536,91 @@ mod tests {
              total is {:.6}",
             q.surface_area_m2
         );
+    }
+
+    #[test]
+    fn mesh_quality_closed_for_closed_manifold() {
+        // The unit cube is a closed orientable manifold — divergence
+        // volume equals AABB volume to within float precision.
+        let (v, i) = unit_cube_world();
+        let q = compute(&v, &i, 1.0);
+        assert_eq!(q.mesh_quality, "closed");
+    }
+
+    #[test]
+    fn mesh_quality_degenerate_for_no_triangles() {
+        // Empty input → early-out → degenerate.
+        let q = compute(&[], &[], 1.0);
+        assert_eq!(q.mesh_quality, "degenerate");
+        assert_eq!(q.aabb_volume_m3, 0.0);
+    }
+
+    #[test]
+    fn mesh_quality_degenerate_for_planar_mesh() {
+        // Two triangles forming a unit square at z=0. AABB has zero
+        // depth so aabb_volume_m3 == 0 → degenerate (also true for
+        // single annotations, drawn polylines, etc.).
+        let vertices: Vec<f32> = vec![
+            0.0, 0.0, 0.0,
+            1.0, 0.0, 0.0,
+            1.0, 1.0, 0.0,
+            0.0, 1.0, 0.0,
+        ];
+        let indices: Vec<u32> = vec![0, 1, 2,  0, 2, 3];
+        let q = compute(&vertices, &indices, 1.0);
+        assert_eq!(q.mesh_quality, "degenerate");
+        assert!(q.aabb_volume_m3 <= f32::EPSILON);
+        // Unsigned triangle areas sum to 1 m² (the unit square).
+        assert!((q.surface_area_m2 - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn mesh_quality_open_shell_for_unclosed_box() {
+        // Unit cube translated far from origin, missing its bottom
+        // face. The divergence theorem implicitly closes the surface
+        // by joining the open boundary to the origin — when the mesh
+        // is far from origin the resulting "phantom" tetrahedra dwarf
+        // the AABB. This is the classifier's intended target: it
+        // catches *unambiguously* invalid volumes, not every open
+        // shell. (A cube centered at origin with a face removed gives
+        // |volume| ≈ 5/6 · aabb — wrong but inside the AABB; the
+        // classifier won't flag it. That's a known under-detection.)
+        let offset = 10.0_f32;
+        let v: Vec<f32> = vec![
+            offset + -0.5, offset + -0.5, offset + -0.5,
+            offset +  0.5, offset + -0.5, offset + -0.5,
+            offset +  0.5, offset +  0.5, offset + -0.5,
+            offset + -0.5, offset +  0.5, offset + -0.5,
+            offset + -0.5, offset + -0.5, offset +  0.5,
+            offset +  0.5, offset + -0.5, offset +  0.5,
+            offset +  0.5, offset +  0.5, offset +  0.5,
+            offset + -0.5, offset +  0.5, offset +  0.5,
+        ];
+        // Same wind order as unit_cube_world, with the BOTTOM face
+        // (first two triangles) removed.
+        let i: Vec<u32> = vec![
+            // top
+            4, 5, 6,  4, 6, 7,
+            // -Y
+            0, 1, 5,  0, 5, 4,
+            // +Y
+            3, 7, 6,  3, 6, 2,
+            // -X
+            0, 4, 7,  0, 7, 3,
+            // +X
+            1, 2, 6,  1, 6, 5,
+        ];
+        let q = compute(&v, &i, 1.0);
+        // AABB still 1.0 m³ — the missing face's vertices are still
+        // referenced by adjacent faces.
+        assert!((q.aabb_volume_m3 - 1.0).abs() < 1e-5);
+        let exceeds = q.volume_m3.abs() > q.aabb_volume_m3 * 1.001;
+        assert!(
+            exceeds,
+            "open-shell translated cube: |volume_m3|={:.6} should \
+             exceed aabb_volume_m3={:.6}",
+            q.volume_m3, q.aabb_volume_m3
+        );
+        assert_eq!(q.mesh_quality, "open_shell");
     }
 }

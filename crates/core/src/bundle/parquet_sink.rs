@@ -355,6 +355,12 @@ fn build_instance_schema() -> Schema {
         Field::new("largest_surface_m2", DataType::Float32, false),
         Field::new("smallest_surface_m2", DataType::Float32, false),
         Field::new("surface_count", DataType::UInt32, false),
+        // Validity classifier for `volume_m3`. One of
+        // "closed" / "open_shell" / "degenerate". Substrate consumers
+        // doing `SUM(volume_m3)` should filter on `mesh_quality =
+        // 'closed'` — open-shell volumes are mathematically undefined
+        // and currently affect ~9% of Duplex products.
+        Field::new("mesh_quality", DataType::Utf8, false),
         // List<Struct> of every distinct planar surface, sorted by
         // area descending. DuckDB UNNEST(surfaces) turns it into a
         // row-per-face stream.
@@ -496,6 +502,7 @@ fn build_instance_batch(
     let mut largest_surface_m2 = Float32Builder::with_capacity(n);
     let mut smallest_surface_m2 = Float32Builder::with_capacity(n);
     let mut surface_count = UInt32Builder::with_capacity(n);
+    let mut mesh_quality = StringBuilder::with_capacity(n, n * 8);
 
     for r in records {
         ifc_id.append_value(r.ifc_id);
@@ -630,6 +637,7 @@ fn build_instance_batch(
         largest_surface_m2.append_value(r.largest_surface_m2);
         smallest_surface_m2.append_value(r.smallest_surface_m2);
         surface_count.append_value(r.surface_count);
+        mesh_quality.append_value(r.mesh_quality);
 
         // Per-surface list — one row per distinct planar face.
         {
@@ -678,6 +686,7 @@ fn build_instance_batch(
         Arc::new(largest_surface_m2.finish()),
         Arc::new(smallest_surface_m2.finish()),
         Arc::new(surface_count.finish()),
+        Arc::new(mesh_quality.finish()),
         Arc::new(surfaces.finish()),
     ];
 

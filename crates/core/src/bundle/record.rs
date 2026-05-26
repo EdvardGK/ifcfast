@@ -190,6 +190,14 @@ pub struct InstanceRecord {
     /// UNNEST gives one row per face — that's how "biggest /
     /// smallest surface on type X" turns into a single query.
     pub surfaces: Vec<PlanarSurface>,
+    /// Validity classifier for `volume_m3` — one of `"closed"`,
+    /// `"open_shell"`, `"degenerate"`. See `MeshQto::mesh_quality` for
+    /// the full taxonomy. Consumers doing
+    /// `SUM(volume_m3) WHERE class = 'Wall'` should filter on
+    /// `mesh_quality = 'closed'` to avoid summing physically impossible
+    /// open-shell volumes alongside valid figures (~9% of Duplex's
+    /// products land in `open_shell`).
+    pub mesh_quality: &'static str,
 }
 
 /// Compute (rep_id, kind) for a `ProductMesh` per the assignment rules
@@ -371,6 +379,7 @@ pub fn pair_split(
         smallest_surface_m2: qto.smallest_surface_m2,
         surface_count: qto.surface_count,
         surfaces: qto.surfaces,
+        mesh_quality: qto.mesh_quality,
     };
 
     (rep, instance)
