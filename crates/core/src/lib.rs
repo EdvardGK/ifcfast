@@ -23,6 +23,7 @@ pub mod entity_table;
 pub mod extractors;
 pub mod indexer;
 pub mod lexer;
+pub mod source;
 
 #[cfg(feature = "mesh")]
 pub mod mesh;
@@ -32,28 +33,20 @@ pub mod bundle;
 
 #[cfg(feature = "python")]
 mod python {
-    use std::fs::File;
+    use std::path::Path;
     use std::time::Instant;
 
-    use memmap2::Mmap;
     use pyo3::prelude::*;
     use pyo3::types::{PyDict, PyList};
 
     use crate::indexer;
+    use crate::source::IfcSource;
 
     // ----- index_ifc ----------------------------------------------------
 
     #[pyfunction]
     fn index_ifc<'py>(py: Python<'py>, path: &str) -> PyResult<Bound<'py, PyDict>> {
-        let t_open = Instant::now();
-        let file = File::open(path)
-            .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("open {path}: {e}")))?;
-        let mmap = unsafe {
-            Mmap::map(&file).map_err(|e| {
-                pyo3::exceptions::PyIOError::new_err(format!("mmap {path}: {e}"))
-            })?
-        };
-        let open_ms = t_open.elapsed().as_secs_f64() * 1000.0;
+        let (mmap, open_ms) = open_mmap(path)?;
 
         let t_index = Instant::now();
         let idx = py.allow_threads(|| indexer::index(&mmap));
@@ -201,16 +194,15 @@ mod python {
         step_to_guid
     }
 
-    fn open_mmap(path: &str) -> PyResult<(Mmap, f64)> {
+    /// Load an IFC source for the PyO3 layer. Dispatches on magic
+    /// bytes via [`crate::source::open`]: plain `.ifc` → mmap (zero
+    /// copy), `.ifczip` → decompressed owned buffer. Either variant
+    /// derefs to `&[u8]` so callers don't change.
+    fn open_mmap(path: &str) -> PyResult<(IfcSource, f64)> {
         let t_open = Instant::now();
-        let file = File::open(path)
+        let src = crate::source::open(Path::new(path))
             .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("open {path}: {e}")))?;
-        let mmap = unsafe {
-            Mmap::map(&file).map_err(|e| {
-                pyo3::exceptions::PyIOError::new_err(format!("mmap {path}: {e}"))
-            })?
-        };
-        Ok((mmap, t_open.elapsed().as_secs_f64() * 1000.0))
+        Ok((src, t_open.elapsed().as_secs_f64() * 1000.0))
     }
 
     // ----- extract_psets -----------------------------------------------

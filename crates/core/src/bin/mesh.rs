@@ -17,8 +17,6 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
 
-use memmap2::Mmap;
-
 use _core::mesh;
 
 fn main() -> ExitCode {
@@ -54,25 +52,21 @@ fn main() -> ExitCode {
     let format_csv = ext == "csv";
 
     let t_open = Instant::now();
-    let file = match File::open(&in_path) {
-        Ok(f) => f,
+    let mmap = match _core::source::open(&in_path) {
+        Ok(s) => s,
         Err(e) => {
             eprintln!("open {}: {e}", in_path.display());
             return ExitCode::from(1);
         }
     };
-    // SAFETY: regular file we own and don't write to.
-    let mmap = match unsafe { Mmap::map(&file) } {
-        Ok(m) => m,
-        Err(e) => {
-            eprintln!("mmap {}: {e}", in_path.display());
-            return ExitCode::from(1);
-        }
-    };
     let open_ms = t_open.elapsed().as_secs_f64() * 1000.0;
     let size_mb = mmap.len() as f64 / 1_000_000.0;
+    let kind = match &mmap {
+        _core::source::IfcSource::Mmap(_) => "mmap",
+        _core::source::IfcSource::Owned(_) => "ifczip",
+    };
     eprintln!(
-        "[ifcfast-mesh] open(mmap) {:.2}ms — {:.1} MB",
+        "[ifcfast-mesh] open({kind}) {:.2}ms — {:.1} MB",
         open_ms, size_mb
     );
 

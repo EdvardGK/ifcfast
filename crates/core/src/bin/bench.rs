@@ -16,11 +16,9 @@
 //!     throughput:       350 MB/s
 
 use std::env;
-use std::fs::File;
+use std::path::Path;
 use std::process::ExitCode;
 use std::time::Instant;
-
-use memmap2::Mmap;
 
 use _core::indexer;
 
@@ -34,18 +32,10 @@ fn main() -> ExitCode {
     let path = &args[1];
 
     let t_open = Instant::now();
-    let file = match File::open(path) {
-        Ok(f) => f,
+    let mmap = match _core::source::open(Path::new(path)) {
+        Ok(s) => s,
         Err(e) => {
             eprintln!("open {path}: {e}");
-            return ExitCode::from(1);
-        }
-    };
-    // SAFETY: mmap is safe for a regular file we own and don't write to.
-    let mmap = match unsafe { Mmap::map(&file) } {
-        Ok(m) => m,
-        Err(e) => {
-            eprintln!("mmap {path}: {e}");
             return ExitCode::from(1);
         }
     };
