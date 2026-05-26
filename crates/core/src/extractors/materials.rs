@@ -67,6 +67,14 @@ pub fn build(
     let mut layer_set_usages: HashMap<u64, u64> = HashMap::with_capacity(512);
     let mut layers: HashMap<u64, LayerRecord> = HashMap::with_capacity(4096);
     let mut material_lists: HashMap<u64, Vec<u64>> = HashMap::with_capacity(256);
+    // IFC4: IfcMaterialConstituentSet → list of IfcMaterialConstituent.
+    // Common in MEP / structural exports where a product is built from
+    // a mix of materials in defined proportions (concrete + rebar,
+    // glass + sealant). Phase 1 stored the raw `Fraction` field on
+    // the constituent record; surfacing it as a Parquet column is
+    // queued behind a `_CACHE_SCHEMA_VERSION` bump.
+    let mut constituent_sets: HashMap<u64, Vec<u64>> = HashMap::with_capacity(256);
+    let mut constituents: HashMap<u64, ConstituentRecord> = HashMap::with_capacity(2048);
 
     // Collect rel-pairs: (related_object_step_ids, relating_material_ref)
     let mut rel_pairs: Vec<(u64, u64)> = Vec::with_capacity(8192);
@@ -117,6 +125,34 @@ pub fn build(
             // (Materials: LIST OF IfcMaterial)
             let fields = split_top_level_args(args);
             material_lists.insert(step_id, ref_list_at(&fields, 0));
+        } else if type_name.eq_ignore_ascii_case(b"IFCMATERIALCONSTITUENTSET") {
+            // IFC4: (Name, Description, MaterialConstituents, Category)
+            // MaterialConstituents at arg index 2 is a LIST of
+            // IfcMaterialConstituent refs.
+            let fields = split_top_level_args(args);
+            constituent_sets.insert(step_id, ref_list_at(&fields, 2));
+        } else if type_name.eq_ignore_ascii_case(b"IFCMATERIALCONSTITUENT") {
+            // IFC4: (Name, Description, Material, Fraction, Category)
+            // Phase 1 captures the IfcMaterial ref and the optional
+            // name/category overrides — same shape as IfcMaterialLayer
+            // without the thickness. Fraction is intentionally dropped
+            // for now (no schema column yet); it'll resurface when the
+            // table grows a `fraction` field.
+            let fields = split_top_level_args(args);
+            let name_override = string_at(&fields, 0);
+            let material_ref = match fields.get(2).copied().map(parse_field) {
+                Some(Field::Ref(id)) => Some(id),
+                _ => None,
+            };
+            let category_override = string_at(&fields, 4);
+            constituents.insert(
+                step_id,
+                ConstituentRecord {
+                    material_ref,
+                    name_override,
+                    category_override,
+                },
+            );
         } else if type_name.eq_ignore_ascii_case(b"IFCRELASSOCIATESMATERIAL") {
             // (GlobalId, OwnerHistory, Name, Description, RelatedObjects, RelatingMaterial)
             let fields = split_top_level_args(args);
@@ -154,6 +190,26 @@ pub fn build(
                     push_row(
                         &mut out, guid, "list", i as i32,
                         mat.name.clone(), None, mat.category.clone(),
+                    );
+                }
+            }
+            continue;
+        }
+        if let Some(constituent_ids) = constituent_sets.get(&relating_id) {
+            for (i, cid) in constituent_ids.iter().enumerate() {
+                if let Some(c) = constituents.get(cid) {
+                    let mat = c.material_ref.and_then(|mid| materials.get(&mid));
+                    let name = c
+                        .name_override
+                        .clone()
+                        .or_else(|| mat.and_then(|m| m.name.clone()));
+                    let category = c
+                        .category_override
+                        .clone()
+                        .or_else(|| mat.and_then(|m| m.category.clone()));
+                    push_row(
+                        &mut out, guid, "constituent", i as i32,
+                        name, None, category,
                     );
                 }
             }
@@ -218,6 +274,12 @@ struct MaterialRecord {
 struct LayerRecord {
     material_ref: Option<u64>,
     thickness_mm: Option<f64>,
+    name_override: Option<String>,
+    category_override: Option<String>,
+}
+
+struct ConstituentRecord {
+    material_ref: Option<u64>,
     name_override: Option<String>,
     category_override: Option<String>,
 }
@@ -351,5 +413,110 @@ END-ISO-10303-21;
             "raw 200 in a metre file scales to 200 000 mm, got {}",
             v[0]
         );
+    }
+
+    /// IfcMaterialConstituentSet support — IFC4 schema used heavily on
+    /// MEP / composite-element exports. Pre-fix this fell through to
+    /// the "unknown" fallback row, so the substrate saw "the product
+    /// has materials" but couldn't enumerate them.
+    fn run_full_table(buf: &str) -> MaterialTable {
+        let table = crate::entity_table::EntityTable::build(buf.as_bytes());
+        let mut step_to_guid: HashMap<u64, String> = HashMap::new();
+        for (sid, _t, args) in table.iter() {
+            let fields = split_top_level_args(args);
+            if let Some(first) = fields.first() {
+                if let Field::String(s) = parse_field(first) {
+                    if s.len() == 22 {
+                        step_to_guid.insert(sid, s);
+                    }
+                }
+            }
+        }
+        build(&table, &step_to_guid, 1.0)
+    }
+
+    #[test]
+    fn constituent_set_resolves_one_row_per_constituent() {
+        let buf = r#"ISO-10303-21;
+HEADER;
+FILE_DESCRIPTION(('ViewDefinition [ReferenceView]'),'2;1');
+FILE_NAME('cset.ifc','2026-05-26T00:00:00',('test'),('test'),'ifcfast','ifcfast','');
+FILE_SCHEMA(('IFC4'));
+ENDSEC;
+DATA;
+#1=IFCPROJECT('0Test000000000000000001',$,'p',$,$,$,$,(#5),#2);
+#2=IFCUNITASSIGNMENT((#3));
+#3=IFCSIUNIT(*,.LENGTHUNIT.,$,.METRE.);
+#5=IFCGEOMETRICREPRESENTATIONCONTEXT($,'Model',3,1.0E-5,#6,$);
+#6=IFCAXIS2PLACEMENT3D(#7,$,$);
+#7=IFCCARTESIANPOINT((0.,0.,0.));
+#10=IFCBEAM('1Beam00000000000000001',$,'B',$,$,$,$,'t',.STANDARD.);
+#20=IFCMATERIAL('Concrete C30/37',$,'Structural');
+#21=IFCMATERIAL('Rebar B500B',$,'Reinforcement');
+#22=IFCMATERIALCONSTITUENT('Concrete body',$,#20,0.97,'Bulk');
+#23=IFCMATERIALCONSTITUENT('Rebar mass',$,#21,0.03,'Reinforcement');
+#24=IFCMATERIALCONSTITUENTSET('RC Beam C30/37 mix',$,(#22,#23),$);
+#25=IFCRELASSOCIATESMATERIAL('2Rel000000000000000001',$,$,$,(#10),#24);
+ENDSEC;
+END-ISO-10303-21;
+"#;
+        let t = run_full_table(buf);
+        assert_eq!(t.len(), 2, "expected 2 constituent rows, got {}", t.len());
+
+        // All rows attribute to the beam, with role="constituent".
+        for i in 0..t.len() {
+            assert_eq!(t.guid[i], "1Beam00000000000000001");
+            assert_eq!(t.role[i], "constituent");
+        }
+        // The name override on the constituent (e.g. "Concrete body")
+        // takes precedence over the referenced material name, mirroring
+        // the IfcMaterialLayer behaviour.
+        let names: std::collections::HashSet<&str> = t
+            .material_name
+            .iter()
+            .filter_map(|n| n.as_deref())
+            .collect();
+        assert!(names.contains("Concrete body"));
+        assert!(names.contains("Rebar mass"));
+        // Categories also override.
+        let cats: std::collections::HashSet<&str> = t
+            .category
+            .iter()
+            .filter_map(|c| c.as_deref())
+            .collect();
+        assert!(cats.contains("Bulk"));
+        assert!(cats.contains("Reinforcement"));
+    }
+
+    #[test]
+    fn constituent_with_no_overrides_falls_back_to_material() {
+        // Constituent declared without Name / Category overrides ($) —
+        // both must fall through to the referenced IfcMaterial's
+        // values (same pattern as IfcMaterialLayer).
+        let buf = r#"ISO-10303-21;
+HEADER;
+FILE_DESCRIPTION(('ViewDefinition [ReferenceView]'),'2;1');
+FILE_NAME('cset2.ifc','2026-05-26T00:00:00',('test'),('test'),'ifcfast','ifcfast','');
+FILE_SCHEMA(('IFC4'));
+ENDSEC;
+DATA;
+#1=IFCPROJECT('0Test000000000000000001',$,'p',$,$,$,$,(#5),#2);
+#2=IFCUNITASSIGNMENT((#3));
+#3=IFCSIUNIT(*,.LENGTHUNIT.,$,.METRE.);
+#5=IFCGEOMETRICREPRESENTATIONCONTEXT($,'Model',3,1.0E-5,#6,$);
+#6=IFCAXIS2PLACEMENT3D(#7,$,$);
+#7=IFCCARTESIANPOINT((0.,0.,0.));
+#10=IFCBEAM('1Beam00000000000000001',$,'B',$,$,$,$,'t',.STANDARD.);
+#20=IFCMATERIAL('Steel S355','High-strength','Structural');
+#22=IFCMATERIALCONSTITUENT($,$,#20,1.0,$);
+#24=IFCMATERIALCONSTITUENTSET('Single-material set',$,(#22),$);
+#25=IFCRELASSOCIATESMATERIAL('2Rel000000000000000001',$,$,$,(#10),#24);
+ENDSEC;
+END-ISO-10303-21;
+"#;
+        let t = run_full_table(buf);
+        assert_eq!(t.len(), 1);
+        assert_eq!(t.material_name[0].as_deref(), Some("Steel S355"));
+        assert_eq!(t.category[0].as_deref(), Some("Structural"));
     }
 }
