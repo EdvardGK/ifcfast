@@ -313,6 +313,69 @@ class Model:
         })
         return products_df, surfaces_df
 
+    def point_cloud(
+        self,
+        per_m2: float = 1000.0,
+        seed: int = 42,
+    ):
+        """Sample a labeled point cloud from every meshed product, fast.
+
+        Designed for synthetic-training-data pipelines (scan-to-BIM
+        classifiers): the output is a flat DataFrame where every row
+        is one point on a product's surface, tagged with that
+        product's GUID, raw entity name, and normalised class. The
+        ``entity`` (or ``class``) column is your training label.
+
+        Sampling is area-weighted uniform: pick a triangle in
+        proportion to its area, then sample uniformly inside the
+        triangle via barycentric coordinates. Total points per
+        product = ``ceil(per_m2 * surface_area_m2)``. Surface normals
+        come from the triangle's face normal — no smoothing.
+
+        Reproducibility: identical ``(path, per_m2, seed)`` produces
+        bit-identical output across runs and across machines (Rust-
+        side xorshift64; each product gets a derived seed so adding
+        / removing a product doesn't shift the others' streams).
+
+        Args:
+            per_m2: target sample density. 1000 pts/m² gives ~1 point
+                per 32 mm × 32 mm. Tune for your scanner's resolution.
+            seed: PRNG seed. Defaults to 42 for repeatability.
+
+        Returns:
+            ``pandas.DataFrame`` with columns:
+
+            * ``guid``    — IfcRoot GlobalId of the source product
+            * ``entity``  — raw ``IfcWall`` / ``IfcWindow`` / ...
+            * ``x, y, z`` — world-coordinate point position (metres)
+            * ``nx, ny, nz`` — outward face normal at the point
+
+        For a typical synthetic-data workflow:
+
+            >>> import numpy as np
+            >>> df = m.point_cloud(per_m2=500, seed=42)
+            >>> # Add Gaussian noise (e.g. 5 mm scanner σ)
+            >>> noise = np.random.default_rng(seed).normal(0, 0.005, (len(df), 3))
+            >>> df[["x", "y", "z"]] += noise
+            >>> # Training pair: (xyz_normal_features, entity_label)
+            >>> X = df[["x", "y", "z", "nx", "ny", "nz"]].values
+            >>> y = df["entity"].values
+        """
+        from . import _core
+        import pandas as pd
+
+        d = _core.sample_point_cloud(str(self.header.path), float(per_m2), int(seed))
+        return pd.DataFrame({
+            "guid": d["guid"],
+            "entity": d["entity"],
+            "x": d["x"],
+            "y": d["y"],
+            "z": d["z"],
+            "nx": d["nx"],
+            "ny": d["ny"],
+            "nz": d["nz"],
+        })
+
     @property
     def segments(self):
         """Long-format per-mesh-segment table — one row per representation

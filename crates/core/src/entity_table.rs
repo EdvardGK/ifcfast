@@ -27,9 +27,22 @@ pub struct EntityRefs {
 
 /// Lookup table for every entity in the IFC's DATA section. Constructed
 /// once and queried many times.
+///
+/// Two-storage layout:
+/// - `entries` (HashMap) — O(1) `get(step_id)` for the ref-walking code
+///   paths (psets, materials, mesh dispatch, etc.).
+/// - `order` (Vec) — step_ids in the order they appeared in the source
+///   file. `iter()` walks this Vec so the iteration order is
+///   deterministic across calls. Without this, std `HashMap`'s
+///   per-instance random hash seeding shuffles iteration order between
+///   `EntityTable::build` invocations on the same buffer — invisible
+///   for most workflows (the substrate doesn't care about row order)
+///   but fatal for the point-cloud sampler, which needs bit-identical
+///   output across runs for the same `(file, per_m2, seed)`.
 pub struct EntityTable<'a> {
     buf: &'a [u8],
     entries: HashMap<u64, EntityRefs>,
+    order: Vec<u64>,
 }
 
 impl<'a> EntityTable<'a> {
@@ -41,6 +54,7 @@ impl<'a> EntityTable<'a> {
         // of DATA section for typical IFCs (smaller for header-heavy files).
         let cap_hint = ((data_end.saturating_sub(data_start)) / 110).max(1024);
         let mut entries: HashMap<u64, EntityRefs> = HashMap::with_capacity(cap_hint);
+        let mut order: Vec<u64> = Vec::with_capacity(cap_hint);
 
         for_each_record(buf, data_start, data_end, |rec| {
             // SAFETY: rec.type_name and rec.args are sub-slices of `buf` from
@@ -48,18 +62,27 @@ impl<'a> EntityTable<'a> {
             // via offset arithmetic from `buf.as_ptr()`.
             let type_start = rec.type_name.as_ptr() as usize - buf.as_ptr() as usize;
             let args_start = rec.args.as_ptr() as usize - buf.as_ptr() as usize;
-            entries.insert(
-                rec.id,
-                EntityRefs {
-                    type_start,
-                    type_len: rec.type_name.len() as u32,
-                    args_start,
-                    args_len: rec.args.len() as u32,
-                },
-            );
+            // Only push to `order` on first insertion. STEP ids should be
+            // unique by spec, but a malformed file with duplicates would
+            // otherwise inflate `order` and cause `iter()` to revisit
+            // entries with the (overwritten) latest value.
+            if entries
+                .insert(
+                    rec.id,
+                    EntityRefs {
+                        type_start,
+                        type_len: rec.type_name.len() as u32,
+                        args_start,
+                        args_len: rec.args.len() as u32,
+                    },
+                )
+                .is_none()
+            {
+                order.push(rec.id);
+            }
         });
 
-        Self { buf, entries }
+        Self { buf, entries, order }
     }
 
     /// Look up an entity by STEP id. Returns `(type_name, args)` byte slices
@@ -83,16 +106,20 @@ impl<'a> EntityTable<'a> {
         Some(&self.buf[e.type_start..end])
     }
 
-    /// Iterate over (id, type, args) for every entity. Useful for diagnostics.
+    /// Iterate over `(id, type, args)` for every entity, in the order
+    /// entries appeared in the source file's DATA section. Determinism
+    /// is contract: two `EntityTable::build` calls on the same buffer
+    /// yield the same iteration sequence.
     pub fn iter(&self) -> impl Iterator<Item = (u64, &[u8], &[u8])> + '_ {
-        self.entries.iter().map(|(id, e)| {
+        self.order.iter().filter_map(|id| {
+            let e = self.entries.get(id)?;
             let type_end = e.type_start + e.type_len as usize;
             let args_end = e.args_start + e.args_len as usize;
-            (
+            Some((
                 *id,
                 &self.buf[e.type_start..type_end],
                 &self.buf[e.args_start..args_end],
-            )
+            ))
         })
     }
 

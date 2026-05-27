@@ -698,6 +698,128 @@ mod python {
         Ok(out)
     }
 
+    // ----- sample_point_cloud ------------------------------------------
+
+    /// Sample `per_m2` points per square metre of surface on every
+    /// meshed product. Returns parallel-list columns suitable for a
+    /// flat `pd.DataFrame` build on the Python side.
+    ///
+    /// Designed for synthetic-training-data pipelines (scan-to-BIM
+    /// classifier): you get (x, y, z, nx, ny, nz, guid, entity, class)
+    /// for every sampled point, with the product's class as the
+    /// training label. Deterministic from `seed`.
+    #[cfg(feature = "mesh")]
+    #[pyfunction]
+    pub fn sample_point_cloud<'py>(
+        py: Python<'py>,
+        path: &str,
+        per_m2: f32,
+        seed: u64,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        use crate::mesh::{sample::sample as sample_mesh, ProductMesh, ProductSink};
+
+        let t_total = Instant::now();
+        let (mmap, _open_ms) = open_mmap(path)?;
+        let t_idx = Instant::now();
+        let idx = py.allow_threads(|| indexer::index(&mmap));
+        let idx_ms = t_idx.elapsed().as_secs_f64() * 1000.0;
+        let unit_scale = idx.unit_scale.unwrap_or(1.0) as f32;
+        let area_scale = unit_scale * unit_scale;
+
+        struct CloudSink {
+            per_m2: f32,
+            seed: u64,
+            area_scale: f32,
+            // One row per emitted point. Each Vec has length equal to
+            // the total point count.
+            guid: Vec<String>,
+            entity: Vec<String>,
+            x: Vec<f32>,
+            y: Vec<f32>,
+            z: Vec<f32>,
+            nx: Vec<f32>,
+            ny: Vec<f32>,
+            nz: Vec<f32>,
+        }
+
+        impl ProductSink for CloudSink {
+            fn on_product(&mut self, mesh: ProductMesh) {
+                // Derive a per-product seed from `(seed, ifc_id)` so
+                // every product's PRNG stream is independent — adding
+                // a product to the file doesn't shift every other
+                // product's sampled points. Cheap one-line splitmix64.
+                let mut s = self.seed ^ mesh.ifc_id.wrapping_mul(0x9E3779B97F4A7C15);
+                s = (s ^ (s >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+                s = (s ^ (s >> 27)).wrapping_mul(0x94D049BB133111EB);
+                s ^= s >> 31;
+
+                let cloud = sample_mesh(
+                    &mesh.vertices,
+                    &mesh.indices,
+                    self.area_scale,
+                    self.per_m2,
+                    s,
+                );
+                let n = cloud.len();
+                if n == 0 {
+                    return;
+                }
+                self.guid.reserve(n);
+                self.entity.reserve(n);
+                for _ in 0..n {
+                    self.guid.push(mesh.guid.clone());
+                    self.entity.push(mesh.entity.clone());
+                }
+                self.x.extend(cloud.x);
+                self.y.extend(cloud.y);
+                self.z.extend(cloud.z);
+                self.nx.extend(cloud.nx);
+                self.ny.extend(cloud.ny);
+                self.nz.extend(cloud.nz);
+            }
+        }
+
+        let mut sink = CloudSink {
+            per_m2,
+            seed,
+            area_scale,
+            guid: Vec::new(),
+            entity: Vec::new(),
+            x: Vec::new(),
+            y: Vec::new(),
+            z: Vec::new(),
+            nx: Vec::new(),
+            ny: Vec::new(),
+            nz: Vec::new(),
+        };
+        let t_mesh = Instant::now();
+        let mesh_stats =
+            py.allow_threads(|| crate::mesh::mesh_ifc_streaming(&mmap, &mut sink));
+        let mesh_ms = t_mesh.elapsed().as_secs_f64() * 1000.0;
+
+        let t_marshal = Instant::now();
+        let out = PyDict::new_bound(py);
+        out.set_item("guid", PyList::new_bound(py, &sink.guid))?;
+        out.set_item("entity", PyList::new_bound(py, &sink.entity))?;
+        out.set_item("x", PyList::new_bound(py, &sink.x))?;
+        out.set_item("y", PyList::new_bound(py, &sink.y))?;
+        out.set_item("z", PyList::new_bound(py, &sink.z))?;
+        out.set_item("nx", PyList::new_bound(py, &sink.nx))?;
+        out.set_item("ny", PyList::new_bound(py, &sink.ny))?;
+        out.set_item("nz", PyList::new_bound(py, &sink.nz))?;
+        out.set_item("unit_scale", unit_scale as f64)?;
+        out.set_item("per_m2", per_m2 as f64)?;
+        out.set_item("seed", seed)?;
+        out.set_item("points_emitted", sink.x.len() as u64)?;
+        out.set_item("products_meshed", mesh_stats.products_meshed as u64)?;
+        out.set_item("indexer_ms", idx_ms)?;
+        out.set_item("mesh_ms", mesh_ms)?;
+        out.set_item("marshal_ms", t_marshal.elapsed().as_secs_f64() * 1000.0)?;
+        out.set_item("total_ms", t_total.elapsed().as_secs_f64() * 1000.0)?;
+        out.set_item("size_bytes", mmap.len() as u64)?;
+        Ok(out)
+    }
+
     #[pymodule]
     fn _core(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_function(wrap_pyfunction!(index_ifc, m)?)?;
@@ -710,6 +832,8 @@ mod python {
         m.add_function(wrap_pyfunction!(analyse_drift, m)?)?;
         #[cfg(feature = "mesh")]
         m.add_function(wrap_pyfunction!(mesh_qto, m)?)?;
+        #[cfg(feature = "mesh")]
+        m.add_function(wrap_pyfunction!(sample_point_cloud, m)?)?;
         m.add("__version__", env!("CARGO_PKG_VERSION"))?;
         Ok(())
     }

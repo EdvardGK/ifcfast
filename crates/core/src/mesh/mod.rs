@@ -28,6 +28,7 @@ pub mod placement;
 pub mod profile;
 pub mod qto;
 pub mod revolved;
+pub mod sample;
 pub mod stats;
 
 use std::collections::HashMap;
