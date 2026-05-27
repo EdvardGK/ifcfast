@@ -156,13 +156,17 @@ impl ProductStats {
         };
 
         // Mesh-quality classifier (mirrors `MeshQto::mesh_quality`):
-        // see field docstring for the full taxonomy. Computing it here
-        // keeps the drift DataFrame self-contained — analysts get the
-        // open-shell flag alongside the placement-drift columns without
-        // a separate substrate-bundle pass.
+        // see field docstring for the full taxonomy. Two-tier — cheap
+        // `|volume| > aabb` upper-bound check first, then edge-pairing
+        // manifold check for the under-detected cases. Computing it
+        // here keeps the drift DataFrame self-contained — analysts get
+        // the open-shell flag alongside the placement-drift columns
+        // without a separate substrate-bundle pass.
         let mesh_quality = if aabb_volume <= 0.0 {
             "degenerate"
         } else if volume.abs() > aabb_volume * 1.001 {
+            "open_shell"
+        } else if !crate::mesh::qto::is_closed_manifold(&mesh.indices) {
             "open_shell"
         } else {
             "closed"

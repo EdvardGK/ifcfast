@@ -319,13 +319,24 @@ pub fn compute(vertices: &[f32], indices: &[u32], unit_scale: f32) -> MeshQto {
     let aabb_volume_m3 = aabb_volume_raw * volume_scale;
 
     // Mesh validity classifier — see field docs on `MeshQto.mesh_quality`.
-    // The 1.001 multiplier on aabb absorbs ~0.1% of float rounding noise
-    // on the divergence-theorem sum; products genuinely outside that
-    // threshold are open shells where `volume_m3` is mathematically
-    // undefined.
+    //
+    // Two-tier classifier:
+    //   1. Cheap upper-bound check — `|volume| > aabb * 1.001` is
+    //      mathematically impossible for a closed manifold and catches
+    //      ~29% of Duplex products (windows, cabinets, IfcSpaces). The
+    //      1.001 multiplier absorbs ~0.1% f32 noise on the divergence
+    //      sum.
+    //   2. Edge-pairing manifold check — closed iff every undirected
+    //      edge is shared by exactly 2 triangles with opposite wind.
+    //      Catches the cases the cheap check misses: open shells whose
+    //      divergence-theorem volume happens to land inside the AABB
+    //      (e.g. a cube at origin with one face removed gives ~5/6 the
+    //      cube volume — wrong but bounded).
     let mesh_quality: &'static str = if aabb_volume_m3 <= 0.0 {
         "degenerate"
     } else if volume_m3.abs() > aabb_volume_m3 * 1.001 {
+        "open_shell"
+    } else if !is_closed_manifold(indices) {
         "open_shell"
     } else {
         "closed"
@@ -345,6 +356,61 @@ pub fn compute(vertices: &[f32], indices: &[u32], unit_scale: f32) -> MeshQto {
         mesh_quality,
         surfaces,
     }
+}
+
+/// Closed-manifold check via directed-edge pairing.
+///
+/// A mesh is a closed manifold iff every undirected edge is shared by
+/// exactly two triangles whose winding agrees that the edge is
+/// traversed in opposite directions. Equivalently:
+///
+/// - Each undirected edge `{u, v}` appears in exactly 2 triangles
+///   (`unsigned_count == 2`).
+/// - The two triangles contribute opposite directed edges along it:
+///   one gives `(u, v)`, the other gives `(v, u)`. Summing `+1` for
+///   `u < v` direction and `-1` otherwise gives `signed_count == 0`.
+///
+/// Open boundaries (only 1 triangle on an edge), T-junctions
+/// (3+ triangles), and consistently-inverted normals (2 triangles
+/// winding the same way) all violate one or the other condition and
+/// classify the mesh as non-manifold.
+///
+/// Vertex deduplication caveat: this uses the raw vertex indices the
+/// mesher emitted. If two geometrically-coincident vertices live at
+/// different indices (no dedup on the mesher's side), the check will
+/// report "open" even on a visually-closed mesh. The reverse case —
+/// false-positive "closed" on a truly open mesh — is impossible by
+/// construction. So this is a conservative classifier: false negatives
+/// (extra "open_shell" labels) are possible; false positives are not.
+pub(crate) fn is_closed_manifold(indices: &[u32]) -> bool {
+    if indices.len() < 9 || indices.len() % 3 != 0 {
+        return false;
+    }
+    // Capacity hint: ~3 directed edges per triangle, but with the
+    // undirected-key merge that's roughly 1.5 unique entries per
+    // triangle on a closed manifold (Euler: V - E + F = 2 → E ≈ 1.5F
+    // for a triangulated 2-manifold).
+    let mut edges: std::collections::HashMap<(u32, u32), (u32, i32)> =
+        std::collections::HashMap::with_capacity(indices.len() / 2);
+    for tri in indices.chunks_exact(3) {
+        let a = tri[0];
+        let b = tri[1];
+        let c = tri[2];
+        for &(u, v) in &[(a, b), (b, c), (c, a)] {
+            if u == v {
+                // Degenerate triangle (edge of zero length). Same
+                // treatment as `mesh::qto::compute` — silently skip;
+                // a single degenerate edge shouldn't condemn the
+                // whole mesh.
+                continue;
+            }
+            let (key, sign) = if u < v { ((u, v), 1) } else { ((v, u), -1) };
+            let entry = edges.entry(key).or_insert((0, 0));
+            entry.0 += 1;
+            entry.1 += sign;
+        }
+    }
+    edges.values().all(|&(unsigned, signed)| unsigned == 2 && signed == 0)
 }
 
 #[cfg(test)]
@@ -622,5 +688,54 @@ mod tests {
             q.volume_m3, q.aabb_volume_m3
         );
         assert_eq!(q.mesh_quality, "open_shell");
+    }
+
+    #[test]
+    fn edge_pairing_catches_open_shell_with_volume_inside_aabb() {
+        // The case the cheap `|volume| > aabb` heuristic misses:
+        // a unit cube centered at origin with one face removed. The
+        // divergence-theorem volume comes out to ~5/6 the cube
+        // volume — wrong but bounded inside the AABB. Without the
+        // edge-pairing check this would label "closed".
+        let (v, mut i) = unit_cube_world();
+        // Remove the top face (indices 6..12 — the +Z face).
+        i.drain(6..12);
+        let q = compute(&v, &i, 1.0);
+        // Sanity: AABB still 1 m³ (the removed face's vertices stay
+        // referenced by adjacent faces, so the AABB doesn't shrink).
+        assert!((q.aabb_volume_m3 - 1.0).abs() < 1e-5);
+        // The classifier's old cheap check would not flag this — the
+        // divergence volume lands inside the AABB. The edge-pairing
+        // tier catches it.
+        assert!(
+            q.volume_m3.abs() < q.aabb_volume_m3 * 1.001,
+            "test setup bug: case must have |volume|={:.6} <= aabb={:.6} \
+             so the cheap heuristic misses it, forcing edge-pairing",
+            q.volume_m3.abs(), q.aabb_volume_m3
+        );
+        assert_eq!(q.mesh_quality, "open_shell");
+    }
+
+    #[test]
+    fn edge_pairing_helper_returns_true_for_unit_cube() {
+        let (_v, i) = unit_cube_world();
+        assert!(is_closed_manifold(&i));
+    }
+
+    #[test]
+    fn edge_pairing_helper_returns_false_for_unit_cube_missing_face() {
+        let (_v, mut i) = unit_cube_world();
+        i.drain(6..12); // drop the +Z face's two triangles
+        assert!(!is_closed_manifold(&i));
+    }
+
+    #[test]
+    fn edge_pairing_helper_rejects_same_winding_pair() {
+        // Two triangles sharing all three vertices, wound the same
+        // way — looks like a duplicate, contributes the same directed
+        // edges twice. signed_count = ±2 on every edge → not closed.
+        let v = vec![0.0, 0.0, 0.0,  1.0, 0.0, 0.0,  0.0, 1.0, 0.0];
+        let i = vec![0, 1, 2,  0, 1, 2];
+        assert!(!is_closed_manifold(&i));
     }
 }
