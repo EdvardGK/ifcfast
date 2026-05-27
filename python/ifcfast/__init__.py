@@ -79,7 +79,7 @@ __all__ = [
     "system_prompt",
 ]
 
-__version__ = "0.4.8"
+__version__ = "0.4.9"
 
 
 def example_path() -> Path:
