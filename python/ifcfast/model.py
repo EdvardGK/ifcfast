@@ -32,6 +32,37 @@ from .header import IFCHeader, header as _header
 #: ``trimesh.Trimesh(mesh.vertices, mesh.faces)``.
 Mesh = namedtuple("Mesh", ["guid", "entity", "vertices", "faces"])
 
+#: How many metres one of each named unit is. Geometry APIs
+#: (:meth:`Model.point_cloud`, :meth:`Model.meshes`) accept any of these
+#: keys as their ``unit=`` argument and scale output coordinates
+#: accordingly. The library's internal invariant is always metres; this
+#: is purely an output convenience so callers don't hand-roll a rescale
+#: (mirrors AutoCAD INSUNITS / ifcopenshell's milli/metre handling).
+_UNIT_TO_M = {
+    "m": 1.0, "metre": 1.0, "meter": 1.0, "metres": 1.0, "meters": 1.0,
+    "dm": 0.1, "decimetre": 0.1, "decimeter": 0.1,
+    "cm": 0.01, "centimetre": 0.01, "centimeter": 0.01,
+    "mm": 0.001, "millimetre": 0.001, "millimeter": 0.001,
+    # Imperial — exact international definitions.
+    "ft": 0.3048, "foot": 0.3048, "feet": 0.3048,
+    "in": 0.0254, "inch": 0.0254, "inches": 0.0254,
+}
+
+
+def _unit_factor(unit: str) -> float:
+    """Multiplier to convert a metres value into ``unit``.
+
+    ``_unit_factor("mm") == 1000.0`` (1 m → 1000 mm);
+    ``_unit_factor("ft") == 3.2808...`` (1 m → 3.28 ft).
+    """
+    key = str(unit).lower().strip()
+    if key not in _UNIT_TO_M:
+        raise ValueError(
+            f"unknown unit {unit!r}; choose from "
+            f"{sorted(set(_UNIT_TO_M))}"
+        )
+    return 1.0 / _UNIT_TO_M[key]
+
 
 @dataclass
 class ProductRow:
@@ -153,6 +184,35 @@ class Model:
 
     def types(self) -> dict[str, int]:
         return dict(self.type_counts)
+
+    @property
+    def length_unit(self) -> str:
+        """The file's authored length unit as a canonical short string
+        (``"mm"`` / ``"cm"`` / ``"dm"`` / ``"m"`` / ``"ft"`` / ``"in"``),
+        derived from :attr:`unit_scale` (metres per model unit).
+
+        Mirrors ifcopenshell's milli/metre mental model. Returns
+        ``"m"`` when no SI length unit was declared (``unit_scale`` is
+        ``None``) — that's the metres-assumed default the geometry
+        pipeline uses. Unrecognised scales fall back to a
+        ``f"{scale}m-per-unit"`` descriptor so the information isn't
+        lost.
+        """
+        scale = self.unit_scale
+        if scale is None:
+            return "m"
+        # Match against the known unit scales (metres per unit).
+        for name, factor in (
+            ("mm", 0.001),
+            ("cm", 0.01),
+            ("dm", 0.1),
+            ("m", 1.0),
+            ("in", 0.0254),
+            ("ft", 0.3048),
+        ):
+            if abs(scale - factor) < 1e-9:
+                return name
+        return f"{scale}m-per-unit"
 
     def by_type(self, entity: str) -> list[ProductRow]:
         """All products of a given entity type.
@@ -325,6 +385,7 @@ class Model:
         self,
         per_m2: float = 1000.0,
         seed: int = 42,
+        unit: str = "m",
     ):
         """Sample a labeled point cloud from every meshed product, fast.
 
@@ -346,17 +407,23 @@ class Model:
         / removing a product doesn't shift the others' streams).
 
         Args:
-            per_m2: target sample density. 1000 pts/m² gives ~1 point
-                per 32 mm × 32 mm. Tune for your scanner's resolution.
+            per_m2: target sample density, in points per square *metre*.
+                This is physical — it does NOT change with ``unit``;
+                1000 pts/m² gives ~1 point per 32 mm × 32 mm regardless
+                of the output coordinate unit. Tune for your scanner.
             seed: PRNG seed. Defaults to 42 for repeatability.
+            unit: output coordinate unit — one of ``"m"`` (default),
+                ``"mm"``, ``"cm"``, ``"dm"``, ``"ft"``, ``"in"`` (long
+                names like ``"millimetre"`` / ``"feet"`` also accepted).
+                Scales the ``x, y, z`` columns; normals stay unit-length.
 
         Returns:
             ``pandas.DataFrame`` with columns:
 
             * ``guid``    — IfcRoot GlobalId of the source product
             * ``entity``  — raw ``IfcWall`` / ``IfcWindow`` / ...
-            * ``x, y, z`` — world-coordinate point position (metres)
-            * ``nx, ny, nz`` — outward face normal at the point
+            * ``x, y, z`` — point position in ``unit`` (default metres)
+            * ``nx, ny, nz`` — outward face normal (always unit-length)
 
         For a typical synthetic-data workflow:
 
@@ -372,8 +439,9 @@ class Model:
         from . import _core
         import pandas as pd
 
+        factor = _unit_factor(unit)
         d = _core.sample_point_cloud(str(self.header.path), float(per_m2), int(seed))
-        return pd.DataFrame({
+        df = pd.DataFrame({
             "guid": d["guid"],
             "entity": d["entity"],
             "x": d["x"],
@@ -383,8 +451,12 @@ class Model:
             "ny": d["ny"],
             "nz": d["nz"],
         })
+        if factor != 1.0:
+            # Coordinates only — normals are unit directions, untouched.
+            df[["x", "y", "z"]] *= factor
+        return df
 
-    def meshes(self):
+    def meshes(self, unit: str = "m"):
         """Raw per-product triangle meshes — the fast drop-in for
         IfcOpenShell tessellation.
 
@@ -396,9 +468,16 @@ class Model:
         * ``guid``     — IfcRoot GlobalId
         * ``entity``   — raw IFC class (``IfcWall``, ``IfcSlab``, ...)
         * ``vertices`` — ``numpy.ndarray`` shape ``(N, 3)``, ``float32``,
-          world coordinates (metres after the project unit scale)
+          world coordinates in ``unit`` (default metres)
         * ``faces``    — ``numpy.ndarray`` shape ``(M, 3)``, ``uint32``,
           triangle vertex indices
+
+        Args:
+            unit: output coordinate unit — ``"m"`` (default), ``"mm"``,
+                ``"cm"``, ``"dm"``, ``"ft"``, ``"in"`` (long names also
+                accepted). For the default metres, ``vertices`` is a
+                zero-copy read-only view of the Rust buffer; any other
+                unit returns a writable scaled copy.
 
         Drop-in for trimesh:
 
@@ -408,7 +487,8 @@ class Model:
             ...     pts = tm.sample(1000)   # your existing sampler logic
 
         Decoding is zero-copy from the Rust byte buffers (one
-        ``np.frombuffer`` per product, no per-element marshalling).
+        ``np.frombuffer`` per product, no per-element marshalling) when
+        ``unit="m"``.
 
         Geometryless products (no body geometry) are omitted — they
         have no triangles. Use :attr:`products_df` or the substrate
@@ -425,22 +505,26 @@ class Model:
         from . import _core
         import numpy as np
 
+        factor = _unit_factor(unit)
         d = _core.extract_meshes(str(self.header.path))
         out = []
         for i in range(len(d["guid"])):
             verts = np.frombuffer(d["vertices"][i], dtype=np.float32).reshape(-1, 3)
+            if factor != 1.0:
+                # Scaled copy (writable). Cast keeps it float32.
+                verts = (verts * np.float32(factor)).astype(np.float32, copy=False)
             faces = np.frombuffer(d["indices"][i], dtype=np.uint32).reshape(-1, 3)
             out.append(Mesh(d["guid"][i], d["entity"][i], verts, faces))
         return out
 
-    def iter_meshes(self):
+    def iter_meshes(self, unit: str = "m"):
         """Generator form of :meth:`meshes` — yields ``Mesh`` namedtuples
         one at a time. Identical data; use this when you want to stream
         through products without materialising the whole list. Note the
         Rust mesher still runs eagerly (one batch pass), so this trades
         list-construction memory for iteration ergonomics, not peak RAM.
         """
-        for mesh in self.meshes():
+        for mesh in self.meshes(unit=unit):
             yield mesh
 
     @property

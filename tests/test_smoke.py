@@ -222,3 +222,53 @@ def test_meshes_returns_metres_not_native_units(tmp_path):
     span = v.max(axis=0) - v.min(axis=0)
     for axis, s in zip("xyz", span):
         assert 0.9 < s < 1.1, f"{axis} span {s:.3f} m — expected ~1.0 (metres, not mm)"
+
+
+def test_point_cloud_unit_parameter(tmp_path):
+    """The `unit=` parameter rescales output coordinates. A 1000 mm
+    cube spans ~1.0 m, ~1000 mm, ~100 cm, ~3.28 ft. Normals must stay
+    unit-length regardless of unit; per_m2 density is physical and does
+    not change with unit.
+    """
+    np = pytest.importorskip("numpy")
+    p = _write_mm_cube(tmp_path)
+    m = ifcfast.open(p, use_cache=False, write_cache=False)
+
+    expectations = {"m": 1.0, "mm": 1000.0, "cm": 100.0, "ft": 3.28084, "in": 39.3701}
+    for unit, expect in expectations.items():
+        df = m.point_cloud(per_m2=50, seed=1, unit=unit)
+        span_x = df["x"].max() - df["x"].min()
+        assert span_x == pytest.approx(expect, rel=0.02), (
+            f"unit={unit}: x span {span_x:.4g}, expected ~{expect:.4g}"
+        )
+        # Normals are direction vectors — must remain unit-length.
+        nmag = np.linalg.norm(df[["nx", "ny", "nz"]].values, axis=1)
+        assert np.allclose(nmag, 1.0, atol=1e-4)
+
+    # Unknown unit raises rather than silently mis-scaling.
+    with pytest.raises(ValueError):
+        m.point_cloud(unit="furlong")
+
+
+def test_meshes_unit_parameter(tmp_path):
+    """meshes(unit=) rescales vertices; default metres is a zero-copy
+    read-only view, any other unit a writable scaled copy.
+    """
+    pytest.importorskip("numpy")
+    p = _write_mm_cube(tmp_path)
+    m = ifcfast.open(p, use_cache=False, write_cache=False)
+
+    v_m = m.meshes(unit="m")[0].vertices
+    assert (v_m.max(axis=0) - v_m.min(axis=0))[0] == pytest.approx(1.0, rel=0.01)
+
+    v_mm = m.meshes(unit="mm")[0].vertices
+    assert (v_mm.max(axis=0) - v_mm.min(axis=0))[0] == pytest.approx(1000.0, rel=0.01)
+    assert v_mm.flags.writeable  # scaled copy is writable
+
+
+def test_length_unit_property(tmp_path):
+    """m.length_unit reflects the file's authored unit."""
+    p = _write_mm_cube(tmp_path)
+    assert ifcfast.open(p, use_cache=False, write_cache=False).length_unit == "mm"
+    # The bundled metres fixture.
+    assert ifcfast.open(FIXTURE, use_cache=False, write_cache=False).length_unit == "m"
