@@ -32,6 +32,17 @@ from .header import IFCHeader, header as _header
 #: ``trimesh.Trimesh(mesh.vertices, mesh.faces)``.
 Mesh = namedtuple("Mesh", ["guid", "entity", "vertices", "faces"])
 
+
+class MeshList(list):
+    """A plain ``list`` of :data:`Mesh` (fully iterable / indexable /
+    ``len()``-able as before) that also carries ``.global_shift`` — the
+    ``[Sx, Sy, Sz]`` CloudCompare-style offset subtracted from every
+    vertex so far-from-origin geometry survives ``float32``. Add it back
+    for absolute world coordinates; ``[0, 0, 0]`` for near-origin models.
+    """
+
+    global_shift = [0.0, 0.0, 0.0]
+
 #: How many metres one of each named unit is. Geometry APIs
 #: (:meth:`Model.point_cloud`, :meth:`Model.meshes`) accept any of these
 #: keys as their ``unit=`` argument and scale output coordinates
@@ -425,6 +436,23 @@ class Model:
             * ``x, y, z`` — point position in ``unit`` (default metres)
             * ``nx, ny, nz`` — outward face normal (always unit-length)
 
+        Global shift (georeferenced models): coordinates are returned in
+        a CloudCompare-style shifted frame — a single model-wide offset
+        ``S`` is subtracted from every point so the cloud stays near the
+        origin and survives ``float32`` precision (georeferenced models
+        sit at 1e8–1e9 mm, where ``float32`` quantises geometry into a
+        single collapsed point). The relative layout of every object is
+        preserved exactly. The shift is on ``df.attrs["global_shift"]``
+        (a ``[Sx, Sy, Sz]`` list in the output ``unit``); add it back for
+        absolute world coordinates::
+
+            >>> S = df.attrs["global_shift"]
+            >>> df[["x", "y", "z"]] + S   # absolute world coords
+
+        For near-origin models ``S`` is ``[0, 0, 0]`` and points are
+        already absolute. The GUID always keeps each point joined to its
+        product in the spatial graph regardless of shift.
+
         For a typical synthetic-data workflow:
 
             >>> import numpy as np
@@ -451,9 +479,14 @@ class Model:
             "ny": d["ny"],
             "nz": d["nz"],
         })
+        # Rust returns coords + shift in metres; scale both to `unit` so
+        # `point + global_shift` stays consistent in the output unit.
+        gshift = list(d.get("global_shift", [0.0, 0.0, 0.0]))
         if factor != 1.0:
             # Coordinates only — normals are unit directions, untouched.
             df[["x", "y", "z"]] *= factor
+            gshift = [s * factor for s in gshift]
+        df.attrs["global_shift"] = gshift
         return df
 
     def meshes(self, unit: str = "m"):
@@ -468,16 +501,36 @@ class Model:
         * ``guid``     — IfcRoot GlobalId
         * ``entity``   — raw IFC class (``IfcWall``, ``IfcSlab``, ...)
         * ``vertices`` — ``numpy.ndarray`` shape ``(N, 3)``, ``float32``,
-          world coordinates in ``unit`` (default metres)
+          world coordinates in ``unit`` (default metres), in the shifted
+          frame described below
         * ``faces``    — ``numpy.ndarray`` shape ``(M, 3)``, ``uint32``,
           triangle vertex indices
+
+        Global shift (georeferenced models): the returned list is a
+        :class:`MeshList` — a normal list with a ``.global_shift``
+        attribute (``[Sx, Sy, Sz]`` in the output ``unit``). A single
+        model-wide offset is subtracted from every vertex of every
+        product so far-from-origin geometry (georeferenced models at
+        1e8–1e9 mm) survives ``float32`` instead of collapsing to a
+        point. Relative placement between objects is preserved exactly;
+        add ``global_shift`` back per vertex for absolute world coords::
+
+            >>> ms = m.meshes()
+            >>> ms.global_shift                 # [Sx, Sy, Sz] or [0,0,0]
+            >>> ms[0].vertices + ms.global_shift  # absolute world coords
+
+        For near-origin models the shift is ``[0, 0, 0]`` and vertices
+        are already absolute. The GUID always keeps each mesh joined to
+        its product in the spatial graph regardless of shift.
 
         Args:
             unit: output coordinate unit — ``"m"`` (default), ``"mm"``,
                 ``"cm"``, ``"dm"``, ``"ft"``, ``"in"`` (long names also
                 accepted). For the default metres, ``vertices`` is a
                 zero-copy read-only view of the Rust buffer; any other
-                unit returns a writable scaled copy.
+                unit returns a writable scaled copy. Either way the
+                global shift is already applied Rust-side, and
+                ``vertices + global_shift`` yields a fresh absolute array.
 
         Drop-in for trimesh:
 
@@ -507,7 +560,7 @@ class Model:
 
         factor = _unit_factor(unit)
         d = _core.extract_meshes(str(self.header.path))
-        out = []
+        out = MeshList()
         for i in range(len(d["guid"])):
             verts = np.frombuffer(d["vertices"][i], dtype=np.float32).reshape(-1, 3)
             if factor != 1.0:
@@ -515,6 +568,10 @@ class Model:
                 verts = (verts * np.float32(factor)).astype(np.float32, copy=False)
             faces = np.frombuffer(d["indices"][i], dtype=np.uint32).reshape(-1, 3)
             out.append(Mesh(d["guid"][i], d["entity"][i], verts, faces))
+        # Rust returns the shift in metres; scale to the output unit so
+        # `vertices + global_shift` is consistent.
+        gshift = list(d.get("global_shift", [0.0, 0.0, 0.0]))
+        out.global_shift = [s * factor for s in gshift] if factor != 1.0 else gshift
         return out
 
     def iter_meshes(self, unit: str = "m"):

@@ -34,7 +34,7 @@ pub mod stats;
 use std::collections::HashMap;
 use std::time::Instant;
 
-use glam::{Mat4, Vec3, Vec4};
+use glam::{DMat4, DVec3, Mat4, Vec3, Vec4};
 
 use crate::entity_table::EntityTable;
 use crate::lexer::{parse_field, split_top_level_args, Field};
@@ -210,6 +210,14 @@ pub struct ProductMesh {
     /// world-baked `vertices` were computed as
     /// `world_transform * part.instance_transform * local_vertex`.
     pub world_transform: [f32; 16],
+    /// Precise (f64) world position of the product's placement origin.
+    /// Same point as `placement_origin` but resolved through the f64
+    /// placement chain, so it stays exact at georeferenced magnitudes
+    /// where the f32 `placement_origin` quantises to tens of mm / metres.
+    /// This is the anchor a [`BakeFrame::Local`] consumer adds back (in
+    /// f64, minus a global shift) to position near-origin shape geometry
+    /// in world space without the f32 collapse.
+    pub world_origin: [f64; 3],
 }
 
 #[derive(Debug, Default, Clone)]
@@ -365,9 +373,18 @@ pub fn mesh_ifc_streaming_framed<S: ProductSink>(
         // need it hoisted so geometryless emits still carry the
         // authoring tool's `placement_origin` (where the element "is"
         // even when it has no body).
-        let world = placement_id
+        // Resolve the chain in f64 (precise origin at georeferenced
+        // magnitudes), then downcast to f32 for the existing local-frame
+        // bake math (rotation is f32-safe; only the translation needed
+        // f64, and that's preserved separately in `world_origin`).
+        let world_f64 = placement_id
             .map(|pid| resolver.world(pid))
-            .unwrap_or(Mat4::IDENTITY);
+            .unwrap_or(DMat4::IDENTITY);
+        let world = world_f64.as_mat4();
+        let world_origin = {
+            let p = world_f64.transform_point3(DVec3::ZERO);
+            [p.x, p.y, p.z]
+        };
         let placement_origin = {
             let p = world * Vec4::new(0.0, 0.0, 0.0, 1.0);
             [p.x, p.y, p.z]
@@ -386,6 +403,7 @@ pub fn mesh_ifc_streaming_framed<S: ProductSink>(
                     step_id,
                     placement_origin,
                     world,
+                    world_origin,
                 );
                 continue;
             }
@@ -403,6 +421,7 @@ pub fn mesh_ifc_streaming_framed<S: ProductSink>(
                 step_id,
                 placement_origin,
                 world,
+                world_origin,
             );
             continue;
         }
@@ -518,6 +537,7 @@ pub fn mesh_ifc_streaming_framed<S: ProductSink>(
                 step_id,
                 placement_origin,
                 world,
+                world_origin,
             );
             continue;
         }
@@ -556,6 +576,7 @@ pub fn mesh_ifc_streaming_framed<S: ProductSink>(
             placement_origin,
             parts,
             world_transform: world.to_cols_array(),
+            world_origin,
         });
     }
 
@@ -579,6 +600,7 @@ fn emit_geometryless<S: ProductSink>(
     ifc_id: u64,
     placement_origin: [f32; 3],
     world: Mat4,
+    world_origin: [f64; 3],
 ) {
     stats.products_deferred += 1;
     *stats.by_source.entry(reason.to_string()).or_insert(0) += 1;
@@ -595,6 +617,7 @@ fn emit_geometryless<S: ProductSink>(
             placement_origin,
             parts: Vec::new(),
             world_transform: world.to_cols_array(),
+            world_origin,
         });
     }
 }

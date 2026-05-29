@@ -704,6 +704,38 @@ mod python {
         Ok(out)
     }
 
+    // ----- global shift (CloudCompare contract) ------------------------
+
+    /// Decide the model-wide global shift from the first geometry
+    /// product's f64 world origin. Returns the rounded origin (so far-
+    /// from-origin geometry is repositioned near the f32-precise origin)
+    /// only when the origin is genuinely large; otherwise `[0, 0, 0]` so
+    /// near-origin models keep absolute world coordinates unchanged.
+    ///
+    /// Threshold is in metres (origin scaled by `unit_scale`): 10 km.
+    /// Below it, f32 already represents the coordinate finely enough
+    /// (~1 mm quantum at 10 km) that no shift is warranted; above it
+    /// (UTM eastings/northings, mm-based georef at 1e8–1e9) geometry
+    /// collapses without the shift.
+    #[cfg(feature = "mesh")]
+    fn global_shift_for(world_origin: &[f64; 3], unit_scale: f32) -> [f64; 3] {
+        const THRESHOLD_M: f64 = 1.0e4;
+        let us = unit_scale as f64;
+        let max_m = world_origin
+            .iter()
+            .map(|c| (c * us).abs())
+            .fold(0.0_f64, f64::max);
+        if max_m > THRESHOLD_M {
+            [
+                world_origin[0].round(),
+                world_origin[1].round(),
+                world_origin[2].round(),
+            ]
+        } else {
+            [0.0, 0.0, 0.0]
+        }
+    }
+
     // ----- sample_point_cloud ------------------------------------------
 
     /// Sample `per_m2` points per square metre of surface on every
@@ -722,7 +754,7 @@ mod python {
         per_m2: f32,
         seed: u64,
     ) -> PyResult<Bound<'py, PyDict>> {
-        use crate::mesh::{sample::sample as sample_mesh, ProductMesh, ProductSink};
+        use crate::mesh::{sample::sample as sample_mesh, BakeFrame, ProductMesh, ProductSink};
 
         let t_total = Instant::now();
         let (mmap, _open_ms) = open_mmap(path)?;
@@ -741,6 +773,14 @@ mod python {
             // matching mesh_qto's m²/m³ convention. Normals are
             // direction vectors and stay unit-length (not scaled).
             unit_scale: f32,
+            // Model-wide global shift (CloudCompare contract), in model
+            // units. Set lazily from the first geometry product's f64
+            // world origin (rounded). Points are positioned as
+            // `local_shape + (world_origin - shift)` — both terms small,
+            // the sum stays in f32-safe range even for georeferenced
+            // models. Exposed back to the caller (scaled to metres) so
+            // absolute world coords are `point + global_shift`.
+            shift: Option<[f64; 3]>,
             // One row per emitted point. Each Vec has length equal to
             // the total point count.
             guid: Vec<String>,
@@ -775,18 +815,43 @@ mod python {
                 if n == 0 {
                     return;
                 }
+                // Pin the model-wide shift to the first geometry product's
+                // world origin (rounded to a clean model-unit value). All
+                // later products subtract the same shift, so the relative
+                // layout of the whole model is preserved while every point
+                // stays near origin in f32. Threshold-gated like
+                // CloudCompare: only shift when the origin is large enough
+                // (>10 km in metres) to actually lose f32 precision, so
+                // normal building models stay byte-identical (shift 0) and
+                // return absolute world coordinates as before.
+                let shift = *self
+                    .shift
+                    .get_or_insert_with(|| global_shift_for(&mesh.world_origin, self.unit_scale));
+                // Offset from shift to THIS product's precise origin, in
+                // model units. Small for any product within a sane model
+                // extent — computed in f64 so it never collapses.
+                let off = [
+                    mesh.world_origin[0] - shift[0],
+                    mesh.world_origin[1] - shift[1],
+                    mesh.world_origin[2] - shift[2],
+                ];
                 self.guid.reserve(n);
                 self.entity.reserve(n);
                 for _ in 0..n {
                     self.guid.push(mesh.guid.clone());
                     self.entity.push(mesh.entity.clone());
                 }
-                // Scale positions native-unit → metres; normals are
-                // directions, copied through unchanged.
-                let us = self.unit_scale;
-                self.x.extend(cloud.x.iter().map(|v| v * us));
-                self.y.extend(cloud.y.iter().map(|v| v * us));
-                self.z.extend(cloud.z.iter().map(|v| v * us));
+                // Position each local-frame point at `local + off` (f64),
+                // then scale native-unit → metres. Local shape is near
+                // origin, `off` is small → no f32 collapse. Normals are
+                // direction vectors, copied through unchanged.
+                let us = self.unit_scale as f64;
+                self.x
+                    .extend(cloud.x.iter().map(|v| ((*v as f64 + off[0]) * us) as f32));
+                self.y
+                    .extend(cloud.y.iter().map(|v| ((*v as f64 + off[1]) * us) as f32));
+                self.z
+                    .extend(cloud.z.iter().map(|v| ((*v as f64 + off[2]) * us) as f32));
                 self.nx.extend(cloud.nx);
                 self.ny.extend(cloud.ny);
                 self.nz.extend(cloud.nz);
@@ -798,6 +863,7 @@ mod python {
             seed,
             area_scale,
             unit_scale,
+            shift: None,
             guid: Vec::new(),
             entity: Vec::new(),
             x: Vec::new(),
@@ -808,8 +874,13 @@ mod python {
             nz: Vec::new(),
         };
         let t_mesh = Instant::now();
-        let mesh_stats =
-            py.allow_threads(|| crate::mesh::mesh_ifc_streaming(&mmap, &mut sink));
+        // Local frame: shape near origin (f32-precise even for
+        // georeferenced models), repositioned per-product in f64 via the
+        // global shift. World-frame baking would collapse small far-from-
+        // origin geometry before sampling ever ran.
+        let mesh_stats = py.allow_threads(|| {
+            crate::mesh::mesh_ifc_streaming_framed(&mmap, &mut sink, BakeFrame::Local)
+        });
         let mesh_ms = t_mesh.elapsed().as_secs_f64() * 1000.0;
 
         let t_marshal = Instant::now();
@@ -823,6 +894,15 @@ mod python {
         out.set_item("ny", PyList::new_bound(py, &sink.ny))?;
         out.set_item("nz", PyList::new_bound(py, &sink.nz))?;
         out.set_item("unit_scale", unit_scale as f64)?;
+        // Global shift in METRES: add this back to (x, y, z) to recover
+        // absolute world coordinates. `[0, 0, 0]` when the model has no
+        // geometry or already sits near origin.
+        let gs = sink.shift.unwrap_or([0.0, 0.0, 0.0]);
+        let us = unit_scale as f64;
+        out.set_item(
+            "global_shift",
+            PyList::new_bound(py, [gs[0] * us, gs[1] * us, gs[2] * us]),
+        )?;
         out.set_item("per_m2", per_m2 as f64)?;
         out.set_item("seed", seed)?;
         out.set_item("points_emitted", sink.x.len() as u64)?;
@@ -861,7 +941,7 @@ mod python {
     #[cfg(feature = "mesh")]
     #[pyfunction]
     pub fn extract_meshes<'py>(py: Python<'py>, path: &str) -> PyResult<Bound<'py, PyDict>> {
-        use crate::mesh::{ProductMesh, ProductSink};
+        use crate::mesh::{BakeFrame, ProductMesh, ProductSink};
 
         let t_total = Instant::now();
         let (mmap, _open_ms) = open_mmap(path)?;
@@ -874,6 +954,12 @@ mod python {
 
         struct MeshSink {
             unit_scale: f32,
+            // Model-wide global shift (CloudCompare contract), model
+            // units. Same scheme as `sample_point_cloud`: set from the
+            // first geometry product's f64 origin (rounded); per-product
+            // vertices are `local + (world_origin - shift)`, scaled to
+            // metres. Add `global_shift` back for absolute coords.
+            shift: Option<[f64; 3]>,
             guid: Vec<String>,
             entity: Vec<String>,
             vertex_count: Vec<u32>,
@@ -888,11 +974,26 @@ mod python {
                 if mesh.indices.is_empty() || mesh.vertices.is_empty() {
                     return;
                 }
-                // Scale native-unit vertices → metres on the way out.
-                let us = self.unit_scale;
+                let shift = *self
+                    .shift
+                    .get_or_insert_with(|| global_shift_for(&mesh.world_origin, self.unit_scale));
+                let off = [
+                    mesh.world_origin[0] - shift[0],
+                    mesh.world_origin[1] - shift[1],
+                    mesh.world_origin[2] - shift[2],
+                ];
+                // Reposition local-frame shape to `local + off` (f64),
+                // scale native-unit → metres. Far-from-origin geometry
+                // stays precise: shape near origin, off small.
+                let us = self.unit_scale as f64;
                 let mut vbytes = Vec::with_capacity(mesh.vertices.len() * 4);
-                for v in &mesh.vertices {
-                    vbytes.extend_from_slice(&(v * us).to_le_bytes());
+                for chunk in mesh.vertices.chunks_exact(3) {
+                    let x = ((chunk[0] as f64 + off[0]) * us) as f32;
+                    let y = ((chunk[1] as f64 + off[1]) * us) as f32;
+                    let z = ((chunk[2] as f64 + off[2]) * us) as f32;
+                    vbytes.extend_from_slice(&x.to_le_bytes());
+                    vbytes.extend_from_slice(&y.to_le_bytes());
+                    vbytes.extend_from_slice(&z.to_le_bytes());
                 }
                 let mut ibytes = Vec::with_capacity(mesh.indices.len() * 4);
                 for i in &mesh.indices {
@@ -909,6 +1010,7 @@ mod python {
 
         let mut sink = MeshSink {
             unit_scale,
+            shift: None,
             guid: Vec::new(),
             entity: Vec::new(),
             vertex_count: Vec::new(),
@@ -917,8 +1019,10 @@ mod python {
             indices_le: Vec::new(),
         };
         let t_mesh = Instant::now();
-        let mesh_stats =
-            py.allow_threads(|| crate::mesh::mesh_ifc_streaming(&mmap, &mut sink));
+        // Local frame + per-product f64 shift — see sample_point_cloud.
+        let mesh_stats = py.allow_threads(|| {
+            crate::mesh::mesh_ifc_streaming_framed(&mmap, &mut sink, BakeFrame::Local)
+        });
         let mesh_ms = t_mesh.elapsed().as_secs_f64() * 1000.0;
 
         let t_marshal = Instant::now();
@@ -939,6 +1043,14 @@ mod python {
             .collect();
         out.set_item("vertices", PyList::new_bound(py, verts))?;
         out.set_item("indices", PyList::new_bound(py, inds))?;
+        // Global shift in METRES — add back to vertices for absolute
+        // world coords. `[0, 0, 0]` for near-origin or empty models.
+        let gs = sink.shift.unwrap_or([0.0, 0.0, 0.0]);
+        let us = unit_scale as f64;
+        out.set_item(
+            "global_shift",
+            PyList::new_bound(py, [gs[0] * us, gs[1] * us, gs[2] * us]),
+        )?;
         out.set_item("products_meshed", mesh_stats.products_meshed as u64)?;
         out.set_item("mesh_ms", mesh_ms)?;
         out.set_item("marshal_ms", t_marshal.elapsed().as_secs_f64() * 1000.0)?;

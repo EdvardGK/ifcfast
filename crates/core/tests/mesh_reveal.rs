@@ -918,4 +918,50 @@ fn far_from_origin_box_collapses_in_world_but_not_local() {
         "placement_origin x {} should be ~5e7",
         local.0[0].placement_origin[0],
     );
+
+    // Stage 2: the precise f64 `world_origin` is exact (sub-mm), unlike
+    // the f32 `placement_origin` which is already quantised to ~6 units
+    // at this magnitude. This is the anchor point_cloud()/meshes() add
+    // back in f64.
+    let wo = local.0[0].world_origin;
+    for (k, &w) in wo.iter().enumerate() {
+        assert!(
+            (w - 50_000_000.0).abs() < 1e-3,
+            "world_origin[{}] = {} should be exactly ~5e7 in f64",
+            k,
+            w,
+        );
+    }
+
+    // Stage 2 reconstruction contract (mirrors CloudSink/MeshSink):
+    // shift = round(world_origin); off = world_origin - shift (≈ 0);
+    // positioning each local vertex as `local + off` then downcasting to
+    // f32 must NOT re-collapse the box — that's the whole point of the
+    // global shift vs. adding the full 5e7 origin back.
+    let shift = [wo[0].round(), wo[1].round(), wo[2].round()];
+    let off = [wo[0] - shift[0], wo[1] - shift[1], wo[2] - shift[2]];
+    for o in off {
+        assert!(o.abs() < 1.0, "per-product offset {} should be small", o);
+    }
+    let shifted: Vec<f32> = local.0[0]
+        .vertices
+        .chunks_exact(3)
+        .flat_map(|c| {
+            [
+                (c[0] as f64 + off[0]) as f32,
+                (c[1] as f64 + off[1]) as f32,
+                (c[2] as f64 + off[2]) as f32,
+            ]
+        })
+        .collect();
+    let qs = qto::compute(&shifted, &local.0[0].indices, 1.0);
+    assert_eq!(
+        qs.surface_count, 6,
+        "shifted box must keep 6 faces (no re-collapse)",
+    );
+    assert!(
+        (qs.volume_m3.abs() - 0.001).abs() < 1e-5,
+        "shifted box volume {} m³, expected ~0.001",
+        qs.volume_m3,
+    );
 }
