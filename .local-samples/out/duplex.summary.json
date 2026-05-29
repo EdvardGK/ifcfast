@@ -1,0 +1,195 @@
+{
+  "path": "/home/edkjo/workspace/inbox/ifcfast/.local-samples/Duplex_A_20110907.ifc",
+  "size_bytes": 2380763,
+  "schema": "IFC2X3",
+  "project_name": "0001",
+  "authoring_app": "Autodesk Revit Architecture 2011",
+  "unit_scale": 1.0,
+  "cache_key": "027b2a6e185668e0",
+  "products": 268,
+  "storeys": 4,
+  "type_counts_total": 15,
+  "top_types": {
+    "IfcFurnishingElement": 61,
+    "IfcWallStandardCase": 56,
+    "IfcOpeningElement": 50,
+    "IfcWindow": 24,
+    "IfcSlab": 21,
+    "IfcDoor": 14,
+    "IfcCovering": 13,
+    "IfcBeam": 8,
+    "IfcFooting": 7,
+    "IfcMember": 4,
+    "IfcRailing": 4,
+    "IfcStair": 2,
+    "IfcStairFlight": 2,
+    "IfcRoof": 1,
+    "IfcWall": 1
+  },
+  "tables": {
+    "products": {
+      "rows": 268,
+      "columns": [
+        "guid",
+        "entity",
+        "name",
+        "predefined_type",
+        "object_type",
+        "tag",
+        "storey_guid",
+        "storey_name",
+        "parent_guid",
+        "mode",
+        "step_id",
+        "type_guid",
+        "type_name",
+        "type_source"
+      ],
+      "loaded": true
+    },
+    "storeys": {
+      "rows": 4,
+      "columns": [
+        "guid",
+        "name",
+        "elevation",
+        "building_guid"
+      ],
+      "loaded": true
+    },
+    "spaces": {
+      "rows": 21,
+      "columns": [
+        "guid",
+        "step_id"
+      ],
+      "loaded": true
+    },
+    "type_objects": {
+      "rows": 25,
+      "columns": [
+        "guid",
+        "entity",
+        "name",
+        "step_id"
+      ],
+      "loaded": true
+    },
+    "contained_in": {
+      "rows": 146,
+      "columns": [
+        "product_guid",
+        "storey_guid"
+      ],
+      "loaded": true
+    },
+    "aggregates": {
+      "rows": 38,
+      "columns": [
+        "child_guid",
+        "parent_guid",
+        "parent_kind"
+      ],
+      "loaded": true
+    },
+    "storey_building": {
+      "rows": 4,
+      "columns": [
+        "storey_guid",
+        "building_guid"
+      ],
+      "loaded": true
+    },
+    "voids": {
+      "rows": 50,
+      "columns": [
+        "opening_guid",
+        "host_guid"
+      ],
+      "loaded": true
+    },
+    "psets": {
+      "rows": 13434,
+      "columns": [
+        "guid",
+        "pset_name",
+        "prop_name",
+        "value",
+        "value_type"
+      ],
+      "loaded": true
+    },
+    "quantities": {
+      "rows": 21,
+      "columns": [
+        "guid",
+        "qto_name",
+        "quantity_name",
+        "value",
+        "quantity_type",
+        "unit_step_id"
+      ],
+      "loaded": true
+    },
+    "materials": {
+      "rows": 271,
+      "columns": [
+        "guid",
+        "role",
+        "layer_index",
+        "material_name",
+        "layer_thickness_mm",
+        "category"
+      ],
+      "loaded": true
+    },
+    "classifications": {
+      "rows": 0,
+      "columns": [
+        "guid",
+        "system_name",
+        "edition",
+        "identification",
+        "name",
+        "location",
+        "source"
+      ],
+      "loaded": true
+    },
+    "drift": {
+      "rows": 286,
+      "columns": [
+        "guid",
+        "entity",
+        "source",
+        "triangle_count",
+        "surface_area",
+        "volume_abs",
+        "placement_x",
+        "placement_y",
+        "placement_z",
+        "centroid_x",
+        "centroid_y",
+        "centroid_z",
+        "drift_distance",
+        "max_extent",
+        "drift_ratio",
+        "drift_severity"
+      ],
+      "loaded": true
+    },
+    "segments": {
+      "rows": 493,
+      "columns": [
+        "guid",
+        "product_index",
+        "segment_index",
+        "source",
+        "triangle_count",
+        "index_start"
+      ],
+      "loaded": true
+    }
+  },
+  "parse_seconds": 0.19379591941833496
+}

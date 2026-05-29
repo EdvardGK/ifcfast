@@ -1,0 +1,200 @@
+{
+  "schema": "IFC2X3",
+  "products": 268,
+  "rows": [
+    {
+      "entity": "IfcFurnishingElement",
+      "count": 61,
+      "storeys": [],
+      "area_m2": 511.1361014844,
+      "volume_m3": 648.8748141676,
+      "triangles": 13684,
+      "products_with_mesh": 61,
+      "products_without_mesh": 0,
+      "source": "mesh"
+    },
+    {
+      "entity": "IfcWallStandardCase",
+      "count": 56,
+      "storeys": [
+        "Level 1",
+        "Level 2",
+        "Roof",
+        "T/FDN"
+      ],
+      "area_m2": 1695.0168027276,
+      "volume_m3": 252.66916299219997,
+      "triangles": 792,
+      "products_with_mesh": 56,
+      "products_without_mesh": 0,
+      "source": "mesh"
+    },
+    {
+      "entity": "IfcOpeningElement",
+      "count": 50,
+      "storeys": [],
+      "area_m2": 335.03077760319997,
+      "volume_m3": 45.996103291899985,
+      "triangles": 632,
+      "products_with_mesh": 50,
+      "products_without_mesh": 0,
+      "source": "mesh"
+    },
+    {
+      "entity": "IfcWindow",
+      "count": 24,
+      "storeys": [
+        "Level 1",
+        "Level 2",
+        "Roof"
+      ],
+      "area_m2": 268.59079027200005,
+      "volume_m3": 50.478135049500004,
+      "triangles": 2656,
+      "products_with_mesh": 24,
+      "products_without_mesh": 0,
+      "source": "mesh"
+    },
+    {
+      "entity": "IfcSlab",
+      "count": 21,
+      "storeys": [
+        "Level 1",
+        "Level 2"
+      ],
+      "area_m2": 1420.8949656485,
+      "volume_m3": 126.34711194420001,
+      "triangles": 540,
+      "products_with_mesh": 21,
+      "products_without_mesh": 0,
+      "source": "mesh"
+    },
+    {
+      "entity": "IfcDoor",
+      "count": 14,
+      "storeys": [
+        "Level 1",
+        "Level 2"
+      ],
+      "area_m2": 85.7958116532,
+      "volume_m3": 1.5617110059,
+      "triangles": 1016,
+      "products_with_mesh": 14,
+      "products_without_mesh": 0,
+      "source": "mesh"
+    },
+    {
+      "entity": "IfcCovering",
+      "count": 13,
+      "storeys": [
+        "Level 1",
+        "Level 2"
+      ],
+      "area_m2": 516.1571111679001,
+      "volume_m3": 345.9632719755,
+      "triangles": 284,
+      "products_with_mesh": 13,
+      "products_without_mesh": 0,
+      "source": "mesh"
+    },
+    {
+      "entity": "IfcBeam",
+      "count": 8,
+      "storeys": [
+        "Level 1",
+        "Level 2"
+      ],
+      "area_m2": 62.615775585399994,
+      "volume_m3": 0.35442105679999997,
+      "triangles": 480,
+      "products_with_mesh": 8,
+      "products_without_mesh": 0,
+      "source": "mesh"
+    },
+    {
+      "entity": "IfcFooting",
+      "count": 7,
+      "storeys": [
+        "T/FDN"
+      ],
+      "area_m2": 150.6960353851,
+      "volume_m3": 16.5280449987,
+      "triangles": 84,
+      "products_with_mesh": 7,
+      "products_without_mesh": 0,
+      "source": "mesh"
+    },
+    {
+      "entity": "IfcMember",
+      "count": 4,
+      "storeys": [],
+      "area_m2": 16.835755348299998,
+      "volume_m3": 0.37048298859999995,
+      "triangles": 80,
+      "products_with_mesh": 4,
+      "products_without_mesh": 0,
+      "source": "mesh"
+    },
+    {
+      "entity": "IfcRailing",
+      "count": 4,
+      "storeys": [],
+      "area_m2": 16.0292403101,
+      "volume_m3": 25.0876907608,
+      "triangles": 2420,
+      "products_with_mesh": 4,
+      "products_without_mesh": 0,
+      "source": "mesh"
+    },
+    {
+      "entity": "IfcStair",
+      "count": 2,
+      "storeys": [
+        "Level 1"
+      ],
+      "area_m2": null,
+      "volume_m3": null,
+      "triangles": 0,
+      "products_with_mesh": 0,
+      "products_without_mesh": 2,
+      "source": "none"
+    },
+    {
+      "entity": "IfcStairFlight",
+      "count": 2,
+      "storeys": [],
+      "area_m2": 29.2489233017,
+      "volume_m3": 0.4126167894,
+      "triangles": 864,
+      "products_with_mesh": 2,
+      "products_without_mesh": 0,
+      "source": "mesh"
+    },
+    {
+      "entity": "IfcRoof",
+      "count": 1,
+      "storeys": [
+        "Roof"
+      ],
+      "area_m2": null,
+      "volume_m3": null,
+      "triangles": 0,
+      "products_with_mesh": 0,
+      "products_without_mesh": 1,
+      "source": "none"
+    },
+    {
+      "entity": "IfcWall",
+      "count": 1,
+      "storeys": [
+        "Level 2"
+      ],
+      "area_m2": 176.9546203613,
+      "volume_m3": 122.8739547729,
+      "triangles": 76,
+      "products_with_mesh": 1,
+      "products_without_mesh": 0,
+      "source": "mesh"
+    }
+  ]
+}

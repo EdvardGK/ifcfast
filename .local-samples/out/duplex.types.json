@@ -1,0 +1,277 @@
+[
+  {
+    "entity": "IfcFurnishingElement",
+    "count": 61,
+    "storeys": [],
+    "predefined_types": [],
+    "object_types": [
+      "0610 x 0610 x 0610mm",
+      "0915 x 1830 x 0457mm",
+      "1000 mm",
+      "1000mm",
+      "1525 x 2007mm - Queen",
+      "1830mm",
+      "1981 x 2032mm - King",
+      "450 x 450 mm",
+      "600mm Depth",
+      "650 x 450 mm",
+      "800 mm"
+    ],
+    "sample_guids": [
+      "0wkEuT1wr1kOyafLY4vyu$",
+      "0wkEuT1wr1kOyafLY4vy_8",
+      "0wkEuT1wr1kOyafLY4vy3H"
+    ]
+  },
+  {
+    "entity": "IfcWallStandardCase",
+    "count": 56,
+    "storeys": [
+      "Level 1",
+      "Level 2",
+      "Roof",
+      "T/FDN"
+    ],
+    "predefined_types": [],
+    "object_types": [
+      "Basic Wall:Exterior - Brick on Block:130892",
+      "Basic Wall:Foundation - Concrete (417mm):128676",
+      "Basic Wall:Foundation - Concrete (435mm):207146",
+      "Basic Wall:Interior - Furring (152 mm Stud):187795",
+      "Basic Wall:Interior - Furring (38 mm Stud):128404",
+      "Basic Wall:Interior - Partition (92mm Stud):128360",
+      "Basic Wall:Interior - Plumbing (152mm Stud):128382",
+      "Basic Wall:Party Wall - CMU Residential Unit Dimising Wall:128555"
+    ],
+    "sample_guids": [
+      "2O2Fr$t4X7Zf8NOew3FNld",
+      "2O2Fr$t4X7Zf8NOew3FNbT",
+      "2O2Fr$t4X7Zf8NOew3FKRi"
+    ]
+  },
+  {
+    "entity": "IfcOpeningElement",
+    "count": 50,
+    "storeys": [],
+    "predefined_types": [],
+    "object_types": [
+      "Opening"
+    ],
+    "sample_guids": [
+      "1xS3BCk291UvhgP2dvNrrP",
+      "1xS3BCk291UvhgP2dvNrv5",
+      "1xS3BCk291UvhgP2dvNrY1"
+    ]
+  },
+  {
+    "entity": "IfcWindow",
+    "count": 24,
+    "storeys": [
+      "Level 1",
+      "Level 2",
+      "Roof"
+    ],
+    "predefined_types": [],
+    "object_types": [
+      "1180 x 1170mm",
+      "2800mm x 2410mm",
+      "4835mm x 2420mm",
+      "750mm x 2200mm",
+      "819mm x 759mm"
+    ],
+    "sample_guids": [
+      "1hOSvn6df7F8_7GcBWlR72",
+      "1hOSvn6df7F8_7GcBWlRBU",
+      "1hOSvn6df7F8_7GcBWlRLx"
+    ]
+  },
+  {
+    "entity": "IfcSlab",
+    "count": 21,
+    "storeys": [
+      "Level 1",
+      "Level 2"
+    ],
+    "predefined_types": [
+      "FLOOR",
+      "ROOF"
+    ],
+    "object_types": [
+      "Basic Roof:Live Roof over Wood Joist Flat Roof",
+      "Floor:127mm Slab on Grade",
+      "Floor:150mm Exterior Slab on Grade",
+      "Floor:Finish Floor - Ceramic Tile",
+      "Floor:Finish Floor - Wood",
+      "Floor:Residential - Wood Joist with Subflooring"
+    ],
+    "sample_guids": [
+      "2O2Fr$t4X7Zf8NOew3FK4F",
+      "2O2Fr$t4X7Zf8NOew3FKcz",
+      "1hOSvn6df7F8_7GcBWlRqU"
+    ]
+  },
+  {
+    "entity": "IfcDoor",
+    "count": 14,
+    "storeys": [
+      "Level 1",
+      "Level 2"
+    ],
+    "predefined_types": [],
+    "object_types": [
+      "0762 x 2032mm",
+      "0813 x 2420mm",
+      "0864 x 2032mm",
+      "1250mm x 2010mm"
+    ],
+    "sample_guids": [
+      "1hOSvn6df7F8_7GcBWlRGQ",
+      "1hOSvn6df7F8_7GcBWlRH8",
+      "1hOSvn6df7F8_7GcBWlS8Z"
+    ]
+  },
+  {
+    "entity": "IfcCovering",
+    "count": 13,
+    "storeys": [
+      "Level 1",
+      "Level 2"
+    ],
+    "predefined_types": [
+      "CEILING"
+    ],
+    "object_types": [
+      "Compound Ceiling:Gypsum Board"
+    ],
+    "sample_guids": [
+      "3bXiCStxP6Fgxdej$yc5T8",
+      "3bXiCStxP6Fgxdej$yc503",
+      "3bXiCStxP6Fgxdej$yc50B"
+    ]
+  },
+  {
+    "entity": "IfcBeam",
+    "count": 8,
+    "storeys": [
+      "Level 1",
+      "Level 2"
+    ],
+    "predefined_types": [],
+    "object_types": [
+      "M_W-Wide Flange:W310X60:208816",
+      "M_W-Wide Flange:W410X60:208814"
+    ],
+    "sample_guids": [
+      "2OrWItJ6zAwBNp0OUxK_l8",
+      "2OrWItJ6zAwBNp0OUxK$8W",
+      "2OrWItJ6zAwBNp0OUxK$Bq"
+    ]
+  },
+  {
+    "entity": "IfcFooting",
+    "count": 7,
+    "storeys": [
+      "T/FDN"
+    ],
+    "predefined_types": [
+      "STRIP_FOOTING"
+    ],
+    "object_types": [
+      "Wall Foundation:Bearing Footing - 900 x 300"
+    ],
+    "sample_guids": [
+      "0kF45Qs8L9PAM9kmb1lT5d",
+      "0kF45Qs8L9PAM9kmb1lT5l",
+      "0kF45Qs8L9PAM9kmb1lT5t"
+    ]
+  },
+  {
+    "entity": "IfcMember",
+    "count": 4,
+    "storeys": [],
+    "predefined_types": [],
+    "object_types": [
+      "stringer"
+    ],
+    "sample_guids": [
+      "1gtrSK5QnDuxDwygd0EDGO",
+      "34qUFGjJzFKwVWpXe2dTPt",
+      "01KzA4SPn5IOODwLEb5RNY"
+    ]
+  },
+  {
+    "entity": "IfcRailing",
+    "count": 4,
+    "storeys": [],
+    "predefined_types": [
+      "NOTDEFINED"
+    ],
+    "object_types": [
+      "Railing:1100mm Guard Rail",
+      "Railing:900mm Handrail Only"
+    ],
+    "sample_guids": [
+      "0wkEuT1wr1kOyafLY4v_PL",
+      "0wkEuT1wr1kOyafLY4v_PH",
+      "21ldoMpbP4VfsJ0XGY_34P"
+    ]
+  },
+  {
+    "entity": "IfcStair",
+    "count": 2,
+    "storeys": [
+      "Level 1"
+    ],
+    "predefined_types": [],
+    "object_types": [
+      "Stair:Residential - 200mm Max Riser 250mm Tread"
+    ],
+    "sample_guids": [
+      "0wkEuT1wr1kOyafLY4v_O1",
+      "21ldoMpbP4VfsJ0XGY_34d"
+    ]
+  },
+  {
+    "entity": "IfcStairFlight",
+    "count": 2,
+    "storeys": [],
+    "predefined_types": [],
+    "object_types": [
+      "Stair:Residential - 200mm Max Riser 250mm Tread"
+    ],
+    "sample_guids": [
+      "1oKjKg9PD3fP1iIwXLh3lK",
+      "3KMJUyUe9DfQ2FOCd5ZoiN"
+    ]
+  },
+  {
+    "entity": "IfcRoof",
+    "count": 1,
+    "storeys": [
+      "Roof"
+    ],
+    "predefined_types": [
+      "NOTDEFINED"
+    ],
+    "object_types": [
+      "Basic Roof:Live Roof over Wood Joist Flat Roof"
+    ],
+    "sample_guids": [
+      "0jf0rYHfX3RAB3bSIRjmxl"
+    ]
+  },
+  {
+    "entity": "IfcWall",
+    "count": 1,
+    "storeys": [
+      "Level 2"
+    ],
+    "predefined_types": [],
+    "object_types": [
+      "Basic Wall:Party Wall - CMU Residential Unit Dimising Wall:128555"
+    ],
+    "sample_guids": [
+      "2O2Fr$t4X7Zf8NOew3FKau"
+    ]
+  }
+]
