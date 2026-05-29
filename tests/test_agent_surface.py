@@ -26,8 +26,29 @@ def test_system_prompt_is_stable_text():
     for needle in (
         "ifcfast.open", "m.summary()", "m.schemas",
         "m.contained_in", "m.aggregates", "m.parent", "m.ancestors",
+        # Geometry surface + agent-first framing.
+        "m.meshes()", "m.point_cloud", "m.mesh_qto",
+        "agent-first",
     ):
         assert needle in p, f"system_prompt missing: {needle}"
+
+
+def test_system_prompt_makes_no_unverified_claims():
+    """The agent helper feeds straight into an LLM's context. It must
+    NOT assert performance or parity claims ifcfast can't back — those
+    would be repeated as fact. ifcfast is untested; the prompt says so
+    and points at cross-checking instead.
+    """
+    p = ifcfast.system_prompt().lower()
+    for forbidden in (
+        "20-30", "20–30", "fastest", "byte-level", "parity",
+        "× faster", "x faster",
+    ):
+        assert forbidden not in p, (
+            f"system_prompt makes an unverified claim: {forbidden!r}"
+        )
+    # It should set honest expectations instead.
+    assert "provisional" in p or "cross-check" in p
 
 
 def test_summary_shape(tmp_path, monkeypatch):

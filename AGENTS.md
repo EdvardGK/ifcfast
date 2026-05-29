@@ -4,24 +4,34 @@
 framework opening IFC files programmatically, this is the page you
 want.
 
-## When `ifcfast` fits
+> **Status: early & unverified.** `ifcfast` is under active
+> development and has not been validated against established tools.
+> Treat its output as provisional — cross-check against
+> `ifcopenshell` or your existing toolchain before relying on it, and
+> [open an issue](https://github.com/EdvardGK/ifcfast/issues) when
+> something looks wrong. It complements `ifcopenshell` (which owns
+> geometry kernels, schema, and authoring) rather than replacing it.
 
-- **Fast cold parse on the audited set:** 22 MB ARK in 29 ms,
-  834 MB MEP with 14.3M records in 905 ms — roughly 20-30× the
-  cold-parse cost of `ifcopenshell.open` on the same files, byte-level
-  parity for the fields `ifcfast` extracts. Different parsers for
-  different jobs; `ifcopenshell` still owns geometry, schema, and
-  authoring work.
-- **Single import, no kernel.** Pandas DataFrames out, no native
-  geometry kernel to compile.
-- **Parquet cache** — second open of a 200 MB IFC returns in tens of
-  milliseconds. Cache key invalidates on any edit.
+## What `ifcfast` gives you
+
+- **Single import, no kernel.** A native (Rust) core reads the IFC
+  STEP data section directly. Pandas DataFrames out, no geometry
+  kernel to compile or load on the hot path.
+- **Data layers as pandas.** Property sets, quantities, materials,
+  classifications — long-format DataFrames you can filter, join,
+  pivot, export.
+- **Geometry without a CAD kernel.** Per-product triangle meshes
+  (`m.meshes()`), area-weighted point-cloud sampling with normals
+  (`m.point_cloud()`), and geometric quantities (`m.mesh_qto()`) —
+  handed back as numpy / pandas, ready for trimesh / Open3D.
 - **Spatial-relationship graph built in.** `m.contained_in /
   .aggregates / .storey_building` + seven traversal helpers. One call
   walks wall → storey → building → site → project.
 - **Self-describing.** `m.summary()` and `m.schemas` answer "what am I
   looking at" without triggering extracts. Every CLI subcommand has
   `--json`.
+- **Parquet cache.** The second open of a file reuses extracted
+  tables; the cache key invalidates on any edit or library change.
 
 ## Via MCP (zero-config, any agent ecosystem)
 
@@ -40,7 +50,7 @@ pip install 'ifcfast[mcp]'
 }
 ```
 
-That gives the agent 18 tools (`open_ifc`, `summary`, `schemas`,
+That gives the agent a set of tools (`open_ifc`, `summary`, `schemas`,
 `preview`, `types`, `by_type`, `parent`, `children`, `ancestors`,
 `descendants`, `storey_of`, `building_of`, `products_in`, `diff`, …)
 plus the `ifcfast://agents-guide` resource (this document).
@@ -75,6 +85,9 @@ releases (additions only, never reorganisations).
 | Tier-1 index (products + storeys) | `m = ifcfast.open(path)`; `m.summary()` |
 | Property sets / quantities / materials | `m.psets` / `m.quantities` / `m.materials` |
 | Classification refs (NS 3451, OmniClass, …) | `m.classifications` |
+| Per-product triangle meshes (verts, faces) | `m.meshes()` (`unit=` opt) |
+| Sample a labeled point cloud (+ normals) | `m.point_cloud(per_m2=1000)` |
+| Geometric quantities (volume, area) | `m.mesh_qto()` |
 | Placement-vs-mesh sanity check | `m.drift` |
 | "Which products live under this storey?" | `m.products_in(storey_guid)` |
 | "What's the building of this wall?" | `m.building_of(wall_guid)` |
@@ -134,9 +147,6 @@ file contained that wasn't tessellated, instead of a silent drop.
   (`IfcRelContainedInSpatialStructure`, `IfcRelAggregates`,
   `IfcRelVoidsElement`, `IfcRelDefinesByType`). File an issue with the
   relation name + a sample if you need another one.
-- Property variants beyond `IfcPropertySingleValue` —
-  `IfcPropertyEnumeratedValue`, `IfcComplexProperty`, etc. are skipped.
-  Covers ~90% of psets seen on real Revit / Archicad / Tekla exports.
 
 ## North star: surgical modelling via code
 
@@ -151,22 +161,23 @@ change.
 If your agent task hits one of these, file an issue with the file
 shape — these are the next-tier extensions.
 
-## Performance budgeting
+## Cost model (relative, not benchmarked)
 
-| op | cost on 200 MB IFC |
-|---|---:|
-| `ifcfast.header(path)` | 30-80 ms (header bytes only) |
-| `ifcfast.open(path)` cold | ~1-2 s |
-| `ifcfast.open(path)` hot (cache) | tens of ms |
-| `m.psets` first access (cold) | ~150 ms |
-| `m.psets` first access (cached) | ~30 ms |
-| `m.summary()` / `m.schemas` | sub-millisecond, no extract |
-| `m.preview("psets", n=5)` cold | triggers full extract |
-| `m.preview("aggregates", n=5)` | sub-millisecond |
+No hard numbers here — `ifcfast` isn't benchmarked yet. The useful
+distinction is *which calls are cheap and which trigger work*:
 
-The cheap calls (`summary`, `schemas`, `preview` on relationship
-tables, `header`) are the agent's friend — call them liberally to
-plan before you spend on the lazy layers.
+- **Free / near-free** — `m.summary()`, `m.schemas`,
+  `ifcfast.header(path)`, and `m.preview()` on the relationship
+  tables. No data-layer extraction. Call these liberally to plan.
+- **Triggers a parse / extract** — `ifcfast.open(path)` (first time,
+  before cache), the lazy data layers (`m.psets`, `m.quantities`,
+  `m.materials`, `m.classifications`, `m.drift`), and the geometry
+  calls (`m.meshes()`, `m.point_cloud()`, `m.mesh_qto()`).
+- **Cheap on re-open** — a previously-opened file reuses its parquet
+  cache until the file (or library version) changes.
+
+Plan with the free calls, then spend on the extracts you actually
+need.
 
 ## CLI quick reference
 

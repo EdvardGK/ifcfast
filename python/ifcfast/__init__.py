@@ -1,10 +1,15 @@
 """ifcfast — the agent-first IFC parser.
 
-Fastest open-source tier-1 IFC indexer (20-30× faster than
-``ifcopenshell.open``) with a spatial-relationship graph, parquet cache,
-and a stable, introspectable API. Designed for AI agents, RPA, and
-analytics pipelines that need to ask questions of an IFC without
-loading a 200 MB geometry kernel.
+A native (Rust) IFC parser with a Python API: reads IFC data and
+geometry into pandas DataFrames, triangle meshes, and point clouds —
+no geometry kernel on the hot path. A spatial-relationship graph,
+parquet cache, and a stable, introspectable API. Designed for AI
+agents, RPA, and analytics pipelines that need to ask questions of an
+IFC without loading a heavy geometry kernel.
+
+Early and under active development — not yet verified against
+established tools. Cross-check output against ``ifcopenshell`` before
+relying on it. Complements ``ifcopenshell`` rather than replacing it.
 
 Quick start::
 
@@ -79,7 +84,7 @@ __all__ = [
     "system_prompt",
 ]
 
-__version__ = "0.4.12"
+__version__ = "0.4.13"
 
 
 def example_path() -> Path:
@@ -111,20 +116,31 @@ def system_prompt() -> str:
 
 
 _SYSTEM_PROMPT = """\
-You have access to ifcfast, the agent-first IFC parser. It's the
-fastest open-source tier-1 IFC indexer (20-30× faster than
-ifcopenshell.open) with byte-level parity on the audited set.
+You have access to ifcfast, an agent-first IFC parser. It reads IFC
+files into pandas DataFrames, triangle meshes, and point clouds via a
+native (Rust) core, with no geometry kernel on the hot path.
+
+It is early and under active development, and NOT yet verified against
+established tools. Treat its output as provisional: cross-check against
+ifcopenshell or your existing toolchain before relying on it, and
+report anything wrong at https://github.com/EdvardGK/ifcfast/issues.
 
 Open and inspect:
     import ifcfast
-    m = ifcfast.open(path)                # ~30 ms hot, ~1 s cold per 100 MB
+    m = ifcfast.open(path)
     m.summary()                           # dict: schema, counts, tables, samples
     m.schemas                             # dict: column-level introspection
     m.preview("psets", n=5)               # sample rows from any table
     m.types()                             # {entity_name: count}
 
-Pandas tables (long format, lazy on first access):
+Data layers (long-format pandas, lazy on first access):
     m.psets / m.quantities / m.materials / m.classifications / m.drift
+
+Geometry (no CAD kernel required):
+    m.meshes()                  # per-product triangles: (guid, entity, vertices, faces)
+    m.point_cloud(per_m2=1000)  # area-weighted surface samples + normals
+    m.mesh_qto()                # per-product volume, area, orientation buckets
+    # meshes() / point_cloud() take unit="m"|"mm"|"cm"|"ft"|"in" (default metres)
 
 Spatial-relationship graph:
     m.contained_in / m.aggregates / m.storey_building   # DataFrames
@@ -133,7 +149,7 @@ Spatial-relationship graph:
 
 All traversal methods return None / [] on unknown guids — they never
 raise. Filter ProductRow iteration via m.filter(entity=..., mode=...,
-storey_guid=...).
+storey_guid=...). Compare two models with m.diff(other_path).
 
 CLI (all subcommands accept --json for machine output):
     ifcfast demo                  # showcase against the bundled IFC

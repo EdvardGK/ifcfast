@@ -47,29 +47,36 @@ pip install 'ifcfast[mcp]'
 { "mcpServers": { "ifcfast": { "command": "ifcfast-mcp" } } }
 ```
 
-**When `ifcfast` fits**
+> **Early & unverified.** `ifcfast` is under active development and has
+> not been validated against established tools. Treat its output as
+> provisional — cross-check against `ifcopenshell` or your existing
+> toolchain before relying on it, and
+> [open an issue](https://github.com/EdvardGK/ifcfast/issues) when
+> something looks wrong. It complements `ifcopenshell` (which owns
+> geometry kernels, authoring, and schema work) rather than replacing it.
 
-- **Fast cold parse on the audited set:** 22 MB ARK in 29 ms,
-  834 MB MEP in 905 ms (14.3M records). Roughly 20-30× the cold-parse
-  cost of `ifcopenshell.open` on the same files, with byte-level parity
-  on 234K products across Tekla, Archicad, Revit IFC4 / IFC2X3, and
-  MagiCAD. Numbers and methodology in
-  [`docs/history/audit/`](docs/history/audit/) — different parsers
-  for different jobs; `ifcopenshell` still handles geometry kernels,
-  authoring, and schema work that `ifcfast` doesn't touch.
+**What `ifcfast` is**
+
+- **A native, kernel-free parser.** A Rust core (via PyO3, mmap-based)
+  reads the IFC STEP data section directly. No geometry kernel on the
+  hot path — a deliberate scope cut.
+- **Data layers as pandas.** Property sets, quantities, materials, and
+  classifications come back as long-format DataFrames. Filter, join,
+  pivot, export.
+- **Geometry without a CAD kernel.** Per-product triangle meshes
+  (`m.meshes()`), area-weighted point-cloud sampling with normals
+  (`m.point_cloud()`), and geometric quantities (`m.mesh_qto()`) —
+  handed back as numpy / pandas, ready for trimesh / Open3D.
 - **Spatial-relationship graph built in.** `m.contained_in /
   .aggregates / .storey_building` + seven traversal helpers
   (`parent`, `children`, `ancestors`, `descendants`, `storey_of`,
-  `building_of`, `products_in`). Unifies aggregates and spatial
-  containment — `m.ancestors(wall_guid)` reaches the project.
+  `building_of`, `products_in`). `m.ancestors(wall_guid)` reaches the
+  project.
 - **Self-describing.** `m.summary()`, `m.schemas`, `m.preview(table)`
   answer "what am I looking at?" without triggering extracts. Every
-  CLI subcommand has `--json`. Stable shape across releases.
-- **Parquet cache.** Second open of a 200 MB IFC returns in tens of
-  milliseconds. Cache key invalidates automatically on any edit.
-- **No geometry kernel on the hot path.** Rust core via PyO3,
-  mmap-based, peaks under 1 GB resident on an 800 MB MEP IFC. That's
-  a deliberate scope cut — kernels live elsewhere when you need them.
+  CLI subcommand has `--json`.
+- **Parquet cache.** A re-open reuses extracted tables; the cache key
+  invalidates on any edit or library change.
 
 See [AGENTS.md](AGENTS.md) for the full agent guide and a copy-paste
 `system_prompt()` you can drop into your LLM's context.
@@ -81,25 +88,24 @@ See [AGENTS.md](AGENTS.md) for the full agent guide and a copy-paste
 
 ## What it gives you
 
-| layer | format | typical latency on 200 MB IFC |
-|---|---|---|
-| Products (GUID, type, name, storey, parent, tag) | dict of parallel lists | tier-1 cold: 0.5–2 s |
-| Property sets | long-format `pandas.DataFrame` | 137 ms |
-| Element quantities | long-format `pandas.DataFrame` | 90 ms |
-| Materials (incl. layer sets) | long-format `pandas.DataFrame` | 27 ms |
-| Classifications | long-format `pandas.DataFrame` | 17 ms |
-| All data layers (shared scan) | bundle | 1.3 s |
-| Triangle meshes (extrusion / mapped / face sets / BREP) | OBJ / glTF / CSV | 2.6 s |
-| Placement-vs-mesh drift report | `pandas.DataFrame` | 322 ms |
-| Parquet cache (all of the above) | parquet | 65 ms hot reload |
+| layer | format |
+|---|---|
+| Products (GUID, type, name, storey, parent, tag) | dict of parallel lists |
+| Property sets (incl. enumerated / list / bounded / complex) | long-format `pandas.DataFrame` |
+| Element quantities | long-format `pandas.DataFrame` |
+| Materials (layer / constituent / profile sets) | long-format `pandas.DataFrame` |
+| Classifications | long-format `pandas.DataFrame` |
+| Per-product triangle meshes | `m.meshes()` → numpy `(vertices, faces)` |
+| Sampled point clouds (+ normals) | `m.point_cloud()` → `pandas.DataFrame` |
+| Geometric QTO (volume, area, orientation) | `m.mesh_qto()` |
+| Triangle meshes (extrusion / mapped / face sets / BREP) | OBJ / glTF / CSV |
+| Placement-vs-mesh drift report | `pandas.DataFrame` |
+| Substrate (geometry + semantics) | GeoParquet (DuckDB-queryable) |
 
-End-to-end cold parse of a 200 MB IFC: under 5 s. Hot reload from cache:
-under 100 ms. Memory peak: under 1 GB resident (mmap-based).
-
-Audited at **234,144 products across 5 authoring tools** (Tekla,
-Archicad, Revit IFC4, Revit IFC2X3, MagiCAD, BSProLib) with byte-level
-parity against `ifcopenshell` for the fields ifcfast extracts. See
-[`docs/history/audit/`](docs/history/audit/).
+The Rust core is built for speed and bounded memory (mmap-based, no
+geometry kernel loaded), but those properties are **not yet
+benchmarked or independently verified** — don't treat any timing as a
+promise. If you measure something surprising, please report it.
 
 ## Install
 
@@ -338,7 +344,7 @@ zstd-compressed parquet, keyed by `sha256(size + 4 MB head + 4 MB tail)`
 so any IFC edit invalidates automatically. Hot reads are pure
 pandas / pyarrow — no Rust call needed. There is no `ifcopenshell.open()`
 anywhere in the data path; `ifcopenshell` is an *optional* dev dep used
-only for cross-checking parity in tests.
+only to cross-check output in tests.
 
 ## Reveal-all geometry stance
 
