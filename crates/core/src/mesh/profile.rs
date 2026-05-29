@@ -315,8 +315,77 @@ fn curve_to_polyline(table: &EntityTable, curve_id: u64) -> Option<Vec<Vec2>> {
         // (Segments: LIST OF IfcCompositeCurveSegment, SelfIntersect)
         return composite_curve(table, &fields);
     }
-    // IfcTrimmedCurve etc. — skip for Phase 1A.
+    if type_name.eq_ignore_ascii_case(b"IFCCIRCLE") {
+        // (Position: IfcAxis2Placement2D, Radius). Full circle — sample
+        // into a CCW polyline. This is the common pipe / round-column
+        // cross-section when authored as an IfcArbitraryProfileDef(WithVoids)
+        // rather than the parametric IfcCircleProfileDef. Without this the
+        // whole profile resolves to None and the product emits an empty
+        // mesh — the annular-pipe empty-mesh failure mode.
+        return circle_curve_2d(table, &fields);
+    }
+    // IfcTrimmedCurve / IfcEllipse arcs — not yet sampled. Returning None
+    // here makes the parent profile resolve to None (empty mesh). Tracked
+    // as a follow-on; full circles (the common pipe case) are handled above.
     None
+}
+
+/// Sample an `IfcCircle` into a closed CCW polyline of `CURVE_SAMPLES`
+/// points, honouring its `IfcAxis2Placement2D` (centre + orientation).
+fn circle_curve_2d(table: &EntityTable, fields: &[&[u8]]) -> Option<Vec<Vec2>> {
+    let radius = number_at(fields, 1)? as f32;
+    if !(radius.is_finite() && radius > 0.0) {
+        return None;
+    }
+    let (center, ref_dir) = match fields.first().copied().map(parse_field) {
+        Some(Field::Ref(pid)) => placement2d_origin_dir(table, pid),
+        _ => (Vec2::ZERO, Vec2::X),
+    };
+    let (cos, sin) = (ref_dir.x, ref_dir.y);
+    let pts = (0..CURVE_SAMPLES)
+        .map(|i| {
+            let a = (i as f32) * (std::f32::consts::TAU / CURVE_SAMPLES as f32);
+            let lx = radius * a.cos();
+            let ly = radius * a.sin();
+            // Rotate the local circle by the placement's ref direction,
+            // then translate to the centre.
+            Vec2::new(
+                center.x + cos * lx - sin * ly,
+                center.y + sin * lx + cos * ly,
+            )
+        })
+        .collect();
+    Some(pts)
+}
+
+/// Extract `(location, ref_direction)` from an `IfcAxis2Placement2D`.
+/// Defaults to origin / +X when absent or malformed.
+fn placement2d_origin_dir(table: &EntityTable, pid: u64) -> (Vec2, Vec2) {
+    let (type_name, args) = match table.get(pid) {
+        Some(x) => x,
+        None => return (Vec2::ZERO, Vec2::X),
+    };
+    if !type_name.eq_ignore_ascii_case(b"IFCAXIS2PLACEMENT2D") {
+        return (Vec2::ZERO, Vec2::X);
+    }
+    let pf = split_top_level_args(args);
+    let loc = pf
+        .first()
+        .copied()
+        .and_then(|f| match parse_field(f) {
+            Field::Ref(p) => cartesian_point_2d(table, p),
+            _ => None,
+        })
+        .unwrap_or(Vec2::ZERO);
+    let dir = pf
+        .get(1)
+        .copied()
+        .and_then(|f| match parse_field(f) {
+            Field::Ref(d) => direction_2d(table, d),
+            _ => None,
+        })
+        .unwrap_or(Vec2::X);
+    (loc, dir)
 }
 
 /// Concatenate the parent curves of an IfcCompositeCurve into a single

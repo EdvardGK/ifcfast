@@ -774,3 +774,70 @@ fn geometryless_products_silent_drop_unless_sink_opts_in() {
         );
     }
 }
+
+/// Annular pipe cross-section authored as IfcArbitraryProfileDefWithVoids
+/// with IfcCircle curves (outer ring r=0.1 m, inner bore r=0.08 m),
+/// extruded 1 m. This is the empty-mesh failure mode reported on RIV
+/// MEP sets: pre-fix, curve_to_polyline returned None for IfcCircle, the
+/// whole profile resolved to None, and the product emitted an empty mesh.
+/// Post-fix the circle is sampled, the annulus triangulates, and the
+/// bore is subtracted.
+const ANNULAR_PIPE_IFC: &str = r#"ISO-10303-21;
+HEADER;
+FILE_DESCRIPTION(('ViewDefinition [ReferenceView]'),'2;1');
+FILE_NAME('annular_pipe.ifc','2026-05-29T00:00:00',('test'),('skiplum'),'ifcfast','ifcfast','');
+FILE_SCHEMA(('IFC4'));
+ENDSEC;
+DATA;
+#1=IFCPROJECT('0Test000000000000000001',$,'p',$,$,$,$,(#5),#2);
+#2=IFCUNITASSIGNMENT((#3,#4));
+#3=IFCSIUNIT(*,.LENGTHUNIT.,$,.METRE.);
+#4=IFCSIUNIT(*,.PLANEANGLEUNIT.,$,.RADIAN.);
+#5=IFCGEOMETRICREPRESENTATIONCONTEXT($,'Model',3,1.0E-5,#6,$);
+#6=IFCAXIS2PLACEMENT3D(#7,$,$);
+#7=IFCCARTESIANPOINT((0.,0.,0.));
+#8=IFCCARTESIANPOINT((0.,0.));
+#9=IFCAXIS2PLACEMENT2D(#8,$);
+#15=IFCLOCALPLACEMENT($,#6);
+#16=IFCLOCALPLACEMENT(#15,#6);
+#30=IFCCIRCLE(#9,0.1);
+#31=IFCCIRCLE(#9,0.08);
+#32=IFCARBITRARYPROFILEDEFWITHVOIDS(.AREA.,'Pipe',#30,(#31));
+#33=IFCDIRECTION((0.,0.,1.));
+#34=IFCEXTRUDEDAREASOLID(#32,#6,#33,1.0);
+#40=IFCSHAPEREPRESENTATION(#5,'Body','SweptSolid',(#34));
+#41=IFCPRODUCTDEFINITIONSHAPE($,$,(#40));
+#50=IFCFLOWSEGMENT('7Pipe00000000000000001',$,'Pipe',$,$,#16,#41,'tag',$);
+ENDSEC;
+END-ISO-10303-21;
+"#;
+
+#[test]
+fn annular_pipe_with_circle_curves_meshes_with_bore() {
+    use _core::mesh::qto;
+
+    let (meshes, _stats) = mesh_ifc(ANNULAR_PIPE_IFC.as_bytes());
+    assert_eq!(meshes.len(), 1, "expected the pipe to mesh, got {} meshes", meshes.len());
+    let pipe = &meshes[0];
+    assert_eq!(pipe.entity, "IfcFlowSegment");
+    // Pre-fix this was empty (IfcCircle dropped → profile None).
+    assert!(
+        !pipe.vertices.is_empty() && !pipe.indices.is_empty(),
+        "annular pipe meshed empty: {} verts / {} indices",
+        pipe.vertices.len(),
+        pipe.indices.len(),
+    );
+
+    // The bore must be cut. Metre file (unit_scale 1.0):
+    //   solid disk  = π·0.1²·1        ≈ 0.0314 m³
+    //   annular     = π·(0.1²−0.08²)·1 ≈ 0.0113 m³
+    // A correct annulus lands near 0.0113; a missed bore (solid disk)
+    // lands near 0.0314. Assert we're well under the solid-disk volume.
+    let q = qto::compute(&pipe.vertices, &pipe.indices, 1.0);
+    let v = q.volume_m3.abs();
+    assert!(
+        v > 0.006 && v < 0.020,
+        "annular volume {v:.5} m³ outside expected ~0.0113 (bore not cut → \
+         solid disk ~0.0314?)",
+    );
+}
