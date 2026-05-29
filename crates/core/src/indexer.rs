@@ -186,6 +186,7 @@ pub(crate) fn extract_unit_scale(table: &crate::entity_table::EntityTable) -> Op
 /// (because they had no Representation reference); the silent-drop fix
 /// would have written them as junk instance rows without this filter
 /// tightening.
+#[cfg_attr(not(feature = "mesh"), allow(dead_code))]
 pub(crate) fn is_meshable_product(type_name: &[u8]) -> bool {
     static SET: OnceLock<HashSet<&'static [u8]>> = OnceLock::new();
     SET.get_or_init(|| {

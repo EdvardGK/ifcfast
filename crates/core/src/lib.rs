@@ -37,7 +37,9 @@ mod python {
     use std::time::Instant;
 
     use pyo3::prelude::*;
-    use pyo3::types::{PyBytes, PyDict, PyList};
+    use pyo3::types::{PyDict, PyList};
+    #[cfg(feature = "mesh")]
+    use pyo3::types::PyBytes;
 
     use crate::indexer;
     use crate::source::IfcSource;
@@ -596,6 +598,7 @@ mod python {
         Ok(out)
     }
 
+    #[cfg(feature = "mesh")]
     #[pyfunction]
     pub fn analyse_drift<'py>(py: Python<'py>, path: &str) -> PyResult<Bound<'py, PyDict>> {
         let t_total = Instant::now();

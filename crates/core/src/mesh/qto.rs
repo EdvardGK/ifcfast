@@ -734,7 +734,6 @@ mod tests {
         // Two triangles sharing all three vertices, wound the same
         // way — looks like a duplicate, contributes the same directed
         // edges twice. signed_count = ±2 on every edge → not closed.
-        let v = vec![0.0, 0.0, 0.0,  1.0, 0.0, 0.0,  0.0, 1.0, 0.0];
         let i = vec![0, 1, 2,  0, 1, 2];
         assert!(!is_closed_manifold(&i));
     }
