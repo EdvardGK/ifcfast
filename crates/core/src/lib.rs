@@ -37,7 +37,7 @@ mod python {
     use std::time::Instant;
 
     use pyo3::prelude::*;
-    use pyo3::types::{PyDict, PyList};
+    use pyo3::types::{PyBytes, PyDict, PyList};
 
     use crate::indexer;
     use crate::source::IfcSource;
@@ -820,6 +820,108 @@ mod python {
         Ok(out)
     }
 
+    // ----- extract_meshes ----------------------------------------------
+
+    /// Raw per-product triangle meshes. Returns parallel lists where
+    /// each entry `i` describes one meshed product:
+    ///
+    /// - `guid[i]`, `entity[i]` — identity + raw IFC class
+    /// - `vertices[i]` — `bytes`, world-coord `f32` LE triples
+    ///   (`vertex_count[i] * 3` floats). Decode with
+    ///   `np.frombuffer(b, np.float32).reshape(-1, 3)`.
+    /// - `indices[i]` — `bytes`, `u32` LE triangle indices
+    ///   (`triangle_count[i] * 3` ints). Decode with
+    ///   `np.frombuffer(b, np.uint32).reshape(-1, 3)`.
+    ///
+    /// This is the fast drop-in for IfcOpenShell tessellation in
+    /// point-sampling / scan-to-BIM corpus pipelines: same Rust mesher
+    /// `mesh_qto` uses internally, but the triangles survive to Python
+    /// instead of being consumed by the QTO sweep. Bytes encoding keeps
+    /// the marshal zero-per-element — a single memcpy per product, not
+    /// N PyFloat allocations.
+    ///
+    /// Geometryless products (no body) are omitted — they have no
+    /// triangles to return. Use the substrate bundle or `m.products_df`
+    /// if you need those rows.
+    #[cfg(feature = "mesh")]
+    #[pyfunction]
+    pub fn extract_meshes<'py>(py: Python<'py>, path: &str) -> PyResult<Bound<'py, PyDict>> {
+        use crate::mesh::{ProductMesh, ProductSink};
+
+        let t_total = Instant::now();
+        let (mmap, _open_ms) = open_mmap(path)?;
+
+        struct MeshSink {
+            guid: Vec<String>,
+            entity: Vec<String>,
+            vertex_count: Vec<u32>,
+            triangle_count: Vec<u32>,
+            vertices_le: Vec<Vec<u8>>,
+            indices_le: Vec<Vec<u8>>,
+        }
+
+        impl ProductSink for MeshSink {
+            fn on_product(&mut self, mesh: ProductMesh) {
+                // Skip geometryless products — no triangles to hand back.
+                if mesh.indices.is_empty() || mesh.vertices.is_empty() {
+                    return;
+                }
+                let mut vbytes = Vec::with_capacity(mesh.vertices.len() * 4);
+                for v in &mesh.vertices {
+                    vbytes.extend_from_slice(&v.to_le_bytes());
+                }
+                let mut ibytes = Vec::with_capacity(mesh.indices.len() * 4);
+                for i in &mesh.indices {
+                    ibytes.extend_from_slice(&i.to_le_bytes());
+                }
+                self.guid.push(mesh.guid);
+                self.entity.push(mesh.entity);
+                self.vertex_count.push((mesh.vertices.len() / 3) as u32);
+                self.triangle_count.push((mesh.indices.len() / 3) as u32);
+                self.vertices_le.push(vbytes);
+                self.indices_le.push(ibytes);
+            }
+        }
+
+        let mut sink = MeshSink {
+            guid: Vec::new(),
+            entity: Vec::new(),
+            vertex_count: Vec::new(),
+            triangle_count: Vec::new(),
+            vertices_le: Vec::new(),
+            indices_le: Vec::new(),
+        };
+        let t_mesh = Instant::now();
+        let mesh_stats =
+            py.allow_threads(|| crate::mesh::mesh_ifc_streaming(&mmap, &mut sink));
+        let mesh_ms = t_mesh.elapsed().as_secs_f64() * 1000.0;
+
+        let t_marshal = Instant::now();
+        let out = PyDict::new_bound(py);
+        out.set_item("guid", PyList::new_bound(py, &sink.guid))?;
+        out.set_item("entity", PyList::new_bound(py, &sink.entity))?;
+        out.set_item("vertex_count", PyList::new_bound(py, &sink.vertex_count))?;
+        out.set_item("triangle_count", PyList::new_bound(py, &sink.triangle_count))?;
+        let verts: Vec<Bound<'py, PyBytes>> = sink
+            .vertices_le
+            .iter()
+            .map(|b| PyBytes::new_bound(py, b))
+            .collect();
+        let inds: Vec<Bound<'py, PyBytes>> = sink
+            .indices_le
+            .iter()
+            .map(|b| PyBytes::new_bound(py, b))
+            .collect();
+        out.set_item("vertices", PyList::new_bound(py, verts))?;
+        out.set_item("indices", PyList::new_bound(py, inds))?;
+        out.set_item("products_meshed", mesh_stats.products_meshed as u64)?;
+        out.set_item("mesh_ms", mesh_ms)?;
+        out.set_item("marshal_ms", t_marshal.elapsed().as_secs_f64() * 1000.0)?;
+        out.set_item("total_ms", t_total.elapsed().as_secs_f64() * 1000.0)?;
+        out.set_item("size_bytes", mmap.len() as u64)?;
+        Ok(out)
+    }
+
     #[pymodule]
     fn _core(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_function(wrap_pyfunction!(index_ifc, m)?)?;
@@ -834,6 +936,8 @@ mod python {
         m.add_function(wrap_pyfunction!(mesh_qto, m)?)?;
         #[cfg(feature = "mesh")]
         m.add_function(wrap_pyfunction!(sample_point_cloud, m)?)?;
+        #[cfg(feature = "mesh")]
+        m.add_function(wrap_pyfunction!(extract_meshes, m)?)?;
         m.add("__version__", env!("CARGO_PKG_VERSION"))?;
         Ok(())
     }

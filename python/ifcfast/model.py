@@ -18,11 +18,19 @@ tables via ``model.psets``, ``model.quantities``, ``model.materials``,
 from __future__ import annotations
 
 import time
+from collections import namedtuple
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, Optional
 
 from .header import IFCHeader, header as _header
+
+#: One product's raw triangle mesh, as returned by :meth:`Model.meshes`.
+#: ``vertices`` is a ``float32[N, 3]`` numpy array of world-coordinate
+#: positions; ``faces`` is a ``uint32[M, 3]`` numpy array of triangle
+#: vertex indices. Constructed for direct use as
+#: ``trimesh.Trimesh(mesh.vertices, mesh.faces)``.
+Mesh = namedtuple("Mesh", ["guid", "entity", "vertices", "faces"])
 
 
 @dataclass
@@ -375,6 +383,65 @@ class Model:
             "ny": d["ny"],
             "nz": d["nz"],
         })
+
+    def meshes(self):
+        """Raw per-product triangle meshes — the fast drop-in for
+        IfcOpenShell tessellation.
+
+        Runs the same Rust mesher ``mesh_qto`` uses internally, but the
+        triangles survive to Python instead of being consumed by the QTO
+        sweep. Returns a list of ``Mesh`` namedtuples, one per meshed
+        product:
+
+        * ``guid``     — IfcRoot GlobalId
+        * ``entity``   — raw IFC class (``IfcWall``, ``IfcSlab``, ...)
+        * ``vertices`` — ``numpy.ndarray`` shape ``(N, 3)``, ``float32``,
+          world coordinates (metres after the project unit scale)
+        * ``faces``    — ``numpy.ndarray`` shape ``(M, 3)``, ``uint32``,
+          triangle vertex indices
+
+        Drop-in for trimesh:
+
+            >>> import trimesh
+            >>> for m_ in model.meshes():
+            ...     tm = trimesh.Trimesh(m_.vertices, m_.faces, process=False)
+            ...     pts = tm.sample(1000)   # your existing sampler logic
+
+        Decoding is zero-copy from the Rust byte buffers (one
+        ``np.frombuffer`` per product, no per-element marshalling).
+
+        Geometryless products (no body geometry) are omitted — they
+        have no triangles. Use :attr:`products_df` or the substrate
+        bundle for those rows.
+
+        For the specific scan-to-BIM point-sampling use case,
+        :meth:`point_cloud` is faster still — it does the surface
+        sampling Rust-side, so the points never cross into Python and
+        you skip the per-product trimesh construction entirely. Use
+        ``meshes()`` when you need the raw topology (your own sampler,
+        mesh export, collision, visualisation); use ``point_cloud()``
+        when you just want sampled points.
+        """
+        from . import _core
+        import numpy as np
+
+        d = _core.extract_meshes(str(self.header.path))
+        out = []
+        for i in range(len(d["guid"])):
+            verts = np.frombuffer(d["vertices"][i], dtype=np.float32).reshape(-1, 3)
+            faces = np.frombuffer(d["indices"][i], dtype=np.uint32).reshape(-1, 3)
+            out.append(Mesh(d["guid"][i], d["entity"][i], verts, faces))
+        return out
+
+    def iter_meshes(self):
+        """Generator form of :meth:`meshes` — yields ``Mesh`` namedtuples
+        one at a time. Identical data; use this when you want to stream
+        through products without materialising the whole list. Note the
+        Rust mesher still runs eagerly (one batch pass), so this trades
+        list-construction memory for iteration ergonomics, not peak RAM.
+        """
+        for mesh in self.meshes():
+            yield mesh
 
     @property
     def segments(self):
