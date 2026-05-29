@@ -841,3 +841,81 @@ fn annular_pipe_with_circle_curves_meshes_with_bore() {
          solid disk ~0.0314?)",
     );
 }
+
+/// A 0.1 m box whose product placement sits 5,000 km from the origin
+/// (5e6 m) — a deliberate stress of the f32 precision cliff. At that
+/// magnitude the f32 quantum (~0.6 m) is larger than the box, so a
+/// World-frame bake rounds every vertex to the same point: degenerate
+/// triangles, surface_count = 0 — the empty-mesh failure mode reported
+/// on georeferenced MEP sets. The Local frame applies the placement's
+/// rotation but drops the large translation, so the shape stays precise.
+const FAR_FROM_ORIGIN_BOX_IFC: &str = r#"ISO-10303-21;
+HEADER;
+FILE_DESCRIPTION(('ViewDefinition [ReferenceView]'),'2;1');
+FILE_NAME('far_box.ifc','2026-05-29T00:00:00',('test'),('skiplum'),'ifcfast','ifcfast','');
+FILE_SCHEMA(('IFC4'));
+ENDSEC;
+DATA;
+#1=IFCPROJECT('0Test000000000000000001',$,'p',$,$,$,$,(#5),#2);
+#2=IFCUNITASSIGNMENT((#3,#4));
+#3=IFCSIUNIT(*,.LENGTHUNIT.,$,.METRE.);
+#4=IFCSIUNIT(*,.PLANEANGLEUNIT.,$,.RADIAN.);
+#5=IFCGEOMETRICREPRESENTATIONCONTEXT($,'Model',3,1.0E-5,#6,$);
+#6=IFCAXIS2PLACEMENT3D(#7,$,$);
+#7=IFCCARTESIANPOINT((0.,0.,0.));
+#8=IFCCARTESIANPOINT((50000000.,50000000.,50000000.));
+#9=IFCAXIS2PLACEMENT3D(#8,$,$);
+#10=IFCCARTESIANPOINT((0.,0.));
+#11=IFCAXIS2PLACEMENT2D(#10,$);
+#15=IFCLOCALPLACEMENT($,#9);
+#30=IFCRECTANGLEPROFILEDEF(.AREA.,'Box',#11,0.1,0.1);
+#32=IFCDIRECTION((0.,0.,1.));
+#33=IFCEXTRUDEDAREASOLID(#30,#6,#32,0.1);
+#40=IFCSHAPEREPRESENTATION(#5,'Body','SweptSolid',(#33));
+#41=IFCPRODUCTDEFINITIONSHAPE($,$,(#40));
+#50=IFCWALL('7Box000000000000000001',$,'FarBox',$,$,#15,#41,'tag',.STANDARD.);
+ENDSEC;
+END-ISO-10303-21;
+"#;
+
+#[test]
+fn far_from_origin_box_collapses_in_world_but_not_local() {
+    use _core::mesh::{mesh_ifc_streaming_framed, qto, BakeFrame, ProductMesh, ProductSink};
+
+    struct Cap(Vec<ProductMesh>);
+    impl ProductSink for Cap {
+        fn on_product(&mut self, m: ProductMesh) { self.0.push(m); }
+    }
+
+    // World frame: the box is baked at ~5e6 m → f32 collapse → the QTO
+    // shape degenerates. This documents the bug (surface_count 0,
+    // volume ~0).
+    let mut world = Cap(Vec::new());
+    mesh_ifc_streaming_framed(FAR_FROM_ORIGIN_BOX_IFC.as_bytes(), &mut world, BakeFrame::World);
+    assert_eq!(world.0.len(), 1);
+    let qw = qto::compute(&world.0[0].vertices, &world.0[0].indices, 1.0);
+    assert_eq!(
+        qw.surface_count, 0,
+        "world-frame far box should collapse (got surface_count {}, volume {})",
+        qw.surface_count, qw.volume_m3,
+    );
+
+    // Local frame: rotation applied, large translation dropped → the
+    // 0.1 m box keeps full precision. Correct QTO: 6 faces, 0.001 m³.
+    let mut local = Cap(Vec::new());
+    mesh_ifc_streaming_framed(FAR_FROM_ORIGIN_BOX_IFC.as_bytes(), &mut local, BakeFrame::Local);
+    assert_eq!(local.0.len(), 1);
+    let ql = qto::compute(&local.0[0].vertices, &local.0[0].indices, 1.0);
+    assert_eq!(ql.surface_count, 6, "local-frame box should have 6 faces");
+    assert!(
+        (ql.volume_m3.abs() - 0.001).abs() < 1e-5,
+        "local-frame box volume {} m³, expected ~0.001",
+        ql.volume_m3,
+    );
+    // And the product origin is preserved for positioning (≈ 5e6 m).
+    assert!(
+        (local.0[0].placement_origin[0] - 50_000_000.0).abs() < 10.0,
+        "placement_origin x {} should be ~5e7",
+        local.0[0].placement_origin[0],
+    );
+}

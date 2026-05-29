@@ -294,8 +294,43 @@ pub fn mesh_ifc(buf: &[u8]) -> (Vec<ProductMesh>, MeshStats) {
 /// `ProductMesh` to `sink`, then drops it. Working-set RAM is bounded
 /// by the topology caches (`PlacementResolver`, `shape_cache` for
 /// `IfcMappedItem` dedup) — both keyed by reusable subgraph ids, not
-/// by product count.
+/// Coordinate frame the mesher bakes vertices into.
+///
+/// - `World`: vertices are full world coordinates (`world * local`). The
+///   default, used by OBJ/glTF/drift/substrate consumers that want
+///   absolute placement.
+/// - `Local`: vertices carry the object's *shape* in a near-origin
+///   frame — the linear (rotation/scale) part of the placement is
+///   applied but the large world *translation* is dropped, with each
+///   fragment's small intra-product offset preserved. This is what
+///   keeps far-from-origin objects (georeferenced MEP, large site
+///   coordinates) from collapsing into a single f32-quantised point.
+///   QTO is translation-invariant, so it computes correct volume /
+///   area / orientation on the Local frame and is immune to the
+///   precision cliff. The product's world origin is still on
+///   `ProductMesh.placement_origin`, so position is never lost — and
+///   the GUID keeps the link to the spatial graph for relative-
+///   placement queries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BakeFrame {
+    World,
+    Local,
+}
+
+/// World-frame streaming mesh — the back-compatible entry point.
+/// See [`mesh_ifc_streaming_framed`] for the frame-selectable form.
 pub fn mesh_ifc_streaming<S: ProductSink>(buf: &[u8], sink: &mut S) -> MeshStats {
+    mesh_ifc_streaming_framed(buf, sink, BakeFrame::World)
+}
+
+/// Streaming mesh with an explicit [`BakeFrame`]. `Local` keeps small
+/// geometry precise far from the origin (see the enum docs); QTO/point-
+/// sampling consumers use it, world-coordinate consumers pass `World`.
+pub fn mesh_ifc_streaming_framed<S: ProductSink>(
+    buf: &[u8],
+    sink: &mut S,
+    frame: BakeFrame,
+) -> MeshStats {
     let mut stats = MeshStats::default();
 
     let t0 = Instant::now();
@@ -383,18 +418,50 @@ pub fn mesh_ifc_streaming<S: ProductSink>(buf: &[u8], sink: &mut S) -> MeshStats
                     MeshFragment::Mesh { mesh: local, source, role, rep_step_id, instance_transform } => {
                         let seg_index_start = combined_i.len() as u32;
                         let base = (combined_v.len() / 3) as u32;
-                        // World-coord vertices for back-compat consumers:
-                        // apply (world * instance_transform) per vertex.
-                        // The instance transform comes from IfcMappedItem
-                        // composition; identity for direct geometry, so
-                        // most products just see `world * v` as before.
+                        // `effective = world * instance_transform` (the
+                        // IfcMappedItem composition; identity for direct
+                        // geometry).
                         let effective = world * instance_transform;
-                        for chunk in local.vertices.chunks_exact(3) {
-                            let p = Vec3::new(chunk[0], chunk[1], chunk[2]);
-                            let w = effective * Vec4::new(p.x, p.y, p.z, 1.0);
-                            combined_v.push(w.x);
-                            combined_v.push(w.y);
-                            combined_v.push(w.z);
+                        match frame {
+                            BakeFrame::World => {
+                                // Full world coordinates: `effective * v`.
+                                for chunk in local.vertices.chunks_exact(3) {
+                                    let p = Vec3::new(chunk[0], chunk[1], chunk[2]);
+                                    let w = effective * Vec4::new(p.x, p.y, p.z, 1.0);
+                                    combined_v.push(w.x);
+                                    combined_v.push(w.y);
+                                    combined_v.push(w.z);
+                                }
+                            }
+                            BakeFrame::Local => {
+                                // Shape only: apply the linear part
+                                // (rotation/scale) via transform_vector3 —
+                                // which NEVER adds the world translation,
+                                // so a small profile far from origin keeps
+                                // full f32 precision instead of collapsing.
+                                // Preserve each fragment's small offset
+                                // relative to the product origin so
+                                // multi-operand products (boolean walls)
+                                // keep their internal layout for a correct
+                                // union; that offset is a difference of two
+                                // large values (≈ tens of mm position error
+                                // at extreme coords) but never collapses the
+                                // shape.
+                                let po = Vec3::new(
+                                    placement_origin[0],
+                                    placement_origin[1],
+                                    placement_origin[2],
+                                );
+                                let frag_off =
+                                    effective.transform_point3(Vec3::ZERO) - po;
+                                for chunk in local.vertices.chunks_exact(3) {
+                                    let p = Vec3::new(chunk[0], chunk[1], chunk[2]);
+                                    let v = effective.transform_vector3(p) + frag_off;
+                                    combined_v.push(v.x);
+                                    combined_v.push(v.y);
+                                    combined_v.push(v.z);
+                                }
+                            }
                         }
                         for &idx in &local.indices {
                             combined_i.push(base + idx);

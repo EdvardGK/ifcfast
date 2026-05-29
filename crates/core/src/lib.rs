@@ -469,7 +469,7 @@ mod python {
     #[pyfunction]
     pub fn mesh_qto<'py>(py: Python<'py>, path: &str) -> PyResult<Bound<'py, PyDict>> {
         use crate::mesh::{
-            mesh_ifc_streaming, qto, ProductMesh, ProductSink,
+            mesh_ifc_streaming_framed, qto, BakeFrame, ProductMesh, ProductSink,
         };
 
         let t_total = Instant::now();
@@ -558,7 +558,13 @@ mod python {
         };
 
         let t_mesh = Instant::now();
-        let mesh_stats = py.allow_threads(|| mesh_ifc_streaming(&mmap, &mut sink));
+        // Local frame: QTO is translation-invariant, so meshing the shape
+        // near origin gives correct volume/area/orientation AND stays
+        // precise for far-from-origin objects (georeferenced MEP) that
+        // would otherwise collapse into an f32-quantised point and report
+        // surface_count = 0.
+        let mesh_stats =
+            py.allow_threads(|| mesh_ifc_streaming_framed(&mmap, &mut sink, BakeFrame::Local));
         let mesh_ms = t_mesh.elapsed().as_secs_f64() * 1000.0;
 
         let out = PyDict::new_bound(py);
