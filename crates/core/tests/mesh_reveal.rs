@@ -965,3 +965,97 @@ fn far_from_origin_box_collapses_in_world_but_not_local() {
         qs.volume_m3,
     );
 }
+
+/// A `IfcPolygonalFaceSet` whose `IfcCartesianPointList3D` carries huge
+/// world coordinates baked directly into the vertex list (the
+/// "transformed" / georeferenced MEP case Stage 3 targets). Stage 2's
+/// f64 placement chain and Local-frame bake can't rescue this — the
+/// largeness is inside the local mesh, so vertices collapse at parse
+/// time in the geometry kernel. The faceset kernel now parses coords in
+/// f64 and rebases by bbox-min before downcasting; the bake loop adds
+/// `rep_origin` back through an f64 anchor.
+const FAR_FACESET_BOX_IFC: &str = r#"ISO-10303-21;
+HEADER;
+FILE_DESCRIPTION(('ViewDefinition [ReferenceView]'),'2;1');
+FILE_NAME('far_faceset.ifc','2026-05-29T00:00:00',('t'),('s'),'ifcfast','ifcfast','');
+FILE_SCHEMA(('IFC4'));
+ENDSEC;
+DATA;
+#1=IFCPROJECT('0Test000000000000000001',$,'p',$,$,$,$,(#5),#2);
+#2=IFCUNITASSIGNMENT((#3,#4));
+#3=IFCSIUNIT(*,.LENGTHUNIT.,$,.METRE.);
+#4=IFCSIUNIT(*,.PLANEANGLEUNIT.,$,.RADIAN.);
+#5=IFCGEOMETRICREPRESENTATIONCONTEXT($,'Model',3,1.0E-5,#6,$);
+#6=IFCAXIS2PLACEMENT3D(#7,$,$);
+#7=IFCCARTESIANPOINT((0.,0.,0.));
+#15=IFCLOCALPLACEMENT($,#6);
+#20=IFCCARTESIANPOINTLIST3D(((50000000.,50000000.,50000000.),(50000000.1,50000000.,50000000.),(50000000.1,50000000.1,50000000.),(50000000.,50000000.1,50000000.),(50000000.,50000000.,50000000.1),(50000000.1,50000000.,50000000.1),(50000000.1,50000000.1,50000000.1),(50000000.,50000000.1,50000000.1)));
+#21=IFCINDEXEDPOLYGONALFACE((1,2,3,4));
+#22=IFCINDEXEDPOLYGONALFACE((5,8,7,6));
+#23=IFCINDEXEDPOLYGONALFACE((1,5,6,2));
+#24=IFCINDEXEDPOLYGONALFACE((2,6,7,3));
+#25=IFCINDEXEDPOLYGONALFACE((3,7,8,4));
+#26=IFCINDEXEDPOLYGONALFACE((4,8,5,1));
+#30=IFCPOLYGONALFACESET(#20,.T.,(#21,#22,#23,#24,#25,#26),$);
+#40=IFCSHAPEREPRESENTATION(#5,'Body','Tessellation',(#30));
+#41=IFCPRODUCTDEFINITIONSHAPE($,$,(#40));
+#50=IFCBUILDINGELEMENTPROXY('7Box000000000000000001',$,'FarBox',$,$,#15,#41,'tag',.NOTDEFINED.);
+ENDSEC;
+END-ISO-10303-21;
+"#;
+
+#[test]
+fn far_faceset_with_baked_world_coords_meshes_intact() {
+    use _core::mesh::{mesh_ifc_streaming_framed, qto, BakeFrame, ProductMesh, ProductSink};
+
+    struct Cap(Vec<ProductMesh>);
+    impl ProductSink for Cap {
+        fn on_product(&mut self, m: ProductMesh) { self.0.push(m); }
+    }
+
+    // Local frame is what point_cloud()/meshes() use. Without the
+    // kernel-level f64 rebase added in Stage 3, the f32 vertex buffer
+    // collapses at parse time inside faceset.rs and this product would
+    // mesh with surface_count = 0 (the empty-pipe bug class). With the
+    // rebase, the box keeps all 6 faces and the correct 0.001 m³ volume.
+    let mut local = Cap(Vec::new());
+    mesh_ifc_streaming_framed(FAR_FACESET_BOX_IFC.as_bytes(), &mut local, BakeFrame::Local);
+    assert_eq!(local.0.len(), 1, "one product expected");
+    let m = &local.0[0];
+    let q = qto::compute(&m.vertices, &m.indices, 1.0);
+    assert_eq!(
+        q.surface_count, 6,
+        "far faceset (baked world coords) should keep 6 faces, got {} (volume {})",
+        q.surface_count, q.volume_m3,
+    );
+    assert!(
+        (q.volume_m3.abs() - 0.001).abs() < 1e-5,
+        "far faceset volume {} m³, expected ~0.001",
+        q.volume_m3,
+    );
+
+    // World frame at this magnitude is inherently f32-limited: the
+    // emitted vertex buffer is `[f32; 3 * n]` of absolute world coords,
+    // and f32 simply cannot hold magnitude 5e7 AND distinguish 0.1 m
+    // offsets simultaneously (quantum at 5e7 ≈ 6 m). That's the whole
+    // reason Stage 2's point_cloud()/meshes() consumers use
+    // BakeFrame::Local + the f64 global shift; the legacy World-frame
+    // consumers (OBJ / glTF / drift / substrate) accept the precision
+    // ceiling at extreme magnitudes. No assertion here — the meaningful
+    // path is Local, and Local works.
+
+    // Sanity: mesh_anchor IS the precise (f64) world position of the
+    // baked geometry, so adding it back to the Local-frame vertices
+    // reconstructs the box at ~5e7 in f64. (The reconstructed coords
+    // themselves can't be held in f32, but they round-trip in f64 — the
+    // shape information is preserved.)
+    let anchor = m.mesh_anchor;
+    for k in 0..3 {
+        assert!(
+            (anchor[k] - 50_000_000.0).abs() < 1e-3,
+            "mesh_anchor[{}] = {} should be ~5e7 in f64",
+            k,
+            anchor[k],
+        );
+    }
+}

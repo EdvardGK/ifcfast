@@ -829,14 +829,14 @@ mod python {
                 // return absolute world coordinates as before.
                 let shift = *self
                     .shift
-                    .get_or_insert_with(|| global_shift_for(&mesh.world_origin, self.unit_scale));
+                    .get_or_insert_with(|| global_shift_for(&mesh.mesh_anchor, self.unit_scale));
                 // Offset from shift to THIS product's precise origin, in
                 // model units. Small for any product within a sane model
                 // extent — computed in f64 so it never collapses.
                 let off = [
-                    mesh.world_origin[0] - shift[0],
-                    mesh.world_origin[1] - shift[1],
-                    mesh.world_origin[2] - shift[2],
+                    mesh.mesh_anchor[0] - shift[0],
+                    mesh.mesh_anchor[1] - shift[1],
+                    mesh.mesh_anchor[2] - shift[2],
                 ];
                 self.guid.reserve(n);
                 self.entity.reserve(n);
@@ -979,11 +979,11 @@ mod python {
                 }
                 let shift = *self
                     .shift
-                    .get_or_insert_with(|| global_shift_for(&mesh.world_origin, self.unit_scale));
+                    .get_or_insert_with(|| global_shift_for(&mesh.mesh_anchor, self.unit_scale));
                 let off = [
-                    mesh.world_origin[0] - shift[0],
-                    mesh.world_origin[1] - shift[1],
-                    mesh.world_origin[2] - shift[2],
+                    mesh.mesh_anchor[0] - shift[0],
+                    mesh.mesh_anchor[1] - shift[1],
+                    mesh.mesh_anchor[2] - shift[2],
                 ];
                 // Reposition local-frame shape to `local + off` (f64),
                 // scale native-unit → metres. Far-from-origin geometry

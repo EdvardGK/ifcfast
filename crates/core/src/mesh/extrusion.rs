@@ -21,10 +21,20 @@ use crate::mesh::placement::axis_placement_3d_from_id;
 use crate::mesh::profile::{self, Polygon2D};
 
 /// Triangle-list mesh in local 3D coordinates.
+///
+/// `rep_origin` is the f64 offset that the kernel subtracted from its
+/// raw coords during parsing so the f32 `vertices` stay near origin
+/// regardless of where the representation places them in world. The
+/// bake loop adds it back through an f64 anchor so a transform that
+/// baked huge world coords into the geometry items (rather than the
+/// `IfcLocalPlacement`) doesn't collapse the mesh under f32. Kernels
+/// that don't rebase (extrusion, profile-dim, csg, revolved) leave it
+/// at `[0, 0, 0]` and behave exactly as before.
 #[derive(Debug, Clone, Default)]
 pub struct LocalMesh {
     pub vertices: Vec<f32>, // [x, y, z, ...]
     pub indices: Vec<u32>,  // triangle indices into vertices
+    pub rep_origin: [f64; 3],
 }
 
 impl LocalMesh {
@@ -32,6 +42,7 @@ impl LocalMesh {
         Self {
             vertices: Vec::new(),
             indices: Vec::new(),
+            rep_origin: [0.0; 3],
         }
     }
 

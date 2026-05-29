@@ -7,11 +7,24 @@
 //! need earcutr with a projection to 2D, which we'll add if it becomes
 //! a problem).
 
-use glam::Vec3;
+use glam::DVec3;
 
 use crate::entity_table::EntityTable;
 use crate::lexer::{parse_field, split_top_level_args, Field};
 use crate::mesh::extrusion::LocalMesh;
+
+/// Compute the f64 bbox-min of a CartesianPointList. The kernel
+/// subtracts this from every vertex before downcasting to f32 so that a
+/// representation whose coords have huge world values baked into them
+/// (transformed/georeferenced MEP) still meshes precisely. The offset
+/// rides on `LocalMesh.rep_origin` and is re-applied through an f64
+/// anchor by the bake loop. For typical authoring (small local coords)
+/// this is `[0, 0, 0]` and behaviour is unchanged.
+fn bbox_min(pts: &[DVec3]) -> DVec3 {
+    pts.iter()
+        .copied()
+        .fold(DVec3::new(f64::INFINITY, f64::INFINITY, f64::INFINITY), |a, p| a.min(p))
+}
 
 /// Mesh an `IfcPolygonalFaceSet` (Archicad's primary export format).
 pub fn polygonal_face_set(table: &EntityTable, id: u64) -> Option<LocalMesh> {
@@ -51,11 +64,17 @@ pub fn polygonal_face_set(table: &EntityTable, id: u64) -> Option<LocalMesh> {
     };
 
     let mut mesh = LocalMesh::new();
-    // Push all coords as vertices once.
+    // Rebase by bbox-min so the f32 vertex buffer stays near origin
+    // even when the file embeds huge world coords directly into the
+    // CartesianPointList. The bake loop re-applies `rep_origin` via an
+    // f64 anchor.
+    let origin = bbox_min(&coords);
+    mesh.rep_origin = [origin.x, origin.y, origin.z];
     for p in &coords {
-        mesh.vertices.push(p.x);
-        mesh.vertices.push(p.y);
-        mesh.vertices.push(p.z);
+        let d = *p - origin;
+        mesh.vertices.push(d.x as f32);
+        mesh.vertices.push(d.y as f32);
+        mesh.vertices.push(d.z as f32);
     }
 
     let face_refs = split_top_level_args(faces_body);
@@ -130,10 +149,14 @@ pub fn triangulated_face_set(table: &EntityTable, id: u64) -> Option<LocalMesh> 
     };
 
     let mut mesh = LocalMesh::new();
+    // Same f64 bbox-min rebase as polygonal_face_set — see comment there.
+    let origin = bbox_min(&coords);
+    mesh.rep_origin = [origin.x, origin.y, origin.z];
     for p in &coords {
-        mesh.vertices.push(p.x);
-        mesh.vertices.push(p.y);
-        mesh.vertices.push(p.z);
+        let d = *p - origin;
+        mesh.vertices.push(d.x as f32);
+        mesh.vertices.push(d.y as f32);
+        mesh.vertices.push(d.z as f32);
     }
 
     // CoordIndex is a list of [i, j, k] triples (1-based).
@@ -172,32 +195,35 @@ pub fn triangulated_face_set(table: &EntityTable, id: u64) -> Option<LocalMesh> 
     Some(mesh)
 }
 
-fn cartesian_point_list_3d(table: &EntityTable, id: u64) -> Option<Vec<Vec3>> {
+fn cartesian_point_list_3d(table: &EntityTable, id: u64) -> Option<Vec<DVec3>> {
     let (type_name, args) = table.get(id)?;
     if !type_name.eq_ignore_ascii_case(b"IFCCARTESIANPOINTLIST3D") {
         return None;
     }
     let fields = split_top_level_args(args);
-    // arg[0] = CoordList — list of (x, y, z) triples.
+    // arg[0] = CoordList — list of (x, y, z) triples. Parsed in f64 so
+    // a representation whose coords have huge world values baked into
+    // them (transformed/georeferenced MEP) doesn't collapse here, before
+    // bbox-min rebase can rescue it.
     let body = match parse_field(fields.first()?) {
         Field::List(b) => b,
         _ => return None,
     };
-    let mut pts: Vec<Vec3> = Vec::new();
+    let mut pts: Vec<DVec3> = Vec::new();
     for sub in split_top_level_args(body) {
         let inner = match parse_field(sub) {
             Field::List(b) => b,
             _ => continue,
         };
-        let coords: Vec<f32> = split_top_level_args(inner)
+        let coords: Vec<f64> = split_top_level_args(inner)
             .into_iter()
             .filter_map(|f| match parse_field(f) {
-                Field::Number(n) => Some(n as f32),
+                Field::Number(n) => Some(n),
                 _ => None,
             })
             .collect();
         if coords.len() >= 3 {
-            pts.push(Vec3::new(coords[0], coords[1], coords[2]));
+            pts.push(DVec3::new(coords[0], coords[1], coords[2]));
         }
     }
     Some(pts)

@@ -41,6 +41,22 @@ use crate::lexer::{parse_field, split_top_level_args, Field};
 use crate::mesh::extrusion::LocalMesh;
 use crate::mesh::placement::PlacementResolver;
 
+/// Lossless upcast of an f32 placement matrix to f64. Used to do the
+/// per-fragment anchor multiply in f64 — the `world_f64 * instance_f64
+/// * rep_origin_f64` chain needs to be precise when `rep_origin` carries
+/// the huge bbox-min of a transformed/georeferenced face set. The f32
+/// `instance_transform` itself is small (mapped-item composition) so
+/// the upcast is exact.
+fn mat4_to_dmat4(m: Mat4) -> DMat4 {
+    let c = m.to_cols_array();
+    DMat4::from_cols_array(&[
+        c[0] as f64, c[1] as f64, c[2] as f64, c[3] as f64,
+        c[4] as f64, c[5] as f64, c[6] as f64, c[7] as f64,
+        c[8] as f64, c[9] as f64, c[10] as f64, c[11] as f64,
+        c[12] as f64, c[13] as f64, c[14] as f64, c[15] as f64,
+    ])
+}
+
 /// One contiguous slice of a `ProductMesh`'s triangle list that came
 /// from a single representation item or operand. Lets the consumer
 /// know which triangles are "the host wall" vs "the door opening
@@ -214,10 +230,20 @@ pub struct ProductMesh {
     /// Same point as `placement_origin` but resolved through the f64
     /// placement chain, so it stays exact at georeferenced magnitudes
     /// where the f32 `placement_origin` quantises to tens of mm / metres.
-    /// This is the anchor a [`BakeFrame::Local`] consumer adds back (in
-    /// f64, minus a global shift) to position near-origin shape geometry
-    /// in world space without the f32 collapse.
+    /// This is the *authoring* placement — where the IfcLocalPlacement
+    /// chain says the product is.
     pub world_origin: [f64; 3],
+    /// Precise (f64) world position of the product's first geometry
+    /// fragment's local origin (kernel rebase reference). For typical
+    /// authoring this equals `world_origin`; for transformed /
+    /// georeferenced files where huge world coords were baked into the
+    /// representation geometry (not the placement) it's the geometry's
+    /// actual world position, which the placement chain doesn't reach.
+    /// This is the anchor a [`BakeFrame::Local`] consumer adds back
+    /// (minus a global shift, in f64) to position near-origin shape
+    /// geometry in world space — using `world_origin` instead would
+    /// re-collapse rebased fragments.
+    pub mesh_anchor: [f64; 3],
 }
 
 #[derive(Debug, Default, Clone)]
@@ -429,6 +455,13 @@ pub fn mesh_ifc_streaming_framed<S: ProductSink>(
         let mut combined_i: Vec<u32> = Vec::new();
         let mut segments: Vec<MeshSegment> = Vec::new();
         let mut parts: Vec<InstancePart> = Vec::new();
+        // Lazily pinned to the first geometry fragment's precise anchor.
+        // Local-frame `frag_off` is computed against this so for the
+        // common no-rebase case it equals the placement origin (frag_off
+        // = 0, shape near origin) and for the rebased-faceset case it
+        // equals the geometry's world position (also frag_off = 0 on
+        // that first fragment, small for siblings).
+        let mut mesh_anchor_f64: Option<DVec3> = None;
 
         for item_id in items {
             let fragments = mesh_item(&table, item_id, &mut shape_cache);
@@ -441,38 +474,73 @@ pub fn mesh_ifc_streaming_framed<S: ProductSink>(
                         // IfcMappedItem composition; identity for direct
                         // geometry).
                         let effective = world * instance_transform;
+                        // Per-fragment f64 anchor — the precise world
+                        // position of the kernel's rebase origin
+                        // (`LocalMesh.rep_origin`, the bbox-min the
+                        // faceset kernel subtracted to keep f32 vertices
+                        // near origin when the file embeds huge world
+                        // coords directly in the geometry). For kernels
+                        // that don't rebase, `rep_origin = [0,0,0]` and
+                        // `precise_anchor_f64 = effective.translation`,
+                        // i.e. exactly the World/Local frame behaviour
+                        // before this change.
+                        let instance_f64 = mat4_to_dmat4(instance_transform);
+                        let effective_f64 = world_f64 * instance_f64;
+                        let rep_origin_f64 = DVec3::new(
+                            local.rep_origin[0],
+                            local.rep_origin[1],
+                            local.rep_origin[2],
+                        );
+                        let precise_anchor_f64 =
+                            effective_f64.transform_point3(rep_origin_f64);
+                        // Pin the product's mesh_anchor on the first
+                        // geometry fragment. Used by Local frame's
+                        // frag_off and by Stage 2 sinks for the global
+                        // shift — pinning here covers both bake frames.
+                        let _ = mesh_anchor_f64.get_or_insert(precise_anchor_f64);
+                        let anchor_f32 = Vec3::new(
+                            precise_anchor_f64.x as f32,
+                            precise_anchor_f64.y as f32,
+                            precise_anchor_f64.z as f32,
+                        );
                         match frame {
                             BakeFrame::World => {
-                                // Full world coordinates: `effective * v`.
+                                // Full world coordinates. Split the
+                                // matrix-multiply: rotation*v in f32 (v
+                                // is small after rebase) + precise anchor
+                                // in f64-downcast. Equivalent to
+                                // `effective * (v + rep_origin)` but with
+                                // the big-number add done in f64.
                                 for chunk in local.vertices.chunks_exact(3) {
                                     let p = Vec3::new(chunk[0], chunk[1], chunk[2]);
-                                    let w = effective * Vec4::new(p.x, p.y, p.z, 1.0);
+                                    let w = effective.transform_vector3(p) + anchor_f32;
                                     combined_v.push(w.x);
                                     combined_v.push(w.y);
                                     combined_v.push(w.z);
                                 }
                             }
                             BakeFrame::Local => {
-                                // Shape only: apply the linear part
-                                // (rotation/scale) via transform_vector3 —
-                                // which NEVER adds the world translation,
-                                // so a small profile far from origin keeps
-                                // full f32 precision instead of collapsing.
-                                // Preserve each fragment's small offset
-                                // relative to the product origin so
-                                // multi-operand products (boolean walls)
-                                // keep their internal layout for a correct
-                                // union; that offset is a difference of two
-                                // large values (≈ tens of mm position error
-                                // at extreme coords) but never collapses the
-                                // shape.
-                                let po = Vec3::new(
-                                    placement_origin[0],
-                                    placement_origin[1],
-                                    placement_origin[2],
+                                // Shape near origin: rotation*v in f32 +
+                                // the small remainder (anchor − mesh
+                                // anchor) in f64-downcast. mesh_anchor is
+                                // pinned above to the first geometry
+                                // fragment's precise anchor; for the
+                                // common no-rebase case it equals the
+                                // placement origin and the first
+                                // fragment's remainder is zero. For the
+                                // rebased-faceset case it equals THIS
+                                // fragment's precise anchor → also zero.
+                                // Siblings get a small remainder
+                                // representing their offset from the
+                                // first fragment, f32-safe.
+                                let anchor = mesh_anchor_f64
+                                    .expect("pinned above for both bake frames");
+                                let frag_off_f64 = precise_anchor_f64 - anchor;
+                                let frag_off = Vec3::new(
+                                    frag_off_f64.x as f32,
+                                    frag_off_f64.y as f32,
+                                    frag_off_f64.z as f32,
                                 );
-                                let frag_off =
-                                    effective.transform_point3(Vec3::ZERO) - po;
                                 for chunk in local.vertices.chunks_exact(3) {
                                     let p = Vec3::new(chunk[0], chunk[1], chunk[2]);
                                     let v = effective.transform_vector3(p) + frag_off;
@@ -565,6 +633,13 @@ pub fn mesh_ifc_streaming_framed<S: ProductSink>(
         for seg in &segments {
             *stats.by_source.entry(seg.source.clone()).or_insert(0) += 1;
         }
+        // Default mesh_anchor to placement origin when no fragment
+        // pinned it (multi-fragment-but-all-unhandled would still emit a
+        // composite product with combined_i empty — handled above).
+        let mesh_anchor = match mesh_anchor_f64 {
+            Some(a) => [a.x, a.y, a.z],
+            None => world_origin,
+        };
         sink.on_product(ProductMesh {
             guid,
             entity: entity_name,
@@ -577,6 +652,7 @@ pub fn mesh_ifc_streaming_framed<S: ProductSink>(
             parts,
             world_transform: world.to_cols_array(),
             world_origin,
+            mesh_anchor,
         });
     }
 
@@ -618,6 +694,10 @@ fn emit_geometryless<S: ProductSink>(
             parts: Vec::new(),
             world_transform: world.to_cols_array(),
             world_origin,
+            // Geometryless products have no geometry to anchor; default
+            // mesh_anchor to the placement origin so Stage 2 sinks see a
+            // consistent f64 anchor.
+            mesh_anchor: world_origin,
         });
     }
 }
@@ -754,6 +834,7 @@ fn clone_local(m: &LocalMesh) -> LocalMesh {
     LocalMesh {
         vertices: m.vertices.clone(),
         indices: m.indices.clone(),
+        rep_origin: m.rep_origin,
     }
 }
 
