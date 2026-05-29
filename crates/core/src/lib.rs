@@ -730,6 +730,11 @@ mod python {
             per_m2: f32,
             seed: u64,
             area_scale: f32,
+            // Linear-unit-to-metres factor. Sampled point COORDINATES
+            // are scaled by this so the output is always metres,
+            // matching mesh_qto's m²/m³ convention. Normals are
+            // direction vectors and stay unit-length (not scaled).
+            unit_scale: f32,
             // One row per emitted point. Each Vec has length equal to
             // the total point count.
             guid: Vec<String>,
@@ -770,9 +775,12 @@ mod python {
                     self.guid.push(mesh.guid.clone());
                     self.entity.push(mesh.entity.clone());
                 }
-                self.x.extend(cloud.x);
-                self.y.extend(cloud.y);
-                self.z.extend(cloud.z);
+                // Scale positions native-unit → metres; normals are
+                // directions, copied through unchanged.
+                let us = self.unit_scale;
+                self.x.extend(cloud.x.iter().map(|v| v * us));
+                self.y.extend(cloud.y.iter().map(|v| v * us));
+                self.z.extend(cloud.z.iter().map(|v| v * us));
                 self.nx.extend(cloud.nx);
                 self.ny.extend(cloud.ny);
                 self.nz.extend(cloud.nz);
@@ -783,6 +791,7 @@ mod python {
             per_m2,
             seed,
             area_scale,
+            unit_scale,
             guid: Vec::new(),
             entity: Vec::new(),
             x: Vec::new(),
@@ -851,7 +860,14 @@ mod python {
         let t_total = Instant::now();
         let (mmap, _open_ms) = open_mmap(path)?;
 
+        // Linear-unit-to-metres factor — vertices are scaled to metres
+        // so the output matches the metres contract (and mesh_qto). The
+        // indexer pass is the same source point_cloud uses.
+        let idx = py.allow_threads(|| indexer::index(&mmap));
+        let unit_scale = idx.unit_scale.unwrap_or(1.0) as f32;
+
         struct MeshSink {
+            unit_scale: f32,
             guid: Vec<String>,
             entity: Vec<String>,
             vertex_count: Vec<u32>,
@@ -866,9 +882,11 @@ mod python {
                 if mesh.indices.is_empty() || mesh.vertices.is_empty() {
                     return;
                 }
+                // Scale native-unit vertices → metres on the way out.
+                let us = self.unit_scale;
                 let mut vbytes = Vec::with_capacity(mesh.vertices.len() * 4);
                 for v in &mesh.vertices {
-                    vbytes.extend_from_slice(&v.to_le_bytes());
+                    vbytes.extend_from_slice(&(v * us).to_le_bytes());
                 }
                 let mut ibytes = Vec::with_capacity(mesh.indices.len() * 4);
                 for i in &mesh.indices {
@@ -884,6 +902,7 @@ mod python {
         }
 
         let mut sink = MeshSink {
+            unit_scale,
             guid: Vec::new(),
             entity: Vec::new(),
             vertex_count: Vec::new(),

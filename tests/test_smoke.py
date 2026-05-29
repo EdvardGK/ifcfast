@@ -152,3 +152,73 @@ def test_cache_key_includes_schema_version():
     )
     assert len(baseline) == 16
     assert len(bumped) == 16
+
+
+# Inline millimetre-unit IFC: a 1000 mm × 1000 mm × 1000 mm extruded
+# cube. The whole point is `IFCSIUNIT(*,.LENGTHUNIT.,.MILLI.,.METRE.)`
+# — vertices are authored as 1000 (mm), so a correct metres-output
+# point cloud / mesh must span ~1.0, not ~1000.
+_MM_CUBE = """ISO-10303-21;
+HEADER;
+FILE_DESCRIPTION(('ViewDefinition [ReferenceView]'),'2;1');
+FILE_NAME('mm_cube.ifc','2026-05-29T00:00:00',('t'),('t'),'ifcfast','ifcfast','');
+FILE_SCHEMA(('IFC4'));
+ENDSEC;
+DATA;
+#1=IFCPROJECT('0Test000000000000000001',$,'p',$,$,$,$,(#5),#2);
+#2=IFCUNITASSIGNMENT((#3));
+#3=IFCSIUNIT(*,.LENGTHUNIT.,.MILLI.,.METRE.);
+#5=IFCGEOMETRICREPRESENTATIONCONTEXT($,'Model',3,1.0E-5,#6,$);
+#6=IFCAXIS2PLACEMENT3D(#7,$,$);
+#7=IFCCARTESIANPOINT((0.,0.,0.));
+#15=IFCLOCALPLACEMENT($,#6);
+#30=IFCRECTANGLEPROFILEDEF(.AREA.,'Sq',#31,1000.,1000.);
+#31=IFCAXIS2PLACEMENT2D(#7,$);
+#32=IFCDIRECTION((0.,0.,1.));
+#33=IFCEXTRUDEDAREASOLID(#30,#6,#32,1000.);
+#40=IFCSHAPEREPRESENTATION(#5,'Body','SweptSolid',(#33));
+#41=IFCPRODUCTDEFINITIONSHAPE($,$,(#40));
+#50=IFCWALL('7Wall00000000000000001',$,'mm cube',$,$,#15,#41,'tag',.STANDARD.);
+ENDSEC;
+END-ISO-10303-21;
+"""
+
+
+def _write_mm_cube(tmp_path):
+    p = tmp_path / "mm_cube.ifc"
+    p.write_text(_MM_CUBE, encoding="utf-8")
+    return p
+
+
+def test_point_cloud_returns_metres_not_native_units(tmp_path):
+    """Regression: point_cloud() xyz must be metres regardless of the
+    file's native length unit. A 1000 mm cube must span ~1.0 m, not
+    ~1000. (v0.4.9/v0.4.10 shipped this in native mm — the docstring
+    promised metres; fixed by scaling Rust-side via unit_scale.)
+    """
+    pytest.importorskip("numpy")
+    p = _write_mm_cube(tmp_path)
+    m = ifcfast.open(p, use_cache=False, write_cache=False)
+    assert m.unit_scale == pytest.approx(0.001)  # millimetre file
+
+    df = m.point_cloud(per_m2=100, seed=1)
+    assert len(df) > 0
+    span = df[["x", "y", "z"]].max().values - df[["x", "y", "z"]].min().values
+    # Each dimension is a 1000 mm = 1.0 m edge.
+    for axis, s in zip("xyz", span):
+        assert 0.9 < s < 1.1, f"{axis} span {s:.3f} m — expected ~1.0 (metres, not mm)"
+
+
+def test_meshes_returns_metres_not_native_units(tmp_path):
+    """Same regression for the raw-mesh API: meshes()[i].vertices must
+    be metres. The mm cube's vertices must span ~1.0 m per axis.
+    """
+    pytest.importorskip("numpy")
+    p = _write_mm_cube(tmp_path)
+    m = ifcfast.open(p, use_cache=False, write_cache=False)
+    meshes = m.meshes()
+    assert len(meshes) == 1
+    v = meshes[0].vertices
+    span = v.max(axis=0) - v.min(axis=0)
+    for axis, s in zip("xyz", span):
+        assert 0.9 < s < 1.1, f"{axis} span {s:.3f} m — expected ~1.0 (metres, not mm)"
