@@ -11,8 +11,11 @@ Typical cost: 30-80 ms even on a 500 MB file (we read a fixed prefix).
 
 from __future__ import annotations
 
+import atexit
 import hashlib
+import os
 import re
+import tempfile
 import time
 import zipfile
 from dataclasses import dataclass, field
@@ -21,6 +24,34 @@ from typing import Optional
 
 
 _ZIP_MAGIC = b"PK\x03\x04"
+
+# Process-scoped cache of fully-decompressed ifczip tempfiles, keyed by
+# (canonical source path, source mtime_ns). Populated lazily by
+# `native_path_for()` the first time the Rust side needs to read the
+# bytes. Without this cache, every `_core.*` call would re-decompress
+# the archive via `source::open` — for a 128 MB Sannergata-style ZIP
+# that's ~3 s × N calls down a typical pipeline.
+_NATIVE_PATH_CACHE: dict[tuple[str, int], Path] = {}
+
+
+def _is_zip_file(p: Path) -> bool:
+    """Magic-byte check — matches the Rust `source::looks_like_zip`."""
+    try:
+        with p.open("rb") as f:
+            return f.read(len(_ZIP_MAGIC)) == _ZIP_MAGIC
+    except OSError:
+        return False
+
+
+def _largest_step_member(zf: zipfile.ZipFile) -> zipfile.ZipInfo:
+    steps = [
+        info
+        for info in zf.infolist()
+        if info.filename.lower().endswith((".ifc", ".step", ".stp"))
+    ]
+    if not steps:
+        raise ValueError("Archive contains no .ifc / .step / .stp member")
+    return max(steps, key=lambda info: info.file_size)
 
 
 def _read_step_prefix(p: Path, n_bytes: int) -> bytes:
@@ -37,19 +68,58 @@ def _read_step_prefix(p: Path, n_bytes: int) -> bytes:
         f.seek(0)
         if magic == _ZIP_MAGIC:
             with zipfile.ZipFile(f) as zf:
-                steps = [
-                    info
-                    for info in zf.infolist()
-                    if info.filename.lower().endswith((".ifc", ".step", ".stp"))
-                ]
-                if not steps:
-                    raise ValueError(
-                        f"Archive contains no .ifc / .step / .stp member: {p}"
-                    )
-                best = max(steps, key=lambda info: info.file_size)
-                with zf.open(best) as member:
+                with zf.open(_largest_step_member(zf)) as member:
                     return member.read(n_bytes)
         return f.read(n_bytes)
+
+
+def native_path_for(p: str | Path) -> Path:
+    """Return a path that the Rust `_core.*` functions can open
+    directly. For a plain `.ifc` this is `p` itself. For an ifczip
+    (whatever the extension), decompress the largest STEP member to a
+    process-scoped tempfile once and return that path on every
+    subsequent call — so a pipeline that does
+    `open() → meshes() → point_cloud() → psets` pays the inflate cost
+    once instead of N times. Cache is keyed by `(canonical path,
+    mtime_ns)`; touching the source invalidates the entry. Tempfiles
+    are removed on process exit via `atexit`.
+    """
+    p = Path(p)
+    if not _is_zip_file(p):
+        return p
+
+    stat = p.stat()
+    key = (str(p.resolve()), stat.st_mtime_ns)
+    cached = _NATIVE_PATH_CACHE.get(key)
+    if cached is not None and cached.exists():
+        return cached
+
+    fd, tmp_str = tempfile.mkstemp(suffix=".ifc", prefix="ifcfast_unzip_")
+    os.close(fd)
+    tmp = Path(tmp_str)
+    try:
+        with p.open("rb") as f, zipfile.ZipFile(f) as zf:
+            member = _largest_step_member(zf)
+            with zf.open(member) as src, tmp.open("wb") as dst:
+                while True:
+                    chunk = src.read(1 << 20)
+                    if not chunk:
+                        break
+                    dst.write(chunk)
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
+
+    _NATIVE_PATH_CACHE[key] = tmp
+    atexit.register(_unlink_quiet, tmp)
+    return tmp
+
+
+def _unlink_quiet(p: Path) -> None:
+    try:
+        p.unlink(missing_ok=True)
+    except OSError:
+        pass
 
 
 _HEADER_READ_BYTES = 64 * 1024

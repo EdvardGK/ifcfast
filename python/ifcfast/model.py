@@ -23,7 +23,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, Optional
 
-from .header import IFCHeader, header as _header
+from .header import IFCHeader, header as _header, native_path_for
 
 #: One product's raw triangle mesh, as returned by :meth:`Model.meshes`.
 #: ``vertices`` is a ``float32[N, 3]`` numpy array of world-coordinate
@@ -367,7 +367,7 @@ class Model:
         from . import _core  # local import keeps top-level fast
         import pandas as pd
 
-        d = _core.mesh_qto(str(self.header.path))
+        d = _core.mesh_qto(str(native_path_for(self.header.path)))
         products_df = pd.DataFrame({
             "guid": d["guid"],
             "entity": d["entity"],
@@ -468,7 +468,7 @@ class Model:
         import pandas as pd
 
         factor = _unit_factor(unit)
-        d = _core.sample_point_cloud(str(self.header.path), float(per_m2), int(seed))
+        d = _core.sample_point_cloud(str(native_path_for(self.header.path)), float(per_m2), int(seed))
         df = pd.DataFrame({
             "guid": d["guid"],
             "entity": d["entity"],
@@ -559,7 +559,7 @@ class Model:
         import numpy as np
 
         factor = _unit_factor(unit)
-        d = _core.extract_meshes(str(self.header.path))
+        d = _core.extract_meshes(str(native_path_for(self.header.path)))
         out = MeshList()
         for i in range(len(d["guid"])):
             verts = np.frombuffer(d["vertices"][i], dtype=np.float32).reshape(-1, 3)
@@ -1378,7 +1378,7 @@ def _index_native(p: Path, hdr: IFCHeader, started: float) -> Model:
     from . import _core
     from .classify import classify_by_name, ElementMode
 
-    raw = _core.index_ifc(str(p))
+    raw = _core.index_ifc(str(native_path_for(p)))
 
     schema = raw.get("schema") or hdr.schema
     type_counts: dict[str, int] = dict(raw.get("type_counts") or {})

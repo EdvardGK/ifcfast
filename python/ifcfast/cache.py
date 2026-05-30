@@ -30,7 +30,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Optional
 
-from .header import IFCHeader
+from .header import IFCHeader, native_path_for
 
 # Bumped whenever on-disk layout changes incompatibly.
 # v2 (2026-05-15): added contained_in / aggregates / storey_building parquets.
@@ -228,7 +228,7 @@ def extract_data_layers(
     out.timing_ms["cold_parse"] = True
 
     t0 = time.perf_counter()
-    raw = _core.extract_all(str(p))
+    raw = _core.extract_all(str(native_path_for(p)))
     out.timing_ms["extract_all_ms"] = (time.perf_counter() - t0) * 1000
     for k in (
         "entity_table_ms",
@@ -252,7 +252,7 @@ def extract_data_layers(
     if include_drift:
         try:
             t0 = time.perf_counter()
-            drift_raw = _core.analyse_drift(str(p))
+            drift_raw = _core.analyse_drift(str(native_path_for(p)))
             df_cols = {
                 k: drift_raw[k]
                 for k in (
