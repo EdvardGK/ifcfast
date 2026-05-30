@@ -14,9 +14,42 @@ from __future__ import annotations
 import hashlib
 import re
 import time
+import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
+
+
+_ZIP_MAGIC = b"PK\x03\x04"
+
+
+def _read_step_prefix(p: Path, n_bytes: int) -> bytes:
+    """Read up to `n_bytes` of STEP text from `p`. Transparently
+    decompresses ZIP archives (the `.ifczip` convention — and the
+    common in-the-wild case where an ifczip ships with a plain `.ifc`
+    extension, which most tools mis-read as "corrupted STEP"). Picks
+    the largest `.ifc` / `.step` / `.stp` member by uncompressed size,
+    same rule as the Rust `source::open` so the Python header and the
+    Rust parser agree on which member to read.
+    """
+    with p.open("rb") as f:
+        magic = f.read(len(_ZIP_MAGIC))
+        f.seek(0)
+        if magic == _ZIP_MAGIC:
+            with zipfile.ZipFile(f) as zf:
+                steps = [
+                    info
+                    for info in zf.infolist()
+                    if info.filename.lower().endswith((".ifc", ".step", ".stp"))
+                ]
+                if not steps:
+                    raise ValueError(
+                        f"Archive contains no .ifc / .step / .stp member: {p}"
+                    )
+                best = max(steps, key=lambda info: info.file_size)
+                with zf.open(best) as member:
+                    return member.read(n_bytes)
+        return f.read(n_bytes)
 
 
 _HEADER_READ_BYTES = 64 * 1024
@@ -108,8 +141,7 @@ def header(path: str | Path) -> IFCHeader:
     size = stat.st_size
     mtime_ns = stat.st_mtime_ns
 
-    with p.open("rb") as f:
-        prefix = f.read(_HEADER_READ_BYTES)
+    prefix = _read_step_prefix(p, _HEADER_READ_BYTES)
     text = prefix.decode("utf-8", errors="replace")
 
     if not text.lstrip().startswith("ISO-10303-21"):

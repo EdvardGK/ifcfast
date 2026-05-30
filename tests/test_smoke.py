@@ -272,3 +272,28 @@ def test_length_unit_property(tmp_path):
     assert ifcfast.open(p, use_cache=False, write_cache=False).length_unit == "mm"
     # The bundled metres fixture.
     assert ifcfast.open(FIXTURE, use_cache=False, write_cache=False).length_unit == "m"
+
+
+def test_zip_disguised_as_ifc(tmp_path):
+    """An ifczip distributed with a plain `.ifc` extension (common in
+    the wild — ACC, Dalux, Trimble Connect all do this; other tools
+    misread it as "corrupted STEP") must still open transparently:
+    same magic-byte dispatch as the Rust `source::open`, applied to
+    Python's header() too so the path doesn't error before Rust runs.
+    """
+    import zipfile
+
+    body = FIXTURE.read_bytes()
+    bogus = tmp_path / "looks_like.ifc"
+    with zipfile.ZipFile(bogus, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("Sannergata_RIV.ifc", body)
+
+    # First 4 bytes are the ZIP magic, not "ISO-".
+    assert bogus.read_bytes()[:4] == b"PK\x03\x04"
+
+    h = ifcfast.header(bogus)
+    assert h.schema == "IFC4"
+    assert h.authoring_app == "ifcfast-tests"
+
+    m = ifcfast.open(bogus, use_cache=False, write_cache=False)
+    assert m.types() == {"IfcWall": 1}
