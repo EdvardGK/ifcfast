@@ -111,7 +111,11 @@ const DEFINES_BY_TYPE_TYPE: &[u8] = b"IFCRELDEFINESBYTYPE";
 /// Mirrors the unit-scale resolution already done inside [`index`],
 /// extracted here so callers that build only the extractor tables
 /// (e.g. `extract_all` in the Python wheel) can pay for one cheap unit
-/// walk instead of an entire indexer pass.
+/// walk instead of an entire indexer pass. Only the Python wrapper
+/// uses this today; gated to keep `--no-default-features --features
+/// csg`-style smoke builds free of dead-code warnings (CI runs with
+/// `-D warnings`).
+#[cfg(feature = "python")]
 pub(crate) fn extract_unit_scale(table: &crate::entity_table::EntityTable) -> Option<f64> {
     use crate::lexer::{parse_field, parse_ref_list, split_top_level_args, Field};
 
