@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Geometric fingerprint columns on `instances.parquet`** — phase 1a
+  of the federated-model clash-control / cross-discipline duplicate
+  detection feature. Three new non-nullable columns on every instance
+  row:
+    * `centroid_xyz` — `FixedSizeList[Float32, 3]`, world-AABB
+      midpoint when the product has mesh geometry, falling back to
+      `placement_xyz` for geometryless products so location queries
+      don't collapse no-body elements onto the world origin.
+    * `vertex_count` — `UInt32`, world-baked mesh vertex count
+      (zero when geometryless).
+    * `triangle_count` — `UInt32`, world-baked mesh triangle count
+      (zero when geometryless).
+  Lets agents compose cross-model duplicate detection, version-diff,
+  and broad-phase clash candidate filtering as pure DuckDB queries
+  against the substrate (centroid distance + bbox overlap +
+  complexity match), without re-running the parser or recomputing
+  midpoints on every join. See the new "Substrate output" section
+  in [`AGENTS.md`](AGENTS.md) for the worked example. Narrow-phase
+  mesh-mesh intersection is not yet exposed — planned as a future
+  `ifcfast.clash()` primitive.
+
+### Changed
+
+- `_CACHE_SCHEMA_VERSION` bumped 4 → 5. Existing caches become
+  orphaned automatically — re-extract on next open is automatic.
+
 ## [0.4.0] - 2026-05-21
 
 ### Added

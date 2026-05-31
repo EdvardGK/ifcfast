@@ -16,7 +16,9 @@ use _core::bundle::parquet_sink::ParquetSink;
 use _core::bundle::Bundle;
 use _core::mesh::mesh_ifc_streaming;
 
-use arrow::array::{Array, AsArray, StringArray, UInt64Array};
+use arrow::array::{
+    Array, AsArray, FixedSizeListArray, Float32Array, StringArray, UInt32Array, UInt64Array,
+};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
 /// One IfcWall with a single boolean pset + one IfcSpace aggregated
@@ -246,4 +248,139 @@ fn mesh_quality_column_classifies_unit_cube_as_closed() {
     }
     assert_eq!(wall_mq.as_deref(), Some("closed"));
     assert_eq!(space_mq.as_deref(), Some("degenerate"));
+}
+
+/// Locks in the v0.4.19 fingerprint columns (`centroid_xyz`,
+/// `vertex_count`, `triangle_count`) on the instance table.
+///
+/// Asserts:
+///   - the wall (extruded solid) carries a centroid lying inside its
+///     AABB and positive vertex / triangle counts;
+///   - the geometryless space falls back to `placement_xyz` for its
+///     centroid (instead of collapsing to world origin) and reports
+///     zero vertices / triangles.
+#[test]
+fn fingerprint_columns_carry_centroid_and_counts() {
+    let (_bundle, out_dir) = bundle_to_parquet(MIXED_FIXTURE.as_bytes());
+    let batches = read_parquet(&out_dir.join("instances.parquet"));
+
+    struct FpRow {
+        bmin: [f32; 3],
+        bmax: [f32; 3],
+        centroid: [f32; 3],
+        placement: [f32; 3],
+        verts: u32,
+        tris: u32,
+    }
+    let mut wall: Option<FpRow> = None;
+    let mut space: Option<FpRow> = None;
+
+    for batch in &batches {
+        let guid = batch
+            .column_by_name("guid")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let bmin = batch
+            .column_by_name("bbox_min_xyz")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<FixedSizeListArray>()
+            .unwrap();
+        let bmax = batch
+            .column_by_name("bbox_max_xyz")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<FixedSizeListArray>()
+            .unwrap();
+        let centroid = batch
+            .column_by_name("centroid_xyz")
+            .expect("centroid_xyz column must exist")
+            .as_any()
+            .downcast_ref::<FixedSizeListArray>()
+            .unwrap();
+        let placement = batch
+            .column_by_name("placement_xyz")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<FixedSizeListArray>()
+            .unwrap();
+        let v_count = batch
+            .column_by_name("vertex_count")
+            .expect("vertex_count column must exist")
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .unwrap();
+        let t_count = batch
+            .column_by_name("triangle_count")
+            .expect("triangle_count column must exist")
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .unwrap();
+
+        let read_xyz = |arr: &FixedSizeListArray, i: usize| -> [f32; 3] {
+            let v = arr.value(i);
+            let f = v.as_any().downcast_ref::<Float32Array>().unwrap();
+            [f.value(0), f.value(1), f.value(2)]
+        };
+
+        for i in 0..batch.num_rows() {
+            let row = FpRow {
+                bmin: read_xyz(bmin, i),
+                bmax: read_xyz(bmax, i),
+                centroid: read_xyz(centroid, i),
+                placement: read_xyz(placement, i),
+                verts: v_count.value(i),
+                tris: t_count.value(i),
+            };
+            match guid.value(i) {
+                "7Wall00000000000000001" => wall = Some(row),
+                "9Spc0000000000000000001" => space = Some(row),
+                _ => {}
+            }
+        }
+    }
+
+    let w = wall.expect("wall row");
+    let (wmin, wmax, wcen, wv, wt) = (w.bmin, w.bmax, w.centroid, w.verts, w.tris);
+    // Centroid inside the AABB on every axis (the wall is a proper solid).
+    for k in 0..3 {
+        assert!(
+            wcen[k] >= wmin[k] && wcen[k] <= wmax[k],
+            "wall centroid axis {k} ({}) outside bbox [{}, {}]",
+            wcen[k],
+            wmin[k],
+            wmax[k]
+        );
+    }
+    // Centroid equals AABB midpoint.
+    for k in 0..3 {
+        let mid = (wmin[k] + wmax[k]) * 0.5;
+        assert!(
+            (wcen[k] - mid).abs() < 1e-3,
+            "wall centroid axis {k} not at AABB midpoint: {} vs {}",
+            wcen[k],
+            mid
+        );
+    }
+    assert!(wv > 0, "wall must have vertices, got {wv}");
+    assert!(wt > 0, "wall must have triangles, got {wt}");
+
+    let s = space.expect("space row");
+    let (smin, smax, scen, sp, sv, st) =
+        (s.bmin, s.bmax, s.centroid, s.placement, s.verts, s.tris);
+    // Geometryless: bbox collapsed to origin.
+    assert_eq!(smin, [0.0, 0.0, 0.0]);
+    assert_eq!(smax, [0.0, 0.0, 0.0]);
+    // Centroid fallback: should equal placement_xyz, NOT world origin
+    // (unless placement IS origin — which it is in this fixture, so
+    // both conditions hold simultaneously). The contract is "equals
+    // placement_xyz"; assert exactly that.
+    assert_eq!(
+        scen, sp,
+        "geometryless space centroid must fall back to placement_xyz"
+    );
+    assert_eq!(sv, 0, "space must report zero vertices");
+    assert_eq!(st, 0, "space must report zero triangles");
 }

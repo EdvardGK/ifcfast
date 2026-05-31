@@ -156,7 +156,14 @@ _HASH_TAIL_BYTES = 4 * 1024 * 1024
 #       IfcMaterialConstituent.Fraction value. Lets composite-material
 #       analytics ("what % of this RC beam is rebar?") work without a
 #       separate raw-IFC re-parse.
-_CACHE_SCHEMA_VERSION = 4
+#   5 — v0.4.19: instances.parquet gains geometric fingerprint columns
+#       — `centroid_xyz` (FixedSizeList[Float32, 3], world-AABB midpoint
+#       with placement_xyz fallback for geometryless), `vertex_count`
+#       (UInt32), `triangle_count` (UInt32). Enables agents to compose
+#       cross-model duplicate detection and broad-phase clash candidate
+#       filtering as DuckDB queries directly against the substrate,
+#       without recomputing midpoints/counts on every join.
+_CACHE_SCHEMA_VERSION = 5
 
 _FIELD_RE = re.compile(r"\(\s*(.*?)\s*\)\s*;", re.DOTALL)
 

@@ -99,6 +99,74 @@ releases (additions only, never reorganisations).
 | ifcopenshell-style `by_type` | `m.by_type("IfcWall")` |
 | What changed between v1 and v2? | `m.diff(other_path)` |
 
+## Substrate output (DuckDB-queryable parquet)
+
+For multi-file / cross-session / pipeline workflows, the in-memory
+Python API isn't always the right shape. `ifcfast-bundle` emits a
+**two-table parquet substrate** you can query with DuckDB, polars, or
+any arrow-aware tool:
+
+```bash
+ifcfast-bundle path/to/model.ifc out/
+# writes:
+#   out/instances.parquet        (one row per IfcProduct)
+#   out/representations.parquet  (one row per unique mesh shape, dedup'd)
+#   out/view.sql                 (DuckDB JOIN view that wires them)
+```
+
+**Why two tables?** A 5000-window facade with one shared
+`IfcRepresentationMap` writes ~1 representation row + 5000 instance
+rows, not 5000 copies of the same geometry. Working-set RAM stays
+bounded on 1 GB+ files.
+
+**Instance columns include** (non-exhaustive — schema is self-
+describing via `pq.read_schema(...)`):
+
+- Identity / structure: `ifc_id`, `guid`, `class` (normalised — "Wall"
+  not "IfcWallStandardCase"), `source_class`, `name`, `tag`,
+  `storey_guid`, `aggregates_parent_guid`, `type_guid`, `rep_id`.
+- Placement / world: `transform` (4×4 col-major), `placement_xyz`.
+- World-AABB: `bbox_min_xyz`, `bbox_max_xyz`.
+- **Geometric fingerprint** (since v0.4.19, cache schema v5):
+  `centroid_xyz` (world-AABB midpoint, falls back to `placement_xyz`
+  for geometryless products), `vertex_count`, `triangle_count`.
+- QTO: `volume_m3`, `aabb_volume_m3`, `surface_area_m2`, orientation-
+  bucketed area columns, `largest_surface_m2`, `smallest_surface_m2`,
+  `surface_count`, `mesh_quality` (`"closed"` / `"open_shell"` /
+  `"degenerate"`).
+- Semantic payload: `materials`, `psets`, `quantities`,
+  `classifications` (list-of-struct columns — `UNNEST` in DuckDB).
+- Per-face stream: `surfaces` (one entry per distinct planar face).
+
+**Why the fingerprint columns matter for agents:** they let you
+compose cross-model duplicate detection, version-diff, and
+broad-phase clash candidate filtering as pure DuckDB queries — no
+re-parse, no recompute on every join. Example: candidates for
+"same physical thing modeled twice across discipline models":
+
+```sql
+SELECT a.guid AS a_guid, b.guid AS b_guid, a.class, b.class
+FROM 'ark/instances.parquet' a
+JOIN 'rib/instances.parquet' b
+  ON sqrt(
+       (a.centroid_xyz[1]-b.centroid_xyz[1])^2 +
+       (a.centroid_xyz[2]-b.centroid_xyz[2])^2 +
+       (a.centroid_xyz[3]-b.centroid_xyz[3])^2
+     ) < 0.05                                              -- 5cm
+ AND abs(a.aabb_volume_m3 - b.aabb_volume_m3)
+     / NULLIF(a.aabb_volume_m3, 0) < 0.05;                 -- ±5% volume
+```
+
+Narrow-phase mesh-mesh intersection (true clash detection) is **not
+yet** part of the substrate — it's a planned `ifcfast.clash()`
+primitive. Use the fingerprint columns for broad-phase / dedup;
+defer to a real geometry kernel (parry3d, CGAL, Open Cascade) for
+narrow-phase until ifcfast ships its own.
+
+**Cache schema version** is at `_CACHE_SCHEMA_VERSION` in
+`python/ifcfast/header.py` — when it bumps, the column set changed.
+Old caches become orphaned automatically.
+
 ## Conventions you can rely on
 
 - **Traversal helpers never raise on unknown guids.** Missing → `None`
@@ -189,6 +257,10 @@ ifcfast schema  FILE  --json       # column-level schema introspection
 ifcfast extract FILE  --json       # data-layer extraction
 ifcfast drift   FILE  --json       # placement-vs-mesh report
 ifcfast cache   FILE  --json       # inspect / clear cache
+
+# Substrate emit (separate binary — see "Substrate output" above).
+ifcfast-bundle FILE OUT_DIR        # writes instances.parquet +
+                                   # representations.parquet + view.sql
 ```
 
 ## Reporting issues from an agent

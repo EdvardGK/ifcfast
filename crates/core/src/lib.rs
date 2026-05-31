@@ -31,6 +31,9 @@ pub mod mesh;
 #[cfg(feature = "bundle")]
 pub mod bundle;
 
+#[cfg(feature = "geom")]
+pub mod geom;
+
 #[cfg(feature = "python")]
 mod python {
     use std::path::Path;

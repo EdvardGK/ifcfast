@@ -160,6 +160,24 @@ pub struct InstanceRecord {
     /// without applying the transform.
     pub bbox_min_xyz: [f32; 3],
     pub bbox_max_xyz: [f32; 3],
+    /// World-coord AABB midpoint — `(bbox_min + bbox_max) * 0.5` when
+    /// the mesh has geometry, falling back to `placement_xyz` for
+    /// geometryless products (so the location signal stays meaningful
+    /// instead of collapsing every no-body product onto the world
+    /// origin). Geometric fingerprint signal for cross-model duplicate
+    /// detection and broad-phase clash candidate filtering — agents can
+    /// query "elements within R metres of point P" directly on this
+    /// column instead of recomputing the midpoint in every join.
+    pub centroid_xyz: [f32; 3],
+    /// Vertex count of the world-baked mesh. Zero for geometryless
+    /// products. Fingerprint signal: same-geometry instances tend to
+    /// have identical vertex counts (subject to tessellation parity
+    /// across exporters — Revit and ArchiCAD may differ on the same
+    /// physical wall, so don't treat this as a strict identity key).
+    pub vertex_count: u32,
+    /// Triangle count of the world-baked mesh. Zero for geometryless
+    /// products. Same caveat as `vertex_count` re: tessellation variance.
+    pub triangle_count: u32,
     /// World-space placement origin — the authoring tool's notion of
     /// "where this element is".
     pub placement_xyz: [f32; 3],
@@ -363,6 +381,21 @@ pub fn pair_split(
         transform,
         bbox_min_xyz: world_bbox.min,
         bbox_max_xyz: world_bbox.max,
+        // For geometryless products `world_bbox` is `[0,0,0]/[0,0,0]`,
+        // which would put their centroid at the world origin and pollute
+        // any "find elements near point P" query. Fall back to the
+        // authored placement so the location signal stays meaningful.
+        centroid_xyz: if mesh.vertices.is_empty() {
+            mesh.placement_origin
+        } else {
+            [
+                (world_bbox.min[0] + world_bbox.max[0]) * 0.5,
+                (world_bbox.min[1] + world_bbox.max[1]) * 0.5,
+                (world_bbox.min[2] + world_bbox.max[2]) * 0.5,
+            ]
+        },
+        vertex_count: (mesh.vertices.len() / 3) as u32,
+        triangle_count: (mesh.indices.len() / 3) as u32,
         placement_xyz: mesh.placement_origin,
         materials: semantics.materials,
         psets: semantics.psets,

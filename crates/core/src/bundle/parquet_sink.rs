@@ -345,6 +345,14 @@ fn build_instance_schema() -> Schema {
         Field::new("transform", DataType::FixedSizeList(mat4_item, 16), false),
         Field::new("bbox_min_xyz", DataType::FixedSizeList(xyz.clone(), 3), false),
         Field::new("bbox_max_xyz", DataType::FixedSizeList(xyz.clone(), 3), false),
+        // World-AABB midpoint (falls back to placement_xyz for
+        // geometryless products). Broad-phase clash + dup-detection
+        // signal — see `InstanceRecord::centroid_xyz`.
+        Field::new("centroid_xyz", DataType::FixedSizeList(xyz.clone(), 3), false),
+        // Vertex / triangle counts of the world-baked mesh. Zero for
+        // geometryless products. Mesh-complexity fingerprint.
+        Field::new("vertex_count", DataType::UInt32, false),
+        Field::new("triangle_count", DataType::UInt32, false),
         Field::new("placement_xyz", DataType::FixedSizeList(xyz, 3), false),
         Field::new(
             "materials",
@@ -513,6 +521,10 @@ fn build_instance_batch(
     let mut bb_min = FixedSizeListBuilder::new(bb_min_inner, 3);
     let bb_max_inner = Float32Builder::with_capacity(n * 3);
     let mut bb_max = FixedSizeListBuilder::new(bb_max_inner, 3);
+    let centroid_inner = Float32Builder::with_capacity(n * 3);
+    let mut centroid = FixedSizeListBuilder::new(centroid_inner, 3);
+    let mut vertex_count = UInt32Builder::with_capacity(n);
+    let mut triangle_count = UInt32Builder::with_capacity(n);
     let placement_inner = Float32Builder::with_capacity(n * 3);
     let mut placement = FixedSizeListBuilder::new(placement_inner, 3);
 
@@ -570,6 +582,9 @@ fn build_instance_batch(
 
         append_xyz(&mut bb_min, r.bbox_min_xyz);
         append_xyz(&mut bb_max, r.bbox_max_xyz);
+        append_xyz(&mut centroid, r.centroid_xyz);
+        vertex_count.append_value(r.vertex_count);
+        triangle_count.append_value(r.triangle_count);
         append_xyz(&mut placement, r.placement_xyz);
 
         {
@@ -715,6 +730,9 @@ fn build_instance_batch(
         Arc::new(transform.finish()),
         Arc::new(bb_min.finish()),
         Arc::new(bb_max.finish()),
+        Arc::new(centroid.finish()),
+        Arc::new(vertex_count.finish()),
+        Arc::new(triangle_count.finish()),
         Arc::new(placement.finish()),
         Arc::new(materials.finish()),
         Arc::new(psets.finish()),
