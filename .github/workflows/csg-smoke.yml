@@ -1,0 +1,44 @@
+# Smoke-test the `csg` Cargo feature across all wheel-release platforms.
+# Tracks GH #22 — the `csg` feature pulls in `manifold-csg`, which
+# compiles the C++ Manifold library via cmake. The native build path
+# is cross-platform-fragile, and `release.yml` would only surface a
+# break at tag time. This workflow runs `cargo check --features csg`
+# plus the end-to-end `cut_openings_integration` test on the same five
+# targets `release.yml` produces wheels for — informational only,
+# not a required gate, until it's been green across a few merges.
+name: csg-smoke
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    name: ${{ matrix.os }} / ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            label: linux-x86_64
+          - os: ubuntu-24.04-arm
+            label: linux-aarch64
+          - os: windows-latest
+            label: windows-x64
+          - os: macos-15-intel
+            label: macos-x86_64
+          - os: macos-latest
+            label: macos-aarch64
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - name: cargo check --features csg
+        run: cargo check -p ifcfast-core --features csg
+      - name: cargo test --features csg --test cut_openings_integration
+        run: cargo test -p ifcfast-core --features csg --test cut_openings_integration --release
