@@ -202,7 +202,7 @@ def test_spaces_collection_present_on_empty_model(minimal):
     """``m.spaces`` is a list (possibly empty), not missing."""
     assert isinstance(minimal.spaces, list)
     df = minimal.spaces_df
-    assert list(df.columns) == ["guid", "step_id"]
+    assert list(df.columns) == ["guid", "step_id", "name", "predefined_type"]
 
 
 def test_voids_dataframe_present_on_empty_model(minimal):

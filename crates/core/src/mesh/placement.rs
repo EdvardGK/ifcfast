@@ -33,12 +33,12 @@ use crate::lexer::{parse_field, split_top_level_args, Field};
 /// (small, f32-safe) for local-geometry math and keep the translation
 /// in f64 for precise positioning / global-shift.
 pub struct PlacementResolver<'a> {
-    table: &'a EntityTable<'a>,
+    table: &'a EntityTable,
     cache: HashMap<u64, DMat4>,
 }
 
 impl<'a> PlacementResolver<'a> {
-    pub fn new(table: &'a EntityTable<'a>) -> Self {
+    pub fn new(table: &'a EntityTable) -> Self {
         Self {
             table,
             cache: HashMap::with_capacity(2048),

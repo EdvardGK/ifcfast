@@ -29,6 +29,12 @@ env/
 .DS_Store
 Thumbs.db
 
+# Local bench + debug (fork scripts under scripts/bench/)
+/reports/
+debug-*.log
+python/ifcfast/_core.pyd
+scripts/bench/local_paths.env
+
 # Cache + ad-hoc test artefacts
 /.cache/
 *.ifc

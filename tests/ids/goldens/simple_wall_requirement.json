@@ -1,0 +1,10 @@
+[
+  {
+    "name": "Wall Existence",
+    "status": true,
+    "applicable": 1,
+    "passed": 1,
+    "failed": 0,
+    "failed_guids": []
+  }
+]

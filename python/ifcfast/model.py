@@ -106,6 +106,7 @@ class ProductRow:
     type_guid: Optional[str] = None
     type_name: Optional[str] = None
     type_source: str = "none"  # 'ifctype' / 'objecttype' / 'none'
+    description: Optional[str] = None
 
 
 @dataclass
@@ -128,6 +129,8 @@ class SpaceRow:
 
     guid: str
     step_id: int
+    name: Optional[str] = None
+    predefined_type: Optional[str] = None
 
 
 @dataclass
@@ -185,9 +188,16 @@ class Model:
     _aggregates_df: Optional["object"] = field(repr=False, default=None)
     _storey_building_df: Optional["object"] = field(repr=False, default=None)
     _voids_df: Optional["object"] = field(repr=False, default=None)
+    _nests_df: Optional["object"] = field(repr=False, default=None)
+    _groups_df: Optional["object"] = field(repr=False, default=None)
+    _aggregates_transitive_df: Optional["object"] = field(repr=False, default=None)
+    _contained_in_space_df: Optional["object"] = field(repr=False, default=None)
     _spaces_df: Optional["object"] = field(repr=False, default=None)
     _type_objects_df: Optional["object"] = field(repr=False, default=None)
     _graph: Optional["object"] = field(repr=False, default=None)
+    _rust_index: Optional[dict] = field(repr=False, default=None)
+    _ifc_native: Optional[object] = field(repr=False, default=None)
+    _ids_session: Optional[object] = field(repr=False, default=None)
 
     # ------------------------------------------------------------------
     # Tier-1 queries
@@ -195,6 +205,50 @@ class Model:
 
     def types(self) -> dict[str, int]:
         return dict(self.type_counts)
+
+    def prepare_ids_session(self, *, compiled: dict | None = None) -> object:
+        """Build the native IDS validation session (index + extract + IFC indexes).
+
+        Call once after :func:`ifcfast.open` before ``engine=\"rust\"`` IDS runs.
+        Pass ``compiled`` (from :func:`ifcfast.ids.compile.compile_ids_doc`) to
+        skip extractors not required by that IDS (faster cold start).
+        """
+        import json
+
+        from ifcfast import _core
+
+        p = str(self.header.path)
+        payload = json.dumps(compiled) if compiled is not None else None
+        native = getattr(self, "_ifc_native", None)
+        if native is not None:
+            self._ids_session = native.prepare_ids_session(payload)
+        else:
+            self._ids_session = _core.prepare_ids_session(p, payload)
+        return self._ids_session
+
+    def prepare_ids_substrate(self) -> object:
+        """Alias for :meth:`prepare_ids_session`."""
+        return self.prepare_ids_session()
+
+    @property
+    def ids_session(self) -> object:
+        """Cached native IDS session; built lazily on first access."""
+        if self._ids_session is None:
+            self.prepare_ids_session()
+        return self._ids_session
+
+    @property
+    def ids_substrate(self) -> object:
+        """Alias for :attr:`ids_session`."""
+        return self.ids_session
+
+    def clear_ids_session(self) -> None:
+        """Drop cached IDS session (e.g. after replacing the IFC on disk)."""
+        self._ids_session = None
+
+    def clear_ids_substrate(self) -> None:
+        """Alias for :meth:`clear_ids_session`."""
+        self.clear_ids_session()
 
     @property
     def length_unit(self) -> str:
@@ -651,7 +705,7 @@ class Model:
         DataFrame with columns ``child_guid``, ``parent_guid``,
         ``parent_kind`` — one row per decomposition relationship.
         ``parent_kind`` is one of ``product`` / ``storey`` / ``building``
-        / ``site`` / ``project`` / ``space``.
+        / ``site`` / ``project`` / ``space`` / ``type``.
         """
         import pandas as pd
 
@@ -660,6 +714,68 @@ class Model:
                 columns=["child_guid", "parent_guid", "parent_kind"]
             )
         return self._aggregates_df
+
+    @property
+    def nests(self):
+        """Long-format ``IfcRelNests`` edges.
+
+        DataFrame with columns ``child_guid``, ``parent_guid`` — one row
+        per nest relationship (child is nested under parent).
+        """
+        import pandas as pd
+
+        if self._nests_df is None:
+            self._nests_df = pd.DataFrame(
+                columns=["child_guid", "parent_guid"]
+            )
+        return self._nests_df
+
+    @property
+    def groups(self):
+        """Long-format ``IfcRelAssignsToGroup`` edges.
+
+        DataFrame with columns ``child_guid``, ``group_guid`` — one row
+        per group assignment.
+        """
+        import pandas as pd
+
+        if self._groups_df is None:
+            self._groups_df = pd.DataFrame(
+                columns=["child_guid", "group_guid"]
+            )
+        return self._groups_df
+
+    @property
+    def aggregates_transitive(self):
+        """Transitive closure of ``IfcRelAggregates`` decomposition.
+
+        DataFrame with columns ``child_guid``, ``ancestor_guid`` — one
+        row per (descendant, ancestor) pair reachable via aggregate
+        parent links (excluding self-loops).
+        """
+        import pandas as pd
+
+        if self._aggregates_transitive_df is None:
+            self._aggregates_transitive_df = pd.DataFrame(
+                columns=["child_guid", "ancestor_guid"]
+            )
+        return self._aggregates_transitive_df
+
+    @property
+    def contained_in_space(self):
+        """Long-format product → ``IfcSpace`` containment edges.
+
+        DataFrame with columns ``product_guid``, ``space_guid`` — one row
+        per (product, space) from ``IfcRelContainedInSpatialStructure``
+        where the relating structure is an ``IfcSpace``.
+        """
+        import pandas as pd
+
+        if self._contained_in_space_df is None:
+            self._contained_in_space_df = pd.DataFrame(
+                columns=["product_guid", "space_guid"]
+            )
+        return self._contained_in_space_df
 
     @property
     def storey_building(self):
@@ -1396,12 +1512,50 @@ def open_ifc(
     return model
 
 
-def _index_native(p: Path, hdr: IFCHeader, started: float) -> Model:
-    """Drive the native Rust tier-1 indexer."""
-    from . import _core
-    from .classify import classify_by_name, ElementMode
+def _build_object_step_to_guid(
+    *,
+    product_step_to_guid: dict[int, str],
+    storey_step_to_guid: dict[int, str],
+    type_step_to_guid: dict[int, str],
+    site_step_to_guid: dict[int, str],
+    building_step_to_guid: dict[int, str],
+    project_step_to_guid: dict[int, str],
+    space_step_to_guid: dict[int, str],
+) -> dict[int, str]:
+    """Unified step-id → GlobalId map for graph edge resolution."""
+    out: dict[int, str] = {}
+    out.update(product_step_to_guid)
+    out.update(storey_step_to_guid)
+    out.update(type_step_to_guid)
+    out.update(site_step_to_guid)
+    out.update(building_step_to_guid)
+    out.update(project_step_to_guid)
+    out.update(space_step_to_guid)
+    return out
 
-    raw = _core.index_ifc(str(native_path_for(p)))
+
+def _resolve_guid_pairs(
+    section: dict,
+    object_step_to_guid: dict[int, str],
+    *,
+    left_key: str,
+    right_key: str,
+) -> list[tuple[str, str]]:
+    """Resolve parallel step-id columns to (left_guid, right_guid) pairs."""
+    rows: list[tuple[str, str]] = []
+    for left, right in zip(
+        section.get(left_key, []), section.get(right_key, [])
+    ):
+        lg = object_step_to_guid.get(int(left))
+        rg = object_step_to_guid.get(int(right))
+        if lg is not None and rg is not None:
+            rows.append((lg, rg))
+    return rows
+
+
+def _model_from_rust_index(raw: dict, hdr: IFCHeader, started: float) -> Model:
+    """Build a :class:`Model` from the native ``index_ifc`` dict."""
+    from .classify import classify_by_name, ElementMode
 
     schema = raw.get("schema") or hdr.schema
     type_counts: dict[str, int] = dict(raw.get("type_counts") or {})
@@ -1451,8 +1605,6 @@ def _index_native(p: Path, hdr: IFCHeader, started: float) -> Model:
         if guid is not None:
             contained_in[int(child)] = guid
 
-    # Aggregate parent map — unified across product / storey / building /
-    # site / project / space step ids.
     site_step_to_guid = {
         int(i): g for i, g in zip(raw["sites"]["step_id"], raw["sites"]["guid"])
     }
@@ -1463,20 +1615,40 @@ def _index_native(p: Path, hdr: IFCHeader, started: float) -> Model:
             raw.get("projects", {}).get("guid", []),
         )
     }
+    raw_spaces = raw.get("spaces", {})
     space_step_to_guid = {
         int(i): g
         for i, g in zip(
-            raw.get("spaces", {}).get("step_id", []),
-            raw.get("spaces", {}).get("guid", []),
+            raw_spaces.get("step_id", []),
+            raw_spaces.get("guid", []),
         )
     }
     prod = raw["products"]
     product_step_to_guid = {
         int(sid): guid for sid, guid in zip(prod["step_id"], prod["guid"])
     }
-    # Step-id → (guid, kind). Build with deliberate precedence so the
-    # "most specific" kind wins if a step id appears in multiple sources
-    # (shouldn't happen in valid IFC but be defensive).
+
+    type_objects_raw = raw.get("type_objects") or {}
+    type_step_to_guid = {
+        int(tsid): tguid
+        for tsid, tguid in zip(
+            type_objects_raw.get("step_id", []),
+            type_objects_raw.get("guid", []),
+        )
+    }
+
+    object_step_to_guid = _build_object_step_to_guid(
+        product_step_to_guid=product_step_to_guid,
+        storey_step_to_guid=storey_step_to_guid,
+        type_step_to_guid=type_step_to_guid,
+        site_step_to_guid=site_step_to_guid,
+        building_step_to_guid=bldg_step_to_guid,
+        project_step_to_guid=project_step_to_guid,
+        space_step_to_guid=space_step_to_guid,
+    )
+
+    # Step-id → (guid, kind) for aggregate parents. Deliberate precedence
+    # so the most specific kind wins if a step id appears twice.
     parent_step_to_guid: dict[int, str] = {}
     parent_kind_by_step: dict[int, str] = {}
     for sid, g in space_step_to_guid.items():
@@ -1497,6 +1669,9 @@ def _index_native(p: Path, hdr: IFCHeader, started: float) -> Model:
     for sid, g in product_step_to_guid.items():
         parent_step_to_guid[sid] = g
         parent_kind_by_step[sid] = "product"
+    for sid, g in type_step_to_guid.items():
+        parent_step_to_guid[sid] = g
+        parent_kind_by_step[sid] = "type"
 
     parent_lookup: dict[int, str] = {}
     aggregates_rows: list[tuple[str, str, str]] = []
@@ -1504,8 +1679,8 @@ def _index_native(p: Path, hdr: IFCHeader, started: float) -> Model:
     for child, parent in zip(agg["child"], agg["parent"]):
         parent_sid = int(parent)
         child_sid = int(child)
-        pguid = parent_step_to_guid.get(parent_sid)
-        cguid = parent_step_to_guid.get(child_sid)
+        pguid = object_step_to_guid.get(parent_sid)
+        cguid = object_step_to_guid.get(child_sid)
         if pguid is None or cguid is None:
             continue
         parent_lookup[child_sid] = pguid
@@ -1513,23 +1688,16 @@ def _index_native(p: Path, hdr: IFCHeader, started: float) -> Model:
             (cguid, pguid, parent_kind_by_step.get(parent_sid, "unknown"))
         )
 
-    # Build the long-format containment table. Use product-step-to-guid
-    # to filter out the rare case where a contained child isn't in our
-    # product table (e.g. an IfcSpace that ifcfast doesn't index).
     contained_in_rows: list[tuple[str, str]] = []
     for child, struct in zip(contained_raw["child"], contained_raw["structure"]):
         s_guid = storey_step_to_guid.get(int(struct))
-        c_guid = product_step_to_guid.get(int(child))
+        c_guid = object_step_to_guid.get(int(child))
         if s_guid is not None and c_guid is not None:
             contained_in_rows.append((c_guid, s_guid))
 
-    # Storey name lookup (small list, linear scan is fine).
     storey_name_by_guid = {sr.guid: sr.name for sr in storeys}
 
-    # Type linkage from IfcRelDefinesByType. Build two lookups: type
-    # step_id → (type_guid, type_name) and product step_id → that pair.
     type_meta_by_step: dict[int, tuple[str, Optional[str]]] = {}
-    type_objects_raw = raw.get("type_objects") or {}
     for tsid, tguid, tname in zip(
         type_objects_raw.get("step_id", []),
         type_objects_raw.get("guid", []),
@@ -1555,8 +1723,6 @@ def _index_native(p: Path, hdr: IFCHeader, started: float) -> Model:
         mode = classify_by_name(entity, schema or "IFC4")
         storey_guid = contained_in.get(sid)
         object_type = pdata["object_type"][i]
-        # Three-tier resolution: IfcRelDefinesByType wins, then
-        # IfcRoot.ObjectType as the Revit-export fallback, then nothing.
         ifc_type = product_type_by_step.get(sid)
         if ifc_type is not None:
             type_guid, type_name = ifc_type
@@ -1570,6 +1736,7 @@ def _index_native(p: Path, hdr: IFCHeader, started: float) -> Model:
                 guid=pdata["guid"][i],
                 entity=entity,
                 name=pdata["name"][i],
+                description=pdata.get("description", [None] * n)[i],
                 predefined_type=pdata["predefined_type"][i],
                 object_type=object_type,
                 tag=pdata["tag"][i],
@@ -1588,17 +1755,27 @@ def _index_native(p: Path, hdr: IFCHeader, started: float) -> Model:
             )
         )
 
-    # Spaces — Rust core emits step_id + guid only; richer fields (name,
-    # elevation, long_name) land later as the indexer learns them.
+    space_names = raw_spaces.get("name")
+    space_predefined = raw_spaces.get("predefined_type")
     spaces: list[SpaceRow] = []
-    raw_spaces = raw.get("spaces", {})
-    for sid, sguid in zip(
-        raw_spaces.get("step_id", []), raw_spaces.get("guid", [])
+    for i, (sid, sguid) in enumerate(
+        zip(raw_spaces.get("step_id", []), raw_spaces.get("guid", []))
     ):
-        spaces.append(SpaceRow(guid=sguid, step_id=int(sid)))
+        name = None
+        predefined_type = None
+        if space_names is not None and i < len(space_names):
+            name = space_names[i]
+        if space_predefined is not None and i < len(space_predefined):
+            predefined_type = space_predefined[i]
+        spaces.append(
+            SpaceRow(
+                guid=sguid,
+                step_id=int(sid),
+                name=name,
+                predefined_type=predefined_type,
+            )
+        )
 
-    # Type objects (IfcWallType, IfcDoorType, …) — caught by the Rust
-    # byte-suffix fallback. Schema mirrors SpaceRow plus entity + name.
     type_objects: list[TypeObjectRow] = []
     raw_types = raw.get("type_objects", {})
     for tsid, tent, tguid, tname in zip(
@@ -1611,18 +1788,33 @@ def _index_native(p: Path, hdr: IFCHeader, started: float) -> Model:
             TypeObjectRow(guid=tguid, entity=tent, name=tname, step_id=int(tsid))
         )
 
-    # Voids — IfcRelVoidsElement (opening_step_id, host_step_id) marshalled
-    # from Rust. Resolve to guids via the product step→guid lookup; openings
-    # are products too, so the same map works for both sides.
-    voids_rows: list[tuple[str, str]] = []
-    voids_raw = raw.get("voids") or {}
-    for opening, host in zip(
-        voids_raw.get("opening", []), voids_raw.get("host", [])
-    ):
-        og = product_step_to_guid.get(int(opening))
-        hg = product_step_to_guid.get(int(host))
-        if og is not None and hg is not None:
-            voids_rows.append((og, hg))
+    voids_rows = _resolve_guid_pairs(
+        raw.get("voids") or {},
+        object_step_to_guid,
+        left_key="opening",
+        right_key="host",
+    )
+
+    nests_rows = _resolve_guid_pairs(
+        raw.get("nests") or {},
+        object_step_to_guid,
+        left_key="child",
+        right_key="parent",
+    )
+
+    groups_rows = _resolve_guid_pairs(
+        raw.get("groups") or {},
+        object_step_to_guid,
+        left_key="child",
+        right_key="parent",
+    )
+
+    agg_trans_rows = _resolve_guid_pairs(
+        raw.get("aggregates_transitive") or {},
+        object_step_to_guid,
+        left_key="child",
+        right_key="ancestor",
+    )
 
     import pandas as pd
 
@@ -1637,6 +1829,25 @@ def _index_native(p: Path, hdr: IFCHeader, started: float) -> Model:
     )
     voids_df = pd.DataFrame(
         voids_rows, columns=["opening_guid", "host_guid"]
+    )
+    nests_df = pd.DataFrame(nests_rows, columns=["child_guid", "parent_guid"])
+    groups_df = pd.DataFrame(groups_rows, columns=["child_guid", "group_guid"])
+    aggregates_transitive_df = pd.DataFrame(
+        agg_trans_rows, columns=["child_guid", "ancestor_guid"]
+    )
+
+    cis_raw = raw.get("contained_in_space") or {}
+    cis_rows: list[tuple[str, str]] = []
+    for child, space_sid in zip(
+        cis_raw.get("child", []), cis_raw.get("space", [])
+    ):
+        pg = object_step_to_guid.get(int(child))
+        sg = space_step_to_guid.get(int(space_sid))
+        if pg is not None and sg is not None:
+            cis_rows.append((pg, sg))
+
+    contained_in_space_df = pd.DataFrame(
+        cis_rows, columns=["product_guid", "space_guid"]
     )
 
     return Model(
@@ -1655,7 +1866,23 @@ def _index_native(p: Path, hdr: IFCHeader, started: float) -> Model:
         _aggregates_df=aggregates_df,
         _storey_building_df=storey_building_df,
         _voids_df=voids_df,
+        _nests_df=nests_df,
+        _groups_df=groups_df,
+        _aggregates_transitive_df=aggregates_transitive_df,
+        _contained_in_space_df=contained_in_space_df,
+        _rust_index=raw,
     )
+
+
+def _index_native(p: Path, hdr: IFCHeader, started: float) -> Model:
+    """Drive the native Rust tier-1 indexer."""
+    from . import _core
+
+    native = _core.open_ifc_index(str(native_path_for(p)))
+    raw = native.as_dict()
+    model = _model_from_rust_index(raw, hdr, started)
+    model._ifc_native = native
+    return model
 
 
 # ----------------------------------------------------------------------
