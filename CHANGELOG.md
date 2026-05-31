@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`m.meshes(cut_openings=True)` — net booleans on demand.** Opt-in
+  CSG path that folds every `boolean_second_operand|...` mesh
+  segment (the door / window void emitted alongside the host wall
+  by the reveal-all pipeline) into the host via `manifold-csg`.
+  Doors and windows render as actual holes instead of solid
+  volumes-on-volumes. Default `cut_openings=False` preserves the
+  reveal-all stance (both operands visible). The substrate stays
+  reveal-all unconditionally — the flag only affects `m.meshes()` /
+  `m.iter_meshes()` callers. Closes the viewer-integrator's P0 #1
+  ask (GH #20). Requires a wheel built with the new `csg` Cargo
+  feature; raises `RuntimeError` if the underlying wheel was
+  compiled without it. Cross-product `IfcRelVoidsElement` openings
+  (host wall + separately-modelled `IfcOpeningElement`, no boolean
+  in the wall's own representation) are NOT cut by this path yet —
+  a follow-on.
+- New `csg` Cargo feature pulling in `manifold-csg = "0.2"` (Apache-2
+  / MIT, f64 precision, Send-safe, cmake-built C++ core). Off in the
+  default Python wheel until cross-platform wheel-build smoke
+  testing lands. Build locally with
+  `maturin develop --features csg`.
+
 - **`ifcfast.clash()` — substrate-aware narrow-phase clash engine.**
   Reads `instances.parquet` + `representations.parquet` from a
   bundle directory, runs broad-phase AABB overlap (via the

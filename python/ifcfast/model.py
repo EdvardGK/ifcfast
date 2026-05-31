@@ -489,7 +489,7 @@ class Model:
         df.attrs["global_shift"] = gshift
         return df
 
-    def meshes(self, unit: str = "m"):
+    def meshes(self, unit: str = "m", cut_openings: bool = False):
         """Raw per-product triangle meshes — the fast drop-in for
         IfcOpenShell tessellation.
 
@@ -531,6 +531,19 @@ class Model:
                 unit returns a writable scaled copy. Either way the
                 global shift is already applied Rust-side, and
                 ``vertices + global_shift`` yields a fresh absolute array.
+            cut_openings: when ``True``, ``IfcOpeningElement`` geometry
+                authored as ``IfcBooleanClippingResult`` in a host
+                product's representation is subtracted from the host
+                via CSG. Doors and windows render as actual holes
+                instead of solid volumes-on-volumes. Default ``False``
+                preserves the reveal-all stance (both operands visible
+                as separate triangle segments). Requires a wheel built
+                with the ``csg`` feature — raises ``RuntimeError`` if
+                the underlying ``ifcfast._core`` was compiled without
+                it. Cross-product openings (``IfcRelVoidsElement``
+                attaching a separately-modelled opening to a solid
+                wall) are NOT cut by this path yet — only the
+                in-representation boolean case.
 
         Drop-in for trimesh:
 
@@ -559,7 +572,10 @@ class Model:
         import numpy as np
 
         factor = _unit_factor(unit)
-        d = _core.extract_meshes(str(native_path_for(self.header.path)))
+        d = _core.extract_meshes(
+            str(native_path_for(self.header.path)),
+            cut_openings=bool(cut_openings),
+        )
         out = MeshList()
         for i in range(len(d["guid"])):
             verts = np.frombuffer(d["vertices"][i], dtype=np.float32).reshape(-1, 3)
@@ -574,14 +590,17 @@ class Model:
         out.global_shift = [s * factor for s in gshift] if factor != 1.0 else gshift
         return out
 
-    def iter_meshes(self, unit: str = "m"):
+    def iter_meshes(self, unit: str = "m", cut_openings: bool = False):
         """Generator form of :meth:`meshes` — yields ``Mesh`` namedtuples
         one at a time. Identical data; use this when you want to stream
         through products without materialising the whole list. Note the
         Rust mesher still runs eagerly (one batch pass), so this trades
         list-construction memory for iteration ergonomics, not peak RAM.
+
+        ``cut_openings`` mirrors :meth:`meshes` — see that method for
+        the full contract.
         """
-        for mesh in self.meshes(unit=unit):
+        for mesh in self.meshes(unit=unit, cut_openings=cut_openings):
             yield mesh
 
     @property

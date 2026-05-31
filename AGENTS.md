@@ -85,7 +85,7 @@ releases (additions only, never reorganisations).
 | Tier-1 index (products + storeys) | `m = ifcfast.open(path)`; `m.summary()` |
 | Property sets / quantities / materials | `m.psets` / `m.quantities` / `m.materials` |
 | Classification refs (NS 3451, OmniClass, …) | `m.classifications` |
-| Per-product triangle meshes (verts, faces) | `m.meshes()` (`unit=` opt) |
+| Per-product triangle meshes (verts, faces) | `m.meshes()` (`unit=`, `cut_openings=` opts) |
 | Sample a labeled point cloud (+ normals) | `m.point_cloud(per_m2=1000)` |
 | Geometric quantities (volume, area) | `m.mesh_qto()` |
 | Placement-vs-mesh sanity check | `m.drift` |
@@ -237,15 +237,29 @@ the project's unit scale as parquet schema metadata
 
 When the mesh pipeline meets a composite solid (`IfcBooleanResult`,
 `IfcBooleanClippingResult`, `IfcCsgSolid`) it does **not** perform the
-boolean. Both operands are emitted as their own visible mesh segments
-with compound tags like `boolean_first_operand|extrusion` (the host
-wall) and `boolean_second_operand|halfspace_bounded` (the door clip).
-This is deliberate: the file says "wall minus opening volume"; we
-preserve both volumes so an agent or human can SEE the structure,
-understand it, and edit it surgically rather than read a curated
-summary. The glTF emitter writes each segment's `(start, count,
+boolean by default. Both operands are emitted as their own visible
+mesh segments with compound tags like `boolean_first_operand|extrusion`
+(the host wall) and `boolean_second_operand|halfspace_bounded` (the
+door clip). This is deliberate: the file says "wall minus opening
+volume"; we preserve both volumes so an agent or human can SEE the
+structure, understand it, and edit it surgically rather than read a
+curated summary. The glTF emitter writes each segment's `(start, count,
 source)` into per-node `extras.segments` so viewers can colour /
 split / filter by role.
+
+**Opt-in cut: `m.meshes(cut_openings=True)`.** For viewer / rendering
+work where you want the net solid (doors and windows as actual
+holes), pass `cut_openings=True`. The mesher then folds every
+`boolean_second_operand|...` segment into the host via CSG
+(`manifold3d`) before returning, so the output has a single segment
+per product tagged `cut_openings`. The substrate stays reveal-all —
+this flag only affects `m.meshes()` / `m.iter_meshes()` callers,
+not `instances.parquet` / `representations.parquet`. Requires a
+wheel built with the `csg` feature (raises `RuntimeError` otherwise).
+Cross-product openings (`IfcRelVoidsElement` attaching a separately-
+modelled `IfcOpeningElement` to a solid wall) are NOT cut by this
+path yet — only the in-representation boolean case. File an issue
+with a sample if your model exercises the cross-product pattern.
 
 Unhandled representation types (e.g. `IfcRevolvedAreaSolid`,
 `IfcSurfaceCurveSweptAreaSolid`) appear as `unhandled:IFCXXX`

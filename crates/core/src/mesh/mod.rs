@@ -18,6 +18,8 @@
 pub mod boolean;
 pub mod brep;
 pub mod csg_primitive;
+#[cfg(feature = "csg")]
+pub mod cut_openings;
 pub mod curveset;
 pub mod extrusion;
 pub mod faceset;

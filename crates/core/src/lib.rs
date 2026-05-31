@@ -949,8 +949,25 @@ mod python {
     /// if you need those rows.
     #[cfg(feature = "mesh")]
     #[pyfunction]
-    pub fn extract_meshes<'py>(py: Python<'py>, path: &str) -> PyResult<Bound<'py, PyDict>> {
+    #[pyo3(signature = (path, cut_openings = false))]
+    pub fn extract_meshes<'py>(
+        py: Python<'py>,
+        path: &str,
+        cut_openings: bool,
+    ) -> PyResult<Bound<'py, PyDict>> {
         use crate::mesh::{BakeFrame, ProductMesh, ProductSink};
+
+        // cut_openings requires the `csg` feature — surface a clear
+        // error rather than silently ignoring the flag.
+        #[cfg(not(feature = "csg"))]
+        if cut_openings {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "extract_meshes(cut_openings=True) requires the `csg` Cargo feature; \
+                 this wheel was built without it. Build with \
+                 `pip install ifcfast[csg]` (once published) or \
+                 `maturin develop --features csg` from source.",
+            ));
+        }
 
         let t_total = Instant::now();
         let (mmap, _open_ms) = open_mmap(path)?;
@@ -963,6 +980,7 @@ mod python {
 
         struct MeshSink {
             unit_scale: f32,
+            cut_openings: bool,
             // Model-wide global shift (CloudCompare contract), model
             // units. Same scheme as `sample_point_cloud`: set from the
             // first geometry product's f64 origin (rounded); per-product
@@ -975,14 +993,39 @@ mod python {
             triangle_count: Vec<u32>,
             vertices_le: Vec<Vec<u8>>,
             indices_le: Vec<Vec<u8>>,
+            cut_stats_cut: usize,
+            cut_stats_passthrough: usize,
+            cut_stats_fallback: usize,
         }
 
         impl ProductSink for MeshSink {
-            fn on_product(&mut self, mesh: ProductMesh) {
+            #[cfg_attr(not(feature = "csg"), allow(unused_mut))]
+            fn on_product(&mut self, mut mesh: ProductMesh) {
                 // Skip geometryless products — no triangles to hand back.
                 if mesh.indices.is_empty() || mesh.vertices.is_empty() {
                     return;
                 }
+                #[cfg(feature = "csg")]
+                if self.cut_openings {
+                    let outcome = crate::mesh::cut_openings::apply(&mut mesh);
+                    match outcome {
+                        crate::mesh::cut_openings::Outcome::Cut => self.cut_stats_cut += 1,
+                        crate::mesh::cut_openings::Outcome::Passthrough => {
+                            self.cut_stats_passthrough += 1
+                        }
+                        crate::mesh::cut_openings::Outcome::Fallback => {
+                            self.cut_stats_fallback += 1
+                        }
+                    }
+                    // The cut may have emptied the mesh (cutter fully
+                    // consumed the host); skip in that case.
+                    if mesh.indices.is_empty() || mesh.vertices.is_empty() {
+                        return;
+                    }
+                }
+                #[cfg(not(feature = "csg"))]
+                let _ = self.cut_openings; // silence unused-field warning
+
                 let shift = *self
                     .shift
                     .get_or_insert_with(|| global_shift_for(&mesh.mesh_anchor, self.unit_scale));
@@ -1019,6 +1062,7 @@ mod python {
 
         let mut sink = MeshSink {
             unit_scale,
+            cut_openings,
             shift: None,
             guid: Vec::new(),
             entity: Vec::new(),
@@ -1026,6 +1070,9 @@ mod python {
             triangle_count: Vec::new(),
             vertices_le: Vec::new(),
             indices_le: Vec::new(),
+            cut_stats_cut: 0,
+            cut_stats_passthrough: 0,
+            cut_stats_fallback: 0,
         };
         let t_mesh = Instant::now();
         // Local frame + per-product f64 shift — see sample_point_cloud.
@@ -1065,6 +1112,10 @@ mod python {
         out.set_item("marshal_ms", t_marshal.elapsed().as_secs_f64() * 1000.0)?;
         out.set_item("total_ms", t_total.elapsed().as_secs_f64() * 1000.0)?;
         out.set_item("size_bytes", mmap.len() as u64)?;
+        out.set_item("cut_openings", cut_openings)?;
+        out.set_item("cut_openings_cut", sink.cut_stats_cut as u64)?;
+        out.set_item("cut_openings_passthrough", sink.cut_stats_passthrough as u64)?;
+        out.set_item("cut_openings_fallback", sink.cut_stats_fallback as u64)?;
         Ok(out)
     }
 
