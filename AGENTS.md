@@ -256,10 +256,15 @@ per product tagged `cut_openings`. The substrate stays reveal-all —
 this flag only affects `m.meshes()` / `m.iter_meshes()` callers,
 not `instances.parquet` / `representations.parquet`. Requires a
 wheel built with the `csg` feature (raises `RuntimeError` otherwise).
-Cross-product openings (`IfcRelVoidsElement` attaching a separately-
-modelled `IfcOpeningElement` to a solid wall) are NOT cut by this
-path yet — only the in-representation boolean case. File an issue
-with a sample if your model exercises the cross-product pattern.
+Both opening patterns are covered: **in-representation** booleans
+(`IfcBooleanClippingResult(host, opening)`) AND **cross-product**
+openings (`IfcRelVoidsElement` linking a separately-modelled
+`IfcOpeningElement` to a solid host). Cross-product openings are
+suppressed from the visible product set in cut mode (they're
+cutters, not user-visible products) and folded into their host's
+net solid; in reveal-all (`cut_openings=False`, the default) both
+the host and the opening still emit as separate products with
+their full operand-by-operand fidelity preserved.
 
 Unhandled representation types (e.g. `IfcRevolvedAreaSolid`,
 `IfcSurfaceCurveSweptAreaSolid`) appear as `unhandled:IFCXXX`

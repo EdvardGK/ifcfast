@@ -996,36 +996,22 @@ mod python {
             cut_stats_cut: usize,
             cut_stats_passthrough: usize,
             cut_stats_fallback: usize,
+            // Cross-product IfcRelVoidsElement buffer. Some(_) only
+            // when cut_openings && the file has at least one void
+            // relation; otherwise None keeps the hot path identical
+            // to the no-cut behaviour. Stored in an Option so the
+            // sink wrapper can mem::take it for the flush phase
+            // without holding two mutable borrows simultaneously.
+            #[cfg(feature = "csg")]
+            cross: Option<crate::mesh::cut_openings::CrossProductCut>,
         }
 
-        impl ProductSink for MeshSink {
-            #[cfg_attr(not(feature = "csg"), allow(unused_mut))]
-            fn on_product(&mut self, mut mesh: ProductMesh) {
-                // Skip geometryless products — no triangles to hand back.
-                if mesh.indices.is_empty() || mesh.vertices.is_empty() {
-                    return;
-                }
-                #[cfg(feature = "csg")]
-                if self.cut_openings {
-                    let outcome = crate::mesh::cut_openings::apply(&mut mesh);
-                    match outcome {
-                        crate::mesh::cut_openings::Outcome::Cut => self.cut_stats_cut += 1,
-                        crate::mesh::cut_openings::Outcome::Passthrough => {
-                            self.cut_stats_passthrough += 1
-                        }
-                        crate::mesh::cut_openings::Outcome::Fallback => {
-                            self.cut_stats_fallback += 1
-                        }
-                    }
-                    // The cut may have emptied the mesh (cutter fully
-                    // consumed the host); skip in that case.
-                    if mesh.indices.is_empty() || mesh.vertices.is_empty() {
-                        return;
-                    }
-                }
-                #[cfg(not(feature = "csg"))]
-                let _ = self.cut_openings; // silence unused-field warning
-
+        impl MeshSink {
+            /// Take a (presumed cut-applied, non-empty) mesh and
+            /// push its scaled+rebased byte buffers onto the output
+            /// columns. Shared between the streaming `on_product`
+            /// path and the post-stream cross-product flush.
+            fn encode(&mut self, mesh: ProductMesh) {
                 let shift = *self
                     .shift
                     .get_or_insert_with(|| global_shift_for(&mesh.mesh_anchor, self.unit_scale));
@@ -1058,7 +1044,67 @@ mod python {
                 self.vertices_le.push(vbytes);
                 self.indices_le.push(ibytes);
             }
+
+            #[cfg(feature = "csg")]
+            fn bump_outcome(&mut self, outcome: crate::mesh::cut_openings::Outcome) {
+                use crate::mesh::cut_openings::Outcome;
+                match outcome {
+                    Outcome::Cut => self.cut_stats_cut += 1,
+                    Outcome::Passthrough => self.cut_stats_passthrough += 1,
+                    Outcome::Fallback => self.cut_stats_fallback += 1,
+                }
+            }
         }
+
+        impl ProductSink for MeshSink {
+            #[cfg_attr(not(feature = "csg"), allow(unused_mut))]
+            fn on_product(&mut self, mut mesh: ProductMesh) {
+                // Skip geometryless products — no triangles to hand back.
+                if mesh.indices.is_empty() || mesh.vertices.is_empty() {
+                    return;
+                }
+                #[cfg(feature = "csg")]
+                if self.cut_openings {
+                    // Cross-product routing first: openings get
+                    // suppressed, hosts get held for the flush phase,
+                    // everything else continues into the in-rep apply.
+                    if let Some(cross) = self.cross.as_mut() {
+                        use crate::mesh::cut_openings::Routed;
+                        match cross.route(mesh) {
+                            Routed::Suppressed | Routed::Held => return,
+                            Routed::PassThrough(m) => mesh = m,
+                        }
+                    }
+                    let outcome = crate::mesh::cut_openings::apply(&mut mesh);
+                    self.bump_outcome(outcome);
+                    // The cut may have emptied the mesh (cutter fully
+                    // consumed the host); skip in that case.
+                    if mesh.indices.is_empty() || mesh.vertices.is_empty() {
+                        return;
+                    }
+                }
+                #[cfg(not(feature = "csg"))]
+                let _ = self.cut_openings; // silence unused-field warning
+
+                self.encode(mesh);
+            }
+        }
+
+        // Build the cross-product void index from the indexer's
+        // parallel arrays. `from_indexer` collapses to an empty
+        // CrossProductCut when no IfcRelVoidsElement exists, so we
+        // only carry the struct when both the flag is on AND there's
+        // actually work for it to do.
+        #[cfg(feature = "csg")]
+        let cross = if cut_openings {
+            let c = crate::mesh::cut_openings::CrossProductCut::from_indexer(
+                &idx.voids_opening,
+                &idx.voids_host,
+            );
+            if c.is_empty() { None } else { Some(c) }
+        } else {
+            None
+        };
 
         let mut sink = MeshSink {
             unit_scale,
@@ -1073,12 +1119,28 @@ mod python {
             cut_stats_cut: 0,
             cut_stats_passthrough: 0,
             cut_stats_fallback: 0,
+            #[cfg(feature = "csg")]
+            cross,
         };
         let t_mesh = Instant::now();
         // Local frame + per-product f64 shift — see sample_point_cloud.
         let mesh_stats = py.allow_threads(|| {
             crate::mesh::mesh_ifc_streaming_framed(&mmap, &mut sink, BakeFrame::Local)
         });
+
+        // Cross-product flush. After the streaming pass, fold every
+        // buffered host with its arrived openings and run the result
+        // through the same encode path. Stats accumulate per host.
+        #[cfg(feature = "csg")]
+        if let Some(mut cross) = sink.cross.take() {
+            for (folded, outcome) in cross.flush() {
+                sink.bump_outcome(outcome);
+                if folded.indices.is_empty() || folded.vertices.is_empty() {
+                    continue;
+                }
+                sink.encode(folded);
+            }
+        }
         let mesh_ms = t_mesh.elapsed().as_secs_f64() * 1000.0;
 
         let t_marshal = Instant::now();

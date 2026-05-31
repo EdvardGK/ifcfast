@@ -1,30 +1,27 @@
 //! Apply CSG opening cuts to a `ProductMesh` in place.
 //!
-//! Closes the viewer-integrator's P0 #1 (GH #20): today every wall
-//! whose IFC representation is `IfcBooleanClippingResult(host, void)`
-//! ships BOTH operands as visible triangles (per the reveal-all
-//! stance), so viewers render solid walls with the door / window
-//! geometry sitting on top as a separate volume. This module gives
-//! the consumer an opt-in path that subtracts the cutter volumes
-//! from the host and emits a single, holes-cut net mesh.
+//! Closes the viewer-integrator's P0 #1 (GH #20). Two patterns are
+//! covered, each by its own entry point:
 //!
-//! Implementation note: ifcfast's extractor already tags every
-//! triangle's provenance in `ProductMesh.segments` —
-//! `"boolean_first_operand|..."` for the host, `"boolean_second_operand|..."`
-//! for the cutter. We don't need to re-walk the IFC tree or consult
-//! `IfcRelVoidsElement` for this in-product case; the segment tags
-//! tell us which triangles to subtract. (Cross-product
-//! `IfcRelVoidsElement` openings — host wall + separately-modelled
-//! IfcOpeningElement linked by `IfcRelVoidsElement`, where the
-//! wall's representation is a solid extrusion with no boolean — are
-//! a separate path that this module does NOT handle yet. See the
-//! `[[viewer-feedback-2026-05-30]]` memory for follow-on.)
+//! * **In-representation booleans** — `IfcBooleanClippingResult(host,
+//!   void)`. ifcfast's extractor already tags every triangle's
+//!   provenance in `ProductMesh.segments` (`"boolean_first_operand|..."`
+//!   for the host, `"boolean_second_operand|..."` for the cutter), so
+//!   the cut is purely consumer-side: see [`apply`].
 //!
-//! Reveal-all stance preserved: this is opt-in per call. The
-//! substrate writer never invokes it, so `instances.parquet` /
+//! * **Cross-product `IfcRelVoidsElement` openings** — a solid
+//!   `IfcWall` whose own representation is a plain `IfcExtrudedAreaSolid`
+//!   with a separately-modelled `IfcOpeningElement` linked via
+//!   `IfcRelVoidsElement`. Both products mesh independently; the cut
+//!   needs the indexer's relationship arrays plus a stream-time buffer
+//!   so opening meshes can fold into their host once both arrive:
+//!   see [`CrossProductCut`].
+//!
+//! Reveal-all stance preserved: both paths are opt-in per call. The
+//! substrate writer never invokes them, so `instances.parquet` /
 //! `representations.parquet` keep their operand-by-operand fidelity.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::geom::csg::{self, CsgKernelError};
 use crate::mesh::{MeshSegment, ProductMesh};
@@ -128,6 +125,221 @@ impl Outcome {
             Self::Passthrough => stats.passthrough += 1,
             Self::Fallback => stats.fallback += 1,
         }
+    }
+}
+
+/// Stream-time buffer for the cross-product `IfcRelVoidsElement`
+/// case. Walls authored as a solid extrusion plus a separately-
+/// modelled `IfcOpeningElement` linked by `IfcRelVoidsElement` mesh
+/// independently — the indexer hands us a `(opening, host)` row per
+/// relation, but the products surface in entity-table order, not
+/// in a topologically sorted way that would let us fold on the fly.
+///
+/// `CrossProductCut` solves that by buffering both sides and folding
+/// at flush time. The caller (typically the `MeshSink` wrapper in
+/// `extract_meshes`) routes each incoming `ProductMesh` through
+/// `route` — opening products get held as cutters, host products
+/// get held as hosts, anything else falls through untouched. After
+/// the streaming pass completes, [`flush`] runs the in-rep [`apply`]
+/// on each buffered host first (so a host with BOTH an
+/// `IfcBooleanClippingResult` and cross-product openings folds
+/// cleanly), then subtracts the gathered openings via
+/// `geom::csg::subtract_many`.
+///
+/// Frame contract: all buffered meshes are expected to live in
+/// `BakeFrame::Local` form — vertices near origin, true world
+/// position carried separately on `ProductMesh.mesh_anchor`. The
+/// fold translates each opening's vertices by
+/// `(opening.mesh_anchor - host.mesh_anchor)` before passing to the
+/// CSG kernel, which keeps everything in the host's local frame and
+/// stays f32-safe (host/opening anchors are typically <10 m apart).
+pub struct CrossProductCut {
+    /// For each host step_id, the set of openings expected per
+    /// `IfcRelVoidsElement`. A host may appear with multiple
+    /// openings (typical for walls with several doors / windows).
+    expected_openings: HashMap<u64, Vec<u64>>,
+    /// Membership test for "is this product an opening?" — drives
+    /// the suppression decision in `route`.
+    openings: HashSet<u64>,
+    /// Membership test for "is this product a host?".
+    hosts: HashSet<u64>,
+    /// Opening meshes that have arrived, keyed by opening step_id.
+    /// Stored as `(vertices, indices, mesh_anchor)` — the smallest
+    /// payload the fold needs, so the rest of `ProductMesh` can be
+    /// dropped immediately.
+    held_openings: HashMap<u64, (Vec<f32>, Vec<u32>, [f64; 3])>,
+    /// Host meshes waiting for their openings, keyed by host
+    /// step_id. The full `ProductMesh` is held so the existing
+    /// MeshSink encoding logic (guid, entity, anchor, byte buffers)
+    /// can run on the folded result without re-derivation.
+    held_hosts: HashMap<u64, ProductMesh>,
+}
+
+/// What `CrossProductCut::route` decided for an incoming mesh.
+#[derive(Debug)]
+pub enum Routed {
+    /// Product was identified as an `IfcOpeningElement` cutter and
+    /// stashed for later folding. Caller MUST drop the mesh without
+    /// forwarding it to the inner sink — in cut mode openings are
+    /// not user-visible products.
+    Suppressed,
+    /// Product was identified as a host with at least one expected
+    /// opening and stashed for later folding. Caller MUST drop the
+    /// mesh without forwarding it; the eventual folded result comes
+    /// out of `flush`.
+    Held,
+    /// Product is neither an opening nor a host (the common case).
+    /// Caller continues with their normal in-rep `apply` pipeline.
+    PassThrough(ProductMesh),
+}
+
+impl CrossProductCut {
+    /// Build the index from the indexer's parallel arrays. Both
+    /// slices must be the same length (one row per
+    /// `IfcRelVoidsElement`).
+    pub fn from_indexer(voids_opening: &[u64], voids_host: &[u64]) -> Self {
+        let mut expected_openings: HashMap<u64, Vec<u64>> = HashMap::new();
+        let mut openings: HashSet<u64> = HashSet::new();
+        let mut hosts: HashSet<u64> = HashSet::new();
+        for (opening, host) in voids_opening.iter().zip(voids_host.iter()) {
+            // Skip self-voids (pathological but cheap to guard).
+            if opening == host {
+                continue;
+            }
+            openings.insert(*opening);
+            hosts.insert(*host);
+            expected_openings.entry(*host).or_default().push(*opening);
+        }
+        Self {
+            expected_openings,
+            openings,
+            hosts,
+            held_openings: HashMap::new(),
+            held_hosts: HashMap::new(),
+        }
+    }
+
+    /// `true` if the index is empty (no `IfcRelVoidsElement` in the
+    /// file). Callers can use this to short-circuit the wrapper and
+    /// keep the hot path identical to non-cut behaviour.
+    pub fn is_empty(&self) -> bool {
+        self.expected_openings.is_empty()
+    }
+
+    /// Classify a mesh against the relationship index and stash it
+    /// if it's a participant. Returns [`Routed::PassThrough`] for
+    /// the common case where the product is neither an opening nor
+    /// a host — the caller continues with their normal pipeline.
+    pub fn route(&mut self, mesh: ProductMesh) -> Routed {
+        let id = mesh.ifc_id;
+        if self.openings.contains(&id) {
+            self.held_openings
+                .insert(id, (mesh.vertices, mesh.indices, mesh.mesh_anchor));
+            return Routed::Suppressed;
+        }
+        if self.hosts.contains(&id) {
+            self.held_hosts.insert(id, mesh);
+            return Routed::Held;
+        }
+        Routed::PassThrough(mesh)
+    }
+
+    /// Fold every buffered host with its arrived openings and yield
+    /// the (mesh, outcome) pairs ready for the caller's emit path.
+    ///
+    /// Per-host sequence: run the in-rep [`apply`] first (so a host
+    /// authored as `IfcBooleanClippingResult` plus a cross-product
+    /// opening collapses the in-rep operands before the cross fold),
+    /// then translate each opening's vertices by
+    /// `(opening.mesh_anchor - host.mesh_anchor)` and call
+    /// `geom::csg::subtract_many`. Combined outcome:
+    /// * `Cut` — at least one subtraction succeeded on this host.
+    /// * `Fallback` — cutters existed but every subtraction failed.
+    /// * `Passthrough` — no openings ever arrived (e.g. all expected
+    ///   openings were geometryless or otherwise unmeshed).
+    pub fn flush(&mut self) -> Vec<(ProductMesh, Outcome)> {
+        let mut out = Vec::with_capacity(self.held_hosts.len());
+        let held_hosts = std::mem::take(&mut self.held_hosts);
+        for (host_id, mut host_mesh) in held_hosts {
+            // Run in-rep cut first. Combined outcome accounting is
+            // simplified to "did any subtraction happen on this
+            // product?" — see the doc above.
+            let in_rep = apply(&mut host_mesh);
+
+            // Gather arrived openings for this host.
+            let expected = self
+                .expected_openings
+                .get(&host_id)
+                .cloned()
+                .unwrap_or_default();
+            let cutter_buffers: Vec<(Vec<f32>, Vec<u32>)> = expected
+                .iter()
+                .filter_map(|oid| {
+                    let (v, i, anchor) = self.held_openings.get(oid)?;
+                    let off = [
+                        (anchor[0] - host_mesh.mesh_anchor[0]) as f32,
+                        (anchor[1] - host_mesh.mesh_anchor[1]) as f32,
+                        (anchor[2] - host_mesh.mesh_anchor[2]) as f32,
+                    ];
+                    let translated: Vec<f32> = v
+                        .chunks_exact(3)
+                        .flat_map(|c| {
+                            [c[0] + off[0], c[1] + off[1], c[2] + off[2]]
+                        })
+                        .collect();
+                    Some((translated, i.clone()))
+                })
+                .collect();
+
+            let combined = if cutter_buffers.is_empty() {
+                // No cross-product cutters arrived → outcome stays
+                // whatever the in-rep apply said (typically
+                // Passthrough for a plain extruded wall).
+                in_rep
+            } else {
+                let cutter_refs: Vec<(&[f32], &[u32])> = cutter_buffers
+                    .iter()
+                    .map(|(v, i)| (v.as_slice(), i.as_slice()))
+                    .collect();
+                match csg::subtract_many(
+                    &host_mesh.vertices,
+                    &host_mesh.indices,
+                    &cutter_refs,
+                ) {
+                    Ok((verts, idx)) => {
+                        let triangle_count = (idx.len() / 3) as u32;
+                        host_mesh.vertices = verts;
+                        host_mesh.indices = idx;
+                        host_mesh.segments = vec![MeshSegment {
+                            index_start: 0,
+                            index_count: triangle_count * 3,
+                            source: "cut_openings".to_string(),
+                        }];
+                        host_mesh.parts.clear();
+                        Outcome::Cut
+                    }
+                    Err(_) => {
+                        // If the in-rep cut already succeeded, keep
+                        // that as the win and surface the
+                        // cross-product failure only via a Fallback
+                        // bump when in-rep also passed/failed.
+                        if matches!(in_rep, Outcome::Cut) {
+                            Outcome::Cut
+                        } else {
+                            Outcome::Fallback
+                        }
+                    }
+                }
+            };
+
+            out.push((host_mesh, combined));
+        }
+        // Any opening meshes still held belong to hosts that never
+        // arrived (geometryless host, host outside the meshable
+        // product set). Drop them — in cut mode they're not visible
+        // products on their own.
+        self.held_openings.clear();
+        out
     }
 }
 

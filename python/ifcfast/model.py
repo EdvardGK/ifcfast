@@ -531,19 +531,23 @@ class Model:
                 unit returns a writable scaled copy. Either way the
                 global shift is already applied Rust-side, and
                 ``vertices + global_shift`` yields a fresh absolute array.
-            cut_openings: when ``True``, ``IfcOpeningElement`` geometry
-                authored as ``IfcBooleanClippingResult`` in a host
-                product's representation is subtracted from the host
-                via CSG. Doors and windows render as actual holes
-                instead of solid volumes-on-volumes. Default ``False``
-                preserves the reveal-all stance (both operands visible
-                as separate triangle segments). Requires a wheel built
-                with the ``csg`` feature — raises ``RuntimeError`` if
-                the underlying ``ifcfast._core`` was compiled without
-                it. Cross-product openings (``IfcRelVoidsElement``
-                attaching a separately-modelled opening to a solid
-                wall) are NOT cut by this path yet — only the
-                in-representation boolean case.
+            cut_openings: when ``True``, opening geometry is
+                subtracted from its host via CSG so doors and
+                windows render as actual holes instead of solid
+                volumes-on-volumes. Both authoring patterns are
+                covered: **in-representation** booleans
+                (``IfcBooleanClippingResult(host, opening)``) AND
+                **cross-product** openings
+                (``IfcRelVoidsElement`` linking a separately-
+                modelled ``IfcOpeningElement`` to a solid host).
+                Cross-product openings are suppressed from the
+                returned product list in cut mode (they're cutters,
+                not user-visible products). Default ``False``
+                preserves the reveal-all stance (both operands /
+                both products emit verbatim). Requires a wheel
+                built with the ``csg`` feature — raises
+                ``RuntimeError`` if the underlying
+                ``ifcfast._core`` was compiled without it.
 
         Drop-in for trimesh:
 

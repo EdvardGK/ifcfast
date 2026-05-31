@@ -13,7 +13,8 @@
 #![cfg(all(feature = "mesh", feature = "csg"))]
 
 use _core::geom::csg;
-use _core::mesh::cut_openings::{apply, Outcome};
+use _core::indexer;
+use _core::mesh::cut_openings::{apply, CrossProductCut, Outcome, Routed};
 use _core::mesh::{mesh_ifc_streaming, ProductMesh, ProductSink};
 
 /// Wall: 1000 × 200 mm cross-section extruded 3000 mm. Cut with an
@@ -190,4 +191,185 @@ END-ISO-10303-21;
     assert_eq!(outcome, Outcome::Passthrough);
     assert_eq!(mesh.vertices, before_verts, "passthrough must not mutate verts");
     assert_eq!(mesh.indices, before_idx, "passthrough must not mutate indices");
+}
+
+// ---------- Cross-product IfcRelVoidsElement (GH #21) ----------
+
+/// Same wall + opening geometry as `WALL_WITH_OPENING`, but authored
+/// the cross-product way: plain `IfcWall` extrusion + separately-
+/// modelled `IfcOpeningElement` extrusion + an `IfcRelVoidsElement`
+/// linking them. Older Revit exports and some MEP authoring tools
+/// produce this pattern instead of `IfcBooleanClippingResult`.
+///
+/// Geometry: wall 1000×200×3000 mm at world origin (centred profile);
+/// opening 500×200×2000 mm at world origin with the extrusion itself
+/// placed at z=500 — so the opening box occupies the same volume
+/// inside the wall as the in-rep fixture. Expected post-cut wall
+/// volume: 0.6 − 0.2 = 0.4 m³.
+const WALL_WITH_CROSS_PRODUCT_OPENING: &str = r#"ISO-10303-21;
+HEADER;
+FILE_DESCRIPTION(('ViewDefinition [ReferenceView]'),'2;1');
+FILE_NAME('voids.ifc','2026-05-31T00:00:00',('test'),('skiplum'),'ifcfast','ifcfast','');
+FILE_SCHEMA(('IFC4'));
+ENDSEC;
+DATA;
+#1=IFCPROJECT('0Test000000000000000001',$,'p',$,$,$,$,(#5),#2);
+#2=IFCUNITASSIGNMENT((#3,#4));
+#3=IFCSIUNIT(*,.LENGTHUNIT.,.MILLI.,.METRE.);
+#4=IFCSIUNIT(*,.PLANEANGLEUNIT.,$,.RADIAN.);
+#5=IFCGEOMETRICREPRESENTATIONCONTEXT($,'Model',3,1.0E-5,#6,$);
+#6=IFCAXIS2PLACEMENT3D(#7,$,$);
+#7=IFCCARTESIANPOINT((0.,0.,0.));
+#10=IFCSITE('1Site000000000000000001',$,'s',$,$,#15,$,$,.ELEMENT.,$,$,$,$,$);
+#11=IFCBUILDING('2Bldg000000000000000001',$,'b',$,$,#15,$,$,.ELEMENT.,$,$,$);
+#12=IFCBUILDINGSTOREY('3Stor000000000000000001',$,'Level 1',$,$,#15,$,$,.ELEMENT.,0.0);
+#15=IFCLOCALPLACEMENT($,#6);
+#16=IFCLOCALPLACEMENT(#15,#6);
+#20=IFCRELAGGREGATES('4Agg000000000000000001',$,$,$,#1,(#10));
+#21=IFCRELAGGREGATES('5Agg000000000000000001',$,$,$,#10,(#11));
+#22=IFCRELAGGREGATES('6Agg000000000000000001',$,$,$,#11,(#12));
+#30=IFCRECTANGLEPROFILEDEF(.AREA.,'WallRect',#31,1000.,200.);
+#31=IFCAXIS2PLACEMENT2D(#7,$);
+#32=IFCDIRECTION((0.,0.,1.));
+#33=IFCEXTRUDEDAREASOLID(#30,#6,#32,3000.);
+#34=IFCSHAPEREPRESENTATION(#5,'Body','SweptSolid',(#33));
+#35=IFCPRODUCTDEFINITIONSHAPE($,$,(#34));
+#40=IFCRECTANGLEPROFILEDEF(.AREA.,'OpeningRect',#41,500.,200.);
+#41=IFCAXIS2PLACEMENT2D(#7,$);
+#42=IFCAXIS2PLACEMENT3D(#43,$,$);
+#43=IFCCARTESIANPOINT((0.,0.,500.));
+#44=IFCEXTRUDEDAREASOLID(#40,#42,#32,2000.);
+#45=IFCSHAPEREPRESENTATION(#5,'Body','SweptSolid',(#44));
+#46=IFCPRODUCTDEFINITIONSHAPE($,$,(#45));
+#50=IFCWALL('7Wall00000000000000001',$,'TestWall',$,$,#16,#35,'tag',.STANDARD.);
+#51=IFCOPENINGELEMENT('8Open00000000000000001',$,'Opening',$,$,#16,#46,'tag',.OPENING.);
+#60=IFCRELVOIDSELEMENT('9Rel000000000000000001',$,$,$,#50,#51);
+#70=IFCRELCONTAINEDINSPATIALSTRUCTURE('ARelC0000000000000001',$,$,$,(#50),#12);
+ENDSEC;
+END-ISO-10303-21;
+"#;
+
+#[test]
+fn cross_product_voids_indexer_captures_relation() {
+    let idx = indexer::index(WALL_WITH_CROSS_PRODUCT_OPENING.as_bytes());
+    assert_eq!(
+        idx.voids_opening.len(),
+        1,
+        "indexer must record the single IfcRelVoidsElement",
+    );
+    assert_eq!(idx.voids_host.len(), 1);
+    // Host (RelatingBuildingElement = #50, the wall) and opening
+    // (RelatedOpeningElement = #51) must be parsed in the documented
+    // order — the cross-product cut buffer relies on this.
+    assert_eq!(idx.voids_host[0], 50);
+    assert_eq!(idx.voids_opening[0], 51);
+}
+
+#[test]
+fn cross_product_voids_reveal_all_emits_both_products() {
+    // With cut_openings off (the default reveal-all behaviour), both
+    // the wall AND the opening reach the sink — neither is suppressed.
+    let mut sink = CaptureSink {
+        products: Vec::new(),
+    };
+    let _ = mesh_ifc_streaming(
+        WALL_WITH_CROSS_PRODUCT_OPENING.as_bytes(),
+        &mut sink,
+    );
+    let entities: Vec<&str> = sink
+        .products
+        .iter()
+        .map(|m| m.entity.as_str())
+        .collect();
+    assert!(
+        entities.iter().any(|e| *e == "IfcWall"),
+        "reveal-all must keep the wall; got {entities:?}",
+    );
+    assert!(
+        entities.iter().any(|e| *e == "IfcOpeningElement"),
+        "reveal-all must keep the opening as a separate product; got {entities:?}",
+    );
+}
+
+#[test]
+fn cross_product_voids_fold_subtracts_opening_volume() {
+    let buf = WALL_WITH_CROSS_PRODUCT_OPENING.as_bytes();
+    let idx = indexer::index(buf);
+
+    // Build the cut buffer from the indexer's relationship arrays —
+    // same construction `extract_meshes` performs in production.
+    let mut cross = CrossProductCut::from_indexer(&idx.voids_opening, &idx.voids_host);
+    assert!(!cross.is_empty(), "cut buffer must see the void relation");
+
+    // Stream the file; route every emitted product through the cut
+    // buffer the same way `MeshSink` does. Opening should be
+    // suppressed, wall should be held; no PassThrough products in
+    // this fixture (no spatial structure products are meshable).
+    let mut sink = CaptureSink {
+        products: Vec::new(),
+    };
+    let _ = mesh_ifc_streaming(buf, &mut sink);
+    let mut passthrough: Vec<ProductMesh> = Vec::new();
+    let mut suppressed = 0_usize;
+    let mut held = 0_usize;
+    for mesh in sink.products {
+        match cross.route(mesh) {
+            Routed::Suppressed => suppressed += 1,
+            Routed::Held => held += 1,
+            Routed::PassThrough(m) => passthrough.push(m),
+        }
+    }
+    assert_eq!(suppressed, 1, "the opening must be suppressed (cutter, not visible)");
+    assert_eq!(held, 1, "the wall must be held for the fold");
+    assert!(
+        passthrough.is_empty(),
+        "no products should pass through in this minimal fixture, got {} entities: {:?}",
+        passthrough.len(),
+        passthrough.iter().map(|m| m.entity.as_str()).collect::<Vec<_>>(),
+    );
+
+    // Flush — fold the wall with its arrived openings.
+    let folded = cross.flush();
+    assert_eq!(folded.len(), 1, "exactly one host emerges from the flush");
+    let (wall_mesh, outcome) = &folded[0];
+    assert_eq!(*outcome, Outcome::Cut, "the cross-product cut must succeed");
+    assert_eq!(wall_mesh.entity, "IfcWall");
+    assert_eq!(
+        wall_mesh.segments.len(),
+        1,
+        "folded mesh must collapse to a single segment",
+    );
+    assert_eq!(wall_mesh.segments[0].source, "cut_openings");
+
+    // Volume check: 0.6 m³ host − 0.2 m³ opening = 0.4 m³.
+    let m = csg::build_manifold(&wall_mesh.vertices, &wall_mesh.indices)
+        .expect("post-cut wall must be a closed manifold");
+    let volume_m3 = m.volume() * 1.0e-9_f64;
+    let expected = 0.4_f64;
+    assert!(
+        (volume_m3 - expected).abs() < 0.02,
+        "expected ~{expected} m³ after cross-product cut, got {volume_m3} m³",
+    );
+}
+
+#[test]
+fn cross_product_buffer_is_empty_when_no_voids_in_file() {
+    // PLAIN_WALL (from the in-rep test above) carries no
+    // IfcRelVoidsElement — the cross-product cut buffer should
+    // construct empty, so the wrapper short-circuits and the hot
+    // path stays identical to the no-cut behaviour.
+    let buf = b"ISO-10303-21;
+HEADER;
+FILE_DESCRIPTION(('x'),'2;1');
+FILE_NAME('x.ifc','x',('x'),('x'),'x','x','');
+FILE_SCHEMA(('IFC4'));
+ENDSEC;
+DATA;
+#1=IFCPROJECT('0',$,'p',$,$,$,$,$,$);
+ENDSEC;
+END-ISO-10303-21;
+";
+    let idx = indexer::index(buf);
+    let cross = CrossProductCut::from_indexer(&idx.voids_opening, &idx.voids_host);
+    assert!(cross.is_empty(), "no voids → buffer must be empty");
 }
