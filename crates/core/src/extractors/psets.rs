@@ -28,6 +28,9 @@ pub struct PsetTable {
     pub prop_name: Vec<String>,
     pub value: Vec<Option<String>>,
     pub value_type: Vec<Option<String>>,
+    /// IfcPropertyTableValue `DefinedValues` column (when distinct from defining).
+    pub value_defined: Vec<Option<String>>,
+    pub value_type_defined: Vec<Option<String>>,
 }
 
 impl PsetTable {
@@ -41,11 +44,11 @@ impl PsetTable {
 }
 
 /// Build the property table given an entity-table and a step_id → guid
-/// resolver for the products you care about (typically the products
-/// the indexer already extracted).
+/// resolver for every indexed object (`object_step_to_guid` from
+/// [`crate::object_guid::build_object_step_to_guid`]).
 pub fn build(
     table: &EntityTable,
-    product_step_to_guid: &HashMap<u64, String>,
+    object_step_to_guid: &HashMap<u64, String>,
 ) -> PsetTable {
     // Pass 1: collect IfcPropertySet records (id → (name, prop_ids))
     //         and IfcPropertySingleValue records (id → Prop).
@@ -72,7 +75,16 @@ pub fn build(
             let fields = split_top_level_args(args);
             let name = string_at(&fields, 0).unwrap_or_default();
             let (val_str, val_type) = parse_nominal_value(fields.get(2).copied());
-            props.insert(step_id, Prop { name, value: val_str, value_type: val_type });
+            props.insert(
+                step_id,
+                Prop {
+                    name,
+                    value: val_str,
+                    value_type: val_type,
+                    value_defined: None,
+                    value_type_defined: None,
+                },
+            );
         } else if type_name.eq_ignore_ascii_case(b"IFCPROPERTYENUMERATEDVALUE")
             || type_name.eq_ignore_ascii_case(b"IFCPROPERTYLISTVALUE")
         {
@@ -91,7 +103,16 @@ pub fn build(
             let name = string_at(&fields, 0).unwrap_or_default();
             let (val_str, val_type) =
                 parse_value_list(fields.get(2).copied());
-            props.insert(step_id, Prop { name, value: val_str, value_type: val_type });
+            props.insert(
+                step_id,
+                Prop {
+                    name,
+                    value: val_str,
+                    value_type: val_type,
+                    value_defined: None,
+                    value_type_defined: None,
+                },
+            );
         } else if type_name.eq_ignore_ascii_case(b"IFCPROPERTYBOUNDEDVALUE") {
             // (Name, Description, UpperBoundValue, LowerBoundValue, Unit, SetPointValue)
             // Three optional IfcValues. Format: "lower..upper" if both
@@ -108,7 +129,32 @@ pub fn build(
             let (lower_val, _) = parse_nominal_value(fields.get(3).copied());
             let (setpoint_val, _) = parse_nominal_value(fields.get(5).copied());
             let val_str = format_bounded(lower_val.as_deref(), upper_val.as_deref(), setpoint_val.as_deref());
-            props.insert(step_id, Prop { name, value: val_str, value_type: upper_type });
+            props.insert(
+                step_id,
+                Prop {
+                    name,
+                    value: val_str,
+                    value_type: upper_type,
+                    value_defined: None,
+                    value_type_defined: None,
+                },
+            );
+        } else if type_name.eq_ignore_ascii_case(b"IFCPROPERTYTABLEVALUE") {
+            // (Name, Description, DefiningValues, DefinedValues, Expression, DefiningUnit, DefinedUnit)
+            let fields = split_top_level_args(args);
+            let name = string_at(&fields, 0).unwrap_or_default();
+            let (def_vals, def_type) = parse_value_list(fields.get(2).copied());
+            let (defined_vals, defined_type) = parse_value_list(fields.get(3).copied());
+            props.insert(
+                step_id,
+                Prop {
+                    name,
+                    value: def_vals,
+                    value_type: def_type,
+                    value_defined: defined_vals,
+                    value_type_defined: defined_type,
+                },
+            );
         } else if type_name.eq_ignore_ascii_case(b"IFCCOMPLEXPROPERTY") {
             // (Name, Description, UsageName, HasProperties)
             // Note: IfcComplexProperty does NOT inherit IfcRoot — no
@@ -117,6 +163,33 @@ pub fn build(
             let name = string_at(&fields, 0).unwrap_or_default();
             let inner_ids = ref_list_at(&fields, 3);
             complex_props.insert(step_id, (name, inner_ids));
+        } else if type_name.ends_with(b"TYPE") {
+            if object_step_to_guid.contains_key(&step_id) {
+                let fields = split_top_level_args(args);
+                if fields.len() > 5 {
+                    if let Field::List(body) = parse_field(fields[5]) {
+                        for pset_id in parse_ref_list(body) {
+                            rel_pairs.push((step_id, pset_id));
+                        }
+                    }
+                }
+            }
+        } else if type_name.eq_ignore_ascii_case(b"IFCDOORPANELPROPERTIES") {
+            let fields = split_top_level_args(args);
+            let name = string_at(&fields, 2).unwrap_or_default();
+            let panel_op = enum_at(&fields, 5);
+            let prop_id = step_id.wrapping_mul(2).wrapping_add(1);
+            props.insert(
+                prop_id,
+                Prop {
+                    name: "PanelOperation".into(),
+                    value: panel_op.clone(),
+                    value_type: Some("IfcDoorPanelOperationEnum".into()),
+                    value_defined: None,
+                    value_type_defined: None,
+                },
+            );
+            psets.insert(step_id, (name, vec![prop_id]));
         } else if type_name.eq_ignore_ascii_case(b"IFCRELDEFINESBYPROPERTIES") {
             // (GlobalId, OwnerHistory, Name, Description, RelatedObjects, RelatingPropertyDefinition)
             let fields = split_top_level_args(args);
@@ -146,9 +219,11 @@ pub fn build(
     out.prop_name.reserve(est);
     out.value.reserve(est);
     out.value_type.reserve(est);
+    out.value_defined.reserve(est);
+    out.value_type_defined.reserve(est);
 
     for (obj_step_id, pset_step_id) in rel_pairs {
-        let guid = match product_step_to_guid.get(&obj_step_id) {
+        let guid = match object_step_to_guid.get(&obj_step_id) {
             Some(g) => g,
             None => continue, // rel pointed at a non-product (type, group, etc.)
         };
@@ -184,6 +259,8 @@ struct Prop {
     name: String,
     value: Option<String>,
     value_type: Option<String>,
+    value_defined: Option<String>,
+    value_type_defined: Option<String>,
 }
 
 /// Cap on IfcComplexProperty nesting depth. The schema allows
@@ -222,6 +299,8 @@ fn emit_property(
         out.prop_name.push(name);
         out.value.push(prop.value.clone());
         out.value_type.push(prop.value_type.clone());
+        out.value_defined.push(prop.value_defined.clone());
+        out.value_type_defined.push(prop.value_type_defined.clone());
         return;
     }
     if let Some((complex_name, inner_ids)) = complex_props.get(pid) {
@@ -271,8 +350,10 @@ fn parse_nominal_value(raw: Option<&[u8]>) -> (Option<String>, Option<String>) {
         // (-> "True"/"False"), but IfcLogical.U has no bool representation
         // and falls back to the all-caps schema enum literal "UNKNOWN".
         let normalised = match (raw_value.as_deref(), type_str.as_str()) {
-            (Some("T"), "IfcBoolean") | (Some("T"), "IfcLogical") => Some("True".to_string()),
-            (Some("F"), "IfcBoolean") | (Some("F"), "IfcLogical") => Some("False".to_string()),
+            (Some("T"), "IfcBoolean") => Some("True".to_string()),
+            (Some("F"), "IfcBoolean") => Some("False".to_string()),
+            (Some("T"), "IfcLogical") => Some("True".to_string()),
+            (Some("F"), "IfcLogical") => Some("False".to_string()),
             (Some("U"), "IfcLogical") => Some("UNKNOWN".to_string()),
             _ => raw_value,
         };
@@ -329,6 +410,29 @@ fn parse_value_list(raw: Option<&[u8]>) -> (Option<String>, Option<String>) {
 ///   setpoint only    → `"@setpoint"`
 ///   bounds + setpt   → `"lower..upper@setpoint"`
 ///   nothing          → `None`
+fn merge_value_lists(a: Option<&str>, b: Option<&str>) -> Option<String> {
+    let mut parts: Vec<&str> = Vec::new();
+    if let Some(s) = a {
+        for p in s.split(", ") {
+            if !p.is_empty() {
+                parts.push(p);
+            }
+        }
+    }
+    if let Some(s) = b {
+        for p in s.split(", ") {
+            if !p.is_empty() {
+                parts.push(p);
+            }
+        }
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(", "))
+    }
+}
+
 fn format_bounded(
     lower: Option<&str>,
     upper: Option<&str>,
@@ -410,6 +514,16 @@ fn trim(s: &[u8]) -> &[u8] {
     &s[start..end]
 }
 
+fn enum_at(fields: &[&[u8]], idx: usize) -> Option<String> {
+    let raw = fields.get(idx)?;
+    match parse_field(raw) {
+        Field::Enum(e) => std::str::from_utf8(e)
+            .ok()
+            .map(|s| s.trim_start_matches('.').trim_end_matches('.').to_string()),
+        _ => None,
+    }
+}
+
 fn string_at(fields: &[&[u8]], idx: usize) -> Option<String> {
     match parse_field(fields.get(idx)?) {
         Field::String(s) => Some(s),
@@ -468,7 +582,7 @@ END-ISO-10303-21;
     }
 
     fn run(buf: &str) -> PsetTable {
-        let table = crate::entity_table::EntityTable::build(buf.as_bytes());
+        let table = crate::entity_table::EntityTable::build_from_slice(buf.as_bytes());
         let mut step_to_guid: HashMap<u64, String> = HashMap::new();
         for (sid, _t, args) in table.iter() {
             let fields = split_top_level_args(args);

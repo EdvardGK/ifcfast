@@ -21,8 +21,12 @@
 
 pub mod entity_table;
 pub mod extractors;
+pub mod ids;
+pub mod ids_session;
 pub mod indexer;
+pub mod scan;
 pub mod lexer;
+pub mod object_guid;
 pub mod source;
 
 #[cfg(feature = "mesh")]
@@ -50,24 +54,104 @@ mod python {
     use crate::indexer;
     use crate::source::IfcSource;
 
-    // ----- index_ifc ----------------------------------------------------
+    // ----- tier-1 index handle (reuse for IDS prepare) -----------------
+
+    #[pyclass]
+    struct IfcFileIndex {
+        path: String,
+        source: std::sync::Arc<IfcSource>,
+        indexed: indexer::IndexedFile,
+        open_ms: f64,
+        scan_ms: f64,
+    }
+
+    #[pymethods]
+    impl IfcFileIndex {
+        #[getter]
+        fn path(&self) -> &str {
+            &self.path
+        }
+
+        fn as_dict<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+            let t_marshal = Instant::now();
+            let dict = marshal_indexed_file(
+                py,
+                &self.indexed,
+                self.source.len() as u64,
+                self.open_ms,
+                self.scan_ms,
+            )?;
+            let marshal_ms = t_marshal.elapsed().as_secs_f64() * 1000.0;
+            dict.set_item("marshal_ms", marshal_ms)?;
+            Ok(dict)
+        }
+
+        #[pyo3(signature = (compiled_json=None))]
+        fn prepare_ids_session<'py>(
+            &self,
+            py: Python<'py>,
+            compiled_json: Option<&str>,
+        ) -> PyResult<IdsSession> {
+            let plan = if let Some(json) = compiled_json {
+                let compiled: crate::ids::CompiledIds = serde_json::from_str(json).map_err(
+                    |e| pyo3::exceptions::PyValueError::new_err(format!("compiled JSON: {e}")),
+                )?;
+                crate::ids::ValidationPlan::from_compiled(&compiled)
+            } else {
+                crate::ids::ValidationPlan {
+                    extract: crate::ids::ExtractNeeds::all(),
+                    needs_entity_table: true,
+                    needs_full_base: true,
+                    tier1_fast_path: false,
+                }
+            };
+            let path = self.path.clone();
+            let source = std::sync::Arc::clone(&self.source);
+            let indexed = self.indexed.clone();
+            let inner = py
+                .allow_threads(|| {
+                    crate::ids_session::IdsSession::prepare_from_source(
+                        &path, source, Some(indexed), plan,
+                    )
+                })
+                .map_err(|e| pyo3::exceptions::PyIOError::new_err(e))?;
+            Ok(IdsSession { inner })
+        }
+    }
 
     #[pyfunction]
-    fn index_ifc<'py>(py: Python<'py>, path: &str) -> PyResult<Bound<'py, PyDict>> {
-        let (mmap, open_ms) = open_mmap(path)?;
+    fn open_ifc_index(py: Python<'_>, path: &str) -> PyResult<IfcFileIndex> {
+        let (source, open_ms) = open_mmap(path)?;
+        let source = std::sync::Arc::new(source);
+        let scan = py.allow_threads(|| {
+            crate::scan::scan_ifc(
+                std::sync::Arc::clone(&source),
+                false,
+                crate::indexer::IndexProfile::Full,
+            )
+        });
+        Ok(IfcFileIndex {
+            path: path.to_string(),
+            source,
+            indexed: scan.indexed,
+            open_ms,
+            scan_ms: scan.scan_ms,
+        })
+    }
 
-        let t_index = Instant::now();
-        let idx = py.allow_threads(|| indexer::index(&mmap));
-        let index_ms = t_index.elapsed().as_secs_f64() * 1000.0;
-
-        let t_marshal = Instant::now();
-
+    fn marshal_indexed_file<'py>(
+        py: Python<'py>,
+        idx: &indexer::IndexedFile,
+        size_bytes: u64,
+        open_ms: f64,
+        index_ms: f64,
+    ) -> PyResult<Bound<'py, PyDict>> {
         let dict = PyDict::new_bound(py);
         dict.set_item("schema", &idx.schema)?;
         dict.set_item("project_name", &idx.project_name)?;
         dict.set_item("authoring_app", &idx.authoring_app)?;
         dict.set_item("unit_scale", idx.unit_scale)?;
-        dict.set_item("size_bytes", mmap.len() as u64)?;
+        dict.set_item("size_bytes", size_bytes)?;
         dict.set_item("open_ms", open_ms)?;
         dict.set_item("index_ms", index_ms)?;
 
@@ -82,6 +166,7 @@ mod python {
         products.set_item("guid", PyList::new_bound(py, &idx.product_guid))?;
         products.set_item("entity", PyList::new_bound(py, &idx.product_entity))?;
         products.set_item("name", PyList::new_bound(py, &idx.product_name))?;
+        products.set_item("description", PyList::new_bound(py, &idx.product_description))?;
         products.set_item(
             "predefined_type",
             PyList::new_bound(py, &idx.product_predefined_type),
@@ -106,10 +191,33 @@ mod python {
         contained.set_item("structure", PyList::new_bound(py, &idx.contained_in_structure))?;
         dict.set_item("contained_in", contained)?;
 
+        let contained_space = PyDict::new_bound(py);
+        contained_space.set_item("child", PyList::new_bound(py, &idx.contained_in_space_child))?;
+        contained_space.set_item("space", PyList::new_bound(py, &idx.contained_in_space_space))?;
+        dict.set_item("contained_in_space", contained_space)?;
+
         let agg = PyDict::new_bound(py);
         agg.set_item("child", PyList::new_bound(py, &idx.aggregates_child))?;
         agg.set_item("parent", PyList::new_bound(py, &idx.aggregates_parent))?;
         dict.set_item("aggregates", agg)?;
+
+        let agg_t = PyDict::new_bound(py);
+        agg_t.set_item("child", PyList::new_bound(py, &idx.aggregates_transitive_child))?;
+        agg_t.set_item(
+            "ancestor",
+            PyList::new_bound(py, &idx.aggregates_transitive_ancestor),
+        )?;
+        dict.set_item("aggregates_transitive", agg_t)?;
+
+        let nests = PyDict::new_bound(py);
+        nests.set_item("child", PyList::new_bound(py, &idx.nests_child))?;
+        nests.set_item("parent", PyList::new_bound(py, &idx.nests_parent))?;
+        dict.set_item("nests", nests)?;
+
+        let groups = PyDict::new_bound(py);
+        groups.set_item("child", PyList::new_bound(py, &idx.groups_child))?;
+        groups.set_item("parent", PyList::new_bound(py, &idx.groups_parent))?;
+        dict.set_item("groups", groups)?;
 
         let sb = PyDict::new_bound(py);
         sb.set_item("storey", PyList::new_bound(py, &idx.storey_building_storey))?;
@@ -136,6 +244,16 @@ mod python {
         types.set_item("name", PyList::new_bound(py, &idx.type_object_name))?;
         dict.set_item("type_objects", types)?;
 
+        let group_objects = PyDict::new_bound(py);
+        group_objects.set_item("step_id", PyList::new_bound(py, &idx.group_object_step_id))?;
+        group_objects.set_item("guid", PyList::new_bound(py, &idx.group_object_guid))?;
+        group_objects.set_item("entity", PyList::new_bound(py, &idx.group_object_entity))?;
+        group_objects.set_item(
+            "predefined_type",
+            PyList::new_bound(py, &idx.group_object_predefined_type),
+        )?;
+        dict.set_item("group_objects", group_objects)?;
+
         let site_ids: Vec<u64> = idx.site_step_id_to_guid.keys().copied().collect();
         let site_guids: Vec<&str> = site_ids
             .iter()
@@ -151,9 +269,14 @@ mod python {
             .iter()
             .map(|i| idx.building_step_id_to_guid.get(i).unwrap().as_str())
             .collect();
+        let bldg_pdt: Vec<Option<&str>> = bldg_ids
+            .iter()
+            .map(|i| idx.building_predefined_type.get(i).map(String::as_str))
+            .collect();
         let buildings = PyDict::new_bound(py);
-        buildings.set_item("step_id", PyList::new_bound(py, bldg_ids))?;
+        buildings.set_item("step_id", PyList::new_bound(py, &bldg_ids))?;
         buildings.set_item("guid", PyList::new_bound(py, bldg_guids))?;
+        buildings.set_item("predefined_type", PyList::new_bound(py, bldg_pdt))?;
         dict.set_item("buildings", buildings)?;
 
         let proj_ids: Vec<u64> = idx.project_step_id_to_guid.keys().copied().collect();
@@ -166,40 +289,27 @@ mod python {
         projects.set_item("guid", PyList::new_bound(py, proj_guids))?;
         dict.set_item("projects", projects)?;
 
-        let space_ids: Vec<u64> = idx.space_step_id_to_guid.keys().copied().collect();
-        let space_guids: Vec<&str> = space_ids
+        let spaces = PyDict::new_bound(py);
+        spaces.set_item("step_id", PyList::new_bound(py, &idx.space_step_id))?;
+        let space_guids: Vec<&str> = idx
+            .space_step_id
             .iter()
             .map(|i| idx.space_step_id_to_guid.get(i).unwrap().as_str())
             .collect();
-        let spaces = PyDict::new_bound(py);
-        spaces.set_item("step_id", PyList::new_bound(py, space_ids))?;
         spaces.set_item("guid", PyList::new_bound(py, space_guids))?;
+        spaces.set_item("name", PyList::new_bound(py, &idx.space_name))?;
+        spaces.set_item(
+            "predefined_type",
+            PyList::new_bound(py, &idx.space_predefined_type),
+        )?;
         dict.set_item("spaces", spaces)?;
 
-        let marshal_ms = t_marshal.elapsed().as_secs_f64() * 1000.0;
-        dict.set_item("marshal_ms", marshal_ms)?;
         Ok(dict)
     }
 
-    // ----- shared GUID-index helper used by every extractor below ------
-
-    fn build_guid_index(table: &crate::entity_table::EntityTable) -> std::collections::HashMap<u64, String> {
-        let mut step_to_guid: std::collections::HashMap<u64, String> =
-            std::collections::HashMap::with_capacity(64_000);
-        for (sid, type_name, args) in table.iter() {
-            if !type_name.starts_with(b"IFC") {
-                continue;
-            }
-            let fields = crate::lexer::split_top_level_args(args);
-            if let Some(first) = fields.first() {
-                if let crate::lexer::Field::String(s) = crate::lexer::parse_field(first) {
-                    if s.len() == 22 {
-                        step_to_guid.insert(sid, s);
-                    }
-                }
-            }
-        }
-        step_to_guid
+    #[pyfunction]
+    fn index_ifc<'py>(py: Python<'py>, path: &str) -> PyResult<Bound<'py, PyDict>> {
+        open_ifc_index(py, path)?.as_dict(py)
     }
 
     /// Load an IFC source for the PyO3 layer. Dispatches on magic
@@ -213,19 +323,214 @@ mod python {
         Ok((src, t_open.elapsed().as_secs_f64() * 1000.0))
     }
 
+    fn validation_report_to_dict<'py>(
+        py: Python<'py>,
+        report: &crate::ids::ValidationReport,
+        open_ms: f64,
+        scan_ms: f64,
+        pset_extract_ms: f64,
+        entity_table_ms: f64,
+        prepare_ms: f64,
+        object_map_ms: f64,
+        base_ms: f64,
+        cached: bool,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let out = PyDict::new_bound(py);
+        out.set_item("ids_path", &report.ids_path)?;
+        out.set_item("ifc_path", &report.ifc_path)?;
+        out.set_item("schema", &report.schema)?;
+        out.set_item("engine", &report.engine)?;
+        out.set_item("open_ms", open_ms)?;
+        out.set_item("index_ms", scan_ms)?;
+        out.set_item("pset_extract_ms", pset_extract_ms)?;
+        out.set_item("validate_ms", report.validate_ms)?;
+        out.set_item("entity_table_ms", entity_table_ms)?;
+        out.set_item("prepare_ms", prepare_ms)?;
+        out.set_item("scan_ms", scan_ms)?;
+        out.set_item("object_map_ms", object_map_ms)?;
+        out.set_item("base_ms", base_ms)?;
+        out.set_item("cached", cached)?;
+
+        let specs = PyList::empty_bound(py);
+        for s in &report.specifications {
+            let sd = PyDict::new_bound(py);
+            sd.set_item("name", &s.name)?;
+            sd.set_item("status", s.status)?;
+            sd.set_item("ifc_version_ok", s.ifc_version_ok)?;
+            sd.set_item("applicable_count", s.applicable_count)?;
+            sd.set_item("passed_count", s.passed_count)?;
+            sd.set_item("failed_count", s.failed_count)?;
+            sd.set_item("failed_guids", PyList::new_bound(py, &s.failed_guids))?;
+            specs.append(sd)?;
+        }
+        out.set_item("specifications", specs)?;
+        Ok(out)
+    }
+
+    // ----- IDS session (prepare once, validate many) -------------------
+
+    #[pyclass]
+    struct IdsSession {
+        inner: crate::ids_session::IdsSession,
+    }
+
+    #[pymethods]
+    impl IdsSession {
+        #[getter]
+        fn ifc_path(&self) -> &str {
+            &self.inner.ifc_path
+        }
+
+        #[getter]
+        fn open_ms(&self) -> f64 {
+            self.inner.open_ms
+        }
+
+        #[getter]
+        fn index_ms(&self) -> f64 {
+            self.inner.index_ms
+        }
+
+        #[getter]
+        fn table_ms(&self) -> f64 {
+            self.inner.table_ms
+        }
+
+        #[getter]
+        fn extract_ms(&self) -> f64 {
+            self.inner.extract_ms
+        }
+
+        #[getter]
+        fn prepare_ms(&self) -> f64 {
+            self.inner.prepare_ms()
+        }
+
+        #[getter]
+        fn scan_ms(&self) -> f64 {
+            self.inner.scan_ms
+        }
+
+        #[getter]
+        fn object_map_ms(&self) -> f64 {
+            self.inner.object_map_ms
+        }
+
+        #[getter]
+        fn base_ms(&self) -> f64 {
+            self.inner.base_ms
+        }
+
+        fn validate<'py>(
+            &self,
+            py: Python<'py>,
+            compiled_json: &str,
+        ) -> PyResult<Bound<'py, PyDict>> {
+            let compiled: crate::ids::CompiledIds = serde_json::from_str(compiled_json)
+                .map_err(|e| {
+                    pyo3::exceptions::PyValueError::new_err(format!("compiled JSON: {e}"))
+                })?;
+            let report = py.allow_threads(|| self.inner.validate(&compiled));
+            validation_report_to_dict(py, &report, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, true)
+        }
+    }
+
+    #[pyfunction]
+    #[pyo3(signature = (ifc_path, compiled_json=None))]
+    fn prepare_ids_session<'py>(
+        py: Python<'py>,
+        ifc_path: &str,
+        compiled_json: Option<&str>,
+    ) -> PyResult<IdsSession> {
+        let inner = if let Some(json) = compiled_json {
+            let compiled: crate::ids::CompiledIds = serde_json::from_str(json).map_err(|e| {
+                pyo3::exceptions::PyValueError::new_err(format!("compiled JSON: {e}"))
+            })?;
+            py.allow_threads(|| crate::ids_session::IdsSession::prepare_for_compiled(ifc_path, &compiled))
+        } else {
+            py.allow_threads(|| crate::ids_session::IdsSession::prepare(ifc_path))
+        }
+        .map_err(|e| pyo3::exceptions::PyIOError::new_err(e))?;
+        Ok(IdsSession { inner })
+    }
+
+    /// Back-compat alias for [`prepare_ids_session`].
+    #[pyfunction]
+    fn prepare_ids_substrate<'py>(py: Python<'py>, ifc_path: &str) -> PyResult<IdsSession> {
+        prepare_ids_session(py, ifc_path, None)
+    }
+
+    // ----- validate_ids_native -----------------------------------------
+
+    #[pyfunction]
+    fn validate_ids_native<'py>(
+        py: Python<'py>,
+        ifc_path: &str,
+        compiled_json: &str,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let compiled: crate::ids::CompiledIds = serde_json::from_str(compiled_json)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("compiled JSON: {e}")))?;
+
+        let (session, report) = py
+            .allow_threads(|| crate::ids_session::IdsSession::prepare_and_validate(ifc_path, &compiled))
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e))?;
+        let prepare_ms = session.prepare_ms();
+        let open_ms = session.open_ms;
+        let table_ms = session.table_ms;
+        let extract_ms = session.extract_ms;
+
+        validation_report_to_dict(
+            py,
+            &report,
+            open_ms,
+            session.scan_ms,
+            extract_ms + table_ms,
+            table_ms,
+            prepare_ms,
+            session.object_map_ms,
+            session.base_ms,
+            false,
+        )
+    }
+
+    #[pyfunction]
+    fn validate_ids_cached<'py>(
+        py: Python<'py>,
+        session: &IdsSession,
+        compiled_json: &str,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let compiled: crate::ids::CompiledIds = serde_json::from_str(compiled_json)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("compiled JSON: {e}")))?;
+        let report = py.allow_threads(|| session.inner.validate(&compiled));
+        validation_report_to_dict(py, &report, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, true)
+    }
+
+    #[pyfunction]
+    fn compile_ids_xml(_py: Python<'_>, ids_path: &str) -> PyResult<String> {
+        let xml = std::fs::read_to_string(ids_path).map_err(|e| {
+            pyo3::exceptions::PyIOError::new_err(format!("read {ids_path}: {e}"))
+        })?;
+        let compiled = crate::ids::xml::parse_ids_xml(ids_path, &xml).map_err(|e| {
+            pyo3::exceptions::PyValueError::new_err(e)
+        })?;
+        serde_json::to_string(&compiled)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+
     // ----- extract_psets -----------------------------------------------
 
     #[pyfunction]
     pub fn extract_psets<'py>(py: Python<'py>, path: &str) -> PyResult<Bound<'py, PyDict>> {
         let (mmap, open_ms) = open_mmap(path)?;
+        let indexed = py.allow_threads(|| indexer::index(&mmap));
         let t_table = Instant::now();
-        let table = crate::entity_table::EntityTable::build(&mmap);
+        let table = crate::entity_table::EntityTable::build(std::sync::Arc::new(mmap));
         let table_ms = t_table.elapsed().as_secs_f64() * 1000.0;
-        let t_guids = Instant::now();
-        let step_to_guid = build_guid_index(&table);
-        let guid_ms = t_guids.elapsed().as_secs_f64() * 1000.0;
+        let object_step_to_guid =
+            crate::object_guid::build_extractor_object_map(&indexed, &table, true);
         let t_psets = Instant::now();
-        let psets = py.allow_threads(|| crate::extractors::psets::build(&table, &step_to_guid));
+        let psets =
+            py.allow_threads(|| crate::extractors::psets::build(&table, &object_step_to_guid));
         let pset_ms = t_psets.elapsed().as_secs_f64() * 1000.0;
 
         let t_marshal = Instant::now();
@@ -237,10 +542,9 @@ mod python {
         out.set_item("value_type", PyList::new_bound(py, &psets.value_type))?;
         out.set_item("open_ms", open_ms)?;
         out.set_item("entity_table_ms", table_ms)?;
-        out.set_item("guid_index_ms", guid_ms)?;
         out.set_item("pset_extract_ms", pset_ms)?;
         out.set_item("marshal_ms", t_marshal.elapsed().as_secs_f64() * 1000.0)?;
-        out.set_item("size_bytes", mmap.len() as u64)?;
+        out.set_item("size_bytes", table.source().len() as u64)?;
         Ok(out)
     }
 
@@ -249,14 +553,16 @@ mod python {
     #[pyfunction]
     pub fn extract_quantities<'py>(py: Python<'py>, path: &str) -> PyResult<Bound<'py, PyDict>> {
         let (mmap, open_ms) = open_mmap(path)?;
+        let indexed = py.allow_threads(|| indexer::index(&mmap));
         let t_table = Instant::now();
-        let table = crate::entity_table::EntityTable::build(&mmap);
+        let table = crate::entity_table::EntityTable::build(std::sync::Arc::new(mmap));
         let table_ms = t_table.elapsed().as_secs_f64() * 1000.0;
-        let t_guids = Instant::now();
-        let step_to_guid = build_guid_index(&table);
-        let guid_ms = t_guids.elapsed().as_secs_f64() * 1000.0;
+        let object_step_to_guid =
+            crate::object_guid::build_extractor_object_map(&indexed, &table, true);
         let t_qto = Instant::now();
-        let qto = py.allow_threads(|| crate::extractors::quantities::build(&table, &step_to_guid));
+        let qto = py.allow_threads(|| {
+            crate::extractors::quantities::build(&table, &object_step_to_guid)
+        });
         let qto_ms = t_qto.elapsed().as_secs_f64() * 1000.0;
 
         let t_marshal = Instant::now();
@@ -269,10 +575,9 @@ mod python {
         out.set_item("unit_step_id", PyList::new_bound(py, &qto.unit_step_id))?;
         out.set_item("open_ms", open_ms)?;
         out.set_item("entity_table_ms", table_ms)?;
-        out.set_item("guid_index_ms", guid_ms)?;
         out.set_item("qto_extract_ms", qto_ms)?;
         out.set_item("marshal_ms", t_marshal.elapsed().as_secs_f64() * 1000.0)?;
-        out.set_item("size_bytes", mmap.len() as u64)?;
+        out.set_item("size_bytes", table.source().len() as u64)?;
         Ok(out)
     }
 
@@ -281,16 +586,16 @@ mod python {
     #[pyfunction]
     pub fn extract_materials<'py>(py: Python<'py>, path: &str) -> PyResult<Bound<'py, PyDict>> {
         let (mmap, open_ms) = open_mmap(path)?;
+        let indexed = py.allow_threads(|| indexer::index(&mmap));
         let t_table = Instant::now();
-        let table = crate::entity_table::EntityTable::build(&mmap);
+        let table = crate::entity_table::EntityTable::build(std::sync::Arc::new(mmap));
         let table_ms = t_table.elapsed().as_secs_f64() * 1000.0;
-        let t_guids = Instant::now();
-        let step_to_guid = build_guid_index(&table);
-        let guid_ms = t_guids.elapsed().as_secs_f64() * 1000.0;
+        let object_step_to_guid =
+            crate::object_guid::build_extractor_object_map(&indexed, &table, true);
         let t_mat = Instant::now();
         let mats = py.allow_threads(|| {
             let unit_scale = crate::indexer::extract_unit_scale(&table).unwrap_or(1.0);
-            crate::extractors::materials::build(&table, &step_to_guid, unit_scale)
+            crate::extractors::materials::build(&table, &object_step_to_guid, unit_scale)
         });
         let mat_ms = t_mat.elapsed().as_secs_f64() * 1000.0;
 
@@ -306,12 +611,12 @@ mod python {
             PyList::new_bound(py, &mats.layer_thickness_mm),
         )?;
         out.set_item("category", PyList::new_bound(py, &mats.category))?;
+        out.set_item("layer_set_name", PyList::new_bound(py, &mats.layer_set_name))?;
         out.set_item("open_ms", open_ms)?;
         out.set_item("entity_table_ms", table_ms)?;
-        out.set_item("guid_index_ms", guid_ms)?;
         out.set_item("materials_extract_ms", mat_ms)?;
         out.set_item("marshal_ms", t_marshal.elapsed().as_secs_f64() * 1000.0)?;
-        out.set_item("size_bytes", mmap.len() as u64)?;
+        out.set_item("size_bytes", table.source().len() as u64)?;
         Ok(out)
     }
 
@@ -323,14 +628,19 @@ mod python {
         path: &str,
     ) -> PyResult<Bound<'py, PyDict>> {
         let (mmap, open_ms) = open_mmap(path)?;
+        let indexed = py.allow_threads(|| indexer::index(&mmap));
         let t_table = Instant::now();
-        let table = crate::entity_table::EntityTable::build(&mmap);
+        let table = crate::entity_table::EntityTable::build(std::sync::Arc::new(mmap));
         let table_ms = t_table.elapsed().as_secs_f64() * 1000.0;
-        let t_guids = Instant::now();
-        let step_to_guid = build_guid_index(&table);
-        let guid_ms = t_guids.elapsed().as_secs_f64() * 1000.0;
+        let object_step_to_guid =
+            crate::object_guid::build_extractor_object_map(&indexed, &table, true);
         let t_cls = Instant::now();
-        let cls = py.allow_threads(|| crate::extractors::classifications::build(&table, &step_to_guid));
+        let cls = py.allow_threads(|| {
+            let mut cls =
+                crate::extractors::classifications::build(&table, &object_step_to_guid);
+            crate::extractors::classifications::expand_for_ids(&table, &mut cls, &indexed);
+            cls
+        });
         let cls_ms = t_cls.elapsed().as_secs_f64() * 1000.0;
 
         let t_marshal = Instant::now();
@@ -344,10 +654,9 @@ mod python {
         out.set_item("source", PyList::new_bound(py, &cls.source))?;
         out.set_item("open_ms", open_ms)?;
         out.set_item("entity_table_ms", table_ms)?;
-        out.set_item("guid_index_ms", guid_ms)?;
         out.set_item("classifications_extract_ms", cls_ms)?;
         out.set_item("marshal_ms", t_marshal.elapsed().as_secs_f64() * 1000.0)?;
-        out.set_item("size_bytes", mmap.len() as u64)?;
+        out.set_item("size_bytes", table.source().len() as u64)?;
         Ok(out)
     }
 
@@ -359,33 +668,32 @@ mod python {
     pub fn extract_all<'py>(py: Python<'py>, path: &str) -> PyResult<Bound<'py, PyDict>> {
         let t_total = Instant::now();
         let (mmap, open_ms) = open_mmap(path)?;
+        let indexed = py.allow_threads(|| indexer::index(&mmap));
         let t_table = Instant::now();
-        let table = crate::entity_table::EntityTable::build(&mmap);
+        let table = crate::entity_table::EntityTable::build(std::sync::Arc::new(mmap));
         let table_ms = t_table.elapsed().as_secs_f64() * 1000.0;
-        let t_guids = Instant::now();
-        let step_to_guid = build_guid_index(&table);
-        let guid_ms = t_guids.elapsed().as_secs_f64() * 1000.0;
+        let object_step_to_guid =
+            crate::object_guid::build_extractor_object_map(&indexed, &table, true);
 
         let (psets, quantities, materials, classifications,
              pset_ms, qto_ms, mat_ms, cls_ms) =
             py.allow_threads(|| {
-                // Materials needs the project's linear-unit scale to
-                // normalize LayerThickness to mm. Cheap walk over the
-                // table for IfcUnitAssignment + IfcSIUnit only — much
-                // less work than a full indexer pass.
                 let unit_scale =
                     crate::indexer::extract_unit_scale(&table).unwrap_or(1.0);
                 let t = Instant::now();
-                let p = crate::extractors::psets::build(&table, &step_to_guid);
+                let p = crate::extractors::psets::build(&table, &object_step_to_guid);
                 let pt = t.elapsed().as_secs_f64() * 1000.0;
                 let t = Instant::now();
-                let q = crate::extractors::quantities::build(&table, &step_to_guid);
+                let q = crate::extractors::quantities::build(&table, &object_step_to_guid);
                 let qt = t.elapsed().as_secs_f64() * 1000.0;
                 let t = Instant::now();
-                let m = crate::extractors::materials::build(&table, &step_to_guid, unit_scale);
+                let m =
+                    crate::extractors::materials::build(&table, &object_step_to_guid, unit_scale);
                 let mt = t.elapsed().as_secs_f64() * 1000.0;
                 let t = Instant::now();
-                let c = crate::extractors::classifications::build(&table, &step_to_guid);
+                let mut c =
+                    crate::extractors::classifications::build(&table, &object_step_to_guid);
+                crate::extractors::classifications::expand_for_ids(&table, &mut c, &indexed);
                 let ct = t.elapsed().as_secs_f64() * 1000.0;
                 (p, q, m, c, pt, qt, mt, ct)
             });
@@ -423,6 +731,7 @@ mod python {
             )?;
             d.set_item("category", PyList::new_bound(py, &materials.category))?;
             d.set_item("fraction", PyList::new_bound(py, &materials.fraction))?;
+            d.set_item("layer_set_name", PyList::new_bound(py, &materials.layer_set_name))?;
             out.set_item("materials", d)?;
         }
         {
@@ -440,14 +749,13 @@ mod python {
         let total_ms = t_total.elapsed().as_secs_f64() * 1000.0;
         out.set_item("open_ms", open_ms)?;
         out.set_item("entity_table_ms", table_ms)?;
-        out.set_item("guid_index_ms", guid_ms)?;
         out.set_item("psets_extract_ms", pset_ms)?;
         out.set_item("quantities_extract_ms", qto_ms)?;
         out.set_item("materials_extract_ms", mat_ms)?;
         out.set_item("classifications_extract_ms", cls_ms)?;
         out.set_item("marshal_ms", marshal_ms)?;
         out.set_item("total_ms", total_ms)?;
-        out.set_item("size_bytes", mmap.len() as u64)?;
+        out.set_item("size_bytes", table.source().len() as u64)?;
         Ok(out)
     }
 
@@ -1275,6 +1583,14 @@ mod python {
     #[pymodule]
     fn _core(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_function(wrap_pyfunction!(index_ifc, m)?)?;
+        m.add_function(wrap_pyfunction!(open_ifc_index, m)?)?;
+        m.add_class::<IfcFileIndex>()?;
+        m.add_class::<IdsSession>()?;
+        m.add_function(wrap_pyfunction!(prepare_ids_session, m)?)?;
+        m.add_function(wrap_pyfunction!(prepare_ids_substrate, m)?)?;
+        m.add_function(wrap_pyfunction!(validate_ids_native, m)?)?;
+        m.add_function(wrap_pyfunction!(validate_ids_cached, m)?)?;
+        m.add_function(wrap_pyfunction!(compile_ids_xml, m)?)?;
         m.add_function(wrap_pyfunction!(extract_psets, m)?)?;
         m.add_function(wrap_pyfunction!(extract_quantities, m)?)?;
         m.add_function(wrap_pyfunction!(extract_materials, m)?)?;

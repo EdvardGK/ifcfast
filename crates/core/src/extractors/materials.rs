@@ -33,6 +33,8 @@ pub struct MaterialTable {
     pub material_name: Vec<Option<String>>,
     pub layer_thickness_mm: Vec<Option<f64>>,
     pub category: Vec<Option<String>>,
+    /// `IfcMaterialLayerSet.LayerSetName` when the row comes from a layer set.
+    pub layer_set_name: Vec<Option<String>>,
     /// Composition fraction for `role = "constituent"` rows — IFC4
     /// `IfcMaterialConstituent.Fraction`, typically a unit-normalised
     /// 0..1 value representing the volume / mass contribution of this
@@ -40,6 +42,10 @@ pub struct MaterialTable {
     /// (layers have `layer_thickness_mm` instead; direct / list /
     /// profile bindings don't have a per-row weight in the IFC schema).
     pub fraction: Vec<Option<f64>>,
+    /// `IfcMaterial.Name` / `Category` on the referenced material entity (IDS value
+    /// checks may match either the row override or the underlying material).
+    pub linked_material_name: Vec<Option<String>>,
+    pub linked_material_category: Vec<Option<String>>,
 }
 
 impl MaterialTable {
@@ -68,13 +74,13 @@ impl MaterialTable {
 /// wrong by 1000×.
 pub fn build(
     table: &EntityTable,
-    product_step_to_guid: &HashMap<u64, String>,
+    object_step_to_guid: &HashMap<u64, String>,
     unit_scale: f64,
 ) -> MaterialTable {
     // Pass 1: index every material-related entity by step_id so we can
     //         resolve refs cheaply during the second pass.
     let mut materials: HashMap<u64, MaterialRecord> = HashMap::with_capacity(2048);
-    let mut layer_sets: HashMap<u64, Vec<u64>> = HashMap::with_capacity(512);
+    let mut layer_sets: HashMap<u64, (Option<String>, Vec<u64>)> = HashMap::with_capacity(512);
     let mut layer_set_usages: HashMap<u64, u64> = HashMap::with_capacity(512);
     let mut layers: HashMap<u64, LayerRecord> = HashMap::with_capacity(4096);
     let mut material_lists: HashMap<u64, Vec<u64>> = HashMap::with_capacity(256);
@@ -84,14 +90,16 @@ pub fn build(
     // glass + sealant). Phase 1 stored the raw `Fraction` field on
     // the constituent record; surfacing it as a Parquet column is
     // queued behind a `_CACHE_SCHEMA_VERSION` bump.
-    let mut constituent_sets: HashMap<u64, Vec<u64>> = HashMap::with_capacity(256);
+    let mut constituent_sets: HashMap<u64, (Option<String>, Option<String>, Vec<u64>)> =
+        HashMap::with_capacity(256);
     let mut constituents: HashMap<u64, ConstituentRecord> = HashMap::with_capacity(2048);
     // IFC4: IfcMaterialProfileSet → list of IfcMaterialProfile. Used
     // for structural elements (steel beam with HEA200 profile +
     // material grade). The profile shape itself (IfcIShapeProfileDef
     // etc.) is parsed by the mesh module, not here — we only carry
     // the material binding.
-    let mut profile_sets: HashMap<u64, Vec<u64>> = HashMap::with_capacity(256);
+    let mut profile_sets: HashMap<u64, (Option<String>, Vec<u64>)> =
+        HashMap::with_capacity(256);
     let mut profiles: HashMap<u64, ConstituentRecord> = HashMap::with_capacity(1024);
 
     // Collect rel-pairs: (related_object_step_ids, relating_material_ref)
@@ -132,7 +140,9 @@ pub fn build(
         } else if type_name.eq_ignore_ascii_case(b"IFCMATERIALLAYERSET") {
             // (MaterialLayers, LayerSetName, ...)
             let fields = split_top_level_args(args);
-            layer_sets.insert(step_id, ref_list_at(&fields, 0));
+            let layer_ids = ref_list_at(&fields, 0);
+            let set_name = string_at(&fields, 1);
+            layer_sets.insert(step_id, (set_name, layer_ids));
         } else if type_name.eq_ignore_ascii_case(b"IFCMATERIALLAYERSETUSAGE") {
             // (ForLayerSet, LayerSetDirection, DirectionSense, OffsetFromReferenceLine)
             let fields = split_top_level_args(args);
@@ -148,7 +158,9 @@ pub fn build(
             // MaterialConstituents at arg index 2 is a LIST of
             // IfcMaterialConstituent refs.
             let fields = split_top_level_args(args);
-            constituent_sets.insert(step_id, ref_list_at(&fields, 2));
+            let set_name = string_at(&fields, 0);
+            let set_category = string_at(&fields, 3);
+            constituent_sets.insert(step_id, (set_name, set_category, ref_list_at(&fields, 2)));
         } else if type_name.eq_ignore_ascii_case(b"IFCMATERIALCONSTITUENT") {
             // IFC4: (Name, Description, Material, Fraction, Category)
             let fields = split_top_level_args(args);
@@ -171,7 +183,8 @@ pub fn build(
         } else if type_name.eq_ignore_ascii_case(b"IFCMATERIALPROFILESET") {
             // IFC4: (Name, Description, MaterialProfiles, CompositeProfile)
             let fields = split_top_level_args(args);
-            profile_sets.insert(step_id, ref_list_at(&fields, 2));
+            let set_name = string_at(&fields, 0);
+            profile_sets.insert(step_id, (set_name, ref_list_at(&fields, 2)));
         } else if type_name.eq_ignore_ascii_case(b"IFCMATERIALPROFILE") {
             // IFC4: (Name, Description, Material, Profile, Priority, Category)
             // The Profile (arg 3) is an IfcProfileDef ref carrying the
@@ -229,42 +242,76 @@ pub fn build(
     let mut out = MaterialTable::default();
 
     for (obj_step_id, relating_id) in rel_pairs {
-        let guid = match product_step_to_guid.get(&obj_step_id) {
+        let guid = match object_step_to_guid.get(&obj_step_id) {
             Some(g) => g,
             None => continue,
         };
 
         // Resolve `relating_id` against each known material container type.
         if let Some(mat) = materials.get(&relating_id) {
-            push_row(&mut out, guid, "direct", -1, mat.name.clone(), None, mat.category.clone(), None);
+            let (name, category, linked_name, linked_category) =
+                resolved_material_fields(&mat.name, &mat.category, Some(mat));
+            push_row(
+                &mut out,
+                guid,
+                "direct",
+                -1,
+                name,
+                None,
+                category,
+                None,
+                None,
+                linked_name,
+                linked_category,
+            );
             continue;
         }
         if let Some(list) = material_lists.get(&relating_id) {
             for (i, mid) in list.iter().enumerate() {
                 if let Some(mat) = materials.get(mid) {
+                    let (name, category, linked_name, linked_category) =
+                        resolved_material_fields(&mat.name, &mat.category, Some(mat));
                     push_row(
-                        &mut out, guid, "list", i as i32,
-                        mat.name.clone(), None, mat.category.clone(), None,
+                        &mut out,
+                        guid,
+                        "list",
+                        i as i32,
+                        name,
+                        None,
+                        category,
+                        None,
+                        None,
+                        linked_name,
+                        linked_category,
                     );
                 }
             }
             continue;
         }
-        if let Some(constituent_ids) = constituent_sets.get(&relating_id) {
+        if let Some((set_name, set_category, constituent_ids)) =
+            constituent_sets.get(&relating_id)
+        {
+            let set_label = set_name.clone().or_else(|| set_category.clone());
             for (i, cid) in constituent_ids.iter().enumerate() {
                 if let Some(c) = constituents.get(cid) {
                     let mat = c.material_ref.and_then(|mid| materials.get(&mid));
-                    let name = c
-                        .name_override
-                        .clone()
-                        .or_else(|| mat.and_then(|m| m.name.clone()));
-                    let category = c
-                        .category_override
-                        .clone()
-                        .or_else(|| mat.and_then(|m| m.category.clone()));
+                    let (name, category, linked_name, linked_category) = resolved_material_fields(
+                        &c.name_override,
+                        &c.category_override,
+                        mat,
+                    );
                     push_row(
-                        &mut out, guid, "constituent", i as i32,
-                        name, None, category, c.fraction,
+                        &mut out,
+                        guid,
+                        "constituent",
+                        i as i32,
+                        name,
+                        None,
+                        category,
+                        c.fraction,
+                        set_label.clone(),
+                        linked_name,
+                        linked_category,
                     );
                 }
             }
@@ -277,21 +324,27 @@ pub fn build(
             .get(&relating_id)
             .copied()
             .unwrap_or(relating_id);
-        if let Some(profile_ids) = profile_sets.get(&pset_id) {
+        if let Some((set_name, profile_ids)) = profile_sets.get(&pset_id) {
             for (i, pid) in profile_ids.iter().enumerate() {
                 if let Some(p) = profiles.get(pid) {
                     let mat = p.material_ref.and_then(|mid| materials.get(&mid));
-                    let name = p
-                        .name_override
-                        .clone()
-                        .or_else(|| mat.and_then(|m| m.name.clone()));
-                    let category = p
-                        .category_override
-                        .clone()
-                        .or_else(|| mat.and_then(|m| m.category.clone()));
+                    let (name, category, linked_name, linked_category) = resolved_material_fields(
+                        &p.name_override,
+                        &p.category_override,
+                        mat,
+                    );
                     push_row(
-                        &mut out, guid, "profile", i as i32,
-                        name, None, category, None,
+                        &mut out,
+                        guid,
+                        "profile",
+                        i as i32,
+                        name,
+                        None,
+                        category,
+                        None,
+                        set_name.clone(),
+                        linked_name,
+                        linked_category,
                     );
                 }
             }
@@ -302,21 +355,27 @@ pub fn build(
             .get(&relating_id)
             .copied()
             .unwrap_or(relating_id);
-        if let Some(layer_ids) = layer_sets.get(&lset_id) {
+        if let Some((layer_set_name, layer_ids)) = layer_sets.get(&lset_id) {
             for (i, lid) in layer_ids.iter().enumerate() {
                 if let Some(layer) = layers.get(lid) {
                     let mat = layer.material_ref.and_then(|mid| materials.get(&mid));
-                    let name = layer
-                        .name_override
-                        .clone()
-                        .or_else(|| mat.and_then(|m| m.name.clone()));
-                    let category = layer
-                        .category_override
-                        .clone()
-                        .or_else(|| mat.and_then(|m| m.category.clone()));
+                    let (name, category, linked_name, linked_category) = resolved_material_fields(
+                        &layer.name_override,
+                        &layer.category_override,
+                        mat,
+                    );
                     push_row(
-                        &mut out, guid, "layer", i as i32,
-                        name, layer.thickness_mm, category, None,
+                        &mut out,
+                        guid,
+                        "layer",
+                        i as i32,
+                        name,
+                        layer.thickness_mm,
+                        category,
+                        None,
+                        layer_set_name.clone(),
+                        linked_name,
+                        linked_category,
                     );
                 }
             }
@@ -324,10 +383,43 @@ pub fn build(
         }
         // Unknown relating type (constituent set, profile set, etc.) — record
         // the GUID with a placeholder so the row count reflects reality.
-        push_row(&mut out, guid, "unknown", -1, None, None, None, None);
+        push_row(
+            &mut out,
+            guid,
+            "unknown",
+            -1,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
     }
 
     out
+}
+
+fn resolved_material_fields(
+    name_override: &Option<String>,
+    category_override: &Option<String>,
+    mat: Option<&MaterialRecord>,
+) -> (
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+) {
+    let linked_name = mat.and_then(|m| m.name.clone());
+    let linked_category = mat.and_then(|m| m.category.clone());
+    let name = name_override
+        .clone()
+        .or_else(|| linked_name.clone());
+    let category = category_override
+        .clone()
+        .or_else(|| linked_category.clone());
+    (name, category, linked_name, linked_category)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -340,6 +432,9 @@ fn push_row(
     thickness: Option<f64>,
     category: Option<String>,
     fraction: Option<f64>,
+    layer_set_name: Option<String>,
+    linked_name: Option<String>,
+    linked_category: Option<String>,
 ) {
     out.guid.push(guid.to_string());
     out.role.push(role);
@@ -348,6 +443,9 @@ fn push_row(
     out.layer_thickness_mm.push(thickness);
     out.category.push(category);
     out.fraction.push(fraction);
+    out.layer_set_name.push(layer_set_name);
+    out.linked_material_name.push(linked_name);
+    out.linked_material_category.push(linked_category);
 }
 
 struct MaterialRecord {
@@ -442,7 +540,7 @@ END-ISO-10303-21;
     }
 
     fn run(buf: &str, unit_scale: f64) -> Vec<f64> {
-        let table = crate::entity_table::EntityTable::build(buf.as_bytes());
+        let table = crate::entity_table::EntityTable::build_from_slice(buf.as_bytes());
         let mut step_to_guid: HashMap<u64, String> = HashMap::new();
         for (sid, _t, args) in table.iter() {
             let fields = split_top_level_args(args);
@@ -508,7 +606,7 @@ END-ISO-10303-21;
     /// the "unknown" fallback row, so the substrate saw "the product
     /// has materials" but couldn't enumerate them.
     fn run_full_table(buf: &str) -> MaterialTable {
-        let table = crate::entity_table::EntityTable::build(buf.as_bytes());
+        let table = crate::entity_table::EntityTable::build_from_slice(buf.as_bytes());
         let mut step_to_guid: HashMap<u64, String> = HashMap::new();
         for (sid, _t, args) in table.iter() {
             let fields = split_top_level_args(args);

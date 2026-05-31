@@ -191,7 +191,7 @@ impl Bundle {
     /// entity count (not geometry size) — fits in modest RAM even on
     /// 1 GB+ files.
     pub fn build(buf: &[u8]) -> Self {
-        let table = EntityTable::build(buf);
+        let table = EntityTable::build_from_slice(buf);
         let mut idx = indexer::index(buf);
 
         // Step-id -> guid for every IfcRoot-derived entity, used by

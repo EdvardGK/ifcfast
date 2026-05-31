@@ -98,6 +98,22 @@ pub(crate) const SPACE_TYPE: &[u8] = b"IFCSPACE";
 const APPLICATION_TYPE: &[u8] = b"IFCAPPLICATION";
 const CONTAINED_TYPE: &[u8] = b"IFCRELCONTAINEDINSPATIALSTRUCTURE";
 const AGGREGATES_TYPE: &[u8] = b"IFCRELAGGREGATES";
+const NESTS_TYPE: &[u8] = b"IFCRELNESTS";
+const ASSIGNS_TO_GROUP_TYPE: &[u8] = b"IFCRELASSIGNSTOGROUP";
+
+/// Objects that may be the relating side of `IfcRelAssignsToGroup` (IDS PartOf).
+const GROUP_OBJECT_TYPES: &[&[u8]] = &[
+    b"IFCGROUP",
+    b"IFCINVENTORY",
+    b"IFCSYSTEM",
+    b"IFCZONE",
+    b"IFCASSET",
+    b"IFCTASK",
+    b"IFCPROCESS",
+    b"IFCRESOURCE",
+    b"IFCSTRUCTURALLOADGROUP",
+    b"IFCSTRUCTURALRESULTGROUP",
+];
 const SI_UNIT_TYPE: &[u8] = b"IFCSIUNIT";
 const UNIT_ASSIGN_TYPE: &[u8] = b"IFCUNITASSIGNMENT";
 const VOIDS_ELEMENT_TYPE: &[u8] = b"IFCRELVOIDSELEMENT";
@@ -210,7 +226,7 @@ pub(crate) fn is_meshable_product(type_name: &[u8]) -> bool {
 /// lookups + byte-slice equality checks — a big win on MEP files where
 /// ~99% of records are types we don't care about (e.g. IfcCartesianPoint,
 /// IfcPolyLoop, IfcPropertySingleValue).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EntityKind {
     Product,
     Storey,
@@ -223,8 +239,12 @@ enum EntityKind {
     SiUnit,
     UnitAssignment,
     Aggregates,
+    Nests,
+    AssignsToGroup,
     VoidsElement,
     DefinesByType,
+    /// IfcGroup, IfcInventory, … — group relationship parents for IDS PartOf.
+    GroupObject,
     /// Any IfcXxxType (IfcWallType, IfcDoorType, IfcSensorType, …)
     /// — matched by a byte-suffix fallback rather than dispatch-map
     /// enumeration so new IFC schema additions don't drop silently.
@@ -253,8 +273,13 @@ fn dispatch_map() -> &'static HashMap<&'static [u8], EntityKind> {
         m.insert(SI_UNIT_TYPE, EntityKind::SiUnit);
         m.insert(UNIT_ASSIGN_TYPE, EntityKind::UnitAssignment);
         m.insert(AGGREGATES_TYPE, EntityKind::Aggregates);
+        m.insert(NESTS_TYPE, EntityKind::Nests);
+        m.insert(ASSIGNS_TO_GROUP_TYPE, EntityKind::AssignsToGroup);
         m.insert(VOIDS_ELEMENT_TYPE, EntityKind::VoidsElement);
         m.insert(DEFINES_BY_TYPE_TYPE, EntityKind::DefinesByType);
+        for t in GROUP_OBJECT_TYPES {
+            m.insert(t, EntityKind::GroupObject);
+        }
         m
     })
 }
@@ -263,7 +288,7 @@ fn dispatch_map() -> &'static HashMap<&'static [u8], EntityKind> {
 // Output containers
 // ----------------------------------------------------------------------
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct IndexedFile {
     // ----- Tier 0/1 manifest fields -----
     pub schema: String,            // e.g. "IFC4" or "IFC2X3"
@@ -278,6 +303,7 @@ pub struct IndexedFile {
     pub product_guid: Vec<String>,
     pub product_entity: Vec<String>,
     pub product_name: Vec<Option<String>>,
+    pub product_description: Vec<Option<String>>,
     pub product_predefined_type: Vec<Option<String>>,
     pub product_object_type: Vec<Option<String>>,
     pub product_tag: Vec<Option<String>>,
@@ -292,8 +318,14 @@ pub struct IndexedFile {
     // ----- Site / Building / Project / Space (for parent_guid resolution) -----
     pub site_step_id_to_guid: HashMap<u64, String>,
     pub building_step_id_to_guid: HashMap<u64, String>,
+    /// IfcBuilding.PredefinedType when present (IFC4 arg 8).
+    pub building_predefined_type: HashMap<u64, String>,
     pub project_step_id_to_guid: HashMap<u64, String>,
     pub space_step_id_to_guid: HashMap<u64, String>,
+    /// Column-major space attributes (same order as spaces appear in the file).
+    pub space_step_id: Vec<u64>,
+    pub space_name: Vec<Option<String>>,
+    pub space_predefined_type: Vec<Option<String>>,
 
     // ----- Containment relationships (parallel `Vec<u64>` columns) -----
     // Stored as parallel arrays rather than `Vec<(u64, u64)>` to avoid one
@@ -307,11 +339,28 @@ pub struct IndexedFile {
     pub contained_in_child: Vec<u64>,
     pub contained_in_structure: Vec<u64>,
 
+    /// Product → IfcSpace containment (same relation type, space parent).
+    pub contained_in_space_child: Vec<u64>,
+    pub contained_in_space_space: Vec<u64>,
+
     /// IfcRelAggregates: parallel arrays of `(child_step_id[i],
     /// parent_step_id[i])`. Spatial relating objects are NOT filtered
     /// out — the parent can be a product, storey, building or site.
     pub aggregates_child: Vec<u64>,
     pub aggregates_parent: Vec<u64>,
+
+    /// Transitive aggregate closure: every (child, ancestor) along
+    /// `IfcRelAggregates` parent chains (for IDS indirect PartOf).
+    pub aggregates_transitive_child: Vec<u64>,
+    pub aggregates_transitive_ancestor: Vec<u64>,
+
+    /// IfcRelNests: (nested_object, relating_object).
+    pub nests_child: Vec<u64>,
+    pub nests_parent: Vec<u64>,
+
+    /// IfcRelAssignsToGroup: (grouped_object, group_object).
+    pub groups_child: Vec<u64>,
+    pub groups_parent: Vec<u64>,
 
     /// IfcRelAggregates filtered to storey↔building pairs only —
     /// `(storey_step_id[i], building_step_id[i])`.
@@ -340,6 +389,12 @@ pub struct IndexedFile {
     pub type_object_entity: Vec<String>,
     pub type_object_guid: Vec<String>,
     pub type_object_name: Vec<Option<String>>,
+
+    /// IfcGroup / IfcInventory / … — `IfcRelAssignsToGroup` relating objects.
+    pub group_object_step_id: Vec<u64>,
+    pub group_object_guid: Vec<String>,
+    pub group_object_entity: Vec<String>,
+    pub group_object_predefined_type: Vec<Option<String>>,
 
     // ----- Length unit (metres per model unit). None means undetermined. -----
     pub unit_scale: Option<f64>,
@@ -445,7 +500,25 @@ fn find_matching_paren(buf: &[u8], open_idx: usize) -> Option<usize> {
 // Main entry: walk the file
 // ----------------------------------------------------------------------
 
+/// How much tier-1 relationship / post-processing to build after the STEP scan.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IndexProfile {
+    /// Default: full index for Python `open()` and IDS full pipeline.
+    Full,
+    /// Entity+attribute IDS on products only: skip expensive post-passes.
+    Tier1Validate,
+}
+
 pub fn index(buf: &[u8]) -> IndexedFile {
+    index_with_table(buf, None, IndexProfile::Full)
+}
+
+/// Tier-1 index; optionally record every entity into [`crate::entity_table::TableBuilder`].
+pub fn index_with_table(
+    buf: &[u8],
+    mut table: Option<&mut crate::entity_table::TableBuilder>,
+    profile: IndexProfile,
+) -> IndexedFile {
     let mut out = IndexedFile::default();
 
     let (schema, originating) = extract_header(buf);
@@ -474,11 +547,28 @@ pub fn index(buf: &[u8]) -> IndexedFile {
     // entity (600K+ on ST28_RIV).
     let mut fields_buf: Vec<&[u8]> = Vec::with_capacity(16);
 
+    let tier1_products_only = profile == IndexProfile::Tier1Validate;
+
     // Two-pass would let us resolve some refs, but a single pass is enough:
     // we only need step_id→guid maps that are built as we go, and downstream
     // (Python) does the final guid resolution for relationships.
     for_each_record(buf, data_start, data_end, |rec| {
+        if let Some(tb) = table.as_mut() {
+            tb.record(&rec);
+        }
         let t = rec.type_name;
+
+        // IDS tier-1 fast path: only `IfcProduct` subclasses (Name/entity checks).
+        // Skips rels, spatial structure, units, type objects — ~40% fewer hot-path
+        // splits on MEP-heavy files vs full index loop.
+        if tier1_products_only {
+            if dispatch.get(t) == Some(&EntityKind::Product) {
+                split_top_level_args_into(rec.args, &mut fields_buf);
+                extract_product(&mut out, rec.id, t, &fields_buf, is_ifc2x3);
+            }
+            return;
+        }
+
         // Single-lookup dispatch. Hot-path miss (>99% of records on big
         // MEP files) is one HashMap probe; previously each miss walked
         // two HashSets and ~8 byte-slice equality checks.
@@ -529,6 +619,9 @@ pub fn index(buf: &[u8]) -> IndexedFile {
                 if let Some(guid) = string_at(&fields_buf, 0) {
                     out.building_step_id_to_guid.insert(rec.id, guid);
                 }
+                if let Some(pt) = enum_at(&fields_buf, 8) {
+                    out.building_predefined_type.insert(rec.id, pt);
+                }
             }
             EntityKind::Project => {
                 split_top_level_args_into(rec.args, &mut fields_buf);
@@ -539,6 +632,19 @@ pub fn index(buf: &[u8]) -> IndexedFile {
                     out.project_step_id_to_guid.insert(rec.id, guid);
                 }
             }
+            EntityKind::GroupObject => {
+                split_top_level_args_into(rec.args, &mut fields_buf);
+                if let Some(guid) = string_at(&fields_buf, 0) {
+                    out.group_object_step_id.push(rec.id);
+                    out.group_object_guid.push(guid);
+                    out.group_object_entity.push(
+                        std::str::from_utf8(t)
+                            .unwrap_or("")
+                            .to_ascii_uppercase(),
+                    );
+                    out.group_object_predefined_type.push(enum_at(&fields_buf, 8));
+                }
+            }
             EntityKind::Space => {
                 // IfcSpace can be a parent in IfcRelAggregates rels (other
                 // spaces or assemblies aggregated under it). Needs a step_id
@@ -546,6 +652,9 @@ pub fn index(buf: &[u8]) -> IndexedFile {
                 split_top_level_args_into(rec.args, &mut fields_buf);
                 if let Some(guid) = string_at(&fields_buf, 0) {
                     out.space_step_id_to_guid.insert(rec.id, guid.clone());
+                    out.space_step_id.push(rec.id);
+                    out.space_name.push(string_at(&fields_buf, 2));
+                    out.space_predefined_type.push(enum_at(&fields_buf, 8));
                     // Also extract as a product so the bundle's semantics
                     // map picks up IfcSpace alongside building elements.
                     // IfcSpace is an IfcProduct subtype in the IFC schema —
@@ -645,6 +754,42 @@ pub fn index(buf: &[u8]) -> IndexedFile {
                     }
                 }
             }
+            EntityKind::Nests => {
+                // IfcRelNests: RelatingObject, RelatedObjects (same as aggregates).
+                split_top_level_args_into(rec.args, &mut fields_buf);
+                if fields_buf.len() >= 6 {
+                    if let Field::Ref(rel) = parse_field(fields_buf[4]) {
+                        if let Field::List(body) = parse_field(fields_buf[5]) {
+                            for child in parse_ref_list(body) {
+                                out.nests_child.push(child);
+                                out.nests_parent.push(rel);
+                            }
+                        }
+                    }
+                }
+            }
+            EntityKind::AssignsToGroup => {
+                // IfcRelAssignsToGroup: RelatedObjects (list ~4), RelatingGroup (last ref).
+                split_top_level_args_into(rec.args, &mut fields_buf);
+                let children: Vec<u64> = match fields_buf.get(4).map(|f| parse_field(f)) {
+                    Some(Field::List(body)) => parse_ref_list(body),
+                    Some(Field::Ref(id)) => vec![id],
+                    _ => Vec::new(),
+                };
+                let group_id = fields_buf.iter().rev().find_map(|f| {
+                    if let Field::Ref(id) = parse_field(f) {
+                        Some(id)
+                    } else {
+                        None
+                    }
+                });
+                if let Some(group_id) = group_id {
+                    for child in children {
+                        out.groups_child.push(child);
+                        out.groups_parent.push(group_id);
+                    }
+                }
+            }
             EntityKind::TypeObject => {
                 // IfcTypeObject / IfcTypeProduct / IfcXxxType all inherit
                 // from IfcRoot: arg[0] GlobalId, arg[1] OwnerHistory,
@@ -663,77 +808,113 @@ pub fn index(buf: &[u8]) -> IndexedFile {
         }
     });
 
-    // Walk aggregates again to populate storey→building from rels whose
-    // relating is an IfcBuilding. We have the building set now.
-    for (child, parent) in out
-        .aggregates_child
-        .iter()
-        .zip(out.aggregates_parent.iter())
-    {
-        if out.building_step_id_to_guid.contains_key(parent) {
-            // child might or might not be a storey — Python side decides
-            // using the storey table.
-            out.storey_building_storey.push(*child);
-            out.storey_building_building.push(*parent);
+    if profile == IndexProfile::Full {
+        // Walk aggregates again to populate storey→building from rels whose
+        // relating is an IfcBuilding. We have the building set now.
+        for (child, parent) in out
+            .aggregates_child
+            .iter()
+            .zip(out.aggregates_parent.iter())
+        {
+            if out.building_step_id_to_guid.contains_key(parent) {
+                out.storey_building_storey.push(*child);
+                out.storey_building_building.push(*parent);
+            }
         }
-    }
 
-    // Filter `contained_in` to storey-relating only. Filter in-place
-    // (write-index pattern) so we don't allocate two fresh Vecs the size
-    // of the unfiltered input — on ST28_RIV that's ~90K entries × 16 B.
-    let storey_ids: HashSet<u64> = out.storey_step_id.iter().copied().collect();
-    let n = out.contained_in_child.len();
-    let mut write = 0;
-    for read in 0..n {
-        let s = out.contained_in_structure[read];
-        if storey_ids.contains(&s) {
-            out.contained_in_child[write] = out.contained_in_child[read];
-            out.contained_in_structure[write] = s;
-            write += 1;
+        // Split spatial containment: storey → `contained_in_*`, IfcSpace →
+        // `contained_in_space_*`. Other structure types are dropped.
+        let storey_ids: HashSet<u64> = out.storey_step_id.iter().copied().collect();
+        let space_ids: HashSet<u64> = out.space_step_id_to_guid.keys().copied().collect();
+        let n = out.contained_in_child.len();
+        let mut storey_write = 0;
+        for read in 0..n {
+            let s = out.contained_in_structure[read];
+            let c = out.contained_in_child[read];
+            if space_ids.contains(&s) {
+                out.contained_in_space_child.push(c);
+                out.contained_in_space_space.push(s);
+            } else if storey_ids.contains(&s) {
+                out.contained_in_child[storey_write] = c;
+                out.contained_in_structure[storey_write] = s;
+                storey_write += 1;
+            }
         }
-    }
-    out.contained_in_child.truncate(write);
-    out.contained_in_structure.truncate(write);
+        out.contained_in_child.truncate(storey_write);
+        out.contained_in_structure.truncate(storey_write);
 
-    // Resolve unit_scale (metres per model unit). Look through the
-    // IfcUnitAssignment.Units list for a LENGTHUNIT SI unit, then map
-    // (Prefix, Name) to a scale factor.
-    for unit_ref in &unit_assignment_refs {
-        if let Some((ut, prefix, name)) = si_units.get(unit_ref) {
-            if ut.eq_ignore_ascii_case("LENGTHUNIT") {
-                let base = match name.as_str() {
-                    "METRE" | "METER" => 1.0,
-                    "FOOT" => 0.3048,
-                    "INCH" => 0.0254,
-                    _ => continue,
-                };
-                let scale = match prefix.as_str() {
-                    "" => base,
-                    "EXA" => base * 1e18,
-                    "PETA" => base * 1e15,
-                    "TERA" => base * 1e12,
-                    "GIGA" => base * 1e9,
-                    "MEGA" => base * 1e6,
-                    "KILO" => base * 1e3,
-                    "HECTO" => base * 1e2,
-                    "DECA" => base * 10.0,
-                    "DECI" => base * 1e-1,
-                    "CENTI" => base * 1e-2,
-                    "MILLI" => base * 1e-3,
-                    "MICRO" => base * 1e-6,
-                    "NANO" => base * 1e-9,
-                    "PICO" => base * 1e-12,
-                    "FEMTO" => base * 1e-15,
-                    "ATTO" => base * 1e-18,
-                    _ => base,
-                };
-                out.unit_scale = Some(scale);
-                break;
+        compute_aggregate_transitive(&mut out);
+
+        for unit_ref in &unit_assignment_refs {
+            if let Some((ut, prefix, name)) = si_units.get(unit_ref) {
+                if ut.eq_ignore_ascii_case("LENGTHUNIT") {
+                    let base = match name.as_str() {
+                        "METRE" | "METER" => 1.0,
+                        "FOOT" => 0.3048,
+                        "INCH" => 0.0254,
+                        _ => continue,
+                    };
+                    let scale = match prefix.as_str() {
+                        "" => base,
+                        "EXA" => base * 1e18,
+                        "PETA" => base * 1e15,
+                        "TERA" => base * 1e12,
+                        "GIGA" => base * 1e9,
+                        "MEGA" => base * 1e6,
+                        "KILO" => base * 1e3,
+                        "HECTO" => base * 1e2,
+                        "DECA" => base * 10.0,
+                        "DECI" => base * 1e-1,
+                        "CENTI" => base * 1e-2,
+                        "MILLI" => base * 1e-3,
+                        "MICRO" => base * 1e-6,
+                        "NANO" => base * 1e-9,
+                        "PICO" => base * 1e-12,
+                        "FEMTO" => base * 1e-15,
+                        "ATTO" => base * 1e-18,
+                        _ => base,
+                    };
+                    out.unit_scale = Some(scale);
+                    break;
+                }
             }
         }
     }
 
     out
+}
+
+/// Populate `aggregates_transitive_*` from direct aggregate edges.
+fn compute_aggregate_transitive(out: &mut IndexedFile) {
+    let mut parents_of: HashMap<u64, Vec<u64>> =
+        HashMap::with_capacity(out.aggregates_child.len());
+    for (&child, &parent) in out
+        .aggregates_child
+        .iter()
+        .zip(out.aggregates_parent.iter())
+    {
+        parents_of.entry(child).or_default().push(parent);
+    }
+
+    let mut seen: HashSet<(u64, u64)> = HashSet::new();
+    let children: HashSet<u64> = out.aggregates_child.iter().copied().collect();
+
+    for child in children {
+        let mut stack: Vec<u64> = parents_of.get(&child).cloned().unwrap_or_default();
+        let mut visited_ancestor: HashSet<u64> = HashSet::new();
+        while let Some(ancestor) = stack.pop() {
+            if !visited_ancestor.insert(ancestor) {
+                continue;
+            }
+            if seen.insert((child, ancestor)) {
+                out.aggregates_transitive_child.push(child);
+                out.aggregates_transitive_ancestor.push(ancestor);
+            }
+            if let Some(grandparents) = parents_of.get(&ancestor) {
+                stack.extend(grandparents.iter().copied());
+            }
+        }
+    }
 }
 
 fn enum_at(fields: &[&[u8]], idx: usize) -> Option<String> {
@@ -758,6 +939,7 @@ fn extract_product(
     let entity = type_name_uppercase_with_proper_case(type_name);
 
     let name = string_at(fields, 2);
+    let description = string_at(fields, 3);
     let object_type = string_at(fields, 4);
     // Tag is always the LAST positional argument that isn't an enum on
     // IfcElement subtypes — but the safe, schema-agnostic move is to try
@@ -805,6 +987,7 @@ fn extract_product(
     out.product_guid.push(guid);
     out.product_entity.push(entity);
     out.product_name.push(name);
+    out.product_description.push(description);
     out.product_predefined_type.push(predefined);
     out.product_object_type.push(object_type);
     out.product_tag.push(tag);
@@ -1055,5 +1238,47 @@ pub(crate) fn type_name_uppercase_with_proper_case(t: &[u8]) -> String {
         s
     } else {
         std::str::from_utf8(t).unwrap_or("").to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const TRANSITIVE_AGG_FIXTURE: &str = r#"ISO-10303-21;
+HEADER;
+FILE_DESCRIPTION(('ViewDefinition [ReferenceView]'),'2;1');
+FILE_NAME('transitive_agg.ifc','2026-05-30T00:00:00',('test'),('test'),'ifcfast','ifcfast','');
+FILE_SCHEMA(('IFC4'));
+ENDSEC;
+DATA;
+#1=IFCPROJECT('0Test000000000000000001',$,'p',$,$,$,$,(#5),#2);
+#2=IFCUNITASSIGNMENT((#3));
+#3=IFCSIUNIT(*,.LENGTHUNIT.,.MILLI.,.METRE.);
+#5=IFCGEOMETRICREPRESENTATIONCONTEXT($,'Model',3,1.0E-5,#6,$);
+#6=IFCAXIS2PLACEMENT3D(#7,$,$);
+#7=IFCCARTESIANPOINT((0.,0.,0.));
+#10=IFCBUILDING('2Bldg000000000000000001',$,'b',$,$,#15,$,$,.ELEMENT.,$,$,$);
+#11=IFCBUILDINGSTOREY('3Stor000000000000000001',$,'Level 1',$,$,#15,$,$,.ELEMENT.,0.0);
+#15=IFCLOCALPLACEMENT($,#6);
+#20=IFCRELAGGREGATES('4Agg000000000000000001',$,$,$,#10,(#11));
+#21=IFCRELAGGREGATES('5Agg000000000000000001',$,$,$,#11,(#50));
+#50=IFCWALL('7Wall00000000000000001',$,'BeamWall',$,$,#15,$,'t',.STANDARD.);
+ENDSEC;
+END-ISO-10303-21;
+"#;
+
+    #[test]
+    fn aggregates_transitive_child_storey_building_chain() {
+        let idx = index(TRANSITIVE_AGG_FIXTURE.as_bytes());
+        let pairs: HashSet<(u64, u64)> = idx
+            .aggregates_transitive_child
+            .iter()
+            .zip(idx.aggregates_transitive_ancestor.iter())
+            .map(|(&c, &a)| (c, a))
+            .collect();
+        assert!(pairs.contains(&(50, 11)), "wall should reach storey #11");
+        assert!(pairs.contains(&(50, 10)), "wall should reach building #10");
+        assert!(pairs.contains(&(11, 10)), "storey should reach building #10");
     }
 }

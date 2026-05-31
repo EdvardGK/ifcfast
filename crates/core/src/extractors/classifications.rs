@@ -22,9 +22,10 @@
 //! IfcClassificationNotationFacet (IFC2X3 legacy) deferred — rare on modern
 //! exports.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::entity_table::EntityTable;
+use crate::indexer::IndexedFile;
 use crate::lexer::{parse_field, split_top_level_args, Field};
 
 #[derive(Debug, Default)]
@@ -48,21 +49,140 @@ impl ClassificationTable {
     }
 }
 
+/// Build classification rows. Resolves related objects through
+/// `object_step_to_guid` (products, types, spatial, etc.).
 pub fn build(
     table: &EntityTable,
-    product_step_to_guid: &HashMap<u64, String>,
+    object_step_to_guid: &HashMap<u64, String>,
 ) -> ClassificationTable {
-    // Pass 1: collect classification records.
-    // - IfcClassification (id → metadata: source, edition, name)
-    // - IfcClassificationReference (id → ref details + parent system id)
+    let (systems, refs, rel_pairs) = collect_classification_maps(table);
+
+    let mut out = ClassificationTable::default();
+    for (obj_step_id, relating_id) in rel_pairs {
+        let guid = match object_step_to_guid.get(&obj_step_id) {
+            Some(g) => g,
+            None => continue,
+        };
+        // The relating object can be either:
+        //  - IfcClassificationReference (most common — Edvard's pattern)
+        //  - IfcClassification directly (rarer)
+        if let Some(r) = refs.get(&relating_id) {
+            let system = r.parent_id.and_then(|sid| systems.get(&sid));
+            push_ref_row(&mut out, guid, r, system);
+        } else if let Some(sys) = systems.get(&relating_id) {
+            out.guid.push(guid.clone());
+            out.system_name.push(sys.name.clone());
+            out.edition.push(sys.edition.clone());
+            out.identification.push(None);
+            out.name.push(None);
+            out.location.push(None);
+            out.source.push(sys.source.clone());
+        }
+    }
+
+    out
+}
+
+/// IDS-oriented expansion: inherited `IfcClassificationReference` chains and
+/// type-object classifications propagated to products via `IfcRelDefinesByType`.
+pub fn expand_for_ids(
+    table: &EntityTable,
+    cls: &mut ClassificationTable,
+    indexed: &IndexedFile,
+) {
+    let object_step_to_guid = crate::object_guid::build_extractor_object_map(indexed, table, true);
+    let (systems, refs, rel_pairs) = collect_classification_maps(table);
+
+    let mut seen = row_keys(cls);
+
+    // 1. Inherited reference rows — walk parent ref chains on each association.
+    for (obj_step_id, relating_id) in rel_pairs {
+        let guid = match object_step_to_guid.get(&obj_step_id) {
+            Some(g) => g,
+            None => continue,
+        };
+        let Some(leaf) = refs.get(&relating_id) else {
+            continue;
+        };
+        let mut current = leaf.parent_id;
+        while let Some(pid) = current {
+            let Some(r) = refs.get(&pid) else {
+                break;
+            };
+            let system = resolve_system(r, &systems, &refs);
+            let key = row_key(guid, &system.0, &r.identification);
+            if seen.insert(key) {
+                push_ref_row_with_system(cls, guid, r, &system);
+            }
+            current = r.parent_id.filter(|p| refs.contains_key(p));
+        }
+    }
+
+    // 2. Type → product propagation when the product has no row for that system.
+    let type_guids: HashSet<&str> = indexed
+        .type_object_guid
+        .iter()
+        .map(|s| s.as_str())
+        .collect();
+
+    let mut product_systems: HashSet<(String, Option<String>)> = HashSet::new();
+    for i in 0..cls.len() {
+        if indexed.product_guid.iter().any(|g| g == &cls.guid[i]) {
+            product_systems.insert((cls.guid[i].clone(), cls.system_name[i].clone()));
+        }
+    }
+
+    for (prod_sid, type_sid) in indexed
+        .defines_by_type_product
+        .iter()
+        .zip(indexed.defines_by_type_type.iter())
+    {
+        let (Some(prod_guid), Some(type_guid)) = (
+            object_step_to_guid.get(prod_sid),
+            object_step_to_guid.get(type_sid),
+        ) else {
+            continue;
+        };
+        if !type_guids.contains(type_guid.as_str()) {
+            continue;
+        }
+        for i in 0..cls.len() {
+            if cls.guid[i] != *type_guid {
+                continue;
+            }
+            let system = cls.system_name[i].clone();
+            if product_systems.contains(&(prod_guid.clone(), system.clone())) {
+                continue;
+            }
+            let key = row_key(prod_guid, &system, &cls.identification[i]);
+            if !seen.insert(key) {
+                continue;
+            }
+            cls.guid.push(prod_guid.clone());
+            cls.system_name.push(system.clone());
+            cls.edition.push(cls.edition[i].clone());
+            cls.identification.push(cls.identification[i].clone());
+            cls.name.push(cls.name[i].clone());
+            cls.location.push(cls.location[i].clone());
+            cls.source.push(cls.source[i].clone());
+            product_systems.insert((prod_guid.clone(), system));
+        }
+    }
+}
+
+fn collect_classification_maps(
+    table: &EntityTable,
+) -> (
+    HashMap<u64, SystemRecord>,
+    HashMap<u64, RefRecord>,
+    Vec<(u64, u64)>,
+) {
     let mut systems: HashMap<u64, SystemRecord> = HashMap::with_capacity(64);
     let mut refs: HashMap<u64, RefRecord> = HashMap::with_capacity(1024);
     let mut rel_pairs: Vec<(u64, u64)> = Vec::with_capacity(4096);
 
     for (step_id, type_name, args) in table.iter() {
         if type_name.eq_ignore_ascii_case(b"IFCCLASSIFICATION") {
-            // IFC2X3: (Source, Edition, EditionDate, Name)
-            // IFC4:   (Source, Edition, EditionDate, Name, Description, Location, ReferenceTokens)
             let fields = split_top_level_args(args);
             systems.insert(
                 step_id,
@@ -73,8 +193,6 @@ pub fn build(
                 },
             );
         } else if type_name.eq_ignore_ascii_case(b"IFCCLASSIFICATIONREFERENCE") {
-            // IFC2X3: (Location, ItemReference, Name, ReferencedSource)
-            // IFC4:   (Location, Identification, Name, ReferencedSource, Description, Sort)
             let fields = split_top_level_args(args);
             let location = string_at(&fields, 0);
             let identification = string_at(&fields, 1);
@@ -93,7 +211,6 @@ pub fn build(
                 },
             );
         } else if type_name.eq_ignore_ascii_case(b"IFCRELASSOCIATESCLASSIFICATION") {
-            // (GlobalId, OwnerHistory, Name, Description, RelatedObjects, RelatingClassification)
             let fields = split_top_level_args(args);
             let relating = match fields.get(5).copied().map(parse_field) {
                 Some(Field::Ref(id)) => id,
@@ -107,39 +224,88 @@ pub fn build(
             for obj_id in relateds {
                 rel_pairs.push((obj_id, relating));
             }
+        } else if type_name.eq_ignore_ascii_case(b"IFCEXTERNALREFERENCERELATIONSHIP") {
+            // IFC4: (Name, Description, RelatingReference, RelatedResourceObjects)
+            let fields = split_top_level_args(args);
+            let relating = match fields.get(2).copied().map(parse_field) {
+                Some(Field::Ref(id)) => id,
+                _ => continue,
+            };
+            let relateds = match fields.get(3).copied().map(parse_field) {
+                Some(Field::List(body)) => parse_ref_list(body),
+                Some(Field::Ref(id)) => vec![id],
+                _ => continue,
+            };
+            for obj_id in relateds {
+                rel_pairs.push((obj_id, relating));
+            }
         }
     }
 
-    let mut out = ClassificationTable::default();
-    for (obj_step_id, relating_id) in rel_pairs {
-        let guid = match product_step_to_guid.get(&obj_step_id) {
-            Some(g) => g,
-            None => continue,
-        };
-        // The relating object can be either:
-        //  - IfcClassificationReference (most common — Edvard's pattern)
-        //  - IfcClassification directly (rarer)
-        if let Some(r) = refs.get(&relating_id) {
-            let system = r.parent_id.and_then(|sid| systems.get(&sid));
-            out.guid.push(guid.clone());
-            out.system_name.push(system.and_then(|s| s.name.clone()));
-            out.edition.push(system.and_then(|s| s.edition.clone()));
-            out.identification.push(r.identification.clone());
-            out.name.push(r.name.clone());
-            out.location.push(r.location.clone());
-            out.source.push(system.and_then(|s| s.source.clone()));
-        } else if let Some(sys) = systems.get(&relating_id) {
-            out.guid.push(guid.clone());
-            out.system_name.push(sys.name.clone());
-            out.edition.push(sys.edition.clone());
-            out.identification.push(None);
-            out.name.push(None);
-            out.location.push(None);
-            out.source.push(sys.source.clone());
+    (systems, refs, rel_pairs)
+}
+
+fn resolve_system(
+    r: &RefRecord,
+    systems: &HashMap<u64, SystemRecord>,
+    refs: &HashMap<u64, RefRecord>,
+) -> (Option<String>, Option<String>, Option<String>) {
+    let mut current = r.parent_id;
+    while let Some(pid) = current {
+        if let Some(sys) = systems.get(&pid) {
+            return (
+                sys.name.clone(),
+                sys.edition.clone(),
+                sys.source.clone(),
+            );
+        }
+        if let Some(parent_ref) = refs.get(&pid) {
+            current = parent_ref.parent_id;
+        } else {
+            break;
         }
     }
+    (None, None, None)
+}
 
-    out
+fn push_ref_row(
+    out: &mut ClassificationTable,
+    guid: &str,
+    r: &RefRecord,
+    system: Option<&SystemRecord>,
+) {
+    out.guid.push(guid.to_string());
+    out.system_name.push(system.and_then(|s| s.name.clone()));
+    out.edition.push(system.and_then(|s| s.edition.clone()));
+    out.identification.push(r.identification.clone());
+    out.name.push(r.name.clone());
+    out.location.push(r.location.clone());
+    out.source.push(system.and_then(|s| s.source.clone()));
+}
+
+fn push_ref_row_with_system(
+    out: &mut ClassificationTable,
+    guid: &str,
+    r: &RefRecord,
+    system: &(Option<String>, Option<String>, Option<String>),
+) {
+    out.guid.push(guid.to_string());
+    out.system_name.push(system.0.clone());
+    out.edition.push(system.1.clone());
+    out.identification.push(r.identification.clone());
+    out.name.push(r.name.clone());
+    out.location.push(r.location.clone());
+    out.source.push(system.2.clone());
+}
+
+fn row_key(guid: &str, system: &Option<String>, identification: &Option<String>) -> (String, Option<String>, Option<String>) {
+    (guid.to_string(), system.clone(), identification.clone())
+}
+
+fn row_keys(cls: &ClassificationTable) -> HashSet<(String, Option<String>, Option<String>)> {
+    (0..cls.len())
+        .map(|i| row_key(&cls.guid[i], &cls.system_name[i], &cls.identification[i]))
+        .collect()
 }
 
 struct SystemRecord {
@@ -207,7 +373,7 @@ END-ISO-10303-21;
     }
 
     fn run(buf: &str) -> ClassificationTable {
-        let table = crate::entity_table::EntityTable::build(buf.as_bytes());
+        let table = crate::entity_table::EntityTable::build_from_slice(buf.as_bytes());
         let mut step_to_guid: HashMap<u64, String> = HashMap::new();
         for (sid, _t, args) in table.iter() {
             let fields = split_top_level_args(args);
@@ -222,11 +388,17 @@ END-ISO-10303-21;
         build(&table, &step_to_guid)
     }
 
+    fn run_indexed(buf: &str) -> ClassificationTable {
+        let indexed = crate::indexer::index(buf.as_bytes());
+        let table = crate::entity_table::EntityTable::build_from_slice(buf.as_bytes());
+        let map = crate::object_guid::build_object_step_to_guid(&indexed);
+        let mut cls = build(&table, &map);
+        expand_for_ids(&table, &mut cls, &indexed);
+        cls
+    }
+
     #[test]
     fn ns_3451_chain_resolves_all_six_fields() {
-        // The canonical Norwegian classification chain — verifies the
-        // ClassificationReference → Classification (via ReferencedSource)
-        // walk, which is the trickier part of this extractor.
         let buf = make_buf(
             r#"
 #30=IFCCLASSIFICATION('Standard Norge','2022',$,'NS 3451');
@@ -246,11 +418,6 @@ END-ISO-10303-21;
 
     #[test]
     fn missing_parent_classification_still_emits_row() {
-        // ClassificationReference with no ReferencedSource — every
-        // system-level field should be None but the identification +
-        // name (carried directly on the reference) must survive. Some
-        // exports do this when they ship a reference URL without
-        // declaring a parent IfcClassification.
         let buf = make_buf(
             r#"
 #31=IFCCLASSIFICATIONREFERENCE('https://example/codes/A1','A1','Test class',$);
@@ -269,8 +436,6 @@ END-ISO-10303-21;
 
     #[test]
     fn one_product_with_multiple_classifications_emits_a_row_each() {
-        // A wall classified under both NS 3451 and OmniClass — both
-        // refs must appear, properly attributed to their parent system.
         let buf = make_buf(
             r#"
 #30=IFCCLASSIFICATION('Standard Norge','2022',$,'NS 3451');
@@ -292,5 +457,83 @@ END-ISO-10303-21;
             .collect();
         assert_eq!(by_system.get("NS 3451"), Some(&"232.1"));
         assert_eq!(by_system.get("OmniClass"), Some(&"21-01 10 10"));
+    }
+
+    #[test]
+    fn inherited_parent_reference_emits_extra_row() {
+        let buf = make_buf(
+            r#"
+#30=IFCCLASSIFICATION('Standard Norge','2022',$,'NS 3451');
+#31=IFCCLASSIFICATIONREFERENCE($,'23','Chapter 23',#30);
+#32=IFCCLASSIFICATIONREFERENCE($,'232.1','Yttervegger',#31);
+#33=IFCRELASSOCIATESCLASSIFICATION('2Cls000000000000000001',$,$,$,(#10),#32);
+"#,
+        );
+        let indexed = crate::indexer::index(buf.as_bytes());
+        let table = crate::entity_table::EntityTable::build_from_slice(buf.as_bytes());
+        let map = crate::object_guid::build_object_step_to_guid(&indexed);
+        let mut t = build(&table, &map);
+        expand_for_ids(&table, &mut t, &indexed);
+        let idents: Vec<_> = t
+            .identification
+            .iter()
+            .filter_map(|i| i.as_deref())
+            .collect();
+        assert!(idents.contains(&"232.1"));
+        assert!(idents.contains(&"23"));
+    }
+
+    #[test]
+    fn external_reference_relationship_on_material() {
+        let buf = r#"ISO-10303-21;
+HEADER;
+FILE_DESCRIPTION(('ViewDefinition [ReferenceView]'),'2;1');
+FILE_NAME('extref.ifc','2026-05-26T00:00:00',('test'),('test'),'ifcfast','ifcfast','');
+FILE_SCHEMA(('IFC4'));
+ENDSEC;
+DATA;
+#1=IFCPROJECT('0Test000000000000000001',$,'p',$,$,$,$,(#5),#2);
+#2=IFCUNITASSIGNMENT((#3));
+#3=IFCSIUNIT(*,.LENGTHUNIT.,$,.METRE.);
+#5=IFCGEOMETRICREPRESENTATIONCONTEXT($,'Model',3,1.0E-5,#6,$);
+#6=IFCAXIS2PLACEMENT3D(#7,$,$);
+#7=IFCCARTESIANPOINT((0.,0.,0.));
+#30=IFCCLASSIFICATION($,$,$,'Foobar',$,$,$);
+#31=IFCCLASSIFICATIONREFERENCE($,'1','Label',#30);
+#16=IFCMATERIAL('Material',$,$);
+#17=IFCEXTERNALREFERENCERELATIONSHIP($,$,#31,(#16));
+ENDSEC;
+END-ISO-10303-21;
+"#;
+        let indexed = crate::indexer::index(buf.as_bytes());
+        let table = crate::entity_table::EntityTable::build_from_slice(buf.as_bytes());
+        let map = crate::object_guid::build_extractor_object_map(&indexed, &table, true);
+        let t = build(&table, &map);
+        assert_eq!(t.len(), 1);
+        assert_eq!(t.guid[0], crate::object_guid::material_step_guid(16));
+        assert_eq!(t.identification[0].as_deref(), Some("1"));
+        assert_eq!(t.system_name[0].as_deref(), Some("Foobar"));
+    }
+
+    #[test]
+    fn type_classification_propagates_to_product() {
+        let buf = make_buf(
+            r#"
+#20=IFCWALLTYPE('1Typ000000000000000001',$,'WT',$,$,$,$,$,$,.STANDARD.);
+#30=IFCCLASSIFICATION('Standard Norge','2022',$,'NS 3451');
+#31=IFCCLASSIFICATIONREFERENCE($,'232.1','Yttervegger',#30);
+#32=IFCRELASSOCIATESCLASSIFICATION('2Cls000000000000000001',$,$,$,(#20),#31);
+#40=IFCRELDEFINESBYTYPE('3Typ000000000000000001',$,$,$,(#10),#20);
+"#,
+        );
+        let t = run_indexed(&buf);
+        let wall_rows: Vec<_> = t
+            .guid
+            .iter()
+            .zip(t.identification.iter())
+            .filter(|(g, _)| g.as_str() == "1Wall00000000000000001")
+            .collect();
+        assert_eq!(wall_rows.len(), 1);
+        assert_eq!(wall_rows[0].1.as_deref(), Some("232.1"));
     }
 }

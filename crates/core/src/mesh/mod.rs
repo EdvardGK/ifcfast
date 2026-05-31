@@ -370,7 +370,7 @@ pub fn mesh_ifc_streaming_framed<S: ProductSink>(
     let mut stats = MeshStats::default();
 
     let t0 = Instant::now();
-    let table = EntityTable::build(buf);
+    let table = EntityTable::build_from_slice(buf);
     stats.entity_table_build_ms = t0.elapsed().as_secs_f64() * 1000.0;
     let _ = table.len();
 

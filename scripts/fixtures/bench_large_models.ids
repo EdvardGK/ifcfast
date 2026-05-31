@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ids xmlns="http://standards.buildingsmart.org/IDS" xmlns:xs="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://standards.buildingsmart.org/IDS http://standards.buildingsmart.org/IDS/1.0/ids.xsd">
+  <info>
+    <title>Large-model benchmark pack</title>
+    <description>Representative specs for throughput comparison on production IFC files.</description>
+  </info>
+  <specifications>
+    <specification name="Walls must have a name" ifcVersion="IFC2X3 IFC4 IFC4X3_ADD2">
+      <applicability maxOccurs="unbounded">
+        <entity>
+          <name>
+            <simpleValue>IFCWALL</simpleValue>
+          </name>
+        </entity>
+      </applicability>
+      <requirements>
+        <attribute cardinality="required">
+          <name>
+            <simpleValue>Name</simpleValue>
+          </name>
+        </attribute>
+      </requirements>
+    </specification>
+    <specification name="Doors must have a name" ifcVersion="IFC2X3 IFC4 IFC4X3_ADD2">
+      <applicability maxOccurs="unbounded">
+        <entity>
+          <name>
+            <simpleValue>IFCDOOR</simpleValue>
+          </name>
+        </entity>
+      </applicability>
+      <requirements>
+        <attribute cardinality="required">
+          <name>
+            <simpleValue>Name</simpleValue>
+          </name>
+        </attribute>
+      </requirements>
+    </specification>
+    <specification name="Windows must have a name" ifcVersion="IFC2X3 IFC4 IFC4X3_ADD2">
+      <applicability maxOccurs="unbounded">
+        <entity>
+          <name>
+            <simpleValue>IFCWINDOW</simpleValue>
+          </name>
+        </entity>
+      </applicability>
+      <requirements>
+        <attribute cardinality="required">
+          <name>
+            <simpleValue>Name</simpleValue>
+          </name>
+        </attribute>
+      </requirements>
+    </specification>
+  </specifications>
+</ids>

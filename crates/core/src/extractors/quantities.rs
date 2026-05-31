@@ -47,7 +47,7 @@ impl QuantityTable {
 
 pub fn build(
     table: &EntityTable,
-    product_step_to_guid: &HashMap<u64, String>,
+    object_step_to_guid: &HashMap<u64, String>,
 ) -> QuantityTable {
     // Pass 1: index IfcElementQuantity records and their physical quantity refs.
     //         Also index each physical-simple-quantity record.
@@ -102,7 +102,7 @@ pub fn build(
             Some(x) => x,
             None => continue,
         };
-        let guid = match product_step_to_guid.get(&obj_step_id) {
+        let guid = match object_step_to_guid.get(&obj_step_id) {
             Some(g) => g,
             None => continue,
         };
@@ -216,7 +216,7 @@ END-ISO-10303-21;
     }
 
     fn run(buf: &str) -> QuantityTable {
-        let table = crate::entity_table::EntityTable::build(buf.as_bytes());
+        let table = crate::entity_table::EntityTable::build_from_slice(buf.as_bytes());
         let mut step_to_guid: HashMap<u64, String> = HashMap::new();
         for (sid, _t, args) in table.iter() {
             let fields = split_top_level_args(args);
