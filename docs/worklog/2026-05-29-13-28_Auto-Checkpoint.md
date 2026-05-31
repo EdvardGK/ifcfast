@@ -1,0 +1,1115 @@
+# Session: Auto-checkpoint (PreCompact)
+
+## Summary
+Auto-generated worklog checkpoint. 2463 file operations tracked.
+Project: ifcfast
+Commit: 951dfbe
+
+## Changes
+- `frontend/src/components/features/projects-gallery/ProjectGalleryCard.tsx` - Edit(8)
+- `projects/ifcfast/python/ifcfast/header.py` - Write(1)
+- `projects/ifcfast/python/ifcfast/cache.py` - Write(1)
+- `projects/ifcfast/python/ifcfast/model.py` - Write(1)
+- `projects/ifcfast/python/ifcfast/__init__.py` - Write(1)
+- `projects/ifcfast/python/ifcfast/cli.py` - Write(1)
+- `projects/ifcfast/python/ifcfast/federated_floors.py` - Edit(1)
+- `frontend/src/components/features/project-models/ModelCard.tsx` - Edit(6)
+- `projects/ifcfast/tests/test_federated_floors.py` - Edit(2)
+- `projects/ifcfast/docs/history/origin.md` - Write(1)
+- `projects/ifcfast/docs/history/audit/README.md` - Write(1)
+- `projects/ifcfast/README.md` - Write(1)
+- `projects/ifcfast/LICENSE` - Write(1)
+- `projects/ifcfast/.gitignore` - Write(1)
+- `projects/ifcfast/Cargo.toml` - Edit(1)
+- `projects/ifcfast/crates/core/Cargo.toml` - Edit(1)
+- `frontend/src/hooks/useCardDensity.ts` - Write(1)
+- `frontend/src/components/ui/CardDensityToggle.tsx` - Write(1), Edit(2)
+- `frontend/src/pages/ProjectModels.tsx` - Edit(5)
+- `frontend/src/pages/ProjectsGallery.tsx` - Edit(5)
+- `frontend/src/i18n/locales/en.json` - Edit(30)
+- `frontend/src/i18n/locales/nb.json` - Edit(31)
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/events-and-meetings-modules.md` - Write(1)
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/gallery-table-toggle.md` - Write(1)
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/MEMORY.md` - Edit(57)
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/main-vs-special-purpose-model.md` - Write(1), Edit(2)
+- `frontend/src/components/Layout/Sidebar.tsx` - Edit(25)
+- `projects/ifcfast/docs/worklog/2026-05-13-08-13_Standalone-repo-extraction-from-ifc-workbench.md` - Write(1)
+- `backend/ifc-service/api/fragments.py` - Edit(2)
+- `backend/apps/models/management/commands/backfill_thumbnails.py` - Write(1), Edit(1)
+- `tests/unit/test_backfill_thumbnails.py` - Write(1)
+- `CLAUDE.md` - Edit(3)
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/feedback-long-running-ops-need-persistent-tracker.md` - Write(1)
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/django-checkconstraint-version-gotcha.md` - Write(1)
+- `docs/worklog/2026-05-13-10-31_Card-iterations-snapshot-pipeline-backfill.md` - Write(1)
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/next-steps.md` - Write(32)
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/ifcfast-benchmark-candidate.md` - Write(2)
+- `backend/apps/entities/services/verification_engine.py` - Edit(19)
+- `backend/apps/models/views.py` - Edit(2)
+- `tests/unit/test_storey_verification_endpoint.py` - Write(1), Edit(5)
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/feedback-elements-types-orphan-terminology.md` - Write(1)
+- `frontend/src/hooks/use-model-analysis.ts` - Edit(2)
+- `frontend/src/lib/api-types.ts` - Edit(7)
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/feedback-chart-truncate-bar-before-labels.md` - Write(1)
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/feedback-text-scales-with-component.md` - Write(1)
+- `frontend/src/components/features/model-workspace/VerifiedStoreyChart.tsx` - Write(1), Edit(11)
+- `frontend/src/pages/ModelWorkspace.tsx` - Edit(171)
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/persona-dion-moult-dashboard-checklist.md` - Write(1)
+- `projects/ifcfast/docs/worklog/2026-05-13-11-45_Workspace-relocation-and-dev-CLAUDE-md-update.md` - Write(1)
+- `/home/edkjo/.claude/projects/-home-edkjo-dev/memory/MEMORY.md` - Edit(3)
+- `/home/edkjo/.claude/projects/-home-edkjo-dev/memory/projects.md` - Edit(1)
+- `/home/edkjo/.claude/projects/-home-edkjo-dev/memory/next-steps.md` - Write(4)
+- `/home/edkjo/workspace/inbox/ifcfast/crates/core/src/lexer.rs` - Edit(1)
+- `/home/edkjo/workspace/inbox/ifcfast/crates/core/src/extractors/classifications.rs` - Edit(1)
+- `/home/edkjo/workspace/inbox/ifcfast/crates/core/src/extractors/psets.rs` - Edit(1)
+- `/home/edkjo/workspace/inbox/ifcfast/.github/workflows/ci.yml` - Write(1), Edit(3)
+- `docs/wireframes/09-model-dash-kpi-dion.html` - Write(1)
+- `/home/edkjo/workspace/inbox/ifcfast/.github/workflows/release.yml` - Write(1), Edit(3)
+- `docs/wireframes/_light.css` - Write(1)
+- `docs/wireframes/index.html` - Write(2), Edit(1)
+- `docs/wireframes/welcome.html` - Write(1)
+- `docs/wireframes/my-page.html` - Write(1)
+- `docs/wireframes/projects-gallery.html` - Write(1)
+- `docs/wireframes/admin.html` - Write(1)
+- `docs/wireframes/webhooks.html` - Write(1)
+- `docs/wireframes/webhook-deliveries.html` - Write(1)
+- `docs/wireframes/embed.html` - Write(1)
+- `docs/wireframes/type-library-global.html` - Write(1)
+- `docs/wireframes/_project-shell.html` - Write(1)
+- `docs/wireframes/project-dashboard.html` - Write(1)
+- `docs/wireframes/project-models.html` - Write(1)
+- `docs/wireframes/model-workspace.html` - Write(1)
+- `docs/wireframes/project-floors.html` - Write(1)
+- `docs/wireframes/project-my-page.html` - Write(1)
+- `docs/wireframes/viewer-groups.html` - Write(1)
+- `docs/wireframes/federated-viewer.html` - Write(1)
+- `docs/wireframes/project-documents.html` - Write(1)
+- `docs/wireframes/project-claims.html` - Write(1)
+- `docs/wireframes/project-drawings.html` - Write(1)
+- `docs/wireframes/project-types.html` - Write(1)
+- `docs/wireframes/project-type-library.html` - Write(1)
+- `docs/wireframes/project-material-library.html` - Write(1)
+- `docs/wireframes/project-field.html` - Write(1)
+- `docs/wireframes/project-eir.html` - Write(1)
+- `docs/wireframes/project-workbench.html` - Write(1)
+- `docs/wireframes/model-kpi-dion.html` - Write(1), Edit(11)
+- `/home/edkjo/workspace/inbox/ifcfast/crates/core/Cargo.toml` - Edit(1)
+- `frontend/src/components/features/model-workspace/AnalysisKpiCluster.tsx` - Write(1), Edit(28)
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/settings-architecture.md` - Write(1), Edit(1)
+- `backend/apps/models/serializers.py` - Edit(1)
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/feedback-dev-language-english.md` - Write(1)
+- `backend/apps/entities/models/reporting.py` - Edit(1)
+- `backend/lib/ifc_toolkit/storeys.py` - Edit(1)
+- `backend/lib/ifc_toolkit/analyze.py` - Edit(1)
+- `backend/apps/entities/services/analysis_ingestion.py` - Edit(1)
+- `frontend/src/components/features/viewer/UnifiedBIMViewer.tsx` - Edit(46)
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/feedback-all-prod-data-is-test.md` - Write(1)
+- `backend/apps/entities/management/commands/reanalyze_models.py` - Write(1)
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/fragments-v3-spatial-tree-shape.md` - Write(1)
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/dashboard-engine-architecture.md` - Write(1)
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/dashboard-marketplace-vision.md` - Write(1)
+- `docs/worklog/2026-05-13-22-04_Storey-verification-GUID-bridge-KPI-rework-Wireframe-kit-Dashboard-engine-vision.md` - Write(1)
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/grouping-axes-data-foundation.md` - Write(1), Edit(1)
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/opening-lifecycle-spec-verify-build.md` - Write(1), Edit(1)
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/tolerance-rules-go-nogo-automation.md` - Write(1)
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/anti-opening-structural-constraint-zones.md` - Write(1)
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/spatial-requirements-generic-engine.md` - Write(1)
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/rules-engine-strategy-build-vs-integrate.md` - Write(1)
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/positioning-bim-coordination-first.md` - Write(1)
+- `docs/worklog/2026-05-13-22-38_Architecture-arc-Grouping-axes-Opening-lifecycle-Tolerance-Anti-opening-Rules-engine-strategy.md` - Write(1)
+- `/home/edkjo/workspace/inbox/ifcfast/tests/fixtures/minimal.ifc` - Write(1), Edit(1)
+- `/home/edkjo/workspace/inbox/ifcfast/.gitignore` - Edit(1)
+- `/home/edkjo/.claude/plans/lets-pick-up-where-delegated-rabin.md` - Write(1)
+- `/home/edkjo/workspace/inbox/ifcfast/tests/test_smoke.py` - Write(1), Edit(4)
+- `frontend/src/lib/embed/types.ts` - Edit(5)
+- `frontend/src/contexts/ProjectFilterProvider.tsx` - Edit(8)
+- `frontend/src/hooks/useProjectFilterUrl.ts` - Edit(2)
+- `frontend/src/components/features/warehouse-v2/TypeBrowserV2.tsx` - Edit(43)
+- `/home/edkjo/workspace/inbox/ifcfast/python/ifcfast/cli.py` - Edit(2)
+- `/home/edkjo/workspace/inbox/ifcfast/python/ifcfast/header.py` - Edit(1)
+- `/home/edkjo/workspace/inbox/ifcfast/README.md` - Edit(3)
+- `docs/worklog/2026-05-13-23-10_Layer-2-GUID-bridge-ifc-class-URL-persist.md` - Write(1), Edit(1)
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/type-guid-synth-hash-fallback.md` - Write(1)
+- `docs/wireframes/color-system.html` - Write(1), Edit(5)
+- `frontend/src/lib/colorMath.ts` - Write(1), Edit(1)
+- `frontend/src/components/features/warehouse-v2/classColors.ts` - Write(1), Edit(2)
+- `frontend/src/lib/design-tokens.ts` - Write(1), Edit(1)
+- `frontend/tailwind.config.ts` - Edit(1)
+- `frontend/src/components/features/model-workspace/StatisticsTab.tsx` - Edit(1)
+- `docs/plans/2026-05-14-10-46_Tester-findings-sweep.md` - Write(1)
+- `docs/worklog/2026-05-14-10-50_Layer-2-GUID-bridge-color-system-design-tokens-tester-sweep-plan.md` - Write(1), Edit(1)
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/design-tokens-iron-rule.md` - Write(1)
+- `/home/edkjo/.claude/plans/i-want-a-admin-idempotent-sprout.md` - Write(1), Edit(1)
+- `backend/apps/accounts/__init__.py` - Write(1)
+- `backend/config/settings.py` - Edit(7)
+- `backend/apps/accounts/views.py` - Edit(7)
+- `frontend/src/pages/AdminDashboard.tsx` - Edit(6), Write(1)
+- `tests/unit/test_admin_dashboard_stats.py` - Write(1)
+- `/home/edkjo/.claude/plans/hiding-opening-elements-is-floating-lemon.md` - Write(1), Edit(4)
+- `.claude/worktrees/agent-a5405390cec573ac1/backend/ifc-service/scripts/convert-to-fragments.mjs` - Edit(2)
+- `.claude/worktrees/agent-a5405390cec573ac1/frontend/src/components/features/viewer/UnifiedBIMViewer.tsx` - Edit(2)
+- `.claude/worktrees/agent-a991d3ac9c5e41a50/backend/apps/entities/views/types.py` - Edit(4)
+- `.claude/worktrees/agent-a991d3ac9c5e41a50/tests/unit/test_dashboard_metrics.py` - Write(1)
+- `/home/edkjo/workspace/inbox/ifcfast/pyproject.toml` - Edit(4)
+- `/home/edkjo/workspace/inbox/ifcfast/python/ifcfast/__init__.py` - Edit(3)
+- `.claude/worktrees/agent-abba8704b1a96a5b4/backend/apps/entities/serializers.py` - Edit(1)
+- `.claude/worktrees/agent-abba8704b1a96a5b4/backend/apps/entities/views/types.py` - Edit(1)
+- `.claude/worktrees/agent-abba8704b1a96a5b4/frontend/src/hooks/use-type-mapping.ts` - Edit(1)
+- `.claude/worktrees/agent-abba8704b1a96a5b4/frontend/src/hooks/use-project-materials.ts` - Edit(2)
+- `docs/worklog/2026-05-14-12-49_Wave-1-2-coordinator-pattern-opening-converter-dashboard-N+1-list-pagination-cross-filter-recompute.md` - Write(1), Edit(1)
+- `frontend/src/components/admin/types.ts` - Write(1)
+- `frontend/src/components/admin/helpers.ts` - Write(1)
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/feedback-click-same-tile-toggles-off.md` - Write(1)
+- `frontend/src/components/admin/primitives.tsx` - Write(1), Edit(1)
+- `frontend/src/components/admin/AdminLayout.tsx` - Write(1), Edit(3)
+- `frontend/src/pages/admin/AdminShell.tsx` - Write(1), Edit(2)
+- `frontend/src/pages/admin/AdminOverview.tsx` - Write(1), Edit(1)
+- `frontend/src/pages/admin/AdminProcessing.tsx` - Write(1)
+- `frontend/src/pages/admin/AdminLogs.tsx` - Write(1)
+- `frontend/src/pages/admin/AdminWebhooks.tsx` - Write(1)
+- `frontend/src/pages/admin/AdminSystem.tsx` - Write(1)
+- `frontend/src/pages/admin/AdminUsers.tsx` - Write(1)
+- `frontend/src/App.tsx` - Edit(35)
+- `backend/apps/models/management/commands/backfill_v3_fragments.py` - Edit(5)
+- `/home/edkjo/workspace/inbox/ifcfast/CHANGELOG.md` - Write(1)
+- `frontend/src/components/filters/FilteredEmptyBanner.tsx` - Write(1)
+- `docs/worklog/2026-05-14-18-00_Prod-frag-backfill-+-filtered-empty-banner.md` - Write(1)
+- `frontend/src/hooks/useProjectFilterValidate.ts` - Write(1)
+- `docs/worklog/2026-05-15-07-12_URL-filter-validation-self-heal.md` - Write(1)
+- `/home/edkjo/.claude/plans/whats-next-piped-avalanche.md` - Write(1)
+- `docs/worklog/2026-05-15-08-02_Latency-reverify-+-per-request-floor-finding.md` - Write(1)
+- `backend/apps/core/middleware.py` - Edit(1)
+- `docs/worklog/2026-05-15-11-16_Always-on-Server-Timing-+-admin-Tooltip-crash-fix-+-Iver-approval.md` - Write(1)
+- `/home/edkjo/.claude/plans/keep-pushing-whimsical-falcon.md` - Write(2)
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/feedback-coordinator-rounds-must-include-frontend.md` - Write(1)
+- `docs/worklog/2026-05-15-15-02_Latency-floor-decomposition-conn_max_age-CACHES.md` - Write(1)
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/feedback-verify-agent-diffs-before-applying.md` - Write(1)
+- `inbox/ifcfast/crates/core/src/lexer.rs` - Edit(2)
+- `inbox/ifcfast/crates/core/src/indexer.rs` - Edit(33)
+- `inbox/ifcfast/CHANGELOG.md` - Edit(11)
+- `inbox/ifcfast/docs/worklog/2026-05-15-15-00_Tier1-indexer-dispatch-perf.md` - Write(1)
+- `/home/edkjo/.claude/plans/lets-keep-working-async-wirth.md` - Write(1)
+- `frontend/src/components/features/warehouse-v2/TypeDataRail.tsx` - Write(1)
+- `frontend/src/components/features/warehouse-v2/TypeViewerPaneV2.tsx` - Edit(11), Write(2)
+- `/home/edkjo/.claude/plans/ok-lets-plan-next-noble-goose.md` - Write(1)
+- `inbox/ifcfast/python/ifcfast/model.py` - Edit(45)
+- `inbox/ifcfast/python/ifcfast/cache.py` - Edit(23)
+- `inbox/ifcfast/tests/test_graph.py` - Write(1), Edit(5)
+- `inbox/ifcfast/README.md` - Edit(9)
+- `inbox/ifcfast/python/ifcfast/__init__.py` - Edit(4), Write(1)
+- `frontend/src/hooks/useResetFiltersOnModelChange.ts` - Write(1)
+- `frontend/src/components/features/model-workspace/AnalysisDetailsRail.tsx` - Edit(5)
+- `inbox/ifcfast/docs/worklog/2026-05-15-13-17_Graph-layer-and-tier1-perf-30pct.md` - Write(1)
+- `/home/edkjo/.claude/knowledge.md` - Edit(6)
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace/memory/next-steps.md` - Write(13)
+- `inbox/ifcfast/pyproject.toml` - Edit(6)
+- `docs/worklog/2026-05-15-16-27_Filter-reset-fix-+-ModelWorkspace-rework.md` - Write(1)
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/filter-reset-on-model-change.md` - Write(1)
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/v2-rail-polish-pattern.md` - Write(1)
+- `inbox/ifcfast/python/ifcfast/cli.py` - Write(1), Edit(2)
+- `inbox/ifcfast/AGENTS.md` - Write(1), Edit(6)
+- `inbox/ifcfast/tests/test_agent_surface.py` - Write(1), Edit(1)
+- `/home/edkjo/.claude/plans/whats-next-frolicking-cookie.md` - Write(1)
+- `inbox/ifcfast/python/ifcfast/mcp_server.py` - Write(1)
+- `inbox/ifcfast/tests/test_types_and_diff.py` - Write(1)
+- `inbox/ifcfast/tests/test_mcp_server.py` - Write(1)
+- `/home/edkjo/.claude/plans/you-re-a-marketing-wizard-cuddly-tarjan.md` - Write(2)
+- `frontend/index.html` - Write(1), Edit(1)
+- `frontend/src/pages/Marketing.css` - Write(1)
+- `frontend/src/pages/Agents.tsx` - Write(1), Edit(5)
+- `frontend/src/pages/Benchmarks.tsx` - Write(1), Edit(1)
+- `frontend/src/pages/Welcome.tsx` - Edit(2)
+- `backend/config/views.py` - Edit(5)
+- `backend/apps/projects/management/commands/seed_sandbox.py` - Write(1)
+- `cli/sprucelab_mcp/pyproject.toml` - Write(1)
+- `cli/sprucelab_mcp/README.md` - Write(1), Edit(3)
+- `cli/sprucelab_mcp/sprucelab_mcp/__init__.py` - Write(1)
+- `cli/sprucelab_mcp/sprucelab_mcp/client.py` - Write(1), Edit(1)
+- `cli/sprucelab_mcp/sprucelab_mcp/server.py` - Write(1), Edit(1)
+- `cli/sprucelab_mcp/sprucelab_mcp/__main__.py` - Write(1)
+- `backend/ifc-service/services/ifc_parser_ifcfast.py` - Write(1), Edit(3)
+- `backend/ifc-service/services/ifc_parser.py` - Edit(6)
+- `backend/ifc-service/requirements.txt` - Edit(1)
+- `inbox/ifcfast-site/app/layout.tsx` - Write(1)
+- `inbox/ifcfast-site/app/globals.css` - Write(1), Edit(1)
+- `inbox/ifcfast-site/components/code.tsx` - Write(1)
+- `inbox/ifcfast-site/components/terminal.tsx` - Write(1)
+- `inbox/ifcfast-site/components/benchmark.tsx` - Write(1), Edit(1)
+- `inbox/ifcfast-site/components/mcp-install.tsx` - Write(1)
+- `inbox/ifcfast-site/app/page.tsx` - Write(1), Edit(20)
+- `docs/worklog/2026-05-15-14-31_Agent-first-marketing-pivot-Phase-1.md` - Write(1)
+- `frontend/vercel.json` - Write(2), Edit(3)
+- `inbox/ifcfast/.gitignore` - Edit(1)
+- `inbox/ifcfast-site/components/viewer.tsx` - Write(2), Edit(25)
+- `inbox/ifcfast-site/components/qto-panel.tsx` - Write(5), Edit(61)
+- `inbox/ifcfast-site/components/graph-view.tsx` - Write(3), Edit(7)
+- `docs/worklog/2026-05-15-15-03_Agent-first-marketing-Phase-1-shipped.md` - Write(1)
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/agent-first-marketing-phase-1.md` - Write(1)
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/api-domain-vercel-proxy.md` - Write(1), Edit(1)
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/ifcfast-adoption-pattern.md` - Write(1), Edit(1)
+- `inbox/ifcfast-site/components/selection-context.tsx` - Write(1), Edit(17)
+- `inbox/ifcfast-site/components/vector-graph.tsx` - Write(5), Edit(34)
+- `inbox/ifcfast-site/components/data-tabs.tsx` - Write(2)
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/deploy-pipeline-gotchas.md` - Edit(3)
+- `/tmp/sprucelab_bench.py` - Write(1)
+- `/tmp/sprucelab_bench_v2.py` - Write(1)
+- `/tmp/sprucelab_bench_v3.py` - Write(1)
+- `inbox/ifcfast/crates/core/src/mesh/brep.rs` - Edit(2)
+- `inbox/ifcfast/crates/core/src/mesh/mod.rs` - Edit(36)
+- `inbox/ifcfast/docs/worklog/2026-05-15-18-00_ifcfast-com-cross-filter-canvas-mesh-coverage.md` - Write(1)
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/feedback-github-sign-scope-machine.md` - Write(1)
+- `inbox/ifcfast/crates/core/src/mesh/profile.rs` - Edit(1)
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace/memory/feedback_gh_issues_cross_scope.md` - Write(1)
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace/memory/MEMORY.md` - Write(1), Edit(8)
+- `docs/worklog/2026-05-15-18-18_Vercel-proxy-fix-and-ifcfast-benchmark-adapter-fix.md` - Write(1)
+- `frontend/src/components/features/viewer/ViewerPane.tsx` - Write(1)
+- `inbox/ifcfast/crates/core/src/mesh/gltf.rs` - Edit(3)
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace/memory/feedback_test_on_deployed.md` - Write(1)
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/feedback-viewer-persists-isolation-drives-state.md` - Write(1)
+- `inbox/ifcfast/docs/worklog/2026-05-15-19-22_QTO-tabs-mesh-viewer-ready.md` - Write(1)
+- `inbox/ifcfast/docs/worklog/2026-05-15-19-46_Layer-sets-spatial-drill-D3-vector-graph-opening-skip.md` - Write(1)
+- `sidehustles/sprucelab/frontend/src/components/Layout/Sidebar.tsx` - Edit(2)
+- `sidehustles/sprucelab/frontend/src/i18n/locales/en.json` - Edit(2)
+- `sidehustles/sprucelab/frontend/src/i18n/locales/nb.json` - Edit(2)
+- `sidehustles/sprucelab/frontend/src/contexts/UploadContext.tsx` - Edit(3)
+- `sidehustles/sprucelab/frontend/src/hooks/use-script-execution.ts` - Edit(2)
+- `sidehustles/sprucelab/frontend/src/components/features/qto/QTODashboard.tsx` - Edit(1)
+- `sidehustles/sprucelab/frontend/src/components/features/viewer/PlatformPanel.tsx` - Edit(1)
+- `frontend/src/pages/DevHub.tsx` - Write(2), Edit(3)
+- `docs/dev.md` - Write(1), Edit(29)
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/dev-md-canonical-tracker.md` - Write(1), Edit(1)
+- `/tmp/sprucelab-16-new.md` - Write(1)
+- `sidehustles/sprucelab/frontend/src/pages/dev/QtoWorkbenchWireframe.tsx` - Write(3)
+- `docs/worklog/2026-05-16-10-35_ViewerPane-persistent-viewer-spine-tracker.md` - Write(1)
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/feedback-deprecate-or-develop-never-default-cut.md` - Write(1)
+- `sidehustles/sprucelab/frontend/src/App.tsx` - Edit(4)
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/spine-three-primitives.md` - Write(1)
+- `inbox/ifcfast-site/app/dev/workbench/page.tsx` - Write(1), Edit(5)
+- `inbox/ifcfast-site/app/dev/workbench/dash-tile.tsx` - Write(2), Edit(37)
+- `/home/edkjo/dev/sidehustles/sprucelab/CLAUDE.md` - Edit(2)
+- `/home/edkjo/dev/sidehustles/sprucelab/docs/worklog/2026-05-16-11-29_Worklog-signature-convention-+-Phase-1-followup.md` - Write(1), Edit(3)
+- `/home/edkjo/.claude/CLAUDE.md` - Edit(1)
+- `/home/edkjo/.claude/worklog/2026-05-16-11-32_Worklog-signature-convention-system-wide.md` - Write(1)
+- `docs/plans/2026-05-16_user-feedback-stream-finish-line.md` - Write(1)
+- `README.md` - Edit(3)
+- `docs/worklog/2026-05-16-16-14_devhub-shared-and-feedback-stream-absorbed.md` - Write(1)
+- `inbox/ifcfast-site/app/dev/workbench/findings.ts` - Write(1), Edit(11)
+- `inbox/ifcfast-site/components/findings-view.tsx` - Write(2), Edit(10)
+- `/tmp/make_test_ifc.py` - Write(2)
+- `inbox/ifcfast/scripts/generate_sample_sidecars.py` - Write(1), Edit(31)
+- `/tmp/make_ghost_probe_ifc.py` - Write(1)
+- `/tmp/make_shapes_probe_ifc.py` - Write(1), Edit(3)
+- `inbox/ifcfast-site/components/ifc-palette.ts` - Write(2), Edit(2)
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace/memory/feedback_no_silent_drops.md` - Write(1)
+- `docs/worklog/2026-05-17-02-08_v3-cross-filter-four-bugs-fixed.md` - Write(1), Edit(1)
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/v3-visibility-culler-needs-update.md` - Write(1)
+- `frontend/src/pages/FederatedViewer.tsx` - Edit(2)
+- `docs/worklog/2026-05-17-21-40_cross-filter-feels-right-second-pass.md` - Write(1)
+- `inbox/ifcfast/docs/worklog/2026-05-17-21-40_ifcfast-com-workbench-layout-A-live-trust-principle.md` - Write(1)
+- `/home/edkjo/.claude/plans/the-website-is-starting-robust-sparrow.md` - Write(1), Edit(3)
+- `frontend/src/hooks/use-project-materials.ts` - Edit(5)
+- `frontend/src/components/features/materials/MaterialsKpiHeader.tsx` - Edit(8)
+- `frontend/src/components/features/materials/MaterialsTable.tsx` - Edit(8)
+- `frontend/src/components/features/materials/MaterialsTopN.tsx` - Edit(11)
+- `frontend/src/components/features/materials/MaterialBrowserView.tsx` - Edit(56), Write(2)
+- `frontend/src/components/features/materials/MaterialUsageDonut.tsx` - Edit(3)
+- `inbox/ifcfast/crates/core/src/lib.rs` - Edit(6)
+- `docs/drafts/2026-05-18_gh-issue-17-closure-comment.md` - Write(1)
+- `frontend/src/contexts/UploadContext.tsx` - Edit(4)
+- `frontend/src/components/ModelUploadDialog.tsx` - Edit(3)
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/feedback-supabase-storage-env-on-railway.md` - Write(2)
+- `docs/drafts/2026-05-18_gh-issue-15-partial-closure-comment.md` - Write(1)
+- `inbox/ifcfast/docs/worklog/2026-05-18-07-50_Close-three-capability-gaps-IfcSpace-Voids-DefinesByType.md` - Write(1)
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace/memory/feedback_close_gaps_dont_decorate.md` - Write(1)
+- `backend/apps/accounts/migrations/0003_enable_rls_on_public_tables.py` - Write(1)
+- `backend/apps/entities/views/types.py` - Edit(5)
+- `backend/apps/projects/views.py` - Edit(5)
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/region-strategy-amsterdam-stays.md` - Write(1), Edit(1)
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/ifc-annotation-cannot-be-typed.md` - Write(1), Edit(2)
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/survey-point-lifecycle-and-anchor.md` - Write(1)
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/survey-point-objecttype-vocabulary.md` - Write(2), Edit(4)
+- `docs/worklog/2026-05-18-14-13_cross-filter-wrapup-materials-upload-security-perf-survey-vocab.md` - Write(1)
+- `tests/unit/test_project_materials_endpoint.py` - Write(1)
+- `docs/worklog/2026-05-18-12-40_materials-fanout-collapse.md` - Write(1)
+- `tests/unit/test_types_instances_zero_count.py` - Write(1), Edit(1)
+- `inbox/ifcfast/crates/core/src/mesh/boolean.rs` - Write(1), Edit(2)
+- `docs/wireframes/2026-05-18_model-dash-10-options.html` - Write(4), Edit(19)
+- `inbox/ifcfast/crates/core/src/mesh/mapped.rs` - Edit(9)
+- `inbox/ifcfast/crates/core/src/mesh/extrusion.rs` - Edit(1)
+- `inbox/ifcfast/crates/core/tests/mesh_reveal.rs` - Write(1), Edit(12)
+- `inbox/ifcfast/docs/worklog/2026-05-18-11-30_Reveal-all-mesh-dispatch-boolean-csg-halfspace.md` - Write(1), Edit(2)
+- `frontend/src/pages/dev/ModelDashPreview.tsx` - Write(1), Edit(4)
+- `frontend/src/pages/dev/ModelDashPreviewV2.tsx` - Write(1)
+- `frontend/src/pages/dev/ModelDashboards.tsx` - Write(1), Edit(1)
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace/memory/project_ifcfast_north_star.md` - Write(1)
+- `frontend/src/pages/ModelDashboards.tsx` - Write(1), Edit(8)
+- `frontend/src/pages/ChartCatalog.tsx` - Write(1), Edit(19)
+- `frontend/src/components/features/model-dashboard/charts.tsx` - Write(1), Edit(7)
+- `frontend/src/components/features/model-dashboard/ModelDashboardBody.tsx` - Write(1), Edit(21)
+- `frontend/.env.local` - Edit(1)
+- `frontend/src/pages/ModelDashboardPreview.tsx` - Write(1)
+- `inbox/ifcfast/docs/worklog/2026-05-18-21-34_Close-mesh-issues-expose-segments-rip-ifcopenshell.md` - Write(1)
+- `frontend/src/components/Layout/DashboardGrid.tsx` - Edit(2)
+- `docs/worklog/2026-05-19-08-34_dashboard-design-discovery-and-8x5-basemap.md` - Write(1)
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/dashboard-8x5-basemap.md` - Write(1), Edit(1)
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/synth-guid-instances-404.md` - Write(1)
+- `inbox/ifcfast/docs/worklog/2026-05-19-09-08_Indexer-18-doorstyle-windowstyle-and-WIP-flush.md` - Write(1)
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace/memory/feedback_confirm_push_to_default_branch.md` - Write(2), Edit(1)
+- `inbox/ifcfast/docs/worklog/2026-05-19-10-32_17-evidence-survey-and-side-findings.md` - Write(1)
+- `inbox/ifcfast/crates/core/src/mesh/curveset.rs` - Write(1)
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace/memory/feedback_ifcfast_industry_scope.md` - Write(1)
+- `inbox/ifcfast/crates/core/src/mesh/csg_primitive.rs` - Write(1)
+- `inbox/ifcfast/crates/core/src/mesh/revolved.rs` - Write(1)
+- `docs/worklog/2026-05-19-12-29_model-dash-iteration-feedback-loop.md` - Write(1)
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/empty-states-notconfigured-vs-nodata.md` - Write(1)
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/ids-is-the-validation-artifact.md` - Write(1)
+- `frontend/src/components/features/materials/MaterialsKpiCluster.tsx` - Write(1), Edit(15)
+- `frontend/src/components/features/materials/MaterialsFamilyTreemap.tsx` - Edit(10)
+- `backend/apps/entities/models/material_override.py` - Write(1), Edit(1)
+- `backend/apps/entities/models/__init__.py` - Edit(4)
+- `backend/apps/entities/migrations/0045_materialoverride.py` - Write(1)
+- `backend/apps/entities/serializers.py` - Edit(2)
+- `backend/apps/entities/views/library.py` - Edit(2)
+- `backend/apps/entities/views/__init__.py` - Edit(4)
+- `backend/apps/entities/urls.py` - Edit(4)
+- `frontend/src/hooks/use-material-overrides.ts` - Write(1)
+- `frontend/src/hooks/use-libraries.ts` - Write(1)
+- `frontend/src/components/features/materials/MaterialDetailTabs.tsx` - Edit(11)
+- `frontend/src/pages/ProjectProductLibrary.tsx` - Write(1)
+- `frontend/src/pages/ProjectEPDLibrary.tsx` - Write(1)
+- `backend/apps/entities/models/material_component.py` - Write(1)
+- `frontend/src/hooks/use-material-components.ts` - Write(1)
+- `frontend/src/components/features/materials/MaterialCompositeSankey.tsx` - Write(1)
+- `inbox/ifcfast/docs/worklog/2026-05-19-16-45_close-17-handlers-and-prune-stray-vercel-project.md` - Write(1)
+- `docs/worklog/2026-05-19-21-55_materials-dash-grid-rebuild-and-editing.md` - Write(1)
+- `inbox/ifcfast/crates/core/Cargo.toml` - Edit(4)
+- `inbox/ifcfast/crates/core/src/bundle/mod.rs` - Write(1), Edit(10)
+- `inbox/ifcfast/crates/core/src/bundle/record.rs` - Write(2), Edit(7)
+- `inbox/ifcfast/crates/core/src/bundle/parquet_sink.rs` - Write(2), Edit(7)
+- `inbox/ifcfast/crates/core/src/bin/bundle.rs` - Write(2)
+- `/home/edkjo/.claude/plans/do-a-review-of-concurrent-riddle.md` - Write(2)
+- `frontend/src/hooks/useProjectFilterPersist.ts` - Edit(1)
+- `frontend/src/components/filters/SavedFiltersDropdown.tsx` - Edit(1)
+- `frontend/src/components/Layout/dashboard-surface-types.ts` - Write(1), Edit(2)
+- `frontend/src/components/Layout/DashboardSurface.tsx` - Write(1), Edit(9)
+- `frontend/src/components/Layout/index.ts` - Edit(1)
+- `frontend/src/components/filters/DashboardFilterChips.tsx` - Write(1)
+- `frontend/src/components/dashboard-tiles/KpiTile.tsx` - Write(2), Edit(6)
+- `frontend/src/components/dashboard-tiles/BarTile.tsx` - Write(1)
+- `frontend/src/components/dashboard-tiles/TreemapTile.tsx` - Write(1)
+- `frontend/src/components/dashboard-tiles/TopNTile.tsx` - Write(1)
+- `frontend/src/components/dashboard-tiles/TableTile.tsx` - Write(1), Edit(2)
+- `frontend/src/components/dashboard-tiles/index.ts` - Write(1)
+- `frontend/src/pages/ProjectDashboard.tsx` - Write(1)
+- `docs/worklog/2026-05-20-09-47_dashboard-engine-resolver-shipped.md` - Write(1)
+- `inbox/ifcfast/docs/worklog/2026-05-20-10-00_streaming-geoparquet-substrate-vertical-slice.md` - Write(1)
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/dashboard-engine-v1-shipped.md` - Write(1)
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/materials-family-is-canonical-dimension.md` - Write(1)
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace/memory/project_ifcfast_substrate_output.md` - Write(1)
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace/memory/feedback_only_awesome_cross_industry.md` - Write(1)
+- `frontend/src/components/filters/ClearAllFiltersButton.tsx` - Write(1)
+- `frontend/src/components/features/warehouse-v2/TypeBrowserFilterBarV2.tsx` - Edit(2)
+- `frontend/src/components/features/warehouse-v2/TypeTreemap.tsx` - Edit(8)
+- `/home/edkjo/.claude/plans/whats-next-real-and-zippy-mist.md` - Write(1)
+- `frontend/src/components/features/warehouse-v2/TypeTableV2.tsx` - Edit(5)
+- `frontend/src/components/features/warehouse-v2/TypeTopBarList.tsx` - Edit(7)
+- `frontend/src/styles/globals.css` - Edit(11)
+- `frontend/src/hooks/usePaletteTheme.ts` - Write(1), Edit(1)
+- `frontend/src/components/Layout/PaletteToggle.tsx` - Write(1), Edit(1)
+- `frontend/src/main.tsx` - Edit(1)
+- `inbox/ifcfast/docs/worklog/2026-05-20-15-00_hierarchical-instanced-substrate.md` - Write(1)
+- `frontend/src/components/features/warehouse-v2/TypeKpiGrid.tsx` - Edit(14)
+- `/home/edkjo/.claude/plans/ok-lets-keep-pushing-drifting-snowflake.md` - Write(1)
+- `/tmp/measure_rss.py` - Write(1)
+- `/tmp/parquet_fingerprint.py` - Write(2)
+- `frontend/src/components/dashboard-tiles/index.tsx` - Edit(1)
+- `/tmp/parquet_diff.py` - Write(1)
+- `inbox/ifcfast/docs/worklog/2026-05-20-15-46_bundle-string-interning-and-zero-clone-regrouping.md` - Write(1), Edit(4)
+- `docs/worklog/2026-05-21-08-30_cross-filter-leader-observer-palette-toggle-kpi-consolidation.md` - Write(1)
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/canonical-kpi-tile.md` - Write(1)
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/cross-filter-leader-observer.md` - Write(1)
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/palette-toggle-mono.md` - Write(1)
+- `inbox/ifcfast/Cargo.toml` - Edit(3)
+- `inbox/ifcfast/crates/core/src/mesh/qto.rs` - Write(1), Edit(5)
+- `docs/worklog/2026-05-21-09-35_treemap-dim-removed-viewer-noise-silenced.md` - Write(1)
+- `inbox/ifcfast/docs/worklog/2026-05-21-12-40_QTO-engine-shipped-to-PyPI.md` - Write(1)
+- `inbox/ifcfast/crates/core/src/extractors/psets.rs` - Edit(2)
+- `inbox/ifcfast/docs/worklog/2026-05-22-10-17_testing-agent-sweep-overflow-bucket-and-casing-fixes.md` - Write(1)
+- `docs/worklog/2026-05-22-10-18_family-hq-scoping.md` - Write(1)
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-family-hq/memory/MEMORY.md` - Write(1)
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-family-hq/memory/project_shape.md` - Write(1)
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-family-hq/memory/project_savings_buckets.md` - Write(1)
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-family-hq/memory/project_import_strategy.md` - Write(1)
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-family-hq/memory/project_open_decisions.md` - Write(1)
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-family-hq/memory/next-steps.md` - Write(1)
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/feedback-dashboards-are-fluff-workflow-first.md` - Write(1)
+- `frontend/src/hooks/use-project-config.ts` - Write(1)
+- `frontend/src/pages/ProjectSettingsPage.tsx` - Edit(29), Write(1)
+- `crates/core/src/mesh/mod.rs` - Edit(9)
+- `crates/core/src/bundle/parquet_sink.rs` - Edit(12)
+- `crates/core/tests/mesh_reveal.rs` - Edit(3)
+- `crates/core/src/indexer.rs` - Edit(5)
+- `crates/core/src/bundle/record.rs` - Edit(3)
+- `backend/apps/entities/services/eir_rule_translator.py` - Write(1), Edit(5)
+- `tests/unit/test_eir_rule_translator.py` - Write(1), Edit(2)
+- `crates/core/src/extractors/materials.rs` - Edit(19)
+- `tests/unit/test_verification_engine.py` - Edit(2)
+- `crates/core/src/bundle/mod.rs` - Edit(4)
+- `crates/core/src/lib.rs` - Edit(18)
+- `frontend/src/hooks/use-model-verification.ts` - Write(1), Edit(1)
+- `crates/core/Cargo.toml` - Edit(10)
+- `crates/core/src/source.rs` - Write(1), Edit(2)
+- `crates/core/src/bin/bundle.rs` - Edit(2)
+- `crates/core/src/bin/mesh.rs` - Edit(2)
+- `crates/core/src/bin/bench.rs` - Edit(2)
+- `Cargo.toml` - Edit(9)
+- `pyproject.toml` - Edit(9)
+- `python/ifcfast/__init__.py` - Edit(11)
+- `docs/worklog/2026-05-26-09-30_v0-4-1-substrate-reveal-all-and-ifczip.md` - Write(1)
+- `backend/apps/entities/tasks.py` - Edit(1)
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/feedback-classification-is-legacy-workspace-tier.md` - Write(1)
+- `backend/apps/issues/__init__.py` - Write(1)
+- `backend/apps/issues/apps.py` - Write(1)
+- `backend/apps/issues/models.py` - Write(1)
+- `backend/apps/issues/serializers.py` - Write(1)
+- `backend/apps/issues/views.py` - Write(1)
+- `backend/apps/issues/urls.py` - Write(1)
+- `backend/apps/issues/admin.py` - Write(1)
+- `backend/config/urls.py` - Edit(2)
+- `backend/apps/issues/migrations/__init__.py` - Write(1)
+- `backend/apps/issues/migrations/0001_initial.py` - Write(1)
+- `tests/unit/test_issues_from_verification.py` - Write(1)
+- `frontend/src/hooks/use-issues.ts` - Write(1)
+- `frontend/src/pages/ProjectIssuesPage.tsx` - Write(1)
+- `docs/worklog/2026-05-26-10-21_workflow-loop-EIR-verify-KPI-Issues.md` - Write(1)
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/workflow-loop-closed.md` - Write(1)
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/feedback-zero-tolerance-on-designated-coords.md` - Write(1)
+- `frontend/src/components/features/settings/eirSections.ts` - Write(1), Edit(7)
+- `frontend/src/components/features/settings/EirSection.tsx` - Write(2), Edit(5)
+- `frontend/src/components/features/settings/EirRuleCard.tsx` - Write(1), Edit(1)
+- `frontend/src/components/features/settings/eirRules.ts` - Edit(24)
+- `frontend/src/components/features/settings/eirConfig.ts` - Edit(5)
+- `frontend/src/components/features/settings/PsetPropertyEditor.tsx` - Write(1)
+- `frontend/src/components/features/settings/EirConfigurator.tsx` - Edit(12)
+- `docs/worklog/2026-05-26-12-24_v0-4-1-pypi-publish-closure.md` - Write(1)
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-inbox-ifcfast/memory/MEMORY.md` - Write(2)
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-inbox-ifcfast/memory/project-overview.md` - Write(1)
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-inbox-ifcfast/memory/release-flow.md` - Write(1)
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-inbox-ifcfast/memory/substrate-architecture.md` - Write(1)
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-inbox-ifcfast/memory/product-type-membership.md` - Write(1)
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-inbox-ifcfast/memory/testing-sweep-residuals.md` - Write(1)
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-inbox-ifcfast/memory/next-steps.md` - Write(2)
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/authoring-tool-config-export.md` - Write(1)
+- `backend/apps/projects/services/revit_pset_export.py` - Write(1), Edit(1)
+- `python/ifcfast/header.py` - Edit(4)
+- `frontend/src/components/features/settings/eirPresets.ts` - Write(1), Edit(1)
+- `tests/test_smoke.py` - Edit(3)
+- `frontend/src/components/features/settings/mmiPresets.ts` - Write(1)
+- `frontend/src/components/features/settings/MmiLevelEditor.tsx` - Write(1)
+- `crates/core/src/mesh/qto.rs` - Edit(8)
+- `crates/core/src/extractors/quantities.rs` - Edit(2)
+- `crates/core/src/mesh/stats.rs` - Edit(5)
+- `python/ifcfast/cache.py` - Edit(1)
+- `crates/core/src/extractors/psets.rs` - Edit(12)
+- `crates/core/tests/bundle_integration.rs` - Write(1)
+- `crates/core/src/extractors/classifications.rs` - Edit(1)
+- `docs/worklog/2026-05-26-16-26_EIR-builder-from-legit-horrible-to-real.md` - Write(1)
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/eir-builder-rebuild.md` - Write(1)
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/project-creation-collect-basics-upfront.md` - Write(1), Edit(2)
+- `backend/apps/projects/models.py` - Edit(1)
+- `backend/apps/projects/serializers.py` - Edit(1)
+- `tests/unit/test_project_creation_seeding.py` - Write(1), Edit(1)
+- `frontend/src/components/CreateProjectDialog.tsx` - Write(1), Edit(6)
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/profile-personal-vs-company-issued.md` - Write(1), Edit(1)
+- `backend/apps/accounts/models.py` - Edit(1)
+- `backend/apps/accounts/serializers.py` - Write(1)
+- `backend/apps/accounts/companies_urls.py` - Write(1)
+- `tests/unit/test_company_workspace.py` - Write(1)
+- `frontend/src/lib/me.ts` - Edit(1)
+- `frontend/src/lib/companies.ts` - Write(1)
+- `frontend/src/pages/PersonalProfilePage.tsx` - Write(1)
+- `frontend/src/pages/CompanyProfilePage.tsx` - Write(1)
+- `docs/worklog/2026-05-27-11-51_Pofin-gap-cards-create-dialog-seeding-company-workspace.md` - Write(1), Edit(5)
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/company-workspace-shipped.md` - Write(1)
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/feedback-gh-issues-as-task-tracker.md` - Write(1)
+- `docs/worklog/2026-05-27-00-04_substrate-completeness-v0-4-4-through-v0-4-7.md` - Write(1)
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-inbox-ifcfast/memory/cache-schema-versioning.md` - Write(1)
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-inbox-ifcfast/memory/mesh-quality-classifier.md` - Write(1)
+- `/home/edkjo/.claude/commands/worklog.md` - Edit(1)
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-inbox-ifcfast/memory/materials-psets-coverage.md` - Write(1)
+- `crates/core/src/mesh/sample.rs` - Write(1)
+- `python/ifcfast/model.py` - Edit(10)
+- `crates/core/src/entity_table.rs` - Edit(2)
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/feedback-eir-curated-not-canvas.md` - Write(1)
+- `frontend/src/components/features/settings/SiteTabDashboard.tsx` - Write(1), Edit(4)
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/feedback-hero-tiles-fill-viewport.md` - Write(1)
+- `frontend/src/components/features/settings/IfcBasicsTabDashboard.tsx` - Write(1), Edit(3)
+- `frontend/src/components/features/settings/PsetsTabDashboard.tsx` - Write(1), Edit(1)
+- `frontend/src/components/features/settings/PmTabDashboard.tsx` - Write(1), Edit(2)
+- `frontend/src/pages/DeliveryMatrixPage.tsx` - Write(1)
+- `frontend/src/pages/ProjectSettingsShell.tsx` - Write(1)
+- `frontend/src/hooks/use-project-access.ts` - Write(1)
+- `docs/worklog/2026-05-28-17-12_curated-eir-tabs-sidebar-regroup-settings-shell.md` - Write(1)
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/eir-curated-tabs-and-settings-shipped.md` - Write(1)
+- `-site/app/layout.tsx` - Edit(1)
+- `-site/components/terminal.tsx` - Edit(1)
+- `-site/components/qto-panel.tsx` - Edit(9)
+- `-site/app/page.tsx` - Write(1)
+- `AGENTS.md` - Edit(5)
+- `tests/test_agent_surface.py` - Edit(1)
+- `-site/components/vector-graph.tsx` - Edit(1)
+- `crates/core/src/mesh/profile.rs` - Edit(1)
+- `docs/worklog/2026-05-29-12-56_stale-chunk-recovery-lazywithreload.md` - Write(1)
+- `crates/core/src/mesh/placement.rs` - Edit(1)
+
+## Cross-Directory Edits
+The following files were edited outside the session directory (`/home/edkjo/workspace/inbox/ifcfast`):
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/feedback-click-same-tile-toggles-off.md`
+- `crates/core/src/extractors/classifications.rs`
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/v3-visibility-culler-needs-update.md`
+- `crates/core/src/mesh/qto.rs`
+- `docs/worklog/2026-05-29-12-56_stale-chunk-recovery-lazywithreload.md`
+- `docs/wireframes/model-kpi-dion.html`
+- `docs/worklog/2026-05-16-16-14_devhub-shared-and-feedback-stream-absorbed.md`
+- `frontend/src/components/Layout/Sidebar.tsx`
+- `/home/edkjo/.claude/commands/worklog.md`
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/feedback-deprecate-or-develop-never-default-cut.md`
+- `inbox/ifcfast/crates/core/src/mesh/mapped.rs`
+- `frontend/src/pages/admin/AdminLogs.tsx`
+- `docs/wireframes/2026-05-18_model-dash-10-options.html`
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/rules-engine-strategy-build-vs-integrate.md`
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/feedback-supabase-storage-env-on-railway.md`
+- `docs/worklog/2026-05-13-22-04_Storey-verification-GUID-bridge-KPI-rework-Wireframe-kit-Dashboard-engine-vision.md`
+- `frontend/src/components/features/materials/MaterialDetailTabs.tsx`
+- `docs/wireframes/admin.html`
+- `frontend/src/components/features/model-workspace/VerifiedStoreyChart.tsx`
+- `frontend/src/hooks/use-project-materials.ts`
+- `backend/apps/models/management/commands/backfill_v3_fragments.py`
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-inbox-ifcfast/memory/project-overview.md`
+- `docs/worklog/2026-05-17-21-40_cross-filter-feels-right-second-pass.md`
+- `backend/apps/issues/models.py`
+- `/tmp/make_shapes_probe_ifc.py`
+- `tests/unit/test_backfill_thumbnails.py`
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace/memory/MEMORY.md`
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/feedback-gh-issues-as-task-tracker.md`
+- `CLAUDE.md`
+- `frontend/src/components/ModelUploadDialog.tsx`
+- `frontend/src/pages/ProjectDashboard.tsx`
+- `backend/apps/accounts/migrations/0003_enable_rls_on_public_tables.py`
+- `backend/apps/entities/models/__init__.py`
+- `frontend/src/pages/admin/AdminUsers.tsx`
+- `inbox/ifcfast/crates/core/src/mesh/csg_primitive.rs`
+- `frontend/src/components/features/settings/MmiLevelEditor.tsx`
+- `inbox/ifcfast/crates/core/src/bin/bundle.rs`
+- `projects/ifcfast/python/ifcfast/federated_floors.py`
+- `backend/ifc-service/api/fragments.py`
+- `frontend/src/pages/ProjectEPDLibrary.tsx`
+- `docs/worklog/2026-05-15-14-31_Agent-first-marketing-pivot-Phase-1.md`
+- `docs/wireframes/project-my-page.html`
+- `sidehustles/sprucelab/frontend/src/App.tsx`
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/fragments-v3-spatial-tree-shape.md`
+- `projects/ifcfast/README.md`
+- `inbox/ifcfast-site/components/mcp-install.tsx`
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-family-hq/memory/MEMORY.md`
+- `cli/sprucelab_mcp/sprucelab_mcp/__main__.py`
+- `inbox/ifcfast/crates/core/src/bundle/record.rs`
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/feedback-eir-curated-not-canvas.md`
+- `frontend/src/pages/ProjectsGallery.tsx`
+- `README.md`
+- `docs/worklog/2026-05-21-09-35_treemap-dim-removed-viewer-noise-silenced.md`
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/feedback-coordinator-rounds-must-include-frontend.md`
+- `docs/wireframes/webhook-deliveries.html`
+- `frontend/src/lib/embed/types.ts`
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/region-strategy-amsterdam-stays.md`
+- `frontend/src/components/features/settings/PsetsTabDashboard.tsx`
+- `frontend/src/lib/api-types.ts`
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/canonical-kpi-tile.md`
+- `docs/wireframes/_light.css`
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/v2-rail-polish-pattern.md`
+- `cli/sprucelab_mcp/README.md`
+- `pyproject.toml`
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/api-domain-vercel-proxy.md`
+- `docs/wireframes/project-claims.html`
+- `frontend/src/components/features/settings/EirRuleCard.tsx`
+- `backend/lib/ifc_toolkit/analyze.py`
+- `tests/unit/test_project_materials_endpoint.py`
+- `inbox/ifcfast-site/app/dev/workbench/dash-tile.tsx`
+- `inbox/ifcfast-site/components/selection-context.tsx`
+- `inbox/ifcfast/python/ifcfast/__init__.py`
+- `frontend/src/lib/companies.ts`
+- `projects/ifcfast/docs/history/audit/README.md`
+- `/home/edkjo/.claude/plans/the-website-is-starting-robust-sparrow.md`
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/feedback-verify-agent-diffs-before-applying.md`
+- `projects/ifcfast/docs/worklog/2026-05-13-11-45_Workspace-relocation-and-dev-CLAUDE-md-update.md`
+- `backend/apps/entities/services/verification_engine.py`
+- `docs/wireframes/projects-gallery.html`
+- `inbox/ifcfast/python/ifcfast/cli.py`
+- `-site/components/qto-panel.tsx`
+- `frontend/src/hooks/use-material-components.ts`
+- `frontend/src/components/features/warehouse-v2/TypeTreemap.tsx`
+- `frontend/src/pages/Benchmarks.tsx`
+- `docs/worklog/2026-05-26-12-24_v0-4-1-pypi-publish-closure.md`
+- `backend/apps/entities/services/analysis_ingestion.py`
+- `inbox/ifcfast/docs/worklog/2026-05-15-15-00_Tier1-indexer-dispatch-perf.md`
+- `crates/core/src/lib.rs`
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/feedback-hero-tiles-fill-viewport.md`
+- `frontend/src/components/features/warehouse-v2/TypeDataRail.tsx`
+- `inbox/ifcfast-site/components/ifc-palette.ts`
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/dashboard-engine-architecture.md`
+- `backend/apps/projects/management/commands/seed_sandbox.py`
+- `inbox/ifcfast/crates/core/src/mesh/curveset.rs`
+- `frontend/src/components/features/model-workspace/AnalysisKpiCluster.tsx`
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/ids-is-the-validation-artifact.md`
+- `frontend/src/components/features/settings/EirSection.tsx`
+- `inbox/ifcfast-site/app/page.tsx`
+- `docs/worklog/2026-05-15-15-02_Latency-floor-decomposition-conn_max_age-CACHES.md`
+- `frontend/src/hooks/use-model-analysis.ts`
+- `/tmp/measure_rss.py`
+- `sidehustles/sprucelab/frontend/src/pages/dev/QtoWorkbenchWireframe.tsx`
+- `frontend/src/components/dashboard-tiles/TreemapTile.tsx`
+- `projects/ifcfast/python/ifcfast/cache.py`
+- `frontend/index.html`
+- `backend/ifc-service/requirements.txt`
+- `frontend/tailwind.config.ts`
+- `frontend/src/components/features/model-workspace/StatisticsTab.tsx`
+- `docs/worklog/2026-05-15-07-12_URL-filter-validation-self-heal.md`
+- `frontend/src/components/filters/SavedFiltersDropdown.tsx`
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/authoring-tool-config-export.md`
+- `/home/edkjo/.claude/plans/whats-next-frolicking-cookie.md`
+- `frontend/src/pages/dev/ModelDashPreview.tsx`
+- `docs/worklog/2026-05-22-10-18_family-hq-scoping.md`
+- `frontend/src/components/features/warehouse-v2/TypeTopBarList.tsx`
+- `/home/edkjo/.claude/plans/lets-pick-up-where-delegated-rabin.md`
+- `frontend/src/components/features/materials/MaterialUsageDonut.tsx`
+- `.claude/worktrees/agent-a5405390cec573ac1/frontend/src/components/features/viewer/UnifiedBIMViewer.tsx`
+- `frontend/src/components/dashboard-tiles/TopNTile.tsx`
+- `docs/worklog/2026-05-13-23-10_Layer-2-GUID-bridge-ifc-class-URL-persist.md`
+- `docs/worklog/2026-05-15-15-03_Agent-first-marketing-Phase-1-shipped.md`
+- `frontend/src/hooks/use-libraries.ts`
+- `frontend/src/pages/FederatedViewer.tsx`
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/grouping-axes-data-foundation.md`
+- `frontend/src/pages/PersonalProfilePage.tsx`
+- `.claude/worktrees/agent-a5405390cec573ac1/backend/ifc-service/scripts/convert-to-fragments.mjs`
+- `frontend/src/components/admin/AdminLayout.tsx`
+- `frontend/src/pages/dev/ModelDashPreviewV2.tsx`
+- `backend/ifc-service/services/ifc_parser_ifcfast.py`
+- `docs/plans/2026-05-16_user-feedback-stream-finish-line.md`
+- `frontend/src/pages/ModelWorkspace.tsx`
+- `backend/apps/entities/serializers.py`
+- `frontend/src/components/features/materials/MaterialCompositeSankey.tsx`
+- `backend/lib/ifc_toolkit/storeys.py`
+- `inbox/ifcfast-site/components/terminal.tsx`
+- `sidehustles/sprucelab/frontend/src/i18n/locales/en.json`
+- `frontend/src/lib/design-tokens.ts`
+- `docs/wireframes/embed.html`
+- `docs/wireframes/viewer-groups.html`
+- `backend/config/settings.py`
+- `docs/wireframes/project-dashboard.html`
+- `tests/unit/test_issues_from_verification.py`
+- `docs/worklog/2026-05-13-10-31_Card-iterations-snapshot-pipeline-backfill.md`
+- `backend/apps/issues/migrations/__init__.py`
+- `inbox/ifcfast/docs/worklog/2026-05-18-07-50_Close-three-capability-gaps-IfcSpace-Voids-DefinesByType.md`
+- `docs/wireframes/project-types.html`
+- `frontend/src/pages/ModelDashboards.tsx`
+- `inbox/ifcfast/crates/core/src/mesh/mod.rs`
+- `docs/worklog/2026-05-19-08-34_dashboard-design-discovery-and-8x5-basemap.md`
+- `backend/apps/issues/__init__.py`
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/workflow-loop-closed.md`
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/feedback-github-sign-scope-machine.md`
+- `frontend/src/components/features/materials/MaterialsTable.tsx`
+- `frontend/src/components/features/materials/MaterialsFamilyTreemap.tsx`
+- `frontend/src/components/filters/DashboardFilterChips.tsx`
+- `docs/wireframes/welcome.html`
+- `frontend/src/components/dashboard-tiles/BarTile.tsx`
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/positioning-bim-coordination-first.md`
+- `frontend/src/components/features/warehouse-v2/TypeBrowserFilterBarV2.tsx`
+- `frontend/src/hooks/use-project-config.ts`
+- `frontend/src/components/features/model-dashboard/ModelDashboardBody.tsx`
+- `cli/sprucelab_mcp/sprucelab_mcp/client.py`
+- `docs/worklog/2026-05-18-12-40_materials-fanout-collapse.md`
+- `docs/wireframes/project-eir.html`
+- `projects/ifcfast/LICENSE`
+- `backend/apps/entities/views/__init__.py`
+- `frontend/src/components/ui/CardDensityToggle.tsx`
+- `inbox/ifcfast/docs/worklog/2026-05-17-21-40_ifcfast-com-workbench-layout-A-live-trust-principle.md`
+- `frontend/src/components/features/settings/PsetPropertyEditor.tsx`
+- `backend/apps/entities/tasks.py`
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace/memory/feedback_gh_issues_cross_scope.md`
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-inbox-ifcfast/memory/product-type-membership.md`
+- `frontend/src/hooks/use-material-overrides.ts`
+- `/home/edkjo/.claude/plans/hiding-opening-elements-is-floating-lemon.md`
+- `inbox/ifcfast/docs/worklog/2026-05-20-10-00_streaming-geoparquet-substrate-vertical-slice.md`
+- `frontend/src/pages/admin/AdminProcessing.tsx`
+- `frontend/src/hooks/useProjectFilterValidate.ts`
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-family-hq/memory/project_shape.md`
+- `frontend/src/hooks/useProjectFilterPersist.ts`
+- `frontend/src/pages/ModelDashboardPreview.tsx`
+- `crates/core/src/mesh/placement.rs`
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/filter-reset-on-model-change.md`
+- `docs/wireframes/_project-shell.html`
+- `docs/worklog/2026-05-27-11-51_Pofin-gap-cards-create-dialog-seeding-company-workspace.md`
+- `frontend/src/lib/colorMath.ts`
+- `frontend/src/pages/admin/AdminWebhooks.tsx`
+- `backend/apps/projects/services/revit_pset_export.py`
+- `backend/apps/issues/admin.py`
+- `frontend/src/App.tsx`
+- `frontend/src/components/features/settings/eirSections.ts`
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/feedback-dashboards-are-fluff-workflow-first.md`
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace/memory/feedback_confirm_push_to_default_branch.md`
+- `backend/apps/issues/migrations/0001_initial.py`
+- `frontend/src/components/features/settings/eirRules.ts`
+- `backend/config/urls.py`
+- `inbox/ifcfast/CHANGELOG.md`
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-family-hq/memory/project_import_strategy.md`
+- `frontend/src/pages/DevHub.tsx`
+- `frontend/src/contexts/UploadContext.tsx`
+- `frontend/src/pages/AdminDashboard.tsx`
+- `-site/app/layout.tsx`
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace/memory/next-steps.md`
+- `crates/core/src/extractors/materials.rs`
+- `tests/unit/test_admin_dashboard_stats.py`
+- `inbox/ifcfast/tests/test_graph.py`
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/palette-toggle-mono.md`
+- `projects/ifcfast/docs/worklog/2026-05-13-08-13_Standalone-repo-extraction-from-ifc-workbench.md`
+- `frontend/src/hooks/use-model-verification.ts`
+- `projects/ifcfast/Cargo.toml`
+- `inbox/ifcfast/crates/core/tests/mesh_reveal.rs`
+- `docs/worklog/2026-05-17-02-08_v3-cross-filter-four-bugs-fixed.md`
+- `inbox/ifcfast/docs/worklog/2026-05-22-10-17_testing-agent-sweep-overflow-bucket-and-casing-fixes.md`
+- `backend/ifc-service/services/ifc_parser.py`
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/company-workspace-shipped.md`
+- `backend/apps/issues/apps.py`
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/feedback-text-scales-with-component.md`
+- `docs/wireframes/project-drawings.html`
+- `inbox/ifcfast-site/components/vector-graph.tsx`
+- `frontend/src/pages/dev/ModelDashboards.tsx`
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/feedback-classification-is-legacy-workspace-tier.md`
+- `inbox/ifcfast-site/app/layout.tsx`
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-inbox-ifcfast/memory/release-flow.md`
+- `/tmp/make_ghost_probe_ifc.py`
+- `docs/wireframes/type-library-global.html`
+- `frontend/src/components/features/settings/EirConfigurator.tsx`
+- `frontend/src/components/features/settings/PmTabDashboard.tsx`
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/events-and-meetings-modules.md`
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/next-steps.md`
+- `tests/test_agent_surface.py`
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/feedback-zero-tolerance-on-designated-coords.md`
+- `inbox/ifcfast/crates/core/src/mesh/brep.rs`
+- `frontend/src/pages/ChartCatalog.tsx`
+- `sidehustles/sprucelab/frontend/src/components/features/qto/QTODashboard.tsx`
+- `/home/edkjo/.claude/worklog/2026-05-16-11-32_Worklog-signature-convention-system-wide.md`
+- `inbox/ifcfast/docs/worklog/2026-05-20-15-46_bundle-string-interning-and-zero-clone-regrouping.md`
+- `backend/apps/entities/management/commands/reanalyze_models.py`
+- `projects/ifcfast/python/ifcfast/model.py`
+- `inbox/ifcfast/crates/core/src/lexer.rs`
+- `cli/sprucelab_mcp/pyproject.toml`
+- `/home/edkjo/dev/sidehustles/sprucelab/docs/worklog/2026-05-16-11-29_Worklog-signature-convention-+-Phase-1-followup.md`
+- `Cargo.toml`
+- `frontend/src/pages/ProjectSettingsPage.tsx`
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/spine-three-primitives.md`
+- `backend/apps/entities/models/reporting.py`
+- `frontend/src/components/features/model-dashboard/charts.tsx`
+- `python/ifcfast/cache.py`
+- `sidehustles/sprucelab/frontend/src/contexts/UploadContext.tsx`
+- `backend/apps/issues/views.py`
+- `docs/wireframes/project-documents.html`
+- `frontend/src/components/features/warehouse-v2/TypeBrowserV2.tsx`
+- `docs/wireframes/model-workspace.html`
+- `backend/apps/accounts/companies_urls.py`
+- `frontend/src/pages/DeliveryMatrixPage.tsx`
+- `frontend/src/components/dashboard-tiles/KpiTile.tsx`
+- `cli/sprucelab_mcp/sprucelab_mcp/__init__.py`
+- `.claude/worktrees/agent-abba8704b1a96a5b4/backend/apps/entities/serializers.py`
+- `crates/core/src/extractors/quantities.rs`
+- `inbox/ifcfast/tests/test_types_and_diff.py`
+- `docs/worklog/2026-05-14-12-49_Wave-1-2-coordinator-pattern-opening-converter-dashboard-N+1-list-pagination-cross-filter-recompute.md`
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/gallery-table-toggle.md`
+- `inbox/ifcfast-site/components/code.tsx`
+- `frontend/src/components/Layout/index.ts`
+- `backend/apps/projects/views.py`
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/feedback-viewer-persists-isolation-drives-state.md`
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/persona-dion-moult-dashboard-checklist.md`
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/synth-guid-instances-404.md`
+- `/home/edkjo/.claude/plans/i-want-a-admin-idempotent-sprout.md`
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/empty-states-notconfigured-vs-nodata.md`
+- `docs/dev.md`
+- `frontend/src/components/features/model-workspace/AnalysisDetailsRail.tsx`
+- `/home/edkjo/.claude/projects/-home-edkjo-dev/memory/next-steps.md`
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/spatial-requirements-generic-engine.md`
+- `frontend/src/hooks/usePaletteTheme.ts`
+- `frontend/src/components/features/settings/IfcBasicsTabDashboard.tsx`
+- `docs/worklog/2026-05-26-10-21_workflow-loop-EIR-verify-KPI-Issues.md`
+- `frontend/src/components/admin/primitives.tsx`
+- `docs/worklog/2026-05-15-08-02_Latency-reverify-+-per-request-floor-finding.md`
+- `frontend/src/components/features/materials/MaterialsTopN.tsx`
+- `sidehustles/sprucelab/frontend/src/components/features/viewer/PlatformPanel.tsx`
+- `frontend/src/components/Layout/DashboardSurface.tsx`
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace/memory/feedback_no_silent_drops.md`
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-inbox-ifcfast/memory/materials-psets-coverage.md`
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace/memory/feedback_ifcfast_industry_scope.md`
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/feedback-elements-types-orphan-terminology.md`
+- `/home/edkjo/.claude/plans/keep-pushing-whimsical-falcon.md`
+- `inbox/ifcfast-site/components/findings-view.tsx`
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/feedback-all-prod-data-is-test.md`
+- `.claude/worktrees/agent-abba8704b1a96a5b4/frontend/src/hooks/use-type-mapping.ts`
+- `frontend/src/pages/Agents.tsx`
+- `docs/worklog/2026-05-27-00-04_substrate-completeness-v0-4-4-through-v0-4-7.md`
+- `/tmp/sprucelab_bench_v2.py`
+- `projects/ifcfast/.gitignore`
+- `frontend/src/components/features/settings/SiteTabDashboard.tsx`
+- `docs/wireframes/project-models.html`
+- `inbox/ifcfast/Cargo.toml`
+- `crates/core/src/bin/bundle.rs`
+- `backend/apps/projects/models.py`
+- `frontend/.env.local`
+- `/home/edkjo/.claude/plans/ok-lets-keep-pushing-drifting-snowflake.md`
+- `crates/core/src/mesh/sample.rs`
+- `inbox/ifcfast/crates/core/src/mesh/profile.rs`
+- `backend/apps/entities/urls.py`
+- `frontend/src/main.tsx`
+- `docs/worklog/2026-05-19-12-29_model-dash-iteration-feedback-loop.md`
+- `docs/wireframes/project-workbench.html`
+- `frontend/src/components/features/viewer/UnifiedBIMViewer.tsx`
+- `frontend/src/pages/CompanyProfilePage.tsx`
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/feedback-dev-language-english.md`
+- `backend/apps/models/views.py`
+- `inbox/ifcfast/.gitignore`
+- `frontend/src/components/dashboard-tiles/index.tsx`
+- `backend/apps/core/middleware.py`
+- `docs/worklog/2026-05-16-10-35_ViewerPane-persistent-viewer-spine-tracker.md`
+- `frontend/src/components/Layout/dashboard-surface-types.ts`
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/eir-builder-rebuild.md`
+- `inbox/ifcfast-site/app/dev/workbench/page.tsx`
+- `inbox/ifcfast/docs/worklog/2026-05-21-12-40_QTO-engine-shipped-to-PyPI.md`
+- `frontend/src/components/features/warehouse-v2/TypeViewerPaneV2.tsx`
+- `inbox/ifcfast-site/app/dev/workbench/findings.ts`
+- `docs/worklog/2026-05-15-16-27_Filter-reset-fix-+-ModelWorkspace-rework.md`
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/ifcfast-adoption-pattern.md`
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/feedback-chart-truncate-bar-before-labels.md`
+- `inbox/ifcfast/AGENTS.md`
+- `inbox/ifcfast/docs/worklog/2026-05-18-21-34_Close-mesh-issues-expose-segments-rip-ifcopenshell.md`
+- `/tmp/sprucelab_bench_v3.py`
+- `frontend/src/components/features/settings/eirConfig.ts`
+- `frontend/src/components/admin/helpers.ts`
+- `python/ifcfast/model.py`
+- `frontend/src/components/filters/ClearAllFiltersButton.tsx`
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/tolerance-rules-go-nogo-automation.md`
+- `docs/wireframes/project-material-library.html`
+- `crates/core/Cargo.toml`
+- `frontend/src/pages/Marketing.css`
+- `backend/apps/entities/views/library.py`
+- `backend/apps/issues/urls.py`
+- `inbox/ifcfast/crates/core/src/mesh/revolved.rs`
+- `docs/wireframes/project-field.html`
+- `docs/wireframes/09-model-dash-kpi-dion.html`
+- `frontend/src/components/features/projects-gallery/ProjectGalleryCard.tsx`
+- `tests/unit/test_types_instances_zero_count.py`
+- `projects/ifcfast/python/ifcfast/__init__.py`
+- `crates/core/tests/bundle_integration.rs`
+- `frontend/src/i18n/locales/en.json`
+- `tests/unit/test_eir_rule_translator.py`
+- `frontend/src/components/features/materials/MaterialsKpiCluster.tsx`
+- `inbox/ifcfast/docs/worklog/2026-05-20-15-00_hierarchical-instanced-substrate.md`
+- `backend/apps/entities/models/material_override.py`
+- `frontend/src/components/features/project-models/ModelCard.tsx`
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/feedback-long-running-ops-need-persistent-tracker.md`
+- `inbox/ifcfast/python/ifcfast/mcp_server.py`
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/opening-lifecycle-spec-verify-build.md`
+- `.claude/worktrees/agent-a991d3ac9c5e41a50/backend/apps/entities/views/types.py`
+- `frontend/src/components/admin/types.ts`
+- `docs/plans/2026-05-14-10-46_Tester-findings-sweep.md`
+- `crates/core/src/source.rs`
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/design-tokens-iron-rule.md`
+- `crates/core/src/mesh/mod.rs`
+- `/home/edkjo/.claude/plans/you-re-a-marketing-wizard-cuddly-tarjan.md`
+- `/home/edkjo/.claude/knowledge.md`
+- `frontend/src/hooks/useProjectFilterUrl.ts`
+- `crates/core/src/bundle/parquet_sink.rs`
+- `projects/ifcfast/crates/core/Cargo.toml`
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace/memory/project_ifcfast_substrate_output.md`
+- `backend/apps/models/serializers.py`
+- `inbox/ifcfast/crates/core/src/indexer.rs`
+- `docs/worklog/2026-05-26-09-30_v0-4-1-substrate-reveal-all-and-ifczip.md`
+- `frontend/vercel.json`
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace/memory/project_ifcfast_north_star.md`
+- `sidehustles/sprucelab/frontend/src/components/Layout/Sidebar.tsx`
+- `frontend/src/components/features/settings/eirPresets.ts`
+- `sidehustles/sprucelab/frontend/src/i18n/locales/nb.json`
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/agent-first-marketing-phase-1.md`
+- `AGENTS.md`
+- `/home/edkjo/.claude/projects/-home-edkjo-dev/memory/projects.md`
+- `frontend/src/contexts/ProjectFilterProvider.tsx`
+- `frontend/src/pages/admin/AdminSystem.tsx`
+- `docs/wireframes/index.html`
+- `inbox/ifcfast/README.md`
+- `inbox/ifcfast/docs/worklog/2026-05-15-18-00_ifcfast-com-cross-filter-canvas-mesh-coverage.md`
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-family-hq/memory/project_open_decisions.md`
+- `backend/config/views.py`
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-inbox-ifcfast/memory/substrate-architecture.md`
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/dashboard-engine-v1-shipped.md`
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/settings-architecture.md`
+- `frontend/src/components/features/settings/mmiPresets.ts`
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/survey-point-lifecycle-and-anchor.md`
+- `cli/sprucelab_mcp/sprucelab_mcp/server.py`
+- `inbox/ifcfast-site/components/benchmark.tsx`
+- `docs/worklog/2026-05-14-10-50_Layer-2-GUID-bridge-color-system-design-tokens-tester-sweep-plan.md`
+- `docs/worklog/2026-05-28-17-12_curated-eir-tabs-sidebar-regroup-settings-shell.md`
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-family-hq/memory/project_savings_buckets.md`
+- `backend/apps/accounts/models.py`
+- `frontend/src/components/features/warehouse-v2/TypeKpiGrid.tsx`
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/MEMORY.md`
+- `frontend/src/i18n/locales/nb.json`
+- `docs/worklog/2026-05-19-21-55_materials-dash-grid-rebuild-and-editing.md`
+- `tests/unit/test_storey_verification_endpoint.py`
+- `frontend/src/hooks/useResetFiltersOnModelChange.ts`
+- `inbox/ifcfast/docs/worklog/2026-05-15-13-17_Graph-layer-and-tier1-perf-30pct.md`
+- `docs/wireframes/federated-viewer.html`
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/deploy-pipeline-gotchas.md`
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/profile-personal-vs-company-issued.md`
+- `tests/test_smoke.py`
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/materials-family-is-canonical-dimension.md`
+- `frontend/src/pages/Welcome.tsx`
+- `inbox/ifcfast-site/components/viewer.tsx`
+- `/home/edkjo/.claude/CLAUDE.md`
+- `frontend/src/components/features/warehouse-v2/classColors.ts`
+- `.claude/worktrees/agent-abba8704b1a96a5b4/frontend/src/hooks/use-project-materials.ts`
+- `/home/edkjo/dev/sidehustles/sprucelab/CLAUDE.md`
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/eir-curated-tabs-and-settings-shipped.md`
+- `crates/core/tests/mesh_reveal.rs`
+- `/home/edkjo/.claude/plans/lets-keep-working-async-wirth.md`
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/dashboard-8x5-basemap.md`
+- `frontend/src/components/features/materials/MaterialBrowserView.tsx`
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace/memory/feedback_only_awesome_cross_industry.md`
+- `inbox/ifcfast/crates/core/src/mesh/boolean.rs`
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/anti-opening-structural-constraint-zones.md`
+- `frontend/src/components/dashboard-tiles/TableTile.tsx`
+- `tests/unit/test_verification_engine.py`
+- `/tmp/sprucelab_bench.py`
+- `tests/unit/test_project_creation_seeding.py`
+- `python/ifcfast/header.py`
+- `inbox/ifcfast/crates/core/src/mesh/qto.rs`
+- `inbox/ifcfast/scripts/generate_sample_sidecars.py`
+- `docs/wireframes/my-page.html`
+- `docs/drafts/2026-05-18_gh-issue-17-closure-comment.md`
+- `inbox/ifcfast/crates/core/src/mesh/gltf.rs`
+- `inbox/ifcfast/crates/core/src/mesh/extrusion.rs`
+- `backend/apps/projects/serializers.py`
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-inbox-ifcfast/memory/next-steps.md`
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-inbox-ifcfast/memory/cache-schema-versioning.md`
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/main-vs-special-purpose-model.md`
+- `/home/edkjo/.claude/plans/whats-next-real-and-zippy-mist.md`
+- `inbox/ifcfast/docs/worklog/2026-05-18-11-30_Reveal-all-mesh-dispatch-boolean-csg-halfspace.md`
+- `crates/core/src/bin/mesh.rs`
+- `inbox/ifcfast-site/components/qto-panel.tsx`
+- `frontend/src/components/dashboard-tiles/index.ts`
+- `frontend/src/components/filters/FilteredEmptyBanner.tsx`
+- `projects/ifcfast/tests/test_federated_floors.py`
+- `docs/worklog/2026-05-15-18-18_Vercel-proxy-fix-and-ifcfast-benchmark-adapter-fix.md`
+- `-site/app/page.tsx`
+- `frontend/src/hooks/use-issues.ts`
+- `inbox/ifcfast/pyproject.toml`
+- `frontend/src/components/features/materials/MaterialsKpiHeader.tsx`
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace/memory/feedback_test_on_deployed.md`
+- `docs/worklog/2026-05-21-08-30_cross-filter-leader-observer-palette-toggle-kpi-consolidation.md`
+- `projects/ifcfast/docs/history/origin.md`
+- `-site/components/vector-graph.tsx`
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-inbox-ifcfast/memory/mesh-quality-classifier.md`
+- `crates/core/src/bin/bench.rs`
+- `/tmp/sprucelab-16-new.md`
+- `inbox/ifcfast/tests/test_agent_surface.py`
+- `inbox/ifcfast-site/app/globals.css`
+- `backend/apps/entities/migrations/0045_materialoverride.py`
+- `frontend/src/components/Layout/DashboardGrid.tsx`
+- `/home/edkjo/.claude/plans/do-a-review-of-concurrent-riddle.md`
+- `frontend/src/components/CreateProjectDialog.tsx`
+- `.claude/worktrees/agent-abba8704b1a96a5b4/backend/apps/entities/views/types.py`
+- `docs/drafts/2026-05-18_gh-issue-15-partial-closure-comment.md`
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace/memory/feedback_close_gaps_dont_decorate.md`
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/cross-filter-leader-observer.md`
+- `crates/core/src/bundle/mod.rs`
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/django-checkconstraint-version-gotcha.md`
+- `docs/worklog/2026-05-18-14-13_cross-filter-wrapup-materials-upload-security-perf-survey-vocab.md`
+- `projects/ifcfast/python/ifcfast/header.py`
+- `backend/apps/accounts/serializers.py`
+- `crates/core/src/entity_table.rs`
+- `inbox/ifcfast-site/components/graph-view.tsx`
+- `inbox/ifcfast/docs/worklog/2026-05-19-16-45_close-17-handlers-and-prune-stray-vercel-project.md`
+- `docs/worklog/2026-05-26-16-26_EIR-builder-from-legit-horrible-to-real.md`
+- `inbox/ifcfast/docs/worklog/2026-05-15-19-46_Layer-sets-spatial-drill-D3-vector-graph-opening-skip.md`
+- `/tmp/parquet_fingerprint.py`
+- `-site/components/terminal.tsx`
+- `inbox/ifcfast/crates/core/src/bundle/mod.rs`
+- `/tmp/parquet_diff.py`
+- `inbox/ifcfast/crates/core/src/extractors/psets.rs`
+- `frontend/src/pages/admin/AdminOverview.tsx`
+- `backend/apps/issues/serializers.py`
+- `backend/apps/accounts/views.py`
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/type-guid-synth-hash-fallback.md`
+- `docs/wireframes/color-system.html`
+- `inbox/ifcfast/docs/worklog/2026-05-19-10-32_17-evidence-survey-and-side-findings.md`
+- `frontend/src/pages/ProjectSettingsShell.tsx`
+- `/tmp/make_test_ifc.py`
+- `frontend/src/hooks/use-project-access.ts`
+- `docs/wireframes/webhooks.html`
+- `frontend/src/components/features/viewer/ViewerPane.tsx`
+- `/home/edkjo/.claude/projects/-home-edkjo-dev/memory/MEMORY.md`
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-inbox-ifcfast/memory/MEMORY.md`
+- `frontend/src/pages/admin/AdminShell.tsx`
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/survey-point-objecttype-vocabulary.md`
+- `.claude/worktrees/agent-a991d3ac9c5e41a50/tests/unit/test_dashboard_metrics.py`
+- `inbox/ifcfast/crates/core/src/bundle/parquet_sink.rs`
+- `crates/core/src/mesh/profile.rs`
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/ifc-annotation-cannot-be-typed.md`
+- `inbox/ifcfast/docs/worklog/2026-05-15-19-22_QTO-tabs-mesh-viewer-ready.md`
+- `frontend/src/components/Layout/PaletteToggle.tsx`
+- `docs/wireframes/project-type-library.html`
+- `crates/core/src/extractors/psets.rs`
+- `backend/apps/accounts/__init__.py`
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-family-hq/memory/next-steps.md`
+- `inbox/ifcfast/crates/core/src/lib.rs`
+- `docs/worklog/2026-05-15-11-16_Always-on-Server-Timing-+-admin-Tooltip-crash-fix-+-Iver-approval.md`
+- `tests/unit/test_company_workspace.py`
+- `python/ifcfast/__init__.py`
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/dev-md-canonical-tracker.md`
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-inbox-ifcfast/memory/testing-sweep-residuals.md`
+- `docs/worklog/2026-05-13-22-38_Architecture-arc-Grouping-axes-Opening-lifecycle-Tolerance-Anti-opening-Rules-engine-strategy.md`
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/dashboard-marketplace-vision.md`
+- `inbox/ifcfast/docs/worklog/2026-05-19-09-08_Indexer-18-doorstyle-windowstyle-and-WIP-flush.md`
+- `inbox/ifcfast/python/ifcfast/model.py`
+- `frontend/src/pages/ProjectIssuesPage.tsx`
+- `inbox/ifcfast-site/components/data-tabs.tsx`
+- `crates/core/src/indexer.rs`
+- `backend/apps/entities/models/material_component.py`
+- `crates/core/src/mesh/stats.rs`
+- `docs/worklog/2026-05-20-09-47_dashboard-engine-resolver-shipped.md`
+- `docs/wireframes/project-floors.html`
+- `frontend/src/pages/ProjectModels.tsx`
+- `sidehustles/sprucelab/frontend/src/hooks/use-script-execution.ts`
+- `frontend/src/components/features/warehouse-v2/TypeTableV2.tsx`
+- `inbox/ifcfast/crates/core/Cargo.toml`
+- `frontend/src/styles/globals.css`
+- `backend/apps/entities/views/types.py`
+- `frontend/src/hooks/useCardDensity.ts`
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/ifcfast-benchmark-candidate.md`
+- `/home/edkjo/.claude/plans/whats-next-piped-avalanche.md`
+- `projects/ifcfast/python/ifcfast/cli.py`
+- `inbox/ifcfast/tests/test_mcp_server.py`
+- `crates/core/src/bundle/record.rs`
+- `frontend/src/lib/me.ts`
+- `frontend/src/pages/ProjectProductLibrary.tsx`
+- `inbox/ifcfast/python/ifcfast/cache.py`
+- `docs/worklog/2026-05-14-18-00_Prod-frag-backfill-+-filtered-empty-banner.md`
+- `backend/apps/entities/services/eir_rule_translator.py`
+- `/home/edkjo/.claude/projects/-home-edkjo-workspace-sidehustles-sprucelab/memory/project-creation-collect-basics-upfront.md`
+- `backend/apps/models/management/commands/backfill_thumbnails.py`
+- `/home/edkjo/.claude/plans/ok-lets-plan-next-noble-goose.md`
+
+## Next
+- Continue from checkpoint
+
+## Notes
+- Trigger: PreCompact
+- Timestamp: 2026-05-29T13:28:25.522219
+- Session directory: /home/edkjo/workspace/inbox/ifcfast
+- Changes since last checkpoint: 2463
+- Git commit: 951dfbe
+- Pushed to remote: Yes
