@@ -34,6 +34,9 @@ pub mod bundle;
 #[cfg(feature = "geom")]
 pub mod geom;
 
+#[cfg(feature = "clash")]
+pub mod clash;
+
 #[cfg(feature = "python")]
 mod python {
     use std::path::Path;
@@ -1065,6 +1068,97 @@ mod python {
         Ok(out)
     }
 
+    // ----- clash --------------------------------------------------------
+
+    #[cfg(feature = "clash")]
+    #[pyfunction]
+    #[pyo3(signature = (
+        bundle_dir,
+        tolerance_m = 0.0,
+        write_parquet = true,
+        include_classes = Vec::<String>::new(),
+        exclude_self_class = Vec::<String>::new(),
+    ))]
+    fn clash<'py>(
+        py: Python<'py>,
+        bundle_dir: &str,
+        tolerance_m: f32,
+        write_parquet: bool,
+        include_classes: Vec<String>,
+        exclude_self_class: Vec<String>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        use crate::clash::{
+            clash as run_clash, write_clashes_parquet, ClashKind, ClashOptions,
+        };
+        let bundle_dir = Path::new(bundle_dir).to_path_buf();
+        let opts = ClashOptions {
+            tolerance_m,
+            include_classes,
+            exclude_self_class,
+        };
+
+        let t = Instant::now();
+        let report = py
+            .allow_threads(|| run_clash(&bundle_dir, &opts))
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("clash: {e}")))?;
+        let clash_ms = t.elapsed().as_secs_f64() * 1000.0;
+
+        let mut written_path: Option<String> = None;
+        if write_parquet {
+            let out = bundle_dir.join("clashes.parquet");
+            py.allow_threads(|| write_clashes_parquet(&out, &report.pairs))
+                .map_err(|e| {
+                    pyo3::exceptions::PyIOError::new_err(format!(
+                        "write {}: {e}",
+                        out.display()
+                    ))
+                })?;
+            written_path = Some(out.to_string_lossy().to_string());
+        }
+
+        let n = report.pairs.len();
+        let mut ifc_id_a: Vec<u64> = Vec::with_capacity(n);
+        let mut ifc_id_b: Vec<u64> = Vec::with_capacity(n);
+        let mut guid_a: Vec<String> = Vec::with_capacity(n);
+        let mut guid_b: Vec<String> = Vec::with_capacity(n);
+        let mut class_a: Vec<String> = Vec::with_capacity(n);
+        let mut class_b: Vec<String> = Vec::with_capacity(n);
+        let mut kind: Vec<&'static str> = Vec::with_capacity(n);
+        let mut min_distance_m: Vec<f32> = Vec::with_capacity(n);
+        for p in &report.pairs {
+            ifc_id_a.push(p.ifc_id_a);
+            ifc_id_b.push(p.ifc_id_b);
+            guid_a.push(p.guid_a.clone());
+            guid_b.push(p.guid_b.clone());
+            class_a.push(p.class_a.clone());
+            class_b.push(p.class_b.clone());
+            kind.push(match p.kind {
+                ClashKind::Hard => "hard",
+                ClashKind::Clearance => "clearance",
+            });
+            min_distance_m.push(p.min_distance_m);
+        }
+
+        let out = PyDict::new_bound(py);
+        out.set_item("ifc_id_a", PyList::new_bound(py, &ifc_id_a))?;
+        out.set_item("ifc_id_b", PyList::new_bound(py, &ifc_id_b))?;
+        out.set_item("guid_a", PyList::new_bound(py, &guid_a))?;
+        out.set_item("guid_b", PyList::new_bound(py, &guid_b))?;
+        out.set_item("class_a", PyList::new_bound(py, &class_a))?;
+        out.set_item("class_b", PyList::new_bound(py, &class_b))?;
+        out.set_item("kind", PyList::new_bound(py, &kind))?;
+        out.set_item("min_distance_m", PyList::new_bound(py, &min_distance_m))?;
+        out.set_item("geometryless_skipped", report.geometryless_skipped as u64)?;
+        out.set_item("narrow_phase_residuals", report.narrow_phase_residuals as u64)?;
+        out.set_item("pair_count", n as u64)?;
+        out.set_item("tolerance_m", tolerance_m)?;
+        out.set_item("clash_ms", clash_ms)?;
+        if let Some(p) = written_path {
+            out.set_item("clashes_parquet", p)?;
+        }
+        Ok(out)
+    }
+
     #[pymodule]
     fn _core(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_function(wrap_pyfunction!(index_ifc, m)?)?;
@@ -1081,6 +1175,8 @@ mod python {
         m.add_function(wrap_pyfunction!(sample_point_cloud, m)?)?;
         #[cfg(feature = "mesh")]
         m.add_function(wrap_pyfunction!(extract_meshes, m)?)?;
+        #[cfg(feature = "clash")]
+        m.add_function(wrap_pyfunction!(clash, m)?)?;
         m.add("__version__", env!("CARGO_PKG_VERSION"))?;
         Ok(())
     }

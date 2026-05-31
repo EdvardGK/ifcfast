@@ -28,19 +28,30 @@ name = "ifcfast-bundle"
 path = "src/bin/bundle.rs"
 required-features = ["bundle"]
 
+[[bin]]
+name = "ifcfast-clash"
+path = "src/bin/clash.rs"
+required-features = ["clash"]
+
 [features]
-default = ["python"]
+default = ["python", "bundle", "geom", "clash"]
 python = ["dep:pyo3"]
 mesh = ["dep:earcutr", "dep:glam"]
-# Streaming substrate writer (GeoParquet-of-products). Heavy deps
-# (arrow, parquet) intentionally gated off the default Python build.
+# Streaming substrate writer (GeoParquet-of-products). Pulls in arrow
+# + parquet. Now in the default Python wheel since the clash engine
+# reads the substrate as its input.
 bundle = ["mesh", "dep:arrow", "dep:parquet"]
-# Geometry kernel — BVH-accelerated mesh queries (intersection, distance,
-# containment), PCA for OOBB / principal axes, and (eventually) CSG for
-# net-boolean baking. Foundation for the clash engine and the boolean
-# behaviour change. Feature-gated because parry3d + nalgebra add ~1 MB
-# to the compiled artifact; default Python wheel decision deferred.
+# Geometry kernel — BVH-accelerated mesh queries (intersection,
+# distance, containment), PCA for OOBB / principal axes, and
+# (eventually) CSG for net-boolean baking. Foundation for the clash
+# engine and the boolean behaviour change. Now in the default Python
+# wheel — `ifcfast.clash()` needs it.
 geom = ["mesh", "dep:parry3d", "dep:nalgebra"]
+# Substrate-aware clash engine — reads the bundle's instances /
+# representations parquet, runs broad-phase AABB overlap + narrow-phase
+# mesh-mesh intersection, writes `clashes.parquet`. Stacks both
+# `bundle` (for I/O) and `geom` (for the kernel).
+clash = ["bundle", "geom"]
 
 [dependencies]
 pyo3 = { version = "0.22", features = ["extension-module", "abi3-py310"], optional = true }

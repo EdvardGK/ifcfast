@@ -157,15 +157,66 @@ JOIN 'rib/instances.parquet' b
      / NULLIF(a.aabb_volume_m3, 0) < 0.05;                 -- ±5% volume
 ```
 
-Narrow-phase mesh-mesh intersection (true clash detection) is **not
-yet** part of the substrate — it's a planned `ifcfast.clash()`
-primitive. Use the fingerprint columns for broad-phase / dedup;
-defer to a real geometry kernel (parry3d, CGAL, Open Cascade) for
-narrow-phase until ifcfast ships its own.
-
 **Cache schema version** is at `_CACHE_SCHEMA_VERSION` in
 `python/ifcfast/header.py` — when it bumps, the column set changed.
 Old caches become orphaned automatically.
+
+### Narrow-phase clash (`ifcfast.clash()`)
+
+True mesh-mesh intersection runs against the same substrate. The
+engine reads `instances.parquet` + `representations.parquet`,
+broad-phases on the `bbox_*` columns, narrow-phases candidate pairs
+against world-baked `parry3d` TriMeshes, and writes a third file —
+`clashes.parquet` — next to the inputs:
+
+```python
+import ifcfast
+
+# default: hard clashes only, writes clashes.parquet alongside
+df = ifcfast.clash("model.bundle/")
+
+# soft-clash: also emit pairs within 50 mm clearance
+df = ifcfast.clash("model.bundle/", tolerance_m=0.05)
+
+# cross-discipline only — suppress wall-vs-wall, slab-vs-slab
+df = ifcfast.clash(
+    "model.bundle/",
+    exclude_self_class=["Wall", "Slab"],
+)
+```
+
+`clashes.parquet` columns:
+
+| column           | type    | meaning                                                  |
+|------------------|---------|----------------------------------------------------------|
+| `ifc_id_a/b`     | UInt64  | STEP entity ids — join back to `instances.parquet`       |
+| `guid_a/b`       | Utf8    | IFC GUIDs                                                |
+| `class_a/b`      | Utf8    | normalised classes (`"Pipe"`, not `"IfcPipe"`)           |
+| `kind`           | Utf8    | `"hard"` (meshes intersect) or `"clearance"` (within tol)|
+| `min_distance_m` | Float32 | minimum mesh-to-mesh distance, metres; `0.0` for hard    |
+
+The engine is just the *fact* layer — does this pair touch, by how
+much. **Policy** (wall-meets-slab is normally not a real clash;
+clashes inside the same opening assembly are noise; BCF emit;
+discipline routing) lives in the layer above and queries
+`clashes.parquet` joined to `instances.parquet`. Example:
+"every MEP-vs-structure hard clash on level 3":
+
+```sql
+SELECT c.guid_a, c.guid_b, c.class_a, c.class_b
+FROM 'model.bundle/clashes.parquet' c
+JOIN 'model.bundle/instances.parquet' ia ON c.ifc_id_a = ia.ifc_id
+JOIN 'model.bundle/instances.parquet' ib ON c.ifc_id_b = ib.ifc_id
+WHERE c.kind = 'hard'
+  AND ia.storey_name = 'Level 3'
+  AND (ia.class IN ('Pipe','Duct','CableCarrier')) XOR
+      (ib.class IN ('Pipe','Duct','CableCarrier'));
+```
+
+**Units.** `tolerance_m` and `min_distance_m` are always in metres,
+regardless of the source IFC's linear unit. The substrate records
+the project's unit scale as parquet schema metadata
+(`ifcfast.unit_scale`) and the clash engine converts at load time.
 
 ## Conventions you can rely on
 
@@ -261,6 +312,11 @@ ifcfast cache   FILE  --json       # inspect / clear cache
 # Substrate emit (separate binary — see "Substrate output" above).
 ifcfast-bundle FILE OUT_DIR        # writes instances.parquet +
                                    # representations.parquet + view.sql
+
+# Narrow-phase clash against a bundle. Writes clashes.parquet next
+# to instances/representations. --tolerance is in metres regardless
+# of the source file's linear unit.
+ifcfast-clash  BUNDLE_DIR  [--tolerance 0.05]  [--out file.parquet]
 ```
 
 ## Reporting issues from an agent

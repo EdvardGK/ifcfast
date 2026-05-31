@@ -69,6 +69,7 @@ from pathlib import Path
 
 from .header import IFCHeader, header
 from .model import Model, ProductRow, StoreyRow, open_ifc as open
+from .clash import clash
 from . import cache, classify
 
 __all__ = [
@@ -78,13 +79,14 @@ __all__ = [
     "StoreyRow",
     "cache",
     "classify",
+    "clash",
     "example_path",
     "header",
     "open",
     "system_prompt",
 ]
 
-__version__ = "0.4.18"
+__version__ = "0.4.19"
 
 
 def example_path() -> Path:

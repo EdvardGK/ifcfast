@@ -79,8 +79,22 @@ impl<'a> ParquetSink<'a> {
         let rep_path = out_dir.as_ref().join("representations.parquet");
         let inst_path = out_dir.as_ref().join("instances.parquet");
 
-        let rep_schema = Arc::new(build_representation_schema());
-        let inst_schema = Arc::new(build_instance_schema());
+        // Record the project's unit_scale (linear-unit → metres factor)
+        // as schema metadata on both files. Downstream consumers
+        // (e.g. the clash engine) need it to convert vertex / bbox
+        // values — which are stored in source units, not metres —
+        // back to metres at query time. Defaults to 1.0 when the
+        // indexer couldn't determine the unit assignment.
+        let unit_scale = bundle.unit_scale.unwrap_or(1.0);
+        let mut meta = std::collections::HashMap::new();
+        meta.insert("ifcfast.unit_scale".to_string(), unit_scale.to_string());
+        meta.insert(
+            "ifcfast.version".to_string(),
+            env!("CARGO_PKG_VERSION").to_string(),
+        );
+
+        let rep_schema = Arc::new(build_representation_schema().with_metadata(meta.clone()));
+        let inst_schema = Arc::new(build_instance_schema().with_metadata(meta));
 
         let rep_file = File::create(&rep_path).map_err(|e| {
             parquet::errors::ParquetError::General(format!(

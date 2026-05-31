@@ -9,6 +9,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`ifcfast.clash()` — substrate-aware narrow-phase clash engine.**
+  Reads `instances.parquet` + `representations.parquet` from a
+  bundle directory, runs broad-phase AABB overlap (via the
+  `geom::pairs_overlapping` kernel landed earlier in v0.4.19), then
+  narrow-phases each candidate pair as a true mesh-mesh
+  intersection / distance query against `parry3d` BVH-built
+  TriMeshes. Writes `clashes.parquet` next to the inputs.
+  ```python
+  import ifcfast
+  df = ifcfast.clash("model.bundle/", tolerance_m=0.05)
+  ```
+  Output columns: `ifc_id_a/b`, `guid_a/b`, `class_a/b`, `kind`
+  (`"hard"` or `"clearance"`), `min_distance_m`. `tolerance_m` and
+  `min_distance_m` are always in metres regardless of the source
+  IFC's linear unit. The bundle now records the project's unit
+  scale as parquet schema metadata (`ifcfast.unit_scale`) and the
+  clash engine converts at load time. The engine is the *fact*
+  layer ("do they touch, by how much, how far apart"); policy
+  (connectivity dismissal, BCF emit, discipline routing) lives in
+  the layer above and queries `clashes.parquet` joined to
+  `instances.parquet`. See the "Narrow-phase clash" section in
+  [`AGENTS.md`](AGENTS.md) for the worked DuckDB example.
+- New `ifcfast-clash` binary mirroring the Python entry:
+  `ifcfast-clash BUNDLE_DIR [--tolerance N] [--out file.parquet]`.
+- `_core.clash(bundle_dir, tolerance_m, write_parquet, ...)` PyO3
+  binding returning the same column-dict shape as the other
+  extractors.
+- `clash` Cargo feature stacking `bundle` + `geom`. The default
+  Python wheel build now ships `bundle`, `geom`, and `clash` —
+  previously it shipped only `python`, so the substrate writer
+  and geom kernel only worked from a `cargo build --features
+  bundle,geom` build. Agents shouldn't need to know about extras
+  for first-class promises.
 - **Geometric fingerprint columns on `instances.parquet`** — phase 1a
   of the federated-model clash-control / cross-discipline duplicate
   detection feature. Three new non-nullable columns on every instance
@@ -25,13 +58,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and broad-phase clash candidate filtering as pure DuckDB queries
   against the substrate (centroid distance + bbox overlap +
   complexity match), without re-running the parser or recomputing
-  midpoints on every join. See the new "Substrate output" section
-  in [`AGENTS.md`](AGENTS.md) for the worked example. Narrow-phase
-  mesh-mesh intersection is not yet exposed — planned as a future
-  `ifcfast.clash()` primitive.
+  midpoints on every join. See the "Substrate output" section in
+  [`AGENTS.md`](AGENTS.md) for the worked example.
 
 ### Changed
 
+- `instances.parquet` and `representations.parquet` now carry
+  `ifcfast.unit_scale` and `ifcfast.version` as parquet schema
+  metadata. Backwards-compatible — readers that ignore the metadata
+  see no change. The clash engine uses `unit_scale` to convert
+  source-unit vertex / bbox data to metres at load time.
 - `_CACHE_SCHEMA_VERSION` bumped 4 → 5. Existing caches become
   orphaned automatically — re-extract on next open is automatic.
 
