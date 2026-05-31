@@ -40,5 +40,12 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@v1
       - name: cargo check --features csg
         run: cargo check -p ifcfast-core --features csg
-      - name: cargo test --features csg --test cut_openings_integration
-        run: cargo test -p ifcfast-core --features csg --test cut_openings_integration --release
+      # The integration test links the rlib half of `ifcfast-core` into a
+      # test binary. With default features, pyo3's `extension-module` is
+      # enabled and Python symbols (`_Py_TrueStruct`, …) are deferred to
+      # runtime — Linux/Windows linkers tolerate this for a cdylib build
+      # but macOS rejects undefined symbols in an executable. The test
+      # itself doesn't touch pyo3, so build it without the `python`
+      # feature; `--features csg` still activates the mesh+geom chain.
+      - name: cargo test --no-default-features --features csg --test cut_openings_integration
+        run: cargo test -p ifcfast-core --no-default-features --features csg --test cut_openings_integration --release
