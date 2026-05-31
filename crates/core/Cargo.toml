@@ -52,6 +52,12 @@ geom = ["mesh", "dep:parry3d", "dep:nalgebra"]
 # mesh-mesh intersection, writes `clashes.parquet`. Stacks both
 # `bundle` (for I/O) and `geom` (for the kernel).
 clash = ["bundle", "geom"]
+# Net booleans via the Manifold C++ CSG library. Used by the
+# cut-openings path that subtracts IfcOpeningElement geometry from
+# its host product (wall, slab, …) so viewer exports render holes
+# instead of solid bodies. Off by default in the wheel until the
+# native build dep is exercised across all wheel platforms.
+csg = ["geom", "dep:manifold-csg"]
 
 [dependencies]
 pyo3 = { version = "0.22", features = ["extension-module", "abi3-py310"], optional = true }
@@ -64,3 +70,4 @@ arrow = { version = "53", optional = true }
 parquet = { version = "53", features = ["arrow"], optional = true }
 parry3d = { version = "0.17", optional = true }
 nalgebra = { version = "0.33", optional = true }
+manifold-csg = { version = "0.2", optional = true, default-features = false, features = ["parallel"] }
