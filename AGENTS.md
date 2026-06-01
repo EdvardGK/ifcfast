@@ -379,6 +379,22 @@ substrate writer don't balloon RSS during tessellation. There's
 also a `RAYON_NUM_THREADS=1` fast path that bypasses the channel
 entirely (no scaffolding cost on single-thread hosts).
 
+**glTF output uses `EXT_mesh_gpu_instancing`** (since v0.4.23) for
+products that share a single-fragment representation. Each rep
+emits one shared mesh + one node with per-instance TRS attributes;
+per-instance identity (`guid`, `entity`, `segments`) goes into
+`node.extras.instances` as a parallel array indexed by instance
+order. Multi-fragment products (booleans, CSG composites) and
+rep-unique singletons fall through to the baked path (one mesh per
+product, world-coord vertices) — backwards-compat with viewers
+that don't read `EXT_mesh_gpu_instancing` is preserved for those.
+Measured savings: 38% smaller `.glb` on a 4.84-instances-per-rep
+structural file (LBK_RIBp_C 118.5 MB → 72.9 MB), ~0% on a
+1.13-instances-per-rep architecture file (still emits the
+extension where possible; just nothing to dedupe). Pick-to-BIM:
+viewers should read `node.extras.guid` (baked) OR
+`node.extras.instances[instance_id].guid` (instanced).
+
 ## CLI quick reference
 
 ```bash

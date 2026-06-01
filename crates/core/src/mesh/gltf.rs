@@ -9,19 +9,36 @@
 //! └── chunk 1 (BIN)            length + 'BIN ' type tag + binary buffer (4-byte padded)
 //! ```
 //!
-//! Strategy for IFC product meshes:
-//!   * One concatenated binary buffer carrying ALL product vertex + index data
-//!   * Per-product `bufferView` × 2  (positions + indices)
-//!   * Per-product `accessor` × 2
-//!   * Per-product `mesh` (with one primitive) and `node` (linked to that mesh)
-//!   * Single scene listing every node
+//! Output strategy for IFC product meshes:
 //!
-//! Per-node `extras` carries `guid` + `entity` so the viewer can pick by GUID.
+//!   * **Baked path**: products with multiple representation fragments
+//!     (e.g. `IfcBooleanResult`, `IfcCsgSolid`) or unique single-fragment
+//!     reps emit one node + mesh per product, baked in world coords.
+//!     Identical to pre-v0.4.23 behaviour.
 //!
-//! No materials, no textures, no animations. The viewer computes face normals
-//! on load (Three.js / Babylon / xeokit all do this for normal-less meshes).
+//!   * **Instanced path** (v0.4.23+): products whose single-fragment
+//!     representation is shared across ≥2 products are grouped by
+//!     `rep_step_id`. Each group emits ONE shared mesh (in LOCAL coords)
+//!     and ONE node with `EXT_mesh_gpu_instancing`, carrying per-instance
+//!     translation / rotation / scale derived from each product's
+//!     `world_transform * instance_transform`. Per-instance identity
+//!     (guid + entity + segments) is preserved in the node's `extras`
+//!     as a parallel array so the viewer can map a picked instance index
+//!     back to the BIM model.
+//!
+//! Per-node `extras` carries `guid` + `entity` (baked path) or per-instance
+//! `instances: [{guid, entity, segments}, ...]` (instanced path) so the
+//! viewer can pick by GUID either way.
+//!
+//! No materials beyond the per-entity-type palette (richer
+//! `IfcSurfaceStyle` colour extraction tracked separately in ifcfast#3),
+//! no textures, no animations. The viewer computes face normals on load
+//! (Three.js / Babylon / xeokit all do this for normal-less meshes).
 
+use std::collections::HashMap;
 use std::io::{self, BufWriter, Write};
+
+use glam::Mat4;
 
 use crate::mesh::ProductMesh;
 
@@ -32,20 +49,35 @@ const U16_T: u32 = 5123;
 
 // glTF accessor types (string in JSON)
 const VEC3: &str = "VEC3";
+const VEC4: &str = "VEC4";
 const SCALAR: &str = "SCALAR";
 
 // glTF buffer view targets
 const ARRAY_BUFFER: u32 = 34962;
 const ELEMENT_ARRAY_BUFFER: u32 = 34963;
 
+/// Minimum group size that triggers EXT_mesh_gpu_instancing. Below this
+/// the rep is emitted as baked individual meshes (no extension
+/// overhead) — at 1 instance there are zero bytes saved and the
+/// extension's JSON overhead is pure loss. At 2 the break-even is
+/// near-immediate (one duplicated mesh saved vs ~3 short TRS arrays).
+const INSTANCE_THRESHOLD: usize = 2;
+
 /// Write `meshes` as a glTF 2.0 binary file.
+///
+/// Products whose single-fragment representation is shared across ≥2
+/// products are emitted using `EXT_mesh_gpu_instancing` (one shared
+/// mesh + per-instance TRS). Multi-fragment products and rep-unique
+/// singletons fall through to the baked path (one mesh + node per
+/// product, world-coord vertices).
 pub fn write<W: Write>(meshes: &[ProductMesh], out: &mut W) -> io::Result<()> {
-    // 1. Build the binary buffer (positions + indices for every product,
-    //    each aligned to 4 bytes).
-    let (binary, views) = pack_binary(meshes);
+    let plan = Plan::classify(meshes);
+
+    // 1. Build the binary buffer.
+    let (binary, layout) = pack_binary(meshes, &plan);
 
     // 2. Build the JSON.
-    let json = build_json(meshes, &views, binary.len() as u32);
+    let json = build_json(meshes, &plan, &layout, binary.len() as u32);
 
     // 3. Pad both chunks to 4-byte multiples (spec requires).
     let json_bytes = pad_json(json.into_bytes());
@@ -76,88 +108,408 @@ pub fn write<W: Write>(meshes: &[ProductMesh], out: &mut W) -> io::Result<()> {
     Ok(())
 }
 
-struct BufferViews {
-    /// Per-product: (positions_view_idx, indices_view_idx, n_verts, n_indices,
-    /// min_xyz, max_xyz, indices_byte_offset, indices_byte_len)
-    products: Vec<ProductViews>,
+// ---------------------------------------------------------------------------
+// Plan: classification of products into baked + instanced groups.
+// ---------------------------------------------------------------------------
+
+/// Which output mode each product gets and what shared shapes look like.
+/// Built once up-front so the binary packer and JSON builder agree on
+/// indices.
+struct Plan {
+    /// Indices into the input `meshes` slice that get the baked-mesh
+    /// treatment: one mesh + one node per product, vertices in world
+    /// coords. Multi-fragment products + rep-unique singletons.
+    baked: Vec<usize>,
+    /// Groups of products that share a single-fragment representation.
+    /// Each entry is one shared mesh + one node with
+    /// `EXT_mesh_gpu_instancing`.
+    instanced: Vec<InstanceGroup>,
 }
 
-struct ProductViews {
-    pos_view: u32,
-    idx_view: u32,
+/// One instance group. `rep_step_id` is the shared representation;
+/// `member_indices` lists every product (by input slice index) that
+/// uses it. Members are stored in input order so per-instance metadata
+/// arrays stay aligned with how the viewer's pick-by-instance-index
+/// reads the TRS attributes.
+struct InstanceGroup {
+    rep_step_id: u64,
+    /// Members in input order; the first member's `parts[0]` supplies
+    /// the shared local geometry.
+    member_indices: Vec<usize>,
+}
+
+impl Plan {
+    fn classify(meshes: &[ProductMesh]) -> Self {
+        // Bucket single-fragment products by rep_step_id; multi-fragment
+        // products and geometryless products go straight to baked.
+        let mut by_rep: HashMap<u64, Vec<usize>> = HashMap::new();
+        let mut forced_baked: Vec<usize> = Vec::new();
+        for (i, mesh) in meshes.iter().enumerate() {
+            if mesh.parts.len() == 1 && !mesh.vertices.is_empty() && !mesh.indices.is_empty() {
+                by_rep
+                    .entry(mesh.parts[0].rep_step_id)
+                    .or_default()
+                    .push(i);
+            } else {
+                forced_baked.push(i);
+            }
+        }
+
+        let mut baked: Vec<usize> = forced_baked;
+        let mut instanced: Vec<InstanceGroup> = Vec::new();
+        for (rep_step_id, mut member_indices) in by_rep {
+            if member_indices.len() >= INSTANCE_THRESHOLD {
+                member_indices.sort_unstable();
+                instanced.push(InstanceGroup {
+                    rep_step_id,
+                    member_indices,
+                });
+            } else {
+                baked.extend(member_indices);
+            }
+        }
+        baked.sort_unstable();
+        // Order instance groups by their first member's input index so
+        // the resulting glTF nodes have a stable, replay-friendly order.
+        instanced.sort_by_key(|g| g.member_indices.first().copied().unwrap_or(u64::MAX as usize));
+        Plan { baked, instanced }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Binary layout.
+// ---------------------------------------------------------------------------
+
+/// Where every emitted accessor's bytes live in the binary buffer +
+/// the AABB / count metadata the JSON builder needs to write the
+/// accessor headers without re-walking the meshes.
+struct BinaryLayout {
+    /// Per baked product (parallel to `plan.baked`): one positions
+    /// view + one indices view.
+    baked: Vec<BakedViews>,
+    /// Per instance group (parallel to `plan.instanced`): one shared
+    /// positions view, one shared indices view, plus the three TRS
+    /// attribute views for the EXT_mesh_gpu_instancing extension.
+    instanced: Vec<InstancedViews>,
+}
+
+#[derive(Clone, Copy)]
+struct View {
+    /// Byte offset into the single concatenated binary buffer.
+    byte_offset: u32,
+    /// Length in bytes (unpadded).
+    byte_length: u32,
+    /// glTF bufferView.target — `ARRAY_BUFFER` for positions/TRS,
+    /// `ELEMENT_ARRAY_BUFFER` for indices, or 0 (omitted) for
+    /// instance attribute buffers (which the spec says SHOULD NOT
+    /// carry a target).
+    target: u32,
+}
+
+struct BakedViews {
+    positions: View,
+    indices: View,
     n_verts: u32,
     n_indices: u32,
     min: [f32; 3],
     max: [f32; 3],
-    // Component type for indices: U16 if n_verts < 65535, else U32.
+    /// `U16_T` (when verts < 65536) or `U32_T`.
     idx_component: u32,
 }
 
-/// Concatenate all product buffers into a single binary blob, aligned to
-/// 4 bytes between regions, and produce the bufferView table.
-fn pack_binary(meshes: &[ProductMesh]) -> (Vec<u8>, BufferViews) {
-    // Reserve a reasonable amount up front.
-    let total_verts: usize = meshes.iter().map(|m| m.vertices.len()).sum();
-    let total_indices: usize = meshes.iter().map(|m| m.indices.len()).sum();
-    let mut bin = Vec::with_capacity(total_verts * 4 + total_indices * 4);
-    let mut products = Vec::with_capacity(meshes.len());
+struct InstancedViews {
+    positions: View,
+    indices: View,
+    translation: View,
+    rotation: View,
+    scale: View,
+    n_verts: u32,
+    n_indices: u32,
+    n_instances: u32,
+    min: [f32; 3],
+    max: [f32; 3],
+    idx_component: u32,
+}
 
-    for (i, mesh) in meshes.iter().enumerate() {
-        // Positions block (f32 × 3 per vertex).
-        let pos_offset = bin.len();
-        let mut min = [f32::INFINITY; 3];
-        let mut max = [f32::NEG_INFINITY; 3];
-        for chunk in mesh.vertices.chunks_exact(3) {
-            for k in 0..3 {
-                let v = chunk[k];
-                if v < min[k] { min[k] = v; }
-                if v > max[k] { max[k] = v; }
-            }
-        }
-        for v in &mesh.vertices {
-            bin.extend_from_slice(&v.to_le_bytes());
-        }
-        let pos_len = bin.len() - pos_offset;
-        pad4(&mut bin);
+/// Concatenate every product's positions + indices (and per-group TRS
+/// arrays) into one binary blob, aligned to 4 bytes between regions.
+fn pack_binary(meshes: &[ProductMesh], plan: &Plan) -> (Vec<u8>, BinaryLayout) {
+    // Conservatively reserve. Over-estimates are cheap; re-allocs are not.
+    let baked_verts: usize = plan
+        .baked
+        .iter()
+        .map(|&i| meshes[i].vertices.len())
+        .sum();
+    let baked_idx: usize = plan.baked.iter().map(|&i| meshes[i].indices.len()).sum();
+    let inst_verts: usize = plan
+        .instanced
+        .iter()
+        .map(|g| meshes[g.member_indices[0]].parts[0].local_vertices.len())
+        .sum();
+    let inst_idx: usize = plan
+        .instanced
+        .iter()
+        .map(|g| meshes[g.member_indices[0]].parts[0].local_indices.len())
+        .sum();
+    let inst_trs: usize = plan
+        .instanced
+        .iter()
+        .map(|g| g.member_indices.len() * (3 + 4 + 3) * 4)
+        .sum();
+    let mut bin =
+        Vec::with_capacity(baked_verts * 4 + baked_idx * 4 + inst_verts * 4 + inst_idx * 4 + inst_trs);
 
-        // Indices block. Use u16 when possible to save 50% space, else u32.
-        let n_verts = (mesh.vertices.len() / 3) as u32;
-        let idx_offset = bin.len();
-        let idx_component = if n_verts <= u16::MAX as u32 + 1 {
-            for &i in &mesh.indices {
-                bin.extend_from_slice(&(i as u16).to_le_bytes());
-            }
-            U16_T
-        } else {
-            for &i in &mesh.indices {
-                bin.extend_from_slice(&i.to_le_bytes());
-            }
-            U32_T
-        };
-        let idx_len = bin.len() - idx_offset;
-        pad4(&mut bin);
+    let mut layout = BinaryLayout {
+        baked: Vec::with_capacity(plan.baked.len()),
+        instanced: Vec::with_capacity(plan.instanced.len()),
+    };
 
-        // Two bufferViews per product (i*2, i*2+1).
-        let _pos_view_byte_offset = pos_offset as u32;
-        let _pos_view_byte_length = pos_len as u32;
-        let _idx_view_byte_offset = idx_offset as u32;
-        let _idx_view_byte_length = idx_len as u32;
-        let _ = (idx_offset, idx_len); // keep clippy quiet
-
-        products.push(ProductViews {
-            pos_view: (i * 2) as u32,
-            idx_view: (i * 2 + 1) as u32,
+    // Baked products first — same packing as pre-v0.4.23 so single-
+    // product OBJ-style consumers see no layout shift.
+    for &i in &plan.baked {
+        let mesh = &meshes[i];
+        let (positions, indices, n_verts, n_indices, min, max, idx_component) =
+            pack_one_baked(mesh, &mut bin);
+        layout.baked.push(BakedViews {
+            positions,
+            indices,
             n_verts,
-            n_indices: mesh.indices.len() as u32,
+            n_indices,
             min,
             max,
             idx_component,
         });
     }
 
+    // Instanced groups next. The shared mesh comes from the first
+    // member's `parts[0]` (local geometry — all members share the same
+    // local mesh by definition of being in this group).
+    for group in &plan.instanced {
+        let first = &meshes[group.member_indices[0]];
+        let part = &first.parts[0];
+        let (positions, indices, n_verts, n_indices, min, max, idx_component) =
+            pack_one_local(&part.local_vertices, &part.local_indices, &mut bin);
+
+        // Per-instance TRS arrays. Each instance's transform is
+        // `world_transform * instance_transform`; decompose into a
+        // (translation, rotation, scale) tuple via glam — the standard
+        // glTF instance attribute shape per the extension spec.
+        let n_instances = group.member_indices.len() as u32;
+        let (translation, rotation, scale) =
+            pack_instance_trs(meshes, group, &mut bin);
+
+        layout.instanced.push(InstancedViews {
+            positions,
+            indices,
+            translation,
+            rotation,
+            scale,
+            n_verts,
+            n_indices,
+            n_instances,
+            min,
+            max,
+            idx_component,
+        });
+    }
+
+    (bin, layout)
+}
+
+/// Pack a single baked product's world-coord positions + indices into
+/// `bin`. Returns the two `View`s + accessor metadata. Identical
+/// content to the pre-v0.4.23 packer, just split into a helper so the
+/// loop body stays readable.
+fn pack_one_baked(
+    mesh: &ProductMesh,
+    bin: &mut Vec<u8>,
+) -> (View, View, u32, u32, [f32; 3], [f32; 3], u32) {
+    let pos_offset = bin.len() as u32;
+    let (min, max) = bbox(&mesh.vertices);
+    for v in &mesh.vertices {
+        bin.extend_from_slice(&v.to_le_bytes());
+    }
+    let pos_len = bin.len() as u32 - pos_offset;
+    pad4(bin);
+
+    let n_verts = (mesh.vertices.len() / 3) as u32;
+    let (idx_offset, idx_component) = pack_indices(&mesh.indices, n_verts, bin);
+    let idx_len = bin.len() as u32 - idx_offset;
+    pad4(bin);
+
     (
-        bin,
-        BufferViews { products },
+        View {
+            byte_offset: pos_offset,
+            byte_length: pos_len,
+            target: ARRAY_BUFFER,
+        },
+        View {
+            byte_offset: idx_offset,
+            byte_length: idx_len,
+            target: ELEMENT_ARRAY_BUFFER,
+        },
+        n_verts,
+        mesh.indices.len() as u32,
+        min,
+        max,
+        idx_component,
+    )
+}
+
+/// Pack a local (untransformed) mesh into `bin`. Same body as the
+/// baked packer; split so the per-instance writer doesn't depend on
+/// the `ProductMesh` shape.
+fn pack_one_local(
+    vertices: &[f32],
+    indices: &[u32],
+    bin: &mut Vec<u8>,
+) -> (View, View, u32, u32, [f32; 3], [f32; 3], u32) {
+    let pos_offset = bin.len() as u32;
+    let (min, max) = bbox(vertices);
+    for v in vertices {
+        bin.extend_from_slice(&v.to_le_bytes());
+    }
+    let pos_len = bin.len() as u32 - pos_offset;
+    pad4(bin);
+
+    let n_verts = (vertices.len() / 3) as u32;
+    let (idx_offset, idx_component) = pack_indices(indices, n_verts, bin);
+    let idx_len = bin.len() as u32 - idx_offset;
+    pad4(bin);
+
+    (
+        View {
+            byte_offset: pos_offset,
+            byte_length: pos_len,
+            target: ARRAY_BUFFER,
+        },
+        View {
+            byte_offset: idx_offset,
+            byte_length: idx_len,
+            target: ELEMENT_ARRAY_BUFFER,
+        },
+        n_verts,
+        indices.len() as u32,
+        min,
+        max,
+        idx_component,
+    )
+}
+
+fn pack_indices(indices: &[u32], n_verts: u32, bin: &mut Vec<u8>) -> (u32, u32) {
+    let idx_offset = bin.len() as u32;
+    let component = if n_verts <= u16::MAX as u32 + 1 {
+        for &i in indices {
+            bin.extend_from_slice(&(i as u16).to_le_bytes());
+        }
+        U16_T
+    } else {
+        for &i in indices {
+            bin.extend_from_slice(&i.to_le_bytes());
+        }
+        U32_T
+    };
+    (idx_offset, component)
+}
+
+/// Compute the per-coord AABB of a flat `[x, y, z, x, y, z, ...]` buffer.
+fn bbox(vertices: &[f32]) -> ([f32; 3], [f32; 3]) {
+    let mut min = [f32::INFINITY; 3];
+    let mut max = [f32::NEG_INFINITY; 3];
+    for chunk in vertices.chunks_exact(3) {
+        for k in 0..3 {
+            let v = chunk[k];
+            if v < min[k] {
+                min[k] = v;
+            }
+            if v > max[k] {
+                max[k] = v;
+            }
+        }
+    }
+    // Empty mesh sanity — caller should have filtered upstream but be
+    // defensive: collapse to origin so the JSON doesn't carry ±inf.
+    if !min[0].is_finite() {
+        min = [0.0; 3];
+        max = [0.0; 3];
+    }
+    (min, max)
+}
+
+/// Pack three per-instance attribute arrays — TRANSLATION (VEC3),
+/// ROTATION (VEC4 quaternion xyzw), SCALE (VEC3) — into `bin`. One
+/// triple per instance, in `member_indices` order. The per-instance
+/// 4×4 is `world_transform * instance_transform`; glam's
+/// `to_scale_rotation_translation` decomposes it.
+fn pack_instance_trs(
+    meshes: &[ProductMesh],
+    group: &InstanceGroup,
+    bin: &mut Vec<u8>,
+) -> (View, View, View) {
+    let n = group.member_indices.len();
+
+    // Translation
+    let t_offset = bin.len() as u32;
+    let mut t_scratch: Vec<(f32, f32, f32)> = Vec::with_capacity(n);
+    let mut r_scratch: Vec<(f32, f32, f32, f32)> = Vec::with_capacity(n);
+    let mut s_scratch: Vec<(f32, f32, f32)> = Vec::with_capacity(n);
+    for &i in &group.member_indices {
+        let mesh = &meshes[i];
+        let world = Mat4::from_cols_array(&mesh.world_transform);
+        let inst = Mat4::from_cols_array(&mesh.parts[0].instance_transform);
+        let m = world * inst;
+        let (scale, rot, trans) = m.to_scale_rotation_translation();
+        t_scratch.push((trans.x, trans.y, trans.z));
+        r_scratch.push((rot.x, rot.y, rot.z, rot.w));
+        s_scratch.push((scale.x, scale.y, scale.z));
+    }
+    for &(x, y, z) in &t_scratch {
+        bin.extend_from_slice(&x.to_le_bytes());
+        bin.extend_from_slice(&y.to_le_bytes());
+        bin.extend_from_slice(&z.to_le_bytes());
+    }
+    let t_len = bin.len() as u32 - t_offset;
+    pad4(bin);
+
+    let r_offset = bin.len() as u32;
+    for &(x, y, z, w) in &r_scratch {
+        bin.extend_from_slice(&x.to_le_bytes());
+        bin.extend_from_slice(&y.to_le_bytes());
+        bin.extend_from_slice(&z.to_le_bytes());
+        bin.extend_from_slice(&w.to_le_bytes());
+    }
+    let r_len = bin.len() as u32 - r_offset;
+    pad4(bin);
+
+    let s_offset = bin.len() as u32;
+    for &(x, y, z) in &s_scratch {
+        bin.extend_from_slice(&x.to_le_bytes());
+        bin.extend_from_slice(&y.to_le_bytes());
+        bin.extend_from_slice(&z.to_le_bytes());
+    }
+    let s_len = bin.len() as u32 - s_offset;
+    pad4(bin);
+
+    // Instance attribute buffer views SHOULD NOT have a target per
+    // the EXT_mesh_gpu_instancing spec (they're not vertex or index
+    // buffers as far as the renderer is concerned).
+    let trs_target = 0u32;
+    (
+        View {
+            byte_offset: t_offset,
+            byte_length: t_len,
+            target: trs_target,
+        },
+        View {
+            byte_offset: r_offset,
+            byte_length: r_len,
+            target: trs_target,
+        },
+        View {
+            byte_offset: s_offset,
+            byte_length: s_len,
+            target: trs_target,
+        },
     )
 }
 
@@ -182,111 +534,148 @@ fn pad_bin(mut bin: Vec<u8>) -> Vec<u8> {
     bin
 }
 
-fn build_json(meshes: &[ProductMesh], views: &BufferViews, binary_len: u32) -> String {
-    // We hand-roll the JSON because the structure is regular and the
-    // serde / gltf-json overhead would dwarf the actual content cost on
-    // 20K+ products.
-    let mut s = String::with_capacity(meshes.len() * 400 + 1024);
+// ---------------------------------------------------------------------------
+// JSON builder.
+// ---------------------------------------------------------------------------
+
+/// Build the entire glTF JSON chunk. Layout, top-down:
+///   asset → buffers → bufferViews → accessors → materials → meshes →
+///   nodes → scenes.
+///
+/// Indices are issued in deterministic order so the binary layout (which
+/// the bufferViews reference) and the JSON references stay in sync.
+fn build_json(
+    meshes: &[ProductMesh],
+    plan: &Plan,
+    layout: &BinaryLayout,
+    binary_len: u32,
+) -> String {
+    // Pre-compute the global index ranges so we can cross-reference
+    // accessors / meshes / nodes / materials without re-walking the
+    // plan multiple times.
+    let n_baked = plan.baked.len();
+    let n_groups = plan.instanced.len();
+
+    // bufferViews + accessors layout:
+    //   - 2 per baked product (positions, indices) → [0, 2*n_baked)
+    //   - 5 per instance group (positions, indices, T, R, S) → next.
+    // meshes layout:
+    //   - 1 per baked product → [0, n_baked)
+    //   - 1 per instance group → [n_baked, n_baked + n_groups)
+    let mesh_baked_base = 0;
+    let mesh_inst_base = n_baked;
+
+    // materials: per-entity-type palette, reused across instances of
+    // the same entity to avoid an N-entry material array per glb.
+    // Baked products carry a per-product GUID material (kept for
+    // pick-to-BIM-by-material backwards-compat); instanced groups
+    // share one material keyed by the first member's entity.
+    let mut entity_palette: Vec<(String, [f32; 4])> = Vec::new();
+    let mut entity_index: HashMap<String, usize> = HashMap::new();
+    let mut baked_material_idx: Vec<usize> = Vec::with_capacity(n_baked);
+    for &i in &plan.baked {
+        let mesh = &meshes[i];
+        // Per-product material name = GUID (legacy pick-to-BIM hook),
+        // colour = entity palette lookup.
+        let color = default_color_for_entity(&mesh.entity);
+        let idx = baked_material_idx.len();
+        baked_material_idx.push(idx);
+        entity_palette.push((mesh.guid.clone(), color));
+    }
+    // Groups: one material per group, named by the rep_step_id-derived
+    // tag `instanced:<entity>` so a viewer sees these aren't
+    // individually addressable by GUID (the per-instance GUIDs live
+    // in node.extras).
+    let mut group_material_idx: Vec<usize> = Vec::with_capacity(n_groups);
+    for group in &plan.instanced {
+        let first = &meshes[group.member_indices[0]];
+        let key = first.entity.clone();
+        let idx = if let Some(&existing) = entity_index.get(&key) {
+            existing
+        } else {
+            let color = default_color_for_entity(&first.entity);
+            let new_idx = entity_palette.len();
+            entity_palette.push((format!("instanced:{}", first.entity), color));
+            entity_index.insert(key, new_idx);
+            new_idx
+        };
+        group_material_idx.push(idx);
+    }
+
+    // ----- begin JSON -----
+    let mut s = String::with_capacity(meshes.len() * 400 + 8192);
     s.push_str(r#"{"asset":{"version":"2.0","generator":"ifcfast-mesh"},"#);
+
+    // Extensions used / required — instancing is required when ≥1
+    // group exists; without that flag the viewer would silently render
+    // each shared mesh at its local origin.
+    if n_groups > 0 {
+        s.push_str(r#""extensionsUsed":["EXT_mesh_gpu_instancing"],"#);
+        s.push_str(r#""extensionsRequired":["EXT_mesh_gpu_instancing"],"#);
+    }
 
     // 1. Single buffer
     s.push_str(r#""buffers":[{"byteLength":"#);
     s.push_str(&binary_len.to_string());
     s.push_str("}],");
 
-    // 2. bufferViews (positions + indices alternating)
+    // 2. bufferViews
     s.push_str(r#""bufferViews":["#);
-    let mut byte_offset: u32 = 0;
     let mut first = true;
-    for (mesh, pv) in meshes.iter().zip(&views.products) {
-        let pos_bytes = (mesh.vertices.len() * 4) as u32;
-        let idx_bytes = match pv.idx_component {
-            U16_T => (mesh.indices.len() * 2) as u32,
-            U32_T => (mesh.indices.len() * 4) as u32,
-            _ => 0,
-        };
-        if !first { s.push(','); }
-        first = false;
-        // Positions view
-        s.push_str(r#"{"buffer":0,"byteOffset":"#);
-        s.push_str(&byte_offset.to_string());
-        s.push_str(r#","byteLength":"#);
-        s.push_str(&pos_bytes.to_string());
-        s.push_str(r#","target":"#);
-        s.push_str(&ARRAY_BUFFER.to_string());
-        s.push('}');
-        byte_offset += pos_bytes;
-        byte_offset = align4(byte_offset);
-        s.push(',');
-        // Indices view
-        s.push_str(r#"{"buffer":0,"byteOffset":"#);
-        s.push_str(&byte_offset.to_string());
-        s.push_str(r#","byteLength":"#);
-        s.push_str(&idx_bytes.to_string());
-        s.push_str(r#","target":"#);
-        s.push_str(&ELEMENT_ARRAY_BUFFER.to_string());
-        s.push('}');
-        byte_offset += idx_bytes;
-        byte_offset = align4(byte_offset);
+    for v in &layout.baked {
+        push_view(&mut s, &mut first, &v.positions);
+        push_view(&mut s, &mut first, &v.indices);
+    }
+    for v in &layout.instanced {
+        push_view(&mut s, &mut first, &v.positions);
+        push_view(&mut s, &mut first, &v.indices);
+        push_view(&mut s, &mut first, &v.translation);
+        push_view(&mut s, &mut first, &v.rotation);
+        push_view(&mut s, &mut first, &v.scale);
     }
     s.push_str("],");
 
-    // 3. Accessors (positions + indices per product)
+    // 3. Accessors. bufferView indices are issued in the same order
+    //    the bufferViews block uses (baked × 2 then instanced × 5).
     s.push_str(r#""accessors":["#);
     first = true;
-    for pv in &views.products {
-        if !first { s.push(','); }
-        first = false;
-        // Positions accessor
-        s.push_str(r#"{"bufferView":"#);
-        s.push_str(&pv.pos_view.to_string());
-        s.push_str(r#","componentType":"#);
-        s.push_str(&F32.to_string());
-        s.push_str(r#","count":"#);
-        s.push_str(&pv.n_verts.to_string());
-        s.push_str(r#","type":""#);
-        s.push_str(VEC3);
-        s.push_str(r#"","min":["#);
-        s.push_str(&format_f32(pv.min[0]));
-        s.push(',');
-        s.push_str(&format_f32(pv.min[1]));
-        s.push(',');
-        s.push_str(&format_f32(pv.min[2]));
-        s.push_str(r#"],"max":["#);
-        s.push_str(&format_f32(pv.max[0]));
-        s.push(',');
-        s.push_str(&format_f32(pv.max[1]));
-        s.push(',');
-        s.push_str(&format_f32(pv.max[2]));
-        s.push_str("]}");
-        s.push(',');
-        // Indices accessor
-        s.push_str(r#"{"bufferView":"#);
-        s.push_str(&pv.idx_view.to_string());
-        s.push_str(r#","componentType":"#);
-        s.push_str(&pv.idx_component.to_string());
-        s.push_str(r#","count":"#);
-        s.push_str(&pv.n_indices.to_string());
-        s.push_str(r#","type":""#);
-        s.push_str(SCALAR);
-        s.push_str(r#""}"#);
+    let mut bv_idx: u32 = 0;
+    for v in &layout.baked {
+        push_accessor_positions(&mut s, &mut first, bv_idx, v.n_verts, v.min, v.max);
+        bv_idx += 1;
+        push_accessor_indices(&mut s, &mut first, bv_idx, v.n_indices, v.idx_component);
+        bv_idx += 1;
+    }
+    for v in &layout.instanced {
+        push_accessor_positions(&mut s, &mut first, bv_idx, v.n_verts, v.min, v.max);
+        bv_idx += 1;
+        push_accessor_indices(&mut s, &mut first, bv_idx, v.n_indices, v.idx_component);
+        bv_idx += 1;
+        // TRANSLATION: VEC3 floats, one per instance.
+        push_accessor_vec(&mut s, &mut first, bv_idx, v.n_instances, VEC3);
+        bv_idx += 1;
+        // ROTATION: VEC4 floats (quaternion xyzw), one per instance.
+        push_accessor_vec(&mut s, &mut first, bv_idx, v.n_instances, VEC4);
+        bv_idx += 1;
+        // SCALE: VEC3 floats, one per instance.
+        push_accessor_vec(&mut s, &mut first, bv_idx, v.n_instances, VEC3);
+        bv_idx += 1;
     }
     s.push_str("],");
 
-    // 4. Materials — one per product, named with the GUID so viewers can
-    //    address each product individually (the demo viewer recolors by
-    //    `material.name == guid`). Default PBR with an entity-aware
-    //    fallback palette; richer colour via IfcSurfaceStyle is tracked
-    //    separately (ifcfast#3).
+    // 4. Materials — palette deduped by entity (instanced) plus per-
+    //    product (baked).
     s.push_str(r#""materials":["#);
     first = true;
-    for mesh in meshes.iter() {
-        if !first { s.push(','); }
+    for (name, color) in &entity_palette {
+        if !first {
+            s.push(',');
+        }
         first = false;
-        let (r, g, b, a) = default_color_for_entity(&mesh.entity);
+        let (r, g, b, a) = (color[0], color[1], color[2], color[3]);
         let translucent = a < 1.0;
         s.push_str(r#"{"name":""#);
-        push_json_string(&mut s, &mesh.guid);
+        push_json_string(&mut s, name);
         s.push_str(r#"","pbrMetallicRoughness":{"baseColorFactor":["#);
         s.push_str(&format_f32(r));
         s.push(',');
@@ -303,36 +692,57 @@ fn build_json(meshes: &[ProductMesh], views: &BufferViews, binary_len: u32) -> S
     }
     s.push_str("],");
 
-    // 5. Meshes — each primitive references its product's material.
+    // 5. Meshes — one per baked product, one per instance group.
     s.push_str(r#""meshes":["#);
     first = true;
-    for (i, _pv) in views.products.iter().enumerate() {
-        if !first { s.push(','); }
+    let mut acc_base: u32 = 0;
+    for (i, _) in plan.baked.iter().enumerate() {
+        if !first {
+            s.push(',');
+        }
         first = false;
-        let pos_acc = (i * 2) as u32;
-        let idx_acc = (i * 2 + 1) as u32;
+        let pos_acc = acc_base;
+        let idx_acc = acc_base + 1;
         s.push_str(r#"{"primitives":[{"attributes":{"POSITION":"#);
         s.push_str(&pos_acc.to_string());
         s.push_str(r#"},"indices":"#);
         s.push_str(&idx_acc.to_string());
         s.push_str(r#","material":"#);
-        s.push_str(&i.to_string());
+        s.push_str(&baked_material_idx[i].to_string());
         s.push_str(r#","mode":4}]}"#);
+        acc_base += 2;
+    }
+    for (g, _group) in plan.instanced.iter().enumerate() {
+        if !first {
+            s.push(',');
+        }
+        first = false;
+        let pos_acc = acc_base;
+        let idx_acc = acc_base + 1;
+        s.push_str(r#"{"primitives":[{"attributes":{"POSITION":"#);
+        s.push_str(&pos_acc.to_string());
+        s.push_str(r#"},"indices":"#);
+        s.push_str(&idx_acc.to_string());
+        s.push_str(r#","material":"#);
+        s.push_str(&group_material_idx[g].to_string());
+        s.push_str(r#","mode":4}]}"#);
+        acc_base += 5; // positions + indices + T + R + S
     }
     s.push_str("],");
 
-    // 6. Nodes — product nodes (with GUID + entity extras) plus a root
-    //    rotator node that wraps them in a glTF-conformant Y-up frame.
-    //    BIM data is authored Z-up; glTF is spec'd Y-up. The root carries
-    //    a quaternion rotation of −90° about X so the whole scene reads
-    //    upright in any glTF viewer without a viewer-side patch.
+    // 6. Nodes — baked products + instance group nodes + a root
+    //    rotator that maps the Z-up BIM frame into glTF's Y-up frame.
     s.push_str(r#""nodes":["#);
     first = true;
-    for (i, mesh) in meshes.iter().enumerate() {
-        if !first { s.push(','); }
+    // 6a. Baked nodes — one per product, mesh idx = baked position.
+    for (bi, &orig_i) in plan.baked.iter().enumerate() {
+        if !first {
+            s.push(',');
+        }
         first = false;
+        let mesh = &meshes[orig_i];
         s.push_str(r#"{"mesh":"#);
-        s.push_str(&i.to_string());
+        s.push_str(&(mesh_baked_base + bi).to_string());
         s.push_str(r#","name":""#);
         push_json_string(&mut s, &mesh.guid);
         s.push_str(r#"","extras":{"guid":""#);
@@ -342,14 +752,10 @@ fn build_json(meshes: &[ProductMesh], views: &BufferViews, binary_len: u32) -> S
         s.push_str(r#"","source":""#);
         push_json_string(&mut s, mesh.source);
         s.push_str(r#"","segments":["#);
-        // Per-segment provenance — lets the viewer split, colour, or
-        // filter a product's triangles by representation role. A wall
-        // built from IfcBooleanClippingResult will have two entries
-        // here, e.g. one tagged "boolean_first_operand|extrusion"
-        // (the host bulk) and one "boolean_second_operand|halfspace_bounded"
-        // (the clip volume) — both visible.
         for (si, seg) in mesh.segments.iter().enumerate() {
-            if si > 0 { s.push(','); }
+            if si > 0 {
+                s.push(',');
+            }
             s.push_str(r#"{"start":"#);
             s.push_str(&seg.index_start.to_string());
             s.push_str(r#","count":"#);
@@ -360,21 +766,82 @@ fn build_json(meshes: &[ProductMesh], views: &BufferViews, binary_len: u32) -> S
         }
         s.push_str(r#"]}}"#);
     }
-    // Root rotator at the end: rotation quat (x, y, z, w) for −90° about X
-    //   = (sin(-π/4), 0, 0, cos(-π/4)) ≈ (-0.7071068, 0, 0, 0.7071068).
-    if !meshes.is_empty() { s.push(','); }
+    // 6b. Instance group nodes — one per group, with EXT_mesh_gpu_instancing
+    //     attributes pointing at the T/R/S accessors. Per-instance
+    //     identity (guid + entity + segments) goes into extras.instances
+    //     as a parallel array indexed by instance order.
+    let mut acc_inst_walker: u32 = (2 * n_baked) as u32; // accessor index of the first instance group's positions
+    for (gi, group) in plan.instanced.iter().enumerate() {
+        if !first {
+            s.push(',');
+        }
+        first = false;
+        // Positions+indices acc, then T, R, S acc.
+        let t_acc = acc_inst_walker + 2;
+        let r_acc = acc_inst_walker + 3;
+        let s_acc = acc_inst_walker + 4;
+        acc_inst_walker += 5;
+        s.push_str(r#"{"mesh":"#);
+        s.push_str(&(mesh_inst_base + gi).to_string());
+        s.push_str(r#","name":"ifcfast_instances_"#);
+        s.push_str(&group.rep_step_id.to_string());
+        s.push_str(r#"","extensions":{"EXT_mesh_gpu_instancing":{"attributes":{"TRANSLATION":"#);
+        s.push_str(&t_acc.to_string());
+        s.push_str(r#","ROTATION":"#);
+        s.push_str(&r_acc.to_string());
+        s.push_str(r#","SCALE":"#);
+        s.push_str(&s_acc.to_string());
+        s.push_str(r#"}}},"extras":{"rep_step_id":"#);
+        s.push_str(&group.rep_step_id.to_string());
+        s.push_str(r#","instances":["#);
+        // Per-instance metadata, indexed by glTF instance order.
+        for (mi, &orig_i) in group.member_indices.iter().enumerate() {
+            let mesh = &meshes[orig_i];
+            if mi > 0 {
+                s.push(',');
+            }
+            s.push_str(r#"{"guid":""#);
+            push_json_string(&mut s, &mesh.guid);
+            s.push_str(r#"","entity":""#);
+            push_json_string(&mut s, &mesh.entity);
+            s.push_str(r#"","source":""#);
+            push_json_string(&mut s, mesh.source);
+            s.push_str(r#"","segments":["#);
+            for (si, seg) in mesh.segments.iter().enumerate() {
+                if si > 0 {
+                    s.push(',');
+                }
+                s.push_str(r#"{"start":"#);
+                s.push_str(&seg.index_start.to_string());
+                s.push_str(r#","count":"#);
+                s.push_str(&seg.index_count.to_string());
+                s.push_str(r#","source":""#);
+                push_json_string(&mut s, &seg.source);
+                s.push_str(r#""}"#);
+            }
+            s.push_str(r#"]}"#);
+        }
+        s.push_str(r#"]}}"#);
+    }
+    // 6c. Root rotator — quaternion for −90° about X (Z-up → Y-up).
+    let n_content_nodes = n_baked + n_groups;
+    if n_content_nodes > 0 {
+        s.push(',');
+    }
     s.push_str(r#"{"name":"ifcfast_root","rotation":[-0.70710677,0,0,0.70710677],"children":["#);
     first = true;
-    for i in 0..meshes.len() {
-        if !first { s.push(','); }
+    for i in 0..n_content_nodes {
+        if !first {
+            s.push(',');
+        }
         first = false;
         s.push_str(&i.to_string());
     }
     s.push_str("]}");
     s.push_str("],");
 
-    // 7. Scene — only the root node; product nodes hang under it.
-    let root_idx = meshes.len();
+    // 7. Scene — only the root node; content nodes hang under it.
+    let root_idx = n_content_nodes;
     s.push_str(r#""scenes":[{"nodes":["#);
     s.push_str(&root_idx.to_string());
     s.push_str(r#"]}],"scene":0}"#);
@@ -382,35 +849,127 @@ fn build_json(meshes: &[ProductMesh], views: &BufferViews, binary_len: u32) -> S
     s
 }
 
+fn push_view(s: &mut String, first: &mut bool, v: &View) {
+    if !*first {
+        s.push(',');
+    }
+    *first = false;
+    s.push_str(r#"{"buffer":0,"byteOffset":"#);
+    s.push_str(&v.byte_offset.to_string());
+    s.push_str(r#","byteLength":"#);
+    s.push_str(&v.byte_length.to_string());
+    if v.target != 0 {
+        s.push_str(r#","target":"#);
+        s.push_str(&v.target.to_string());
+    }
+    s.push('}');
+}
+
+fn push_accessor_positions(
+    s: &mut String,
+    first: &mut bool,
+    bv_idx: u32,
+    n_verts: u32,
+    min: [f32; 3],
+    max: [f32; 3],
+) {
+    if !*first {
+        s.push(',');
+    }
+    *first = false;
+    s.push_str(r#"{"bufferView":"#);
+    s.push_str(&bv_idx.to_string());
+    s.push_str(r#","componentType":"#);
+    s.push_str(&F32.to_string());
+    s.push_str(r#","count":"#);
+    s.push_str(&n_verts.to_string());
+    s.push_str(r#","type":""#);
+    s.push_str(VEC3);
+    s.push_str(r#"","min":["#);
+    s.push_str(&format_f32(min[0]));
+    s.push(',');
+    s.push_str(&format_f32(min[1]));
+    s.push(',');
+    s.push_str(&format_f32(min[2]));
+    s.push_str(r#"],"max":["#);
+    s.push_str(&format_f32(max[0]));
+    s.push(',');
+    s.push_str(&format_f32(max[1]));
+    s.push(',');
+    s.push_str(&format_f32(max[2]));
+    s.push_str("]}");
+}
+
+fn push_accessor_indices(
+    s: &mut String,
+    first: &mut bool,
+    bv_idx: u32,
+    n_indices: u32,
+    component: u32,
+) {
+    if !*first {
+        s.push(',');
+    }
+    *first = false;
+    s.push_str(r#"{"bufferView":"#);
+    s.push_str(&bv_idx.to_string());
+    s.push_str(r#","componentType":"#);
+    s.push_str(&component.to_string());
+    s.push_str(r#","count":"#);
+    s.push_str(&n_indices.to_string());
+    s.push_str(r#","type":""#);
+    s.push_str(SCALAR);
+    s.push_str(r#""}"#);
+}
+
+fn push_accessor_vec(
+    s: &mut String,
+    first: &mut bool,
+    bv_idx: u32,
+    count: u32,
+    vec_type: &str,
+) {
+    if !*first {
+        s.push(',');
+    }
+    *first = false;
+    s.push_str(r#"{"bufferView":"#);
+    s.push_str(&bv_idx.to_string());
+    s.push_str(r#","componentType":"#);
+    s.push_str(&F32.to_string());
+    s.push_str(r#","count":"#);
+    s.push_str(&count.to_string());
+    s.push_str(r#","type":""#);
+    s.push_str(vec_type);
+    s.push_str(r#""}"#);
+}
+
 /// Per-entity-type default colour palette. Returns linear-space sRGB +
 /// alpha. Translucent entries (alpha < 1) flag the material as BLEND in
 /// the JSON emitter so the viewer can see *through* spaces and openings
 /// to the solid geometry behind. Real IfcSurfaceStyle colour extraction
 /// is tracked in ifcfast#3 — this is the neutral fallback.
-fn default_color_for_entity(entity: &str) -> (f32, f32, f32, f32) {
+fn default_color_for_entity(entity: &str) -> [f32; 4] {
     // Lowercase, strip "Ifc" prefix for matching.
     let e = entity.to_ascii_lowercase();
     let e = e.strip_prefix("ifc").unwrap_or(&e);
-    match e {
+    let (r, g, b, a) = match e {
         "wall" | "wallstandardcase" => (0.88, 0.85, 0.78, 1.0),
-        "slab"                       => (0.78, 0.78, 0.80, 1.0),
-        "footing"                    => (0.55, 0.55, 0.55, 1.0),
+        "slab" => (0.78, 0.78, 0.80, 1.0),
+        "footing" => (0.55, 0.55, 0.55, 1.0),
         "beam" | "member" | "column" => (0.62, 0.66, 0.72, 1.0),
-        "covering"                   => (0.85, 0.83, 0.78, 1.0),
-        "railing"                    => (0.35, 0.35, 0.38, 1.0),
-        "stairflight" | "stair"      => (0.70, 0.68, 0.62, 1.0),
-        "door"                       => (0.50, 0.36, 0.24, 1.0),
-        "window"                     => (0.55, 0.72, 0.85, 0.55),
-        "furnishingelement"          => (0.78, 0.65, 0.48, 1.0),
-        "space"                      => (0.62, 0.80, 0.78, 0.18),
-        "openingelement"             => (0.95, 0.55, 0.20, 0.22),
-        "roof"                       => (0.45, 0.30, 0.25, 1.0),
-        _                             => (0.75, 0.75, 0.75, 1.0),
-    }
-}
-
-fn align4(n: u32) -> u32 {
-    (n + 3) & !3
+        "covering" => (0.85, 0.83, 0.78, 1.0),
+        "railing" => (0.35, 0.35, 0.38, 1.0),
+        "stairflight" | "stair" => (0.70, 0.68, 0.62, 1.0),
+        "door" => (0.50, 0.36, 0.24, 1.0),
+        "window" => (0.55, 0.72, 0.85, 0.55),
+        "furnishingelement" => (0.78, 0.65, 0.48, 1.0),
+        "space" => (0.62, 0.80, 0.78, 0.18),
+        "openingelement" => (0.95, 0.55, 0.20, 0.22),
+        "roof" => (0.45, 0.30, 0.25, 1.0),
+        _ => (0.75, 0.75, 0.75, 1.0),
+    };
+    [r, g, b, a]
 }
 
 fn push_json_string(out: &mut String, s: &str) {
