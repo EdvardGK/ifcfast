@@ -34,7 +34,7 @@ path = "src/bin/clash.rs"
 required-features = ["clash"]
 
 [features]
-default = ["python", "bundle", "geom", "clash"]
+default = ["python", "bundle", "geom", "clash", "csg"]
 python = ["dep:pyo3"]
 mesh = ["dep:earcutr", "dep:glam", "dep:rayon", "dep:dashmap", "dep:crossbeam-channel"]
 # Streaming substrate writer (GeoParquet-of-products). Pulls in arrow

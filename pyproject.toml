@@ -48,7 +48,7 @@ Issues = "https://github.com/EdvardGK/ifcfast/issues"
 [tool.maturin]
 manifest-path = "crates/core/Cargo.toml"
 module-name = "ifcfast._core"
-features = ["python", "mesh"]
+features = ["python", "mesh", "csg"]
 strip = true
 python-source = "python"
 # LICENSE / AGENTS.md live outside python-source, so they need an explicit
