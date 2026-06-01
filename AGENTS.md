@@ -87,6 +87,7 @@ releases (additions only, never reorganisations).
 | Classification refs (NS 3451, OmniClass, …) | `m.classifications` |
 | Per-product triangle meshes (verts, faces) | `m.meshes()` (`unit=`, `cut_openings=` opts) |
 | Sample a labeled point cloud (+ normals) | `m.point_cloud(per_m2=1000)` |
+| Stream a point cloud in bounded-RAM chunks | `m.iter_point_cloud(per_m2=1000, chunk_points=1_000_000)` |
 | Geometric quantities (volume, area) | `m.mesh_qto()` |
 | Placement-vs-mesh sanity check | `m.drift` |
 | "Which products live under this storey?" | `m.products_in(storey_guid)` |
@@ -232,6 +233,42 @@ the project's unit scale as parquet schema metadata
   `"path"` and `"tables"` fields are guaranteed-present.
 - **Cache version is in the manifest** (`~/.cache/ifcfast/{key}/meta.json`)
   — bumping the library invalidates incompatible caches automatically.
+- **Recoverable Rust failures raise `ifcfast.IfcfastError`** (since
+  v0.4.20). The geometry-pipeline entry points
+  (`m.point_cloud`, `m.iter_point_cloud`, `m.meshes`, `m.mesh_qto`,
+  `m.drift`) catch Rust panics at the PyO3 boundary and surface them
+  as `IfcfastError` instead of the uncatchable
+  `pyo3_runtime.PanicException`. Wrap geometry calls in
+  `try: ... except ifcfast.IfcfastError: ...` if you need per-file
+  resilience in a corpus pipeline.
+
+## Streaming point cloud (`m.iter_point_cloud(...)`)
+
+`m.point_cloud(per_m2, seed)` materialises the entire sampled cloud
+in one DataFrame — for 200 MB – 1 GB ARK IFCs that DataFrame doesn't
+fit in 32 GB workstation RAM and the failure modes (Arrow realloc,
+Python `MemoryError`, Rust panic) can lock the host.
+
+```python
+for chunk in m.iter_point_cloud(per_m2=200.0, seed=0,
+                                 chunk_points=1_000_000):
+    chunk.to_parquet(out_dir / f"part-{i:04d}.parquet")
+    i += 1
+```
+
+- Peak RAM is ~`chunk_points × 80 B` (xyz + normals + guid + entity
+  strings), independent of total point count.
+- Every chunk has the same columns as the single-shot
+  `point_cloud()` output, plus `df.attrs["global_shift"]` (identical
+  across chunks for a given file).
+- A single product whose samples cross a chunk boundary splits; the
+  `guid` column still tags every row, so a groupby-by-GUID across
+  chunks reconstructs the per-product sample set.
+- The Rust mesh pass runs on a worker thread; `__next__` releases the
+  GIL while waiting on the worker, so Python KeyboardInterrupt fires
+  promptly and you don't block other Python work during tessellation.
+- Dropping the iterator early (e.g. `it = ...; next(it); del it`)
+  signals the worker via an atomic stop flag — no thread leak.
 
 ## Reveal-all geometry stance
 

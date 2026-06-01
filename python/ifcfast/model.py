@@ -489,6 +489,98 @@ class Model:
         df.attrs["global_shift"] = gshift
         return df
 
+    def iter_point_cloud(
+        self,
+        per_m2: float = 1000.0,
+        seed: int = 42,
+        unit: str = "m",
+        chunk_points: int = 1_000_000,
+    ):
+        """Streaming variant of :meth:`point_cloud` — yields DataFrame
+        chunks of ``chunk_points`` rows each.
+
+        Bounded-RAM sampling for large models. The single-shot
+        :meth:`point_cloud` materialises the entire result in one
+        DataFrame; for 200 MB – 1 GB ARK IFCs that DataFrame doesn't
+        fit in 32 GB workstation RAM and the failure modes (Arrow
+        realloc, ``MemoryError``, Rust panic) lock the host. This
+        iterator caps peak RAM at one chunk by pulling rows from a
+        background worker through a bounded channel.
+
+        Each yielded DataFrame has the same columns as
+        :meth:`point_cloud` (``guid``, ``entity``, ``x``, ``y``, ``z``,
+        ``nx``, ``ny``, ``nz``) and the same ``df.attrs["global_shift"]``
+        contract (a per-file model-wide shift, identical across every
+        chunk for a given file). A single product whose samples span a
+        chunk boundary splits across consecutive chunks; the ``guid``
+        column still tags every row with its source product, so a
+        groupby-by-GUID across chunks reconstructs the per-product
+        sample set exactly.
+
+        Reproducibility is identical to :meth:`point_cloud`: for a given
+        ``(file, per_m2, seed)`` the union of all yielded chunks is
+        bit-equivalent to the single-shot output (modulo row ordering,
+        which matches the streaming mesh-pass order across both APIs).
+
+        Args:
+            per_m2: target sample density, in points per square *metre*
+                (see :meth:`point_cloud` for the unit semantics).
+            seed: PRNG seed. Defaults to 42.
+            unit: output coordinate unit. Same set as :meth:`point_cloud`.
+            chunk_points: rows per yielded DataFrame. Default 1_000_000
+                gives ~80 MB per chunk (with guid + entity strings).
+                Tune down for tighter RAM budgets; ``chunk_points=0``
+                raises ``IfcfastError``.
+
+        Yields:
+            ``pandas.DataFrame`` — one chunk at a time. The iterator is
+            single-pass: iterate it once or convert it explicitly
+            (``list(m.iter_point_cloud(...))``).
+
+        Raises:
+            IfcfastError: on a Rust panic inside the worker (allocator
+                pressure, degenerate geometry) — surfaced as a
+                recoverable Python exception instead of the uncatchable
+                ``pyo3_runtime.PanicException`` the single-shot API
+                raised under the same conditions.
+
+        Example::
+
+            >>> for chunk in m.iter_point_cloud(per_m2=200.0, seed=0,
+            ...                                  chunk_points=1_000_000):
+            ...     chunk.to_parquet(out_dir / f"part-{i:04d}.parquet")
+            ...     i += 1
+            >>> # Sum of len(chunk) across the iteration == total points
+            >>> # All chunks carry the same chunk.attrs["global_shift"]
+        """
+        from . import _core
+        import pandas as pd
+
+        factor = _unit_factor(unit)
+        it = _core.iter_point_cloud(
+            str(native_path_for(self.header.path)),
+            float(per_m2),
+            int(seed),
+            int(chunk_points),
+        )
+        for d in it:
+            df = pd.DataFrame({
+                "guid": d["guid"],
+                "entity": d["entity"],
+                "x": d["x"],
+                "y": d["y"],
+                "z": d["z"],
+                "nx": d["nx"],
+                "ny": d["ny"],
+                "nz": d["nz"],
+            })
+            gshift = list(d.get("global_shift", [0.0, 0.0, 0.0]))
+            if factor != 1.0:
+                df[["x", "y", "z"]] *= factor
+                gshift = [s * factor for s in gshift]
+            df.attrs["global_shift"] = gshift
+            yield df
+
     def meshes(self, unit: str = "m", cut_openings: bool = False):
         """Raw per-product triangle meshes — the fast drop-in for
         IfcOpenShell tessellation.

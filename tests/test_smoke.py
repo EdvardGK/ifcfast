@@ -297,3 +297,122 @@ def test_zip_disguised_as_ifc(tmp_path):
 
     m = ifcfast.open(bogus, use_cache=False, write_cache=False)
     assert m.types() == {"IfcWall": 1}
+
+
+# ---------------------------------------------------------------------------
+# iter_point_cloud — streaming point cloud (GH #23 fix)
+# ---------------------------------------------------------------------------
+
+
+def test_iter_point_cloud_chunks_sum_matches_single_shot(tmp_path):
+    """Streaming union must equal single-shot output. The iterator can
+    flush mid-product, so a stable groupby-by-GUID across chunks
+    reconstructs the per-product sample set; sum of points across
+    chunks equals total from `point_cloud()` at the same (per_m2, seed).
+    """
+    pd = pytest.importorskip("pandas")
+    p = _write_mm_cube(tmp_path)
+    m = ifcfast.open(p, use_cache=False, write_cache=False)
+
+    single = m.point_cloud(per_m2=100, seed=1)
+    chunks = list(m.iter_point_cloud(per_m2=100, seed=1, chunk_points=17))
+    total = sum(len(c) for c in chunks)
+    assert total == len(single)
+    assert all(len(c) > 0 for c in chunks)
+    # Every chunk except the last should be exactly chunk_points; the
+    # current sink flushes the moment the buffer crosses the threshold,
+    # so all middle chunks are pinned at exactly 17.
+    for c in chunks[:-1]:
+        assert len(c) == 17
+    assert len(chunks[-1]) <= 17
+
+
+def test_iter_point_cloud_global_shift_stable_per_chunk(tmp_path):
+    """Every yielded chunk carries the same global_shift (model-wide,
+    not per-chunk). Near-origin fixture → shift == [0, 0, 0].
+    """
+    pytest.importorskip("pandas")
+    p = _write_mm_cube(tmp_path)
+    m = ifcfast.open(p, use_cache=False, write_cache=False)
+
+    chunks = list(m.iter_point_cloud(per_m2=200, seed=7, chunk_points=25))
+    assert len(chunks) >= 2
+    shifts = [tuple(c.attrs["global_shift"]) for c in chunks]
+    assert len(set(shifts)) == 1, f"global_shift drifted across chunks: {shifts}"
+    assert shifts[0] == (0.0, 0.0, 0.0)
+
+
+def test_iter_point_cloud_unit_factor_applies_per_chunk(tmp_path):
+    """`unit="mm"` scales every chunk's xyz (and its global_shift) the
+    same way the single-shot API does — verifies the Python wrapper
+    applies the factor per yielded DataFrame.
+    """
+    pytest.importorskip("pandas")
+    p = _write_mm_cube(tmp_path)
+    m = ifcfast.open(p, use_cache=False, write_cache=False)
+
+    chunks_m = list(m.iter_point_cloud(per_m2=50, seed=3, unit="m", chunk_points=20))
+    chunks_mm = list(m.iter_point_cloud(per_m2=50, seed=3, unit="mm", chunk_points=20))
+    assert len(chunks_m) == len(chunks_mm)
+    for cm, cmm in zip(chunks_m, chunks_mm):
+        span_m = cm["x"].max() - cm["x"].min()
+        span_mm = cmm["x"].max() - cmm["x"].min()
+        # mm chunk should be 1000× the metres chunk per axis.
+        assert span_mm == pytest.approx(span_m * 1000.0, rel=1e-3)
+
+
+def test_iter_point_cloud_deterministic(tmp_path):
+    """Same (per_m2, seed) at same chunk_points → bit-identical chunk
+    contents across iterations. Determinism is a hard contract for ML
+    pipelines using this as a sampling backend.
+    """
+    pytest.importorskip("pandas")
+    p = _write_mm_cube(tmp_path)
+    m = ifcfast.open(p, use_cache=False, write_cache=False)
+
+    a = list(m.iter_point_cloud(per_m2=50, seed=42, chunk_points=23))
+    b = list(m.iter_point_cloud(per_m2=50, seed=42, chunk_points=23))
+    assert len(a) == len(b)
+    for ca, cb in zip(a, b):
+        assert (ca["x"].values == cb["x"].values).all()
+        assert (ca["y"].values == cb["y"].values).all()
+        assert (ca["z"].values == cb["z"].values).all()
+        assert (ca["guid"].values == cb["guid"].values).all()
+
+
+def test_iter_point_cloud_zero_chunk_raises(tmp_path):
+    """`chunk_points=0` is a user error — surface as IfcfastError, not
+    a confusing downstream divide-by-zero deep in the Rust sink."""
+    p = _write_mm_cube(tmp_path)
+    m = ifcfast.open(p, use_cache=False, write_cache=False)
+    with pytest.raises(ifcfast.IfcfastError):
+        list(m.iter_point_cloud(per_m2=10, seed=1, chunk_points=0))
+
+
+def test_ifcfast_error_is_exposed():
+    """IfcfastError is the public catch type for recoverable Rust
+    failures (panic-to-Python translation, validation errors). Make
+    sure the public re-export is wired correctly.
+    """
+    assert issubclass(ifcfast.IfcfastError, Exception)
+
+
+def test_iter_point_cloud_early_drop_does_not_hang(tmp_path):
+    """Dropping the iterator before exhausting it must release the
+    worker promptly via the AtomicBool stop flag — otherwise consumer
+    code that reads one chunk and bails (e.g. preview / sampling
+    pipelines) would leak a tessellation thread per file.
+    """
+    pytest.importorskip("pandas")
+    p = _write_mm_cube(tmp_path)
+    m = ifcfast.open(p, use_cache=False, write_cache=False)
+
+    it = m.iter_point_cloud(per_m2=200, seed=1, chunk_points=10)
+    first = next(it)
+    assert len(first) == 10
+    # Explicitly drop the generator + underlying pyclass.
+    del it
+    # If the worker were stuck holding GIL / refs, a subsequent call
+    # would block. Run a second iter immediately as a liveness check.
+    second_chunks = list(m.iter_point_cloud(per_m2=50, seed=2, chunk_points=999_999))
+    assert len(second_chunks) >= 1

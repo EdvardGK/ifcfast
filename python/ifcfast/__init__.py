@@ -72,8 +72,22 @@ from .model import Model, ProductRow, StoreyRow, open_ifc as open
 from .clash import clash
 from . import cache, classify
 
+# Re-export the Rust-side IfcfastError so callers can
+# `from ifcfast import IfcfastError` without reaching into `_core`.
+# The native module is only present in built wheels — fall back to a
+# Python-defined placeholder during source-only imports (tooling, type
+# checkers) so the import itself doesn't fail.
+try:
+    from ._core import IfcfastError  # type: ignore[attr-defined]
+except ImportError:  # pragma: no cover
+    class IfcfastError(Exception):
+        """Raised when the Rust core hits a recoverable failure (e.g.
+        a panic caught at the PyO3 boundary). Provided as a Python
+        fallback when the native `_core` extension is unavailable."""
+
 __all__ = [
     "IFCHeader",
+    "IfcfastError",
     "Model",
     "ProductRow",
     "StoreyRow",
@@ -86,7 +100,7 @@ __all__ = [
     "system_prompt",
 ]
 
-__version__ = "0.4.19"
+__version__ = "0.4.20"
 
 
 def example_path() -> Path:

@@ -40,6 +40,7 @@ pub mod clash;
 #[cfg(feature = "python")]
 mod python {
     use std::path::Path;
+    use std::panic::{catch_unwind, AssertUnwindSafe};
     use std::time::Instant;
 
     use pyo3::prelude::*;
@@ -49,6 +50,44 @@ mod python {
 
     use crate::indexer;
     use crate::source::IfcSource;
+
+    // ----- panic / error helpers ---------------------------------------
+
+    // Custom Python exception so callers can `except IfcfastError`
+    // instead of getting hit with the uncatchable `pyo3_runtime.PanicException`
+    // when a Rust panic crosses the boundary. Covers the third failure
+    // mode reported in GH #23 (worker death under allocator pressure).
+    pyo3::create_exception!(_core, IfcfastError, pyo3::exceptions::PyException);
+
+    /// Stringify a panic payload (`Box<dyn Any + Send>`) the way the
+    /// default Rust panic hook would, so the Python error message
+    /// carries the actual panic text instead of `<non-string payload>`.
+    fn panic_payload_to_string(payload: Box<dyn std::any::Any + Send>) -> String {
+        if let Some(s) = payload.downcast_ref::<&'static str>() {
+            (*s).to_string()
+        } else if let Some(s) = payload.downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "<non-string panic payload>".to_string()
+        }
+    }
+
+    /// Wrap a `PyResult`-returning closure in `catch_unwind` and
+    /// translate any panic into an `IfcfastError`. Apply at the PyO3
+    /// boundary so a Rust panic never reaches the Python interpreter
+    /// as the uncatchable `PanicException`.
+    fn catch_panic<F, R>(f: F) -> PyResult<R>
+    where
+        F: FnOnce() -> PyResult<R>,
+    {
+        match catch_unwind(AssertUnwindSafe(f)) {
+            Ok(r) => r,
+            Err(payload) => Err(PyErr::new::<IfcfastError, _>(format!(
+                "ifcfast Rust panic: {}",
+                panic_payload_to_string(payload)
+            ))),
+        }
+    }
 
     // ----- index_ifc ----------------------------------------------------
 
@@ -476,6 +515,7 @@ mod python {
     #[cfg(feature = "mesh")]
     #[pyfunction]
     pub fn mesh_qto<'py>(py: Python<'py>, path: &str) -> PyResult<Bound<'py, PyDict>> {
+        catch_panic(|| {
         use crate::mesh::{
             mesh_ifc_streaming_framed, qto, BakeFrame, ProductMesh, ProductSink,
         };
@@ -602,11 +642,13 @@ mod python {
         out.set_item("products_meshed", mesh_stats.products_meshed)?;
         out.set_item("size_bytes", mmap.len() as u64)?;
         Ok(out)
+        })
     }
 
     #[cfg(feature = "mesh")]
     #[pyfunction]
     pub fn analyse_drift<'py>(py: Python<'py>, path: &str) -> PyResult<Bound<'py, PyDict>> {
+        catch_panic(|| {
         let t_total = Instant::now();
         let (mmap, _open_ms) = open_mmap(path)?;
         let (meshes, mesh_stats) = py.allow_threads(|| crate::mesh::mesh_ifc(&mmap));
@@ -711,6 +753,7 @@ mod python {
         out.set_item("total_ms", t_total.elapsed().as_secs_f64() * 1000.0)?;
         out.set_item("size_bytes", mmap.len() as u64)?;
         Ok(out)
+        })
     }
 
     // ----- global shift (CloudCompare contract) ------------------------
@@ -763,6 +806,7 @@ mod python {
         per_m2: f32,
         seed: u64,
     ) -> PyResult<Bound<'py, PyDict>> {
+        catch_panic(|| {
         use crate::mesh::{sample::sample as sample_mesh, BakeFrame, ProductMesh, ProductSink};
 
         let t_total = Instant::now();
@@ -922,6 +966,380 @@ mod python {
         out.set_item("total_ms", t_total.elapsed().as_secs_f64() * 1000.0)?;
         out.set_item("size_bytes", mmap.len() as u64)?;
         Ok(out)
+        })
+    }
+
+    // ----- iter_point_cloud --------------------------------------------
+
+    // Streaming point-cloud generator (GH #23). The single-shot
+    // [`sample_point_cloud`] materialises every sampled point into one
+    // dict before returning — for 200 MB – 1 GB ARK IFCs the dict
+    // doesn't fit in 32 GB RAM and the failure modes (Arrow realloc,
+    // Python MemoryError, uncatchable Rust panic) lock the host. The
+    // iterator caps peak RAM at `chunk_points` rows by emitting chunks
+    // through a bounded mpsc channel from a worker thread.
+
+    /// Per-chunk payload sent over the worker→iterator channel. All
+    /// coordinates are in METRES (matching the single-shot
+    /// `sample_point_cloud` contract); the Python wrapper applies the
+    /// user's output unit factor per chunk.
+    #[cfg(feature = "mesh")]
+    struct CloudChunk {
+        guid: Vec<String>,
+        entity: Vec<String>,
+        x: Vec<f32>,
+        y: Vec<f32>,
+        z: Vec<f32>,
+        nx: Vec<f32>,
+        ny: Vec<f32>,
+        nz: Vec<f32>,
+        /// Same value across every chunk for a given file — the model-
+        /// wide CloudCompare shift, in metres. Carried per chunk so the
+        /// Python iterator can set `df.attrs["global_shift"]` without
+        /// waiting for the worker to finish.
+        global_shift_m: [f64; 3],
+    }
+
+    /// Per-call worker→iterator channel item: either a chunk or a
+    /// human-readable error message (panic text caught at the worker
+    /// boundary, surfaced as `IfcfastError` in `__next__`).
+    #[cfg(feature = "mesh")]
+    type CloudChunkResult = Result<CloudChunk, String>;
+
+    /// Streaming `ProductSink` that buffers sampled points and flushes
+    /// every `chunk_points` rows over a bounded channel. Honours an
+    /// `Arc<AtomicBool>` stop flag so dropping the Python iterator
+    /// short-circuits the rest of the mesh pass instead of doing full
+    /// tessellation only to discard it.
+    #[cfg(feature = "mesh")]
+    struct StreamingCloudSink {
+        per_m2: f32,
+        seed: u64,
+        area_scale: f32,
+        unit_scale: f32,
+        chunk_points: usize,
+        shift: Option<[f64; 3]>,
+        // Working buffer. Flushed (drained) when len >= chunk_points.
+        buf_guid: Vec<String>,
+        buf_entity: Vec<String>,
+        buf_x: Vec<f32>,
+        buf_y: Vec<f32>,
+        buf_z: Vec<f32>,
+        buf_nx: Vec<f32>,
+        buf_ny: Vec<f32>,
+        buf_nz: Vec<f32>,
+        tx: std::sync::mpsc::SyncSender<CloudChunkResult>,
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[cfg(feature = "mesh")]
+    impl StreamingCloudSink {
+        #[inline]
+        fn buf_len(&self) -> usize {
+            self.buf_x.len()
+        }
+
+        /// Move the current buffer into a `CloudChunk` and send it. The
+        /// shift must already be set before any flush (we only push to
+        /// the buffer after `shift.get_or_insert_with`).
+        fn flush(&mut self) {
+            let shift = self.shift.expect("shift set before any flush");
+            let us = self.unit_scale as f64;
+            let shift_m = [shift[0] * us, shift[1] * us, shift[2] * us];
+            let chunk = CloudChunk {
+                guid: std::mem::take(&mut self.buf_guid),
+                entity: std::mem::take(&mut self.buf_entity),
+                x: std::mem::take(&mut self.buf_x),
+                y: std::mem::take(&mut self.buf_y),
+                z: std::mem::take(&mut self.buf_z),
+                nx: std::mem::take(&mut self.buf_nx),
+                ny: std::mem::take(&mut self.buf_ny),
+                nz: std::mem::take(&mut self.buf_nz),
+                global_shift_m: shift_m,
+            };
+            if self.tx.send(Ok(chunk)).is_err() {
+                // Consumer dropped the iterator — flip the stop flag so
+                // the rest of the mesh pass returns early.
+                self.stop
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+
+        /// Final flush at end-of-stream. Only emits if there's a partial
+        /// buffer; no-op for files that produced no points.
+        fn flush_final(mut self) {
+            if self.buf_len() > 0 && self.shift.is_some() {
+                self.flush();
+            }
+        }
+    }
+
+    #[cfg(feature = "mesh")]
+    impl crate::mesh::ProductSink for StreamingCloudSink {
+        fn on_product(&mut self, mesh: crate::mesh::ProductMesh) {
+            use crate::mesh::sample::sample as sample_mesh;
+            if self
+                .stop
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                return;
+            }
+            // Per-product splitmix64-derived seed — same scheme as the
+            // single-shot `sample_point_cloud` so bit-identical output
+            // is preserved across the streaming and batch APIs at a
+            // given (file, per_m2, seed).
+            let mut s = self.seed ^ mesh.ifc_id.wrapping_mul(0x9E3779B97F4A7C15);
+            s = (s ^ (s >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+            s = (s ^ (s >> 27)).wrapping_mul(0x94D049BB133111EB);
+            s ^= s >> 31;
+
+            let cloud = sample_mesh(
+                &mesh.vertices,
+                &mesh.indices,
+                self.area_scale,
+                self.per_m2,
+                s,
+            );
+            let n = cloud.len();
+            if n == 0 {
+                return;
+            }
+            let shift = *self
+                .shift
+                .get_or_insert_with(|| global_shift_for(&mesh.mesh_anchor, self.unit_scale));
+            let off = [
+                mesh.mesh_anchor[0] - shift[0],
+                mesh.mesh_anchor[1] - shift[1],
+                mesh.mesh_anchor[2] - shift[2],
+            ];
+            let us = self.unit_scale as f64;
+            // Reserve to keep `extend` allocations bounded; cap at the
+            // remaining-to-chunk-boundary count so a single huge product
+            // doesn't briefly balloon the buffer past chunk_points.
+            for i in 0..n {
+                self.buf_x
+                    .push(((cloud.x[i] as f64 + off[0]) * us) as f32);
+                self.buf_y
+                    .push(((cloud.y[i] as f64 + off[1]) * us) as f32);
+                self.buf_z
+                    .push(((cloud.z[i] as f64 + off[2]) * us) as f32);
+                self.buf_nx.push(cloud.nx[i]);
+                self.buf_ny.push(cloud.ny[i]);
+                self.buf_nz.push(cloud.nz[i]);
+                self.buf_guid.push(mesh.guid.clone());
+                self.buf_entity.push(mesh.entity.clone());
+                if self.buf_len() >= self.chunk_points {
+                    self.flush();
+                    if self
+                        .stop
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                    {
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Iterator over chunks of a streaming point cloud. Construct via
+    /// [`iter_point_cloud`]; each `__next__` returns a Python dict
+    /// matching the per-chunk columns of [`sample_point_cloud`], or
+    /// `None` (StopIteration) when the worker is drained.
+    #[cfg(feature = "mesh")]
+    #[pyclass]
+    pub struct PointCloudIter {
+        rx: Option<std::sync::mpsc::Receiver<CloudChunkResult>>,
+        worker: Option<std::thread::JoinHandle<()>>,
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        // Echoed back on each chunk dict — handy for Python wrappers
+        // building DataFrames + stamping shift on `.attrs`.
+        per_m2: f32,
+        seed: u64,
+    }
+
+    #[cfg(feature = "mesh")]
+    impl PointCloudIter {
+        /// Signal the worker to stop and detach the channel. Called on
+        /// `Drop` and after the worker reports either StopIteration or
+        /// a panic, so subsequent `__next__` calls just return None.
+        fn close(&mut self) {
+            self.stop
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            self.rx.take();
+        }
+    }
+
+    #[cfg(feature = "mesh")]
+    impl Drop for PointCloudIter {
+        fn drop(&mut self) {
+            self.stop
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            // Detach the receiver so the worker's next send fails fast
+            // and it exits without blocking. Don't join — the worker
+            // may still be inside a `mesh_ifc_streaming_framed` phase;
+            // letting it run to completion in the background is fine.
+            self.rx.take();
+            // Discard the JoinHandle; the thread cleans up itself.
+            self.worker.take();
+        }
+    }
+
+    #[cfg(feature = "mesh")]
+    #[pymethods]
+    impl PointCloudIter {
+        fn __iter__(slf: PyRef<Self>) -> PyRef<Self> {
+            slf
+        }
+
+        fn __next__<'py>(
+            &mut self,
+            py: Python<'py>,
+        ) -> PyResult<Option<Bound<'py, PyDict>>> {
+            let Some(rx) = self.rx.take() else {
+                return Ok(None);
+            };
+            // Release the GIL while waiting for the worker; without
+            // this, Python is fully blocked through every chunk's
+            // tessellation phase and the iterator stops being useful
+            // (e.g. interrupts can't fire, parallel Python work stalls).
+            //
+            // `Receiver` is `Send` but not `Sync`, so we move it into
+            // the closure rather than borrowing — pyo3's `Ungil` bound
+            // requires `Send` for everything captured under
+            // `allow_threads`. After the recv returns we put the
+            // receiver back so the next `__next__` can reuse it.
+            let (rx, received) = py.allow_threads(move || {
+                let r = rx.recv();
+                (rx, r)
+            });
+            self.rx = Some(rx);
+            match received {
+                Ok(Ok(chunk)) => {
+                    let out = PyDict::new_bound(py);
+                    out.set_item("guid", PyList::new_bound(py, &chunk.guid))?;
+                    out.set_item("entity", PyList::new_bound(py, &chunk.entity))?;
+                    out.set_item("x", PyList::new_bound(py, &chunk.x))?;
+                    out.set_item("y", PyList::new_bound(py, &chunk.y))?;
+                    out.set_item("z", PyList::new_bound(py, &chunk.z))?;
+                    out.set_item("nx", PyList::new_bound(py, &chunk.nx))?;
+                    out.set_item("ny", PyList::new_bound(py, &chunk.ny))?;
+                    out.set_item("nz", PyList::new_bound(py, &chunk.nz))?;
+                    out.set_item(
+                        "global_shift",
+                        PyList::new_bound(py, chunk.global_shift_m),
+                    )?;
+                    out.set_item("per_m2", self.per_m2 as f64)?;
+                    out.set_item("seed", self.seed)?;
+                    out.set_item("points_in_chunk", chunk.x.len() as u64)?;
+                    Ok(Some(out))
+                }
+                Ok(Err(msg)) => {
+                    self.close();
+                    Err(PyErr::new::<IfcfastError, _>(msg))
+                }
+                Err(_) => {
+                    // Channel closed — worker finished cleanly.
+                    self.close();
+                    Ok(None)
+                }
+            }
+        }
+    }
+
+    /// Build a streaming point-cloud iterator for `path`. The full
+    /// mesh pass runs on a worker thread and pushes chunks of
+    /// `chunk_points` rows through a bounded channel — peak RAM is
+    /// O(chunk_points), independent of total point count. Each chunk
+    /// dict has the same per-column shape as [`sample_point_cloud`]'s
+    /// output plus a per-chunk `global_shift` (same value across all
+    /// chunks for a given file).
+    ///
+    /// Panics inside the worker (the GH #23 third failure mode) are
+    /// caught and surfaced as `IfcfastError` on the next `__next__`,
+    /// not as the uncatchable `pyo3_runtime.PanicException`.
+    #[cfg(feature = "mesh")]
+    #[pyfunction]
+    #[pyo3(signature = (path, per_m2, seed, chunk_points = 1_000_000))]
+    pub fn iter_point_cloud(
+        path: &str,
+        per_m2: f32,
+        seed: u64,
+        chunk_points: usize,
+    ) -> PyResult<PointCloudIter> {
+        catch_panic(|| {
+            if chunk_points == 0 {
+                return Err(PyErr::new::<IfcfastError, _>(
+                    "chunk_points must be > 0",
+                ));
+            }
+            // Open the file on the calling thread so I/O errors surface
+            // synchronously (matches `sample_point_cloud` / `extract_meshes`
+            // behaviour) instead of being smuggled through the channel.
+            let (mmap, _open_ms) = open_mmap(path)?;
+            // Channel bound = 2 chunks. At 1M points × ~50 B/row ≈ 50 MB
+            // per chunk, that's ~100 MB of in-flight backpressure — small
+            // enough not to dominate RAM, large enough that the worker
+            // never starves when Python is mid-DataFrame-build.
+            let (tx, rx) =
+                std::sync::mpsc::sync_channel::<CloudChunkResult>(2);
+            let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let worker_tx = tx.clone();
+            let worker_stop = stop.clone();
+            let worker = std::thread::spawn(move || {
+                // Run the entire mesh pass inside catch_unwind; on
+                // panic, ship the message back over the channel so the
+                // Python `__next__` raises `IfcfastError` instead of
+                // the uncatchable `pyo3_runtime.PanicException`.
+                let result = catch_unwind(AssertUnwindSafe(|| {
+                    let idx = crate::indexer::index(&mmap);
+                    let unit_scale = idx.unit_scale.unwrap_or(1.0) as f32;
+                    let area_scale = unit_scale * unit_scale;
+                    let sink = StreamingCloudSink {
+                        per_m2,
+                        seed,
+                        area_scale,
+                        unit_scale,
+                        chunk_points,
+                        shift: None,
+                        buf_guid: Vec::new(),
+                        buf_entity: Vec::new(),
+                        buf_x: Vec::new(),
+                        buf_y: Vec::new(),
+                        buf_z: Vec::new(),
+                        buf_nx: Vec::new(),
+                        buf_ny: Vec::new(),
+                        buf_nz: Vec::new(),
+                        tx: worker_tx.clone(),
+                        stop: worker_stop.clone(),
+                    };
+                    let mut sink = sink;
+                    crate::mesh::mesh_ifc_streaming_framed(
+                        &mmap,
+                        &mut sink,
+                        crate::mesh::BakeFrame::Local,
+                    );
+                    sink.flush_final();
+                }));
+                if let Err(payload) = result {
+                    let msg = format!(
+                        "ifcfast Rust panic (point cloud worker): {}",
+                        panic_payload_to_string(payload)
+                    );
+                    // Best-effort send — if receiver dropped, drop too.
+                    let _ = worker_tx.send(Err(msg));
+                }
+                // tx drops here, closing the channel and signaling
+                // StopIteration to the iterator.
+                drop(worker_tx);
+            });
+            Ok(PointCloudIter {
+                rx: Some(rx),
+                worker: Some(worker),
+                stop,
+                per_m2,
+                seed,
+            })
+        })
     }
 
     // ----- extract_meshes ----------------------------------------------
@@ -955,6 +1373,7 @@ mod python {
         path: &str,
         cut_openings: bool,
     ) -> PyResult<Bound<'py, PyDict>> {
+        catch_panic(|| {
         use crate::mesh::{BakeFrame, ProductMesh, ProductSink};
 
         // cut_openings requires the `csg` feature — surface a clear
@@ -1179,6 +1598,7 @@ mod python {
         out.set_item("cut_openings_passthrough", sink.cut_stats_passthrough as u64)?;
         out.set_item("cut_openings_fallback", sink.cut_stats_fallback as u64)?;
         Ok(out)
+        })
     }
 
     // ----- clash --------------------------------------------------------
@@ -1274,6 +1694,7 @@ mod python {
 
     #[pymodule]
     fn _core(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
+        m.add("IfcfastError", _py.get_type_bound::<IfcfastError>())?;
         m.add_function(wrap_pyfunction!(index_ifc, m)?)?;
         m.add_function(wrap_pyfunction!(extract_psets, m)?)?;
         m.add_function(wrap_pyfunction!(extract_quantities, m)?)?;
@@ -1286,6 +1707,10 @@ mod python {
         m.add_function(wrap_pyfunction!(mesh_qto, m)?)?;
         #[cfg(feature = "mesh")]
         m.add_function(wrap_pyfunction!(sample_point_cloud, m)?)?;
+        #[cfg(feature = "mesh")]
+        m.add_function(wrap_pyfunction!(iter_point_cloud, m)?)?;
+        #[cfg(feature = "mesh")]
+        m.add_class::<PointCloudIter>()?;
         #[cfg(feature = "mesh")]
         m.add_function(wrap_pyfunction!(extract_meshes, m)?)?;
         #[cfg(feature = "clash")]
