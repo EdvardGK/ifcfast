@@ -22,8 +22,6 @@
 //!                                   consumer knows this is a finite
 //!                                   stand-in for an unbounded volume.
 
-use std::collections::HashMap;
-
 use glam::{Mat4, Vec2, Vec3};
 
 use crate::entity_table::EntityTable;
@@ -50,8 +48,8 @@ const HALFSPACE_SLAB_THICKNESS: f32 = 1.0;
 pub fn boolean_result(
     table: &EntityTable,
     id: u64,
-    shape_cache: &mut HashMap<u64, Vec<(LocalMesh, &'static str)>>,
-    recurse: &dyn Fn(&EntityTable, u64, &mut HashMap<u64, Vec<(LocalMesh, &'static str)>>) -> Vec<MeshFragment>,
+    shape_cache: &super::ShapeCache,
+    recurse: &dyn Fn(&EntityTable, u64, &super::ShapeCache) -> Vec<MeshFragment>,
 ) -> Vec<MeshFragment> {
     let (_, args) = match table.get(id) {
         Some(x) => x,
@@ -88,8 +86,8 @@ pub fn boolean_result(
 pub fn csg_solid(
     table: &EntityTable,
     id: u64,
-    shape_cache: &mut HashMap<u64, Vec<(LocalMesh, &'static str)>>,
-    recurse: &dyn Fn(&EntityTable, u64, &mut HashMap<u64, Vec<(LocalMesh, &'static str)>>) -> Vec<MeshFragment>,
+    shape_cache: &super::ShapeCache,
+    recurse: &dyn Fn(&EntityTable, u64, &super::ShapeCache) -> Vec<MeshFragment>,
 ) -> Vec<MeshFragment> {
     let (_, args) = match table.get(id) {
         Some(x) => x,

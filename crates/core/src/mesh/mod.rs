@@ -75,6 +75,19 @@ pub struct MeshSegment {
     pub source: String,
 }
 
+/// IfcMappedItem dedup cache. Keyed by the inner representation item's
+/// `step_id`; entries are the tessellated direct-geometry fragments
+/// (`Vec<(LocalMesh, source_tag)>`). DashMap (sharded RwLock) is the
+/// concurrency story for parallel per-product tessellation in
+/// [`mesh_ifc_streaming_framed`] — multiple worker threads can `get`/
+/// `insert` without serialising on a single lock. Single-shard
+/// contention is rare in real files (most representations are unique
+/// per product); when it happens at startup on a wide-facade model
+/// (5000 identical windows sharing one `IfcRepresentationMap`), the
+/// worst case is a handful of duplicated tessellations of the same
+/// `LocalMesh` before the shard warms.
+pub(crate) type ShapeCache = dashmap::DashMap<u64, Vec<(LocalMesh, &'static str)>>;
+
 /// What `mesh_item` returns per representation item it walks. Either a
 /// real triangle mesh with its source tag, or an explicit "we saw a
 /// representation of this type but don't have a handler for it" marker
@@ -367,6 +380,8 @@ pub fn mesh_ifc_streaming_framed<S: ProductSink>(
     sink: &mut S,
     frame: BakeFrame,
 ) -> MeshStats {
+    use rayon::prelude::*;
+
     let mut stats = MeshStats::default();
 
     let t0 = Instant::now();
@@ -375,11 +390,18 @@ pub fn mesh_ifc_streaming_framed<S: ProductSink>(
     let _ = table.len();
 
     let t_mesh = Instant::now();
-    let mut resolver = PlacementResolver::new(&table);
-    let mut shape_cache: HashMap<u64, Vec<(LocalMesh, &'static str)>> = HashMap::new();
 
+    // Phase 1 (serial): walk the entity table in iteration order,
+    // filter for products, resolve each product's placement chain via
+    // a single PlacementResolver (whose cache is share-heavy — every
+    // product under a building reuses the same `IfcLocalPlacement`
+    // tail), and emit a `Work` item per product. Placement resolution
+    // requires a `&mut PlacementResolver`, so it cannot move into the
+    // parallel phase, but it's cheap relative to tessellation (cached
+    // matrix multiplies; <5% of total mesh time on real files).
+    let mut resolver = PlacementResolver::new(&table);
+    let mut work: Vec<Work> = Vec::new();
     for (step_id, type_name, args) in table.iter() {
-        // Skip anything we know isn't a product (rels, primitives, etc.).
         if !is_product_type(type_name) {
             continue;
         }
@@ -387,7 +409,6 @@ pub fn mesh_ifc_streaming_framed<S: ProductSink>(
 
         let fields = split_top_level_args(args);
         let guid = string_at(&fields, 0).unwrap_or_default();
-        // IfcProduct: arg[5] = ObjectPlacement, arg[6] = Representation
         let placement_id = match fields.get(5).copied().map(parse_field) {
             Some(Field::Ref(id)) => Some(id),
             _ => None,
@@ -397,14 +418,6 @@ pub fn mesh_ifc_streaming_framed<S: ProductSink>(
             _ => None,
         };
 
-        // World placement is computable independent of geometry — we
-        // need it hoisted so geometryless emits still carry the
-        // authoring tool's `placement_origin` (where the element "is"
-        // even when it has no body).
-        // Resolve the chain in f64 (precise origin at georeferenced
-        // magnitudes), then downcast to f32 for the existing local-frame
-        // bake math (rotation is f32-safe; only the translation needed
-        // f64, and that's preserved separately in `world_origin`).
         let world_f64 = placement_id
             .map(|pid| resolver.world(pid))
             .unwrap_or(DMat4::IDENTITY);
@@ -419,230 +432,263 @@ pub fn mesh_ifc_streaming_framed<S: ProductSink>(
         };
         let entity_name = crate::indexer::type_name_uppercase_with_proper_case(type_name);
 
-        let repr_id = match repr_id_opt {
-            Some(id) => id,
-            None => {
-                emit_geometryless(
-                    sink,
-                    &mut stats,
-                    "no_representation",
-                    guid,
-                    entity_name,
-                    step_id,
-                    placement_origin,
-                    world,
-                    world_origin,
-                );
-                continue;
-            }
-        };
+        work.push(Work {
+            step_id,
+            guid,
+            entity_name,
+            repr_id_opt,
+            world_f64,
+            world,
+            world_origin,
+            placement_origin,
+        });
+    }
+    drop(resolver);
 
-        // Find a body/facetation Items list.
-        let items = body_items(&table, repr_id);
-        if items.is_empty() {
-            emit_geometryless(
-                sink,
-                &mut stats,
-                "no_body_items",
+    // Phase 2 (parallel): per-product tessellation. Worker threads
+    // share `&table` (EntityTable: Sync) and the DashMap-backed
+    // `shape_cache` (concurrent dedup for IfcMappedItem). Output is a
+    // `ProductOutcome` per work item; stats and sink emission are
+    // deferred to phase 3 to keep ordering deterministic and to avoid
+    // contention on stats counters. Worst-case working-set RAM is
+    // bounded by `num_threads × max_product_mesh + total outcomes
+    // queued up to drain` — the outcomes vec holds finished products
+    // until phase 3 consumes them, so this temporarily relaxes the
+    // strict "1 product in flight" bound that the serial streaming
+    // sink contract used to give.
+    let shape_cache: ShapeCache = ShapeCache::new();
+    let outcomes: Vec<ProductOutcome> = work
+        .into_par_iter()
+        .map(|w| tessellate_one(&table, &shape_cache, frame, w))
+        .collect();
+
+    // Phase 3 (serial): drain outcomes to sink + stats in input order.
+    for outcome in outcomes {
+        apply_outcome(outcome, sink, &mut stats);
+    }
+
+    stats.elapsed_ms = t_mesh.elapsed().as_secs_f64() * 1000.0;
+    stats
+}
+
+/// Per-product work item emitted by phase 1 of
+/// [`mesh_ifc_streaming_framed`]. Owns everything the parallel
+/// tessellation phase needs so the worker closure doesn't borrow
+/// per-item table slices across thread boundaries.
+struct Work {
+    step_id: u64,
+    guid: String,
+    entity_name: String,
+    repr_id_opt: Option<u64>,
+    world_f64: DMat4,
+    world: Mat4,
+    world_origin: [f64; 3],
+    placement_origin: [f32; 3],
+}
+
+/// Result of tessellating one product. Carries enough context for the
+/// serial drain in phase 3 to:
+///   - bump stats counters (products_meshed, triangles, by_source);
+///   - emit the right `ProductMesh` (or invoke the geometryless path)
+///     via the sink, in IFC iteration order.
+/// Stats live here (as `Vec<String>` and counters) rather than being
+/// updated from the parallel closures, so we avoid a hot lock on
+/// `MeshStats.by_source`.
+enum ProductOutcome {
+    Mesh {
+        product: ProductMesh,
+        triangle_count: usize,
+        segment_tags: Vec<String>,
+        unhandled_types: Vec<String>,
+    },
+    Geometryless {
+        reason: &'static str,
+        guid: String,
+        entity_name: String,
+        ifc_id: u64,
+        placement_origin: [f32; 3],
+        world: Mat4,
+        world_origin: [f64; 3],
+        unhandled_types: Vec<String>,
+    },
+}
+
+/// Tessellate a single product into a [`ProductOutcome`]. Called from
+/// the parallel phase 2 of [`mesh_ifc_streaming_framed`]; reads-only
+/// against `&table`, share-by-reference against the DashMap
+/// `shape_cache`. No mutation of caller-visible state.
+fn tessellate_one(
+    table: &EntityTable,
+    shape_cache: &ShapeCache,
+    frame: BakeFrame,
+    w: Work,
+) -> ProductOutcome {
+    let Work {
+        step_id,
+        guid,
+        entity_name,
+        repr_id_opt,
+        world_f64,
+        world,
+        world_origin,
+        placement_origin,
+    } = w;
+
+    let repr_id = match repr_id_opt {
+        Some(id) => id,
+        None => {
+            return ProductOutcome::Geometryless {
+                reason: "no_representation",
                 guid,
                 entity_name,
-                step_id,
+                ifc_id: step_id,
                 placement_origin,
                 world,
                 world_origin,
-            );
-            continue;
+                unhandled_types: Vec::new(),
+            };
         }
-        let mut combined_v: Vec<f32> = Vec::new();
-        let mut combined_i: Vec<u32> = Vec::new();
-        let mut segments: Vec<MeshSegment> = Vec::new();
-        let mut parts: Vec<InstancePart> = Vec::new();
-        // Lazily pinned to the first geometry fragment's precise anchor.
-        // Local-frame `frag_off` is computed against this so for the
-        // common no-rebase case it equals the placement origin (frag_off
-        // = 0, shape near origin) and for the rebased-faceset case it
-        // equals the geometry's world position (also frag_off = 0 on
-        // that first fragment, small for siblings).
-        let mut mesh_anchor_f64: Option<DVec3> = None;
+    };
 
-        for item_id in items {
-            let fragments = mesh_item(&table, item_id, &mut shape_cache);
-            for frag in fragments {
-                match frag {
-                    MeshFragment::Mesh { mesh: local, source, role, rep_step_id, instance_transform } => {
-                        let seg_index_start = combined_i.len() as u32;
-                        let base = (combined_v.len() / 3) as u32;
-                        // `effective = world * instance_transform` (the
-                        // IfcMappedItem composition; identity for direct
-                        // geometry).
-                        let effective = world * instance_transform;
-                        // Per-fragment f64 anchor — the precise world
-                        // position of the kernel's rebase origin
-                        // (`LocalMesh.rep_origin`, the bbox-min the
-                        // faceset kernel subtracted to keep f32 vertices
-                        // near origin when the file embeds huge world
-                        // coords directly in the geometry). For kernels
-                        // that don't rebase, `rep_origin = [0,0,0]` and
-                        // `precise_anchor_f64 = effective.translation`,
-                        // i.e. exactly the World/Local frame behaviour
-                        // before this change.
-                        let instance_f64 = mat4_to_dmat4(instance_transform);
-                        let effective_f64 = world_f64 * instance_f64;
-                        let rep_origin_f64 = DVec3::new(
-                            local.rep_origin[0],
-                            local.rep_origin[1],
-                            local.rep_origin[2],
-                        );
-                        let precise_anchor_f64 =
-                            effective_f64.transform_point3(rep_origin_f64);
-                        // Pin the product's mesh_anchor on the first
-                        // geometry fragment. Used by Local frame's
-                        // frag_off and by Stage 2 sinks for the global
-                        // shift — pinning here covers both bake frames.
-                        let _ = mesh_anchor_f64.get_or_insert(precise_anchor_f64);
-                        let anchor_f32 = Vec3::new(
-                            precise_anchor_f64.x as f32,
-                            precise_anchor_f64.y as f32,
-                            precise_anchor_f64.z as f32,
-                        );
-                        match frame {
-                            BakeFrame::World => {
-                                // Full world coordinates. Split the
-                                // matrix-multiply: rotation*v in f32 (v
-                                // is small after rebase) + precise anchor
-                                // in f64-downcast. Equivalent to
-                                // `effective * (v + rep_origin)` but with
-                                // the big-number add done in f64.
-                                for chunk in local.vertices.chunks_exact(3) {
-                                    let p = Vec3::new(chunk[0], chunk[1], chunk[2]);
-                                    let w = effective.transform_vector3(p) + anchor_f32;
-                                    combined_v.push(w.x);
-                                    combined_v.push(w.y);
-                                    combined_v.push(w.z);
-                                }
-                            }
-                            BakeFrame::Local => {
-                                // Shape near origin: rotation*v in f32 +
-                                // the small remainder (anchor − mesh
-                                // anchor) in f64-downcast. mesh_anchor is
-                                // pinned above to the first geometry
-                                // fragment's precise anchor; for the
-                                // common no-rebase case it equals the
-                                // placement origin and the first
-                                // fragment's remainder is zero. For the
-                                // rebased-faceset case it equals THIS
-                                // fragment's precise anchor → also zero.
-                                // Siblings get a small remainder
-                                // representing their offset from the
-                                // first fragment, f32-safe.
-                                let anchor = mesh_anchor_f64
-                                    .expect("pinned above for both bake frames");
-                                let frag_off_f64 = precise_anchor_f64 - anchor;
-                                let frag_off = Vec3::new(
-                                    frag_off_f64.x as f32,
-                                    frag_off_f64.y as f32,
-                                    frag_off_f64.z as f32,
-                                );
-                                for chunk in local.vertices.chunks_exact(3) {
-                                    let p = Vec3::new(chunk[0], chunk[1], chunk[2]);
-                                    let v = effective.transform_vector3(p) + frag_off;
-                                    combined_v.push(v.x);
-                                    combined_v.push(v.y);
-                                    combined_v.push(v.z);
-                                }
+    let items = body_items(table, repr_id);
+    if items.is_empty() {
+        return ProductOutcome::Geometryless {
+            reason: "no_body_items",
+            guid,
+            entity_name,
+            ifc_id: step_id,
+            placement_origin,
+            world,
+            world_origin,
+            unhandled_types: Vec::new(),
+        };
+    }
+
+    let mut combined_v: Vec<f32> = Vec::new();
+    let mut combined_i: Vec<u32> = Vec::new();
+    let mut segments: Vec<MeshSegment> = Vec::new();
+    let mut parts: Vec<InstancePart> = Vec::new();
+    let mut mesh_anchor_f64: Option<DVec3> = None;
+    let mut unhandled_types: Vec<String> = Vec::new();
+
+    for item_id in items {
+        let fragments = mesh_item(table, item_id, shape_cache);
+        for frag in fragments {
+            match frag {
+                MeshFragment::Mesh {
+                    mesh: local,
+                    source,
+                    role,
+                    rep_step_id,
+                    instance_transform,
+                } => {
+                    let seg_index_start = combined_i.len() as u32;
+                    let base = (combined_v.len() / 3) as u32;
+                    let effective = world * instance_transform;
+                    let instance_f64 = mat4_to_dmat4(instance_transform);
+                    let effective_f64 = world_f64 * instance_f64;
+                    let rep_origin_f64 = DVec3::new(
+                        local.rep_origin[0],
+                        local.rep_origin[1],
+                        local.rep_origin[2],
+                    );
+                    let precise_anchor_f64 = effective_f64.transform_point3(rep_origin_f64);
+                    let _ = mesh_anchor_f64.get_or_insert(precise_anchor_f64);
+                    let anchor_f32 = Vec3::new(
+                        precise_anchor_f64.x as f32,
+                        precise_anchor_f64.y as f32,
+                        precise_anchor_f64.z as f32,
+                    );
+                    match frame {
+                        BakeFrame::World => {
+                            for chunk in local.vertices.chunks_exact(3) {
+                                let p = Vec3::new(chunk[0], chunk[1], chunk[2]);
+                                let w = effective.transform_vector3(p) + anchor_f32;
+                                combined_v.push(w.x);
+                                combined_v.push(w.y);
+                                combined_v.push(w.z);
                             }
                         }
-                        for &idx in &local.indices {
-                            combined_i.push(base + idx);
-                        }
-                        let seg_index_count = combined_i.len() as u32 - seg_index_start;
-                        if seg_index_count > 0 {
-                            // Compound tag preserves BOTH the structural
-                            // role (if any) and the leaf representation
-                            // type, so a polygonal halfspace used as a
-                            // boolean cut reads as
-                            // "boolean_second_operand|halfspace_bounded".
-                            let tag = match role {
-                                Some(r) => format!("{}|{}", r, source),
-                                None => source.to_string(),
-                            };
-                            segments.push(MeshSegment {
-                                index_start: seg_index_start,
-                                index_count: seg_index_count,
-                                source: tag.clone(),
-                            });
-                            parts.push(InstancePart {
-                                rep_step_id,
-                                instance_transform: instance_transform.to_cols_array(),
-                                local_vertices: local.vertices,
-                                local_indices: local.indices,
-                                index_start: seg_index_start,
-                                index_count: seg_index_count,
-                                source: tag,
-                            });
+                        BakeFrame::Local => {
+                            let anchor = mesh_anchor_f64
+                                .expect("pinned above for both bake frames");
+                            let frag_off_f64 = precise_anchor_f64 - anchor;
+                            let frag_off = Vec3::new(
+                                frag_off_f64.x as f32,
+                                frag_off_f64.y as f32,
+                                frag_off_f64.z as f32,
+                            );
+                            for chunk in local.vertices.chunks_exact(3) {
+                                let p = Vec3::new(chunk[0], chunk[1], chunk[2]);
+                                let v = effective.transform_vector3(p) + frag_off;
+                                combined_v.push(v.x);
+                                combined_v.push(v.y);
+                                combined_v.push(v.z);
+                            }
                         }
                     }
-                    MeshFragment::Unhandled { ifc_type } => {
-                        // Explicit "we saw this representation but
-                        // don't tessellate it yet" — the whole point
-                        // of the reveal-all stance.
-                        *stats
-                            .by_source
-                            .entry(format!("unhandled:{}", ifc_type))
-                            .or_insert(0) += 1;
+                    for &idx in &local.indices {
+                        combined_i.push(base + idx);
                     }
+                    let seg_index_count = combined_i.len() as u32 - seg_index_start;
+                    if seg_index_count > 0 {
+                        let tag = match role {
+                            Some(r) => format!("{}|{}", r, source),
+                            None => source.to_string(),
+                        };
+                        segments.push(MeshSegment {
+                            index_start: seg_index_start,
+                            index_count: seg_index_count,
+                            source: tag.clone(),
+                        });
+                        parts.push(InstancePart {
+                            rep_step_id,
+                            instance_transform: instance_transform.to_cols_array(),
+                            local_vertices: local.vertices,
+                            local_indices: local.indices,
+                            index_start: seg_index_start,
+                            index_count: seg_index_count,
+                            source: tag,
+                        });
+                    }
+                }
+                MeshFragment::Unhandled { ifc_type } => {
+                    unhandled_types.push(format!("unhandled:{}", ifc_type));
                 }
             }
         }
+    }
 
-        if combined_i.is_empty() {
-            // Already credited to unhandled:IFCXXX above; record the
-            // outer-level miss too so the consumer can correlate.
-            emit_geometryless(
-                sink,
-                &mut stats,
-                "item_unhandled",
-                guid,
-                entity_name,
-                step_id,
-                placement_origin,
-                world,
-                world_origin,
-            );
-            continue;
-        }
-
-        // `placement_origin` was computed above; reused here so substrate
-        // consumers and the drift analyser see the same value regardless
-        // of which code path emitted the product. Compare against the
-        // mesh centroid downstream to detect placement-vs-geometry drift.
-
-        // Dominant source = leaf tag of the first segment. Compound
-        // tags ("boolean_first_operand|extrusion") collapse to their
-        // leaf (`"extrusion"`) for the legacy `.source` field — full
-        // detail still available via `.segments`. Keeps back-compat for
-        // consumers (stats.rs, gltf.rs) that read `.source` directly.
-        let source_tag: &'static str = segments
-            .first()
-            .and_then(|s| {
-                let leaf = s.source.rsplit('|').next().unwrap_or(s.source.as_str());
-                MeshFragment::source_tags().iter().find(|t| **t == leaf).copied()
-            })
-            .unwrap_or("composite");
-
-        stats.products_meshed += 1;
-        stats.triangles += combined_i.len() / 3;
-        for seg in &segments {
-            *stats.by_source.entry(seg.source.clone()).or_insert(0) += 1;
-        }
-        // Default mesh_anchor to placement origin when no fragment
-        // pinned it (multi-fragment-but-all-unhandled would still emit a
-        // composite product with combined_i empty — handled above).
-        let mesh_anchor = match mesh_anchor_f64 {
-            Some(a) => [a.x, a.y, a.z],
-            None => world_origin,
+    if combined_i.is_empty() {
+        return ProductOutcome::Geometryless {
+            reason: "item_unhandled",
+            guid,
+            entity_name,
+            ifc_id: step_id,
+            placement_origin,
+            world,
+            world_origin,
+            unhandled_types,
         };
-        sink.on_product(ProductMesh {
+    }
+
+    let source_tag: &'static str = segments
+        .first()
+        .and_then(|s| {
+            let leaf = s.source.rsplit('|').next().unwrap_or(s.source.as_str());
+            MeshFragment::source_tags().iter().find(|t| **t == leaf).copied()
+        })
+        .unwrap_or("composite");
+
+    let triangle_count = combined_i.len() / 3;
+    let segment_tags: Vec<String> = segments.iter().map(|s| s.source.clone()).collect();
+    let mesh_anchor = match mesh_anchor_f64 {
+        Some(a) => [a.x, a.y, a.z],
+        None => world_origin,
+    };
+
+    ProductOutcome::Mesh {
+        product: ProductMesh {
             guid,
             entity: entity_name,
             ifc_id: step_id,
@@ -655,11 +701,65 @@ pub fn mesh_ifc_streaming_framed<S: ProductSink>(
             world_transform: world.to_cols_array(),
             world_origin,
             mesh_anchor,
-        });
+        },
+        triangle_count,
+        segment_tags,
+        unhandled_types,
     }
+}
 
-    stats.elapsed_ms = t_mesh.elapsed().as_secs_f64() * 1000.0;
-    stats
+/// Apply one [`ProductOutcome`] to stats + sink. Called serially from
+/// phase 3 of [`mesh_ifc_streaming_framed`] so emission order matches
+/// the IFC entity-table iteration order and stats counters need no
+/// synchronisation.
+fn apply_outcome<S: ProductSink>(
+    outcome: ProductOutcome,
+    sink: &mut S,
+    stats: &mut MeshStats,
+) {
+    match outcome {
+        ProductOutcome::Mesh {
+            product,
+            triangle_count,
+            segment_tags,
+            unhandled_types,
+        } => {
+            stats.products_meshed += 1;
+            stats.triangles += triangle_count;
+            for tag in segment_tags {
+                *stats.by_source.entry(tag).or_insert(0) += 1;
+            }
+            for tag in unhandled_types {
+                *stats.by_source.entry(tag).or_insert(0) += 1;
+            }
+            sink.on_product(product);
+        }
+        ProductOutcome::Geometryless {
+            reason,
+            guid,
+            entity_name,
+            ifc_id,
+            placement_origin,
+            world,
+            world_origin,
+            unhandled_types,
+        } => {
+            for tag in unhandled_types {
+                *stats.by_source.entry(tag).or_insert(0) += 1;
+            }
+            emit_geometryless(
+                sink,
+                stats,
+                reason,
+                guid,
+                entity_name,
+                ifc_id,
+                placement_origin,
+                world,
+                world_origin,
+            );
+        }
+    }
 }
 
 /// Emit a `ProductMesh` with an empty geometry buffer when the sink
@@ -712,7 +812,7 @@ fn emit_geometryless<S: ProductSink>(
 pub(crate) fn mesh_item(
     table: &EntityTable,
     item_id: u64,
-    shape_cache: &mut HashMap<u64, Vec<(LocalMesh, &'static str)>>,
+    shape_cache: &ShapeCache,
 ) -> Vec<MeshFragment> {
     if let Some(cached) = shape_cache.get(&item_id) {
         return cached
@@ -774,10 +874,11 @@ pub(crate) fn mesh_item(
         } else if type_name.eq_ignore_ascii_case(b"IFCBOOLEANRESULT")
             || type_name.eq_ignore_ascii_case(b"IFCBOOLEANCLIPPINGRESULT")
         {
-            // Recurse into operands. We must avoid borrow-checker pain
-            // when passing &mut shape_cache through a callback closure;
-            // boolean::boolean_result takes a function pointer to
-            // `mesh_item` so the recursion happens on this exact frame.
+            // The recurse callback into mesh_item threads the shared
+            // `&ShapeCache` through — boolean::boolean_result takes a
+            // function pointer so the recursion happens on this exact
+            // frame (still useful for clarity; the borrow argument
+            // is now moot since DashMap is share-by-reference).
             boolean::boolean_result(table, item_id, shape_cache, &mesh_item)
         } else if type_name.eq_ignore_ascii_case(b"IFCCSGSOLID") {
             boolean::csg_solid(table, item_id, shape_cache, &mesh_item)

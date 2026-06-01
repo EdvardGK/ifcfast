@@ -13,13 +13,10 @@
 //! `super::mesh_item`; this module just resolves the references and the
 //! composition matrix.
 
-use std::collections::HashMap;
-
 use glam::{Mat4, Vec3, Vec4};
 
 use crate::entity_table::EntityTable;
 use crate::lexer::{parse_field, split_top_level_args, Field};
-use crate::mesh::extrusion::LocalMesh;
 use crate::mesh::placement::axis_placement_3d_from_id;
 use crate::mesh::MeshFragment;
 
@@ -27,7 +24,7 @@ use crate::mesh::MeshFragment;
 pub fn expand(
     table: &EntityTable,
     item_id: u64,
-    shape_cache: &mut HashMap<u64, Vec<(LocalMesh, &'static str)>>,
+    shape_cache: &super::ShapeCache,
 ) -> Vec<MeshFragment> {
     let (type_name, args) = match table.get(item_id) {
         Some(x) => x,

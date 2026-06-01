@@ -317,6 +317,19 @@ distinction is *which calls are cheap and which trigger work*:
 Plan with the free calls, then spend on the extracts you actually
 need.
 
+**Tessellation is parallel** (since v0.4.20). `m.meshes()` and
+everything downstream (substrate emit, `m.mesh_qto()`,
+`m.point_cloud()`) tessellate one product per rayon worker thread.
+Defaults to all available cores; cap with `RAYON_NUM_THREADS=<n>` in
+the environment if you need to share the host. Emission order to
+sinks is **still IFC entity-table iteration order** — the parallel
+phase fans out, results are reordered back into source order before
+the streaming sink sees them. So existing consumers that relied on
+stable order (substrate writer, OBJ/glTF writers, the cut_openings
+wrapper) keep that contract. The first-cut speedup at 8 cores is
+roughly 2× end-to-end on real files; the cap is collect overhead
+that future revisions can streamline.
+
 ## CLI quick reference
 
 ```bash
