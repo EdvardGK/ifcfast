@@ -1,0 +1,27 @@
+# Cargo config — cross-compile hints for the `release` CI matrix.
+#
+# manifold-csg-sys's build.rs drives a CMake build of the Manifold C++
+# library + its embedded TBB pull. For cross-compilation to
+# aarch64-unknown-linux-gnu the C++ side needs an aarch64-capable
+# toolchain (`g++-aarch64-linux-gnu`), and the `cmake` crate that
+# manifold-csg-sys uses reads CC_<target> / CXX_<target> via cc-rs
+# convention to set CMAKE_C_COMPILER / CMAKE_CXX_COMPILER.
+#
+# Exports inside `release.yml`'s `before-script-linux` don't persist to
+# the maturin/cargo invocation that follows, so anchor the values here
+# instead — they apply only when the build's `target` actually matches
+# `aarch64-unknown-linux-gnu`. Native x86_64 builds (host == target)
+# are unaffected.
+
+[target.aarch64-unknown-linux-gnu]
+linker = "aarch64-linux-gnu-gcc"
+
+[env]
+CC_aarch64_unknown_linux_gnu = "aarch64-linux-gnu-gcc"
+CXX_aarch64_unknown_linux_gnu = "aarch64-linux-gnu-g++"
+AR_aarch64_unknown_linux_gnu = "aarch64-linux-gnu-ar"
+# CMake reads these without the target suffix; setting them only takes
+# effect when cmake-rs / manifold-csg-sys actually run, and they're
+# overridden by per-call options when the host build needs different
+# compilers. Empty defaults so the values can be set by the CI shell
+# script for the aarch64 leg without leaking into native builds.
