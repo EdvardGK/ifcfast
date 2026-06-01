@@ -34,6 +34,30 @@ jobs:
           target: ${{ matrix.target }}
           args: --release --out dist --manifest-path crates/core/Cargo.toml
           manylinux: auto
+          # manifold-csg-sys builds the C++ Manifold library + TBB at
+          # build time via CMake. The default manylinux container ships
+          # gcc + g++ for the host arch; aarch64 cross-compile needs
+          # `g++-aarch64-linux-gnu`. Install it, then point manifold's
+          # build.rs at the cross compilers via the standard cc-rs
+          # `CC_<target>` / `CXX_<target>` env vars + the CMake
+          # toolchain hint Manifold reads for its embedded TBB pull.
+          # x86_64 needs nothing — the container's native toolchain
+          # builds in place.
+          before-script-linux: |
+            if [ "${{ matrix.target }}" = "aarch64" ]; then
+              if command -v dnf >/dev/null 2>&1; then
+                dnf install -y gcc-aarch64-linux-gnu gcc-c++-aarch64-linux-gnu cmake
+              elif command -v yum >/dev/null 2>&1; then
+                yum install -y gcc-aarch64-linux-gnu gcc-c++-aarch64-linux-gnu cmake
+              elif command -v apt-get >/dev/null 2>&1; then
+                apt-get update && apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu cmake
+              fi
+              export CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc
+              export CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++
+              export AR_aarch64_unknown_linux_gnu=aarch64-linux-gnu-ar
+              export CMAKE_C_COMPILER=aarch64-linux-gnu-gcc
+              export CMAKE_CXX_COMPILER=aarch64-linux-gnu-g++
+            fi
       - name: Smoke-test built wheel (native arch only)
         if: ${{ matrix.target == 'x86_64' }}
         run: |
@@ -77,6 +101,15 @@ jobs:
             target: x86_64
           - runner: macos-latest
             target: aarch64
+    env:
+      # Manifold's embedded TBB uses C++17 aligned `operator delete(p,
+      # std::align_val_t)`, which Apple's libc++ only exports on macOS
+      # 10.13 or newer. The default deployment target on macos-15-intel
+      # is older, so the build fails with "aligned deallocation
+      # function ... is only available on macOS 10.13 or newer". 10.15
+      # matches what manifold-csg-sys upstream targets and what every
+      # current viewer / IDE supports as the floor.
+      MACOSX_DEPLOYMENT_TARGET: "10.15"
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-python@v6
