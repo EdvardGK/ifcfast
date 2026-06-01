@@ -55,6 +55,16 @@ impl<'a> PlacementResolver<'a> {
         m
     }
 
+    /// Consume the resolver and return its fully-warmed cache as a
+    /// frozen `HashMap`. The cache is the only state worth preserving
+    /// across the resolver's lifetime; the rest is back-references.
+    /// Used by `mesh_ifc_streaming_framed`'s parallel phase 1 so the
+    /// finalize step can index a shared `Arc<HashMap>` instead of
+    /// taking `&mut PlacementResolver` across worker threads.
+    pub fn into_cache(self) -> HashMap<u64, DMat4> {
+        self.cache
+    }
+
     fn resolve(&mut self, placement_id: u64) -> DMat4 {
         let (type_name, args) = match self.table.get(placement_id) {
             Some(x) => x,

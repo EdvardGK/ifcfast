@@ -391,59 +391,119 @@ pub fn mesh_ifc_streaming_framed<S: ProductSink>(
 
     let t_mesh = Instant::now();
 
-    // Phase 1 (serial): walk the entity table in iteration order,
-    // filter for products, resolve each product's placement chain via
-    // a single PlacementResolver (whose cache is share-heavy — every
-    // product under a building reuses the same `IfcLocalPlacement`
-    // tail), and emit a `Work` item per product. Placement resolution
-    // requires a `&mut PlacementResolver`, so it cannot move into the
-    // parallel phase, but it's cheap relative to tessellation (cached
-    // matrix multiplies; <5% of total mesh time on real files).
-    let mut resolver = PlacementResolver::new(&table);
-    let mut work: Vec<Work> = Vec::new();
-    for (step_id, type_name, args) in table.iter() {
-        if !is_product_type(type_name) {
-            continue;
-        }
-        stats.products_seen += 1;
+    // Phase 1: build `Vec<Work>` for every product. Three sub-phases,
+    // two of which run in parallel (GH #26):
+    //
+    //   1a (parallel): shard the entity table's order vec across rayon
+    //      workers. Each worker filters for products and parses each
+    //      product's args far enough to extract guid, entity_name,
+    //      placement_id, repr_id. Placement matrix is NOT computed yet
+    //      because the resolver is share-heavy + recursive.
+    //   1b (serial): warm a single `PlacementResolver` against every
+    //      placement_id seen in 1a, then freeze its cache into an
+    //      `Arc<HashMap>`. The resolver's chain-caching makes this
+    //      cheap (placement chains share long tails — every product
+    //      under a building reuses the same IfcLocalPlacement parent
+    //      chain).
+    //   1c (parallel): each partial-work entry from 1a looks up its
+    //      placement matrix in the frozen Arc map and finishes the
+    //      Work entry (world, world_origin, placement_origin).
+    //
+    // Why split 1a/1c rather than merge into one parallel pass: 1a
+    // collects the unique placement set so 1b knows what to resolve.
+    // Merging would force every worker to either run the resolver
+    // itself (impossible — `&mut self`) or do duplicate placement
+    // lookups against a thread-safe cache (DashMap), which contends
+    // on shared parent chains. Two passes with a frozen Arc map in
+    // between is share-nothing and matches the contract that the
+    // resolver only walks each chain once.
 
-        let fields = split_top_level_args(args);
-        let guid = string_at(&fields, 0).unwrap_or_default();
-        let placement_id = match fields.get(5).copied().map(parse_field) {
-            Some(Field::Ref(id)) => Some(id),
-            _ => None,
-        };
-        let repr_id_opt = match fields.get(6).copied().map(parse_field) {
-            Some(Field::Ref(id)) => Some(id),
-            _ => None,
-        };
-
-        let world_f64 = placement_id
-            .map(|pid| resolver.world(pid))
-            .unwrap_or(DMat4::IDENTITY);
-        let world = world_f64.as_mat4();
-        let world_origin = {
-            let p = world_f64.transform_point3(DVec3::ZERO);
-            [p.x, p.y, p.z]
-        };
-        let placement_origin = {
-            let p = world * Vec4::new(0.0, 0.0, 0.0, 1.0);
-            [p.x, p.y, p.z]
-        };
-        let entity_name = crate::indexer::type_name_uppercase_with_proper_case(type_name);
-
-        work.push(Work {
-            step_id,
-            guid,
-            entity_name,
-            repr_id_opt,
-            world_f64,
-            world,
-            world_origin,
-            placement_origin,
-        });
+    /// Intermediate stub between phases 1a and 1c. Owns the parsed
+    /// string fields so 1c can move them into the final `Work`.
+    struct PartialWork {
+        step_id: u64,
+        guid: String,
+        entity_name: String,
+        repr_id_opt: Option<u64>,
+        placement_id: Option<u64>,
     }
-    drop(resolver);
+
+    let partial: Vec<PartialWork> = table
+        .order()
+        .par_iter()
+        .filter_map(|&step_id| {
+            let (type_name, args) = table.get(step_id)?;
+            if !is_product_type(type_name) {
+                return None;
+            }
+            let fields = split_top_level_args(args);
+            let guid = string_at(&fields, 0).unwrap_or_default();
+            let placement_id = match fields.get(5).copied().map(parse_field) {
+                Some(Field::Ref(id)) => Some(id),
+                _ => None,
+            };
+            let repr_id_opt = match fields.get(6).copied().map(parse_field) {
+                Some(Field::Ref(id)) => Some(id),
+                _ => None,
+            };
+            let entity_name =
+                crate::indexer::type_name_uppercase_with_proper_case(type_name);
+            Some(PartialWork {
+                step_id,
+                guid,
+                entity_name,
+                repr_id_opt,
+                placement_id,
+            })
+        })
+        .collect();
+    stats.products_seen = partial.len();
+
+    // Phase 1b: warm the placement cache against every referenced
+    // placement_id. The resolver's recursive resolve() walks each
+    // chain once and caches every intermediate, so resolving N
+    // placements is amortized over the shared chain prefixes.
+    let mut resolver = PlacementResolver::new(&table);
+    for pw in &partial {
+        if let Some(pid) = pw.placement_id {
+            let _ = resolver.world(pid);
+        }
+    }
+    let placement_cache = std::sync::Arc::new(resolver.into_cache());
+
+    // Phase 1c: parallel finalize. Look up placement matrix from the
+    // frozen cache, derive origin + placement origin, build Work.
+    let work: Vec<Work> = partial
+        .into_par_iter()
+        .map(|pw| {
+            let world_f64 = pw
+                .placement_id
+                .and_then(|pid| placement_cache.get(&pid).copied())
+                .unwrap_or(DMat4::IDENTITY);
+            let world = world_f64.as_mat4();
+            let world_origin = {
+                let p = world_f64.transform_point3(DVec3::ZERO);
+                [p.x, p.y, p.z]
+            };
+            let placement_origin = {
+                let p = world * Vec4::new(0.0, 0.0, 0.0, 1.0);
+                [p.x, p.y, p.z]
+            };
+            Work {
+                step_id: pw.step_id,
+                guid: pw.guid,
+                entity_name: pw.entity_name,
+                repr_id_opt: pw.repr_id_opt,
+                world_f64,
+                world,
+                world_origin,
+                placement_origin,
+            }
+        })
+        .collect();
+    // `placement_cache` Arc drops when phase 1c finishes — no longer
+    // needed once every Work has its baked world matrix.
+    drop(placement_cache);
 
     // Phase 2 + 3 (interleaved): bounded ordered channel between
     // parallel tessellation workers and the serial drain. Workers send

@@ -106,6 +106,16 @@ impl<'a> EntityTable<'a> {
         Some(&self.buf[e.type_start..end])
     }
 
+    /// The step_ids of every entity, in the order they appeared in the
+    /// source file's DATA section. Determinism contract — two
+    /// `EntityTable::build` calls on the same buffer yield the same
+    /// slice. Exposed so consumers can shard the walk in parallel
+    /// (rayon `par_iter` over the slice + `table.get(id)` per shard).
+    #[inline]
+    pub fn order(&self) -> &[u64] {
+        &self.order
+    }
+
     /// Iterate over `(id, type, args)` for every entity, in the order
     /// entries appeared in the source file's DATA section. Determinism
     /// is contract: two `EntityTable::build` calls on the same buffer

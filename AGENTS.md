@@ -364,7 +364,10 @@ phase fans out, results are reordered back into source order before
 the streaming sink sees them. So existing consumers that relied on
 stable order (substrate writer, OBJ/glTF writers, the cut_openings
 wrapper) keep that contract. End-to-end speedup at 8 cores is
-~1.9–2.0× on real files.
+~2.4–2.6× on real files (since v0.4.22; the earlier ~2× cap was
+the serial phase-1 Amdahl tail, removed in GH #26 by parallelising
+the entity-table walk + parsing with a frozen `PlacementResolver`
+cache).
 
 **RAM is bounded across the parallel mesh pass** (since v0.4.21).
 Workers stream `(seq, ProductOutcome)` over a lock-free bounded
