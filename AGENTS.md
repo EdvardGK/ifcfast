@@ -388,12 +388,22 @@ order. Multi-fragment products (booleans, CSG composites) and
 rep-unique singletons fall through to the baked path (one mesh per
 product, world-coord vertices) — backwards-compat with viewers
 that don't read `EXT_mesh_gpu_instancing` is preserved for those.
-Measured savings: 38% smaller `.glb` on a 4.84-instances-per-rep
-structural file (LBK_RIBp_C 118.5 MB → 72.9 MB), ~0% on a
-1.13-instances-per-rep architecture file (still emits the
-extension where possible; just nothing to dedupe). Pick-to-BIM:
-viewers should read `node.extras.guid` (baked) OR
+Pick-to-BIM: viewers should read `node.extras.guid` (baked) OR
 `node.extras.instances[instance_id].guid` (instanced).
+
+**Baked positions are `KHR_mesh_quantization` u16** (since v0.4.24).
+Each baked node carries `translation` = AABB min and `scale` =
+range/65535 so the runtime reconstructs world coords as
+`translation + scale * u16_vertex`. Quantization error is
+±range/131070 — for a 1 m-spanning mesh that's ±15 μm, well under
+the precision an IFC-authored model carries anyway. Instanced
+shared meshes stay f32 for now (per-instance TRS composes with
+the node TRS, naive quantization would multiply the per-instance
+transform by the raw u16). Combined size savings on real files:
+LBK_RIBp_C 118.5 MB → 56 MB (52% smaller, 2.1× compression) with
+instancing + quantization stacked; LBK_ARK_C 86.9 MB → 68 MB
+(22% smaller from quantization alone where instancing was a
+near-no-op).
 
 ## CLI quick reference
 

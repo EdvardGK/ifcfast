@@ -211,10 +211,21 @@ struct BakedViews {
     indices: View,
     n_verts: u32,
     n_indices: u32,
-    min: [f32; 3],
-    max: [f32; 3],
     /// `U16_T` (when verts < 65536) or `U32_T`.
     idx_component: u32,
+    /// Quantization metadata for KHR_mesh_quantization. The position
+    /// bufferView holds U16 triples in `[0, 65535]`; the runtime
+    /// reconstructs world coords as `translation + scale * u16` via
+    /// the node TRS. Per-axis scale is 0 when the AABB collapses
+    /// along that axis (a planar mesh / single vertex); the u16
+    /// value is always 0 in that case, so 0 * 0 + translation gives
+    /// the right answer.
+    quant_translation: [f32; 3],
+    quant_scale: [f32; 3],
+    /// Per-axis quantized max — `0` for collapsed axes, `65535`
+    /// otherwise. Drives the accessor's `min`/`max` in the spec
+    /// (which must be in encoded units when quantization is in use).
+    quant_u16_max: [u32; 3],
 }
 
 struct InstancedViews {
@@ -256,29 +267,21 @@ fn pack_binary(meshes: &[ProductMesh], plan: &Plan) -> (Vec<u8>, BinaryLayout) {
         .iter()
         .map(|g| g.member_indices.len() * (3 + 4 + 3) * 4)
         .sum();
-    let mut bin =
-        Vec::with_capacity(baked_verts * 4 + baked_idx * 4 + inst_verts * 4 + inst_idx * 4 + inst_trs);
+    // baked positions are quantized u16 (2 bytes per coord, 3 per vert);
+    // instanced shared positions still f32; indices are f32 capacity
+    // upper-bound regardless of u16 vs u32 narrowing.
+    let mut bin = Vec::with_capacity(
+        baked_verts * 2 + baked_idx * 4 + inst_verts * 4 + inst_idx * 4 + inst_trs,
+    );
 
     let mut layout = BinaryLayout {
         baked: Vec::with_capacity(plan.baked.len()),
         instanced: Vec::with_capacity(plan.instanced.len()),
     };
 
-    // Baked products first — same packing as pre-v0.4.23 so single-
-    // product OBJ-style consumers see no layout shift.
+    // Baked products first — quantized positions + indices.
     for &i in &plan.baked {
-        let mesh = &meshes[i];
-        let (positions, indices, n_verts, n_indices, min, max, idx_component) =
-            pack_one_baked(mesh, &mut bin);
-        layout.baked.push(BakedViews {
-            positions,
-            indices,
-            n_verts,
-            n_indices,
-            min,
-            max,
-            idx_component,
-        });
+        layout.baked.push(pack_one_baked(&meshes[i], &mut bin));
     }
 
     // Instanced groups next. The shared mesh comes from the first
@@ -316,18 +319,47 @@ fn pack_binary(meshes: &[ProductMesh], plan: &Plan) -> (Vec<u8>, BinaryLayout) {
     (bin, layout)
 }
 
-/// Pack a single baked product's world-coord positions + indices into
-/// `bin`. Returns the two `View`s + accessor metadata. Identical
-/// content to the pre-v0.4.23 packer, just split into a helper so the
-/// loop body stays readable.
-fn pack_one_baked(
-    mesh: &ProductMesh,
-    bin: &mut Vec<u8>,
-) -> (View, View, u32, u32, [f32; 3], [f32; 3], u32) {
-    let pos_offset = bin.len() as u32;
+/// Pack a single baked product's positions (KHR_mesh_quantization
+/// U16-quantized) + indices into `bin`. Halves the position-buffer
+/// footprint vs the pre-v0.4.24 f32 layout. The denorm transform
+/// (per-axis translation + scale) is recorded on the returned
+/// `BakedViews` so the JSON builder can attach it as `node.translation`
+/// / `node.scale` per the extension contract.
+fn pack_one_baked(mesh: &ProductMesh, bin: &mut Vec<u8>) -> BakedViews {
     let (min, max) = bbox(&mesh.vertices);
-    for v in &mesh.vertices {
-        bin.extend_from_slice(&v.to_le_bytes());
+    // Per-axis range. Floor at f32::MIN_POSITIVE-equivalent (any
+    // positive value) so the divisor isn't 0 — when range is 0 the
+    // quantized value is forced to 0 anyway, so the scale never
+    // actually multiplies a non-zero u16.
+    let range = [max[0] - min[0], max[1] - min[1], max[2] - min[2]];
+    // Quantized max per axis: 65535 normally, 0 when the AABB is
+    // collapsed along this axis (every vert quantizes to 0).
+    let q_max: [u32; 3] = [
+        if range[0] > 0.0 { 65535 } else { 0 },
+        if range[1] > 0.0 { 65535 } else { 0 },
+        if range[2] > 0.0 { 65535 } else { 0 },
+    ];
+    // Denorm scale per axis. Zero range → zero scale (the u16 is
+    // always 0, so 0*0 + translation = translation = the only
+    // world value along that axis).
+    let q_scale: [f32; 3] = [
+        if range[0] > 0.0 { range[0] / 65535.0 } else { 0.0 },
+        if range[1] > 0.0 { range[1] / 65535.0 } else { 0.0 },
+        if range[2] > 0.0 { range[2] / 65535.0 } else { 0.0 },
+    ];
+
+    let pos_offset = bin.len() as u32;
+    for chunk in mesh.vertices.chunks_exact(3) {
+        for k in 0..3 {
+            let q: u16 = if range[k] > 0.0 {
+                // (v - min) / range * 65535, clamped to u16.
+                let f = ((chunk[k] - min[k]) / range[k] * 65535.0).round();
+                f.clamp(0.0, 65535.0) as u16
+            } else {
+                0
+            };
+            bin.extend_from_slice(&q.to_le_bytes());
+        }
     }
     let pos_len = bin.len() as u32 - pos_offset;
     pad4(bin);
@@ -337,23 +369,24 @@ fn pack_one_baked(
     let idx_len = bin.len() as u32 - idx_offset;
     pad4(bin);
 
-    (
-        View {
+    BakedViews {
+        positions: View {
             byte_offset: pos_offset,
             byte_length: pos_len,
             target: ARRAY_BUFFER,
         },
-        View {
+        indices: View {
             byte_offset: idx_offset,
             byte_length: idx_len,
             target: ELEMENT_ARRAY_BUFFER,
         },
         n_verts,
-        mesh.indices.len() as u32,
-        min,
-        max,
+        n_indices: mesh.indices.len() as u32,
         idx_component,
-    )
+        quant_translation: min,
+        quant_scale: q_scale,
+        quant_u16_max: q_max,
+    }
 }
 
 /// Pack a local (untransformed) mesh into `bin`. Same body as the
@@ -606,12 +639,44 @@ fn build_json(
     let mut s = String::with_capacity(meshes.len() * 400 + 8192);
     s.push_str(r#"{"asset":{"version":"2.0","generator":"ifcfast-mesh"},"#);
 
-    // Extensions used / required — instancing is required when ≥1
-    // group exists; without that flag the viewer would silently render
-    // each shared mesh at its local origin.
-    if n_groups > 0 {
-        s.push_str(r#""extensionsUsed":["EXT_mesh_gpu_instancing"],"#);
-        s.push_str(r#""extensionsRequired":["EXT_mesh_gpu_instancing"],"#);
+    // Extensions used / required.
+    //   - EXT_mesh_gpu_instancing: declared whenever ≥1 instance group
+    //     exists. Required because without it the viewer would
+    //     silently render each shared mesh at its local origin.
+    //   - KHR_mesh_quantization: declared whenever ≥1 baked mesh
+    //     exists (always, on real files). Required because the
+    //     position accessors are u16 — a viewer that doesn't know
+    //     to apply node.translation + node.scale would render
+    //     geometry in [0, 65535]³, several km from origin.
+    let want_quant = n_baked > 0;
+    let want_instancing = n_groups > 0;
+    if want_quant || want_instancing {
+        s.push_str(r#""extensionsUsed":["#);
+        let mut first_ext = true;
+        if want_quant {
+            s.push_str(r#""KHR_mesh_quantization""#);
+            first_ext = false;
+        }
+        if want_instancing {
+            if !first_ext {
+                s.push(',');
+            }
+            s.push_str(r#""EXT_mesh_gpu_instancing""#);
+        }
+        s.push_str("],");
+        s.push_str(r#""extensionsRequired":["#);
+        let mut first_ext = true;
+        if want_quant {
+            s.push_str(r#""KHR_mesh_quantization""#);
+            first_ext = false;
+        }
+        if want_instancing {
+            if !first_ext {
+                s.push(',');
+            }
+            s.push_str(r#""EXT_mesh_gpu_instancing""#);
+        }
+        s.push_str("],");
     }
 
     // 1. Single buffer
@@ -641,12 +706,20 @@ fn build_json(
     first = true;
     let mut bv_idx: u32 = 0;
     for v in &layout.baked {
-        push_accessor_positions(&mut s, &mut first, bv_idx, v.n_verts, v.min, v.max);
+        // Quantized positions: UNSIGNED_SHORT, accessor min/max in
+        // *encoded* (u16) units per the KHR_mesh_quantization spec.
+        push_accessor_positions_quantized(&mut s, &mut first, bv_idx, v.n_verts, v.quant_u16_max);
         bv_idx += 1;
         push_accessor_indices(&mut s, &mut first, bv_idx, v.n_indices, v.idx_component);
         bv_idx += 1;
     }
     for v in &layout.instanced {
+        // Instanced shared mesh stays f32 — the per-instance TRS
+        // composes with the node's TRS, so naive quantization would
+        // multiply the per-instance transform by the (pre-decode)
+        // raw u16 vertex. Future: bake the quant denorm into the
+        // shared mesh + adjust instance TRS, or use a different
+        // primitive layout. For now: float positions, full precision.
         push_accessor_positions(&mut s, &mut first, bv_idx, v.n_verts, v.min, v.max);
         bv_idx += 1;
         push_accessor_indices(&mut s, &mut first, bv_idx, v.n_indices, v.idx_component);
@@ -735,15 +808,34 @@ fn build_json(
     s.push_str(r#""nodes":["#);
     first = true;
     // 6a. Baked nodes — one per product, mesh idx = baked position.
+    //     Each node carries `translation` + `scale` to dequantize its
+    //     u16 vertex buffer per KHR_mesh_quantization. The root
+    //     rotator is applied AFTER the per-node TRS in the standard
+    //     glTF chain (`world = root.matrix * node.matrix * vertex`),
+    //     so the Z-up→Y-up rotation lands correctly on the
+    //     dequantized world coords.
     for (bi, &orig_i) in plan.baked.iter().enumerate() {
         if !first {
             s.push(',');
         }
         first = false;
         let mesh = &meshes[orig_i];
+        let views = &layout.baked[bi];
         s.push_str(r#"{"mesh":"#);
         s.push_str(&(mesh_baked_base + bi).to_string());
-        s.push_str(r#","name":""#);
+        s.push_str(r#","translation":["#);
+        s.push_str(&format_f32(views.quant_translation[0]));
+        s.push(',');
+        s.push_str(&format_f32(views.quant_translation[1]));
+        s.push(',');
+        s.push_str(&format_f32(views.quant_translation[2]));
+        s.push_str(r#"],"scale":["#);
+        s.push_str(&format_f32(views.quant_scale[0]));
+        s.push(',');
+        s.push_str(&format_f32(views.quant_scale[1]));
+        s.push(',');
+        s.push_str(&format_f32(views.quant_scale[2]));
+        s.push_str(r#"],"name":""#);
         push_json_string(&mut s, &mesh.guid);
         s.push_str(r#"","extras":{"guid":""#);
         push_json_string(&mut s, &mesh.guid);
@@ -863,6 +955,37 @@ fn push_view(s: &mut String, first: &mut bool, v: &View) {
         s.push_str(&v.target.to_string());
     }
     s.push('}');
+}
+
+/// Emit a position accessor for a `KHR_mesh_quantization` u16-quantized
+/// vertex buffer. `min` / `max` are encoded units per the spec
+/// (`[0, 65535]` for live axes, `0` for collapsed axes).
+fn push_accessor_positions_quantized(
+    s: &mut String,
+    first: &mut bool,
+    bv_idx: u32,
+    n_verts: u32,
+    q_max: [u32; 3],
+) {
+    if !*first {
+        s.push(',');
+    }
+    *first = false;
+    s.push_str(r#"{"bufferView":"#);
+    s.push_str(&bv_idx.to_string());
+    s.push_str(r#","componentType":"#);
+    s.push_str(&U16_T.to_string());
+    s.push_str(r#","count":"#);
+    s.push_str(&n_verts.to_string());
+    s.push_str(r#","type":""#);
+    s.push_str(VEC3);
+    s.push_str(r#"","min":[0,0,0],"max":["#);
+    s.push_str(&q_max[0].to_string());
+    s.push(',');
+    s.push_str(&q_max[1].to_string());
+    s.push(',');
+    s.push_str(&q_max[2].to_string());
+    s.push_str("]}");
 }
 
 fn push_accessor_positions(
