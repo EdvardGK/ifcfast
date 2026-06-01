@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "ifcfast"
-version = "0.4.24"
+version = "0.4.25"
 description = "Fast native IFC parsing, data extraction, and geometric analytics"
 readme = "README.md"
 requires-python = ">=3.10"

@@ -88,6 +88,7 @@ releases (additions only, never reorganisations).
 | Per-product triangle meshes (verts, faces) | `m.meshes()` (`unit=`, `cut_openings=` opts) |
 | Sample a labeled point cloud (+ normals) | `m.point_cloud(per_m2=1000)` |
 | Stream a point cloud in bounded-RAM chunks | `m.iter_point_cloud(per_m2=1000, chunk_points=1_000_000)` |
+| One-call viewer export to glTF binary | `m.to_gltf("out.glb")` (cuts on, instancing on, quant on) |
 | Geometric quantities (volume, area) | `m.mesh_qto()` |
 | Placement-vs-mesh sanity check | `m.drift` |
 | "Which products live under this storey?" | `m.products_in(storey_guid)` |
@@ -391,19 +392,33 @@ that don't read `EXT_mesh_gpu_instancing` is preserved for those.
 Pick-to-BIM: viewers should read `node.extras.guid` (baked) OR
 `node.extras.instances[instance_id].guid` (instanced).
 
-**Baked positions are `KHR_mesh_quantization` u16** (since v0.4.24).
-Each baked node carries `translation` = AABB min and `scale` =
-range/65535 so the runtime reconstructs world coords as
-`translation + scale * u16_vertex`. Quantization error is
+**All positions are `KHR_mesh_quantization` u16** (since v0.4.25).
+Baked positions: per-node `translation` = AABB min and `scale` =
+range/65535, the runtime reconstructs world coords as `translation
++ scale * u16_vertex`. Instanced positions: the per-rep quant
+denorm is baked into each per-instance TRS via
+`(T, R, S) := (T_inst + R_inst*(S_inst⊙T_quant), R_inst, S_inst⊙S_quant)`
+so the instanced node carries no local TRS and the per-instance
+TRS goes straight from u16 to world. Quantization error is
 ±range/131070 — for a 1 m-spanning mesh that's ±15 μm, well under
-the precision an IFC-authored model carries anyway. Instanced
-shared meshes stay f32 for now (per-instance TRS composes with
-the node TRS, naive quantization would multiply the per-instance
-transform by the raw u16). Combined size savings on real files:
-LBK_RIBp_C 118.5 MB → 56 MB (52% smaller, 2.1× compression) with
-instancing + quantization stacked; LBK_ARK_C 86.9 MB → 68 MB
-(22% smaller from quantization alone where instancing was a
-near-no-op).
+the precision an IFC-authored model carries anyway. Combined size
+savings on real files: LBK_RIBp_C 118.5 MB → 56 MB (52% smaller,
+2.1× compression) with instancing + quantization stacked; LBK_ARK_C
+86.9 MB → 68 MB (22% smaller from quantization alone where
+instancing was a near-no-op).
+
+**One-call viewer export: `m.to_gltf(out_path, cut_openings=True)`**
+(since v0.4.25). Defaults are viewer-optimal — opening geometry
+subtracted from host walls via the manifold-csg boolean path
+(both in-rep `IfcBooleanClippingResult` and cross-product
+`IfcRelVoidsElement`), `KHR_mesh_quantization` u16 positions,
+`EXT_mesh_gpu_instancing` when `cut_openings=False` (the cut
+modifies per-product geometry, so instancing is disabled with
+cuts on). Per-product identity carries through `node.extras.guid`
+(baked) and `node.extras.instances[instance_id].guid` (instanced).
+The wheel ships with `csg` in the default Cargo features (since
+v0.4.25), so `pip install ifcfast` is enough — no extras or
+build-from-source needed.
 
 ## CLI quick reference
 
