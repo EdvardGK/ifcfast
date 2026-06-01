@@ -363,9 +363,18 @@ sinks is **still IFC entity-table iteration order** — the parallel
 phase fans out, results are reordered back into source order before
 the streaming sink sees them. So existing consumers that relied on
 stable order (substrate writer, OBJ/glTF writers, the cut_openings
-wrapper) keep that contract. The first-cut speedup at 8 cores is
-roughly 2× end-to-end on real files; the cap is collect overhead
-that future revisions can streamline.
+wrapper) keep that contract. End-to-end speedup at 8 cores is
+~1.9–2.0× on real files.
+
+**RAM is bounded across the parallel mesh pass** (since v0.4.21).
+Workers stream `(seq, ProductOutcome)` over a lock-free bounded
+channel (`crossbeam-channel`) instead of materialising every
+outcome into one large `Vec` before drain. Peak in-flight memory =
+`channel_cap × per_product_mesh ≈ a few MB` for typical AEC files,
+independent of total product count — so 1 GB IFCs through the
+substrate writer don't balloon RSS during tessellation. There's
+also a `RAYON_NUM_THREADS=1` fast path that bypasses the channel
+entirely (no scaffolding cost on single-thread hosts).
 
 ## CLI quick reference
 
