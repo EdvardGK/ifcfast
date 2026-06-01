@@ -1601,6 +1601,212 @@ mod python {
         })
     }
 
+    // ----- write_gltf --------------------------------------------------
+
+    /// Write `path` (an IFC file) as `out_path` (a `.glb`), running the
+    /// streaming mesh pass, optionally cutting openings, and emitting
+    /// glTF 2.0 binary with `EXT_mesh_gpu_instancing` (where applicable)
+    /// + `KHR_mesh_quantization` baked positions.
+    ///
+    /// `cut_openings=True` applies the manifold-csg net-boolean path
+    /// (`m.meshes(cut_openings=True)` semantics): in-rep
+    /// `IfcBooleanClippingResult` AND cross-product `IfcRelVoidsElement`.
+    /// Instancing is disabled in this mode because the cut produces
+    /// per-product geometry that no longer matches the shared rep mesh
+    /// — every product gets a baked node instead. Quantization (u16
+    /// positions per node) still applies.
+    ///
+    /// Returns a small dict of stats: `products_meshed`,
+    /// `products_emitted`, `cut_openings_*` counts, output file size.
+    #[cfg(feature = "mesh")]
+    #[pyfunction]
+    #[pyo3(signature = (path, out_path, cut_openings = false))]
+    pub fn write_gltf<'py>(
+        py: Python<'py>,
+        path: &str,
+        out_path: &str,
+        cut_openings: bool,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        catch_panic(|| {
+            use crate::mesh::{BakeFrame, ProductMesh, ProductSink};
+
+            #[cfg(not(feature = "csg"))]
+            if cut_openings {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                    "write_gltf(cut_openings=True) requires the `csg` Cargo feature; \
+                     this wheel was built without it.",
+                ));
+            }
+
+            let t_total = Instant::now();
+            let (mmap, _open_ms) = open_mmap(path)?;
+            let idx = py.allow_threads(|| indexer::index(&mmap));
+            let unit_scale = idx.unit_scale.unwrap_or(1.0) as f32;
+
+            /// Accumulating sink: collects every `ProductMesh` into a
+            /// `Vec`, optionally routing cross-product void hosts and
+            /// in-rep cut applies through the same dispatcher
+            /// `extract_meshes` uses, then scales world-baked vertices
+            /// from model units to metres so the glTF writer sees a
+            /// metres-everywhere contract.
+            struct GltfSink {
+                products: Vec<ProductMesh>,
+                cut_openings: bool,
+                unit_scale: f32,
+                cut_stats_cut: usize,
+                cut_stats_passthrough: usize,
+                cut_stats_fallback: usize,
+                #[cfg(feature = "csg")]
+                cross: Option<crate::mesh::cut_openings::CrossProductCut>,
+            }
+
+            impl GltfSink {
+                /// Scale a world-baked product's vertices from model
+                /// units into metres so the glTF emitter sees the same
+                /// metres-everywhere contract `m.meshes()` ships. Also
+                /// rebases against the model's f64 mesh_anchor so the
+                /// f32 vertex stream stays precise for far-from-origin
+                /// (georeferenced) geometry. The output is appended
+                /// to `self.products`.
+                fn push_scaled(&mut self, mut mesh: ProductMesh) {
+                    if mesh.indices.is_empty() || mesh.vertices.is_empty() {
+                        return;
+                    }
+                    let us = self.unit_scale as f64;
+                    for chunk in mesh.vertices.chunks_exact_mut(3) {
+                        chunk[0] = (chunk[0] as f64 * us) as f32;
+                        chunk[1] = (chunk[1] as f64 * us) as f32;
+                        chunk[2] = (chunk[2] as f64 * us) as f32;
+                    }
+                    self.products.push(mesh);
+                }
+
+                #[cfg(feature = "csg")]
+                fn bump_outcome(&mut self, outcome: crate::mesh::cut_openings::Outcome) {
+                    use crate::mesh::cut_openings::Outcome;
+                    match outcome {
+                        Outcome::Cut => self.cut_stats_cut += 1,
+                        Outcome::Passthrough => self.cut_stats_passthrough += 1,
+                        Outcome::Fallback => self.cut_stats_fallback += 1,
+                    }
+                }
+            }
+
+            impl ProductSink for GltfSink {
+                #[cfg_attr(not(feature = "csg"), allow(unused_mut))]
+                fn on_product(&mut self, mut mesh: ProductMesh) {
+                    #[cfg(feature = "csg")]
+                    if self.cut_openings {
+                        if let Some(cross) = self.cross.as_mut() {
+                            use crate::mesh::cut_openings::Routed;
+                            match cross.route(mesh) {
+                                Routed::Suppressed | Routed::Held => return,
+                                Routed::PassThrough(m) => mesh = m,
+                            }
+                        }
+                        let outcome = crate::mesh::cut_openings::apply(&mut mesh);
+                        self.bump_outcome(outcome);
+                    }
+                    #[cfg(not(feature = "csg"))]
+                    let _ = self.cut_openings;
+                    self.push_scaled(mesh);
+                }
+            }
+
+            #[cfg(feature = "csg")]
+            let cross = if cut_openings {
+                let c = crate::mesh::cut_openings::CrossProductCut::from_indexer(
+                    &idx.voids_opening,
+                    &idx.voids_host,
+                );
+                if c.is_empty() { None } else { Some(c) }
+            } else {
+                None
+            };
+
+            let mut sink = GltfSink {
+                products: Vec::new(),
+                cut_openings,
+                unit_scale,
+                cut_stats_cut: 0,
+                cut_stats_passthrough: 0,
+                cut_stats_fallback: 0,
+                #[cfg(feature = "csg")]
+                cross,
+            };
+
+            let t_mesh = Instant::now();
+            // World frame so the glTF writer can compute per-product
+            // AABBs directly from `mesh.vertices`. The kernel already
+            // applies the model-wide global shift to prevent far-from-
+            // origin f32 collapse internally.
+            let mesh_stats = py.allow_threads(|| {
+                crate::mesh::mesh_ifc_streaming_framed(
+                    &mmap,
+                    &mut sink,
+                    BakeFrame::World,
+                )
+            });
+
+            // Cross-product flush — fold buffered hosts with their
+            // arrived openings, run the result through `push_scaled`.
+            #[cfg(feature = "csg")]
+            if let Some(mut cross) = sink.cross.take() {
+                for (folded, outcome) in cross.flush() {
+                    sink.bump_outcome(outcome);
+                    sink.push_scaled(folded);
+                }
+            }
+            let mesh_ms = t_mesh.elapsed().as_secs_f64() * 1000.0;
+
+            // Cut-applied meshes have geometry diverging from any
+            // shared rep — disable instancing in that case so each
+            // wall keeps its own cut.
+            let options = crate::mesh::gltf::WriteOptions {
+                instancing: !cut_openings,
+            };
+
+            let t_write = Instant::now();
+            let file = std::fs::File::create(out_path).map_err(|e| {
+                pyo3::exceptions::PyIOError::new_err(format!(
+                    "create {out_path}: {e}"
+                ))
+            })?;
+            let mut buf = std::io::BufWriter::with_capacity(1 << 20, file);
+            crate::mesh::gltf::write_with_options(&sink.products, &options, &mut buf)
+                .map_err(|e| {
+                    pyo3::exceptions::PyIOError::new_err(format!(
+                        "write {out_path}: {e}"
+                    ))
+                })?;
+            use std::io::Write;
+            buf.flush().map_err(|e| {
+                pyo3::exceptions::PyIOError::new_err(format!(
+                    "flush {out_path}: {e}"
+                ))
+            })?;
+            let write_ms = t_write.elapsed().as_secs_f64() * 1000.0;
+
+            let out_size = std::fs::metadata(out_path).map(|m| m.len()).unwrap_or(0);
+
+            let out = PyDict::new_bound(py);
+            out.set_item("products_emitted", sink.products.len() as u64)?;
+            out.set_item("products_meshed", mesh_stats.products_meshed as u64)?;
+            out.set_item("triangles", mesh_stats.triangles as u64)?;
+            out.set_item("mesh_ms", mesh_ms)?;
+            out.set_item("write_ms", write_ms)?;
+            out.set_item("total_ms", t_total.elapsed().as_secs_f64() * 1000.0)?;
+            out.set_item("size_bytes", mmap.len() as u64)?;
+            out.set_item("out_size_bytes", out_size)?;
+            out.set_item("cut_openings", cut_openings)?;
+            out.set_item("cut_openings_cut", sink.cut_stats_cut as u64)?;
+            out.set_item("cut_openings_passthrough", sink.cut_stats_passthrough as u64)?;
+            out.set_item("cut_openings_fallback", sink.cut_stats_fallback as u64)?;
+            out.set_item("instancing", options.instancing)?;
+            Ok(out)
+        })
+    }
+
     // ----- clash --------------------------------------------------------
 
     #[cfg(feature = "clash")]
@@ -1713,6 +1919,8 @@ mod python {
         m.add_class::<PointCloudIter>()?;
         #[cfg(feature = "mesh")]
         m.add_function(wrap_pyfunction!(extract_meshes, m)?)?;
+        #[cfg(feature = "mesh")]
+        m.add_function(wrap_pyfunction!(write_gltf, m)?)?;
         #[cfg(feature = "clash")]
         m.add_function(wrap_pyfunction!(clash, m)?)?;
         m.add("__version__", env!("CARGO_PKG_VERSION"))?;

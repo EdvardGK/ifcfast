@@ -581,6 +581,84 @@ class Model:
             df.attrs["global_shift"] = gshift
             yield df
 
+    def to_gltf(self, out_path, *, cut_openings: bool = True) -> dict:
+        """One-call IFC → glTF binary (`.glb`) export.
+
+        Runs the streaming mesh pass, optionally subtracts opening
+        geometry from host walls / slabs / etc. via the manifold-csg
+        boolean path, and emits a glTF 2.0 binary using two extensions:
+
+        * ``EXT_mesh_gpu_instancing`` — products sharing a single-
+          fragment representation collapse into one shared mesh +
+          per-instance TRS. Large savings on structural / facade
+          models with repeating bolts, beams, windows, etc.
+        * ``KHR_mesh_quantization`` — baked positions are stored as
+          u16 instead of f32 (50% smaller per coord). The per-node
+          ``translation`` + ``scale`` denormalises on the GPU. Error
+          is ±range/131070 — well under the noise floor in any IFC
+          authoring tool's snap rounding.
+
+        Per-product identity carries through:
+
+        * **Baked path**: ``node.extras.guid`` + ``node.extras.entity``
+          + ``node.extras.segments``. The per-product material is also
+          named by the GUID so legacy pick-to-BIM-by-material works.
+        * **Instanced path**: ``node.extras.instances`` is a parallel
+          array indexed by instance order — ``[{guid, entity,
+          source, segments}, ...]``. Viewers map picked instance_id
+          back to GUID via this array.
+
+        Args:
+            out_path: destination ``.glb`` path. Parent directory must
+                exist. Existing files are overwritten.
+            cut_openings: when ``True`` (default), opening geometry is
+                subtracted from its host so doors / windows render
+                as actual holes instead of solid blocks. Covers both
+                authoring patterns (in-rep
+                ``IfcBooleanClippingResult`` AND cross-product
+                ``IfcRelVoidsElement``). Disables instancing
+                automatically because the cut produces per-product
+                geometry that no longer matches the shared rep mesh.
+                Set ``False`` for the reveal-all stance (both
+                operands emitted as visible mesh) — gives smaller
+                glTFs when instancing kicks in, at the cost of
+                rendering door volumes as solid blocks.
+
+        Returns:
+            Stats dict with:
+
+            * ``products_emitted`` — products written into the glb
+            * ``products_meshed`` — products with non-empty geometry
+            * ``triangles`` — total triangle count
+            * ``out_size_bytes`` — final ``.glb`` size on disk
+            * ``mesh_ms`` / ``write_ms`` / ``total_ms`` — phase timings
+            * ``cut_openings`` — echo of the input flag
+            * ``cut_openings_cut`` / ``passthrough`` / ``fallback`` —
+              per-policy counts when cut_openings was applied
+            * ``instancing`` — whether the writer emitted
+              ``EXT_mesh_gpu_instancing`` (always False when
+              cut_openings=True)
+
+        Example::
+
+            >>> stats = m.to_gltf("./tower.glb")
+            >>> print(f"{stats['out_size_bytes']/1e6:.1f} MB, "
+            ...       f"{stats['triangles']:,} tris, "
+            ...       f"cut {stats['cut_openings_cut']} hosts")
+
+        The emitted ``.glb`` opens in any glTF 2.0 viewer that
+        supports ``EXT_mesh_gpu_instancing`` + ``KHR_mesh_quantization``
+        (Three.js, Babylon, xeokit, gltf.report). Both extensions are
+        declared in ``extensionsRequired`` — a viewer without support
+        will refuse to load rather than render wrong.
+        """
+        from . import _core
+        return _core.write_gltf(
+            str(native_path_for(self.header.path)),
+            str(out_path),
+            bool(cut_openings),
+        )
+
     def meshes(self, unit: str = "m", cut_openings: bool = False):
         """Raw per-product triangle meshes — the fast drop-in for
         IfcOpenShell tessellation.

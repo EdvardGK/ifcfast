@@ -63,15 +63,45 @@ const ELEMENT_ARRAY_BUFFER: u32 = 34963;
 /// near-immediate (one duplicated mesh saved vs ~3 short TRS arrays).
 const INSTANCE_THRESHOLD: usize = 2;
 
-/// Write `meshes` as a glTF 2.0 binary file.
-///
-/// Products whose single-fragment representation is shared across ≥2
-/// products are emitted using `EXT_mesh_gpu_instancing` (one shared
-/// mesh + per-instance TRS). Multi-fragment products and rep-unique
-/// singletons fall through to the baked path (one mesh + node per
-/// product, world-coord vertices).
+/// Knobs for [`write_with_options`]. Defaulted to viewer-optimal:
+/// instancing on. The single one-arg `write()` continues to use these
+/// defaults so existing call sites (the `ifcfast-mesh` binary, tests)
+/// keep their behaviour.
+#[derive(Debug, Clone, Copy)]
+pub struct WriteOptions {
+    /// When true, products sharing a single-fragment `rep_step_id`
+    /// are emitted with `EXT_mesh_gpu_instancing` (one shared mesh,
+    /// per-instance TRS). When false, every product gets a baked
+    /// node — required when `cut_openings` has been applied because
+    /// the cut changes per-product geometry away from the shared
+    /// local mesh, breaking the "all members share `parts[0]`'s
+    /// local geometry" assumption the instancer relies on.
+    pub instancing: bool,
+}
+
+impl Default for WriteOptions {
+    fn default() -> Self {
+        Self { instancing: true }
+    }
+}
+
+/// Write `meshes` as a glTF 2.0 binary file with default options
+/// (instancing enabled). See [`write_with_options`] for the knob-
+/// configurable form.
 pub fn write<W: Write>(meshes: &[ProductMesh], out: &mut W) -> io::Result<()> {
-    let plan = Plan::classify(meshes);
+    write_with_options(meshes, &WriteOptions::default(), out)
+}
+
+/// Like [`write`] but with caller-supplied options. `m.to_gltf` calls
+/// this directly with `instancing = !cut_openings` so cut-applied
+/// glTFs render correctly (every wall keeps its own cut geometry
+/// rather than being snapped back to the shared pre-cut rep).
+pub fn write_with_options<W: Write>(
+    meshes: &[ProductMesh],
+    options: &WriteOptions,
+    out: &mut W,
+) -> io::Result<()> {
+    let plan = Plan::classify(meshes, options.instancing);
 
     // 1. Build the binary buffer.
     let (binary, layout) = pack_binary(meshes, &plan);
@@ -139,7 +169,21 @@ struct InstanceGroup {
 }
 
 impl Plan {
-    fn classify(meshes: &[ProductMesh]) -> Self {
+    /// `instancing_enabled = false` forces every mesh down the baked
+    /// path — used by `m.to_gltf(cut_openings=True)` because the cut
+    /// modifies per-product geometry and breaks the "all members
+    /// share `parts[0]`'s local mesh" assumption.
+    fn classify(meshes: &[ProductMesh], instancing_enabled: bool) -> Self {
+        if !instancing_enabled {
+            let baked: Vec<usize> = (0..meshes.len())
+                .filter(|&i| !meshes[i].vertices.is_empty() && !meshes[i].indices.is_empty())
+                .collect();
+            return Plan {
+                baked,
+                instanced: Vec::new(),
+            };
+        }
+
         // Bucket single-fragment products by rep_step_id; multi-fragment
         // products and geometryless products go straight to baked.
         let mut by_rep: HashMap<u64, Vec<usize>> = HashMap::new();
