@@ -38,7 +38,7 @@
 use std::collections::HashMap;
 use std::io::{self, BufWriter, Write};
 
-use glam::Mat4;
+use glam::{Mat4, Vec3};
 
 use crate::mesh::ProductMesh;
 
@@ -281,9 +281,11 @@ struct InstancedViews {
     n_verts: u32,
     n_indices: u32,
     n_instances: u32,
-    min: [f32; 3],
-    max: [f32; 3],
     idx_component: u32,
+    /// Quantized max per axis — `0` for collapsed axes, `65535`
+    /// otherwise. Drives the accessor's encoded `min`/`max` per the
+    /// KHR_mesh_quantization spec.
+    quant_u16_max: [u32; 3],
 }
 
 /// Concatenate every product's positions + indices (and per-group TRS
@@ -311,11 +313,11 @@ fn pack_binary(meshes: &[ProductMesh], plan: &Plan) -> (Vec<u8>, BinaryLayout) {
         .iter()
         .map(|g| g.member_indices.len() * (3 + 4 + 3) * 4)
         .sum();
-    // baked positions are quantized u16 (2 bytes per coord, 3 per vert);
-    // instanced shared positions still f32; indices are f32 capacity
-    // upper-bound regardless of u16 vs u32 narrowing.
+    // Both baked AND instanced positions are quantized u16 (2 bytes
+    // per coord, 3 per vert); indices are f32 capacity upper-bound
+    // regardless of u16 vs u32 narrowing; TRS is f32.
     let mut bin = Vec::with_capacity(
-        baked_verts * 2 + baked_idx * 4 + inst_verts * 4 + inst_idx * 4 + inst_trs,
+        baked_verts * 2 + baked_idx * 4 + inst_verts * 2 + inst_idx * 4 + inst_trs,
     );
 
     let mut layout = BinaryLayout {
@@ -330,20 +332,26 @@ fn pack_binary(meshes: &[ProductMesh], plan: &Plan) -> (Vec<u8>, BinaryLayout) {
 
     // Instanced groups next. The shared mesh comes from the first
     // member's `parts[0]` (local geometry — all members share the same
-    // local mesh by definition of being in this group).
+    // local mesh by definition of being in this group). Quantize the
+    // shared mesh AND bake the quant denorm into each instance's TRS
+    // so the per-instance world placement composes correctly with the
+    // u16 vertex stream.
     for group in &plan.instanced {
         let first = &meshes[group.member_indices[0]];
         let part = &first.parts[0];
-        let (positions, indices, n_verts, n_indices, min, max, idx_component) =
-            pack_one_local(&part.local_vertices, &part.local_indices, &mut bin);
+        let (positions, indices, n_verts, n_indices, idx_component, q_max, q_translation, q_scale) =
+            pack_one_local_quantized(&part.local_vertices, &part.local_indices, &mut bin);
 
-        // Per-instance TRS arrays. Each instance's transform is
+        // Per-instance TRS arrays. Each member's instance matrix is
         // `world_transform * instance_transform`; decompose into a
         // (translation, rotation, scale) tuple via glam — the standard
-        // glTF instance attribute shape per the extension spec.
+        // glTF instance attribute shape per the extension spec — then
+        // compose the per-rep quantization denorm into the TRS so the
+        // shared u16 vertex stream reconstructs world coords through
+        // the per-instance transform alone (no extra node TRS).
         let n_instances = group.member_indices.len() as u32;
         let (translation, rotation, scale) =
-            pack_instance_trs(meshes, group, &mut bin);
+            pack_instance_trs_quantized(meshes, group, q_translation, q_scale, &mut bin);
 
         layout.instanced.push(InstancedViews {
             positions,
@@ -354,9 +362,8 @@ fn pack_binary(meshes: &[ProductMesh], plan: &Plan) -> (Vec<u8>, BinaryLayout) {
             n_verts,
             n_indices,
             n_instances,
-            min,
-            max,
             idx_component,
+            quant_u16_max: q_max,
         });
     }
 
@@ -433,18 +440,40 @@ fn pack_one_baked(mesh: &ProductMesh, bin: &mut Vec<u8>) -> BakedViews {
     }
 }
 
-/// Pack a local (untransformed) mesh into `bin`. Same body as the
-/// baked packer; split so the per-instance writer doesn't depend on
-/// the `ProductMesh` shape.
-fn pack_one_local(
+/// Pack a local (untransformed) mesh into `bin`, quantized as u16 per
+/// `KHR_mesh_quantization`. Returns positions+indices views, accessor
+/// metadata, quantized-max bounds for the accessor's encoded min/max,
+/// and the denorm (translation + scale) that the per-instance TRS
+/// composer will fold into each instance's transform.
+fn pack_one_local_quantized(
     vertices: &[f32],
     indices: &[u32],
     bin: &mut Vec<u8>,
-) -> (View, View, u32, u32, [f32; 3], [f32; 3], u32) {
-    let pos_offset = bin.len() as u32;
+) -> (View, View, u32, u32, u32, [u32; 3], [f32; 3], [f32; 3]) {
     let (min, max) = bbox(vertices);
-    for v in vertices {
-        bin.extend_from_slice(&v.to_le_bytes());
+    let range = [max[0] - min[0], max[1] - min[1], max[2] - min[2]];
+    let q_max: [u32; 3] = [
+        if range[0] > 0.0 { 65535 } else { 0 },
+        if range[1] > 0.0 { 65535 } else { 0 },
+        if range[2] > 0.0 { 65535 } else { 0 },
+    ];
+    let q_scale: [f32; 3] = [
+        if range[0] > 0.0 { range[0] / 65535.0 } else { 0.0 },
+        if range[1] > 0.0 { range[1] / 65535.0 } else { 0.0 },
+        if range[2] > 0.0 { range[2] / 65535.0 } else { 0.0 },
+    ];
+
+    let pos_offset = bin.len() as u32;
+    for chunk in vertices.chunks_exact(3) {
+        for k in 0..3 {
+            let q: u16 = if range[k] > 0.0 {
+                let f = ((chunk[k] - min[k]) / range[k] * 65535.0).round();
+                f.clamp(0.0, 65535.0) as u16
+            } else {
+                0
+            };
+            bin.extend_from_slice(&q.to_le_bytes());
+        }
     }
     let pos_len = bin.len() as u32 - pos_offset;
     pad4(bin);
@@ -467,9 +496,10 @@ fn pack_one_local(
         },
         n_verts,
         indices.len() as u32,
-        min,
-        max,
         idx_component,
+        q_max,
+        min,
+        q_scale,
     )
 }
 
@@ -514,36 +544,64 @@ fn bbox(vertices: &[f32]) -> ([f32; 3], [f32; 3]) {
 }
 
 /// Pack three per-instance attribute arrays — TRANSLATION (VEC3),
-/// ROTATION (VEC4 quaternion xyzw), SCALE (VEC3) — into `bin`. One
-/// triple per instance, in `member_indices` order. The per-instance
-/// 4×4 is `world_transform * instance_transform`; glam's
-/// `to_scale_rotation_translation` decomposes it.
-fn pack_instance_trs(
+/// ROTATION (VEC4 quaternion xyzw), SCALE (VEC3) — into `bin`, with
+/// the rep's quantization denorm baked into each instance.
+///
+/// For a rigid IFC instance (S_inst = identity scale, which is the
+/// usual case for IfcMappedItem / world placement chains), the
+/// composed TRS that takes a u16 vertex straight to world coords is:
+///
+///   T_new = T_inst + R_inst · (S_inst ⊙ T_quant)
+///   R_new = R_inst   (unchanged)
+///   S_new = S_inst ⊙ S_quant   (component-wise scale composition)
+///
+/// where ⊙ is Hadamard (element-wise) product on vec3. The derivation:
+///
+///   world = T_inst + R_inst · S_inst · (T_quant + S_quant · v_u16)
+///         = (T_inst + R_inst · S_inst · T_quant) + R_inst · (S_inst ⊙ S_quant) · v_u16
+///
+/// This works cleanly when S_inst is axis-aligned scale (true for all
+/// IFC placements I've seen). If a future file presents a sheared
+/// per-instance transform glam's `to_scale_rotation_translation` is
+/// already lossy in that case (rotation+scale don't separate), so
+/// the same caveat applies.
+fn pack_instance_trs_quantized(
     meshes: &[ProductMesh],
     group: &InstanceGroup,
+    q_translation: [f32; 3],
+    q_scale: [f32; 3],
     bin: &mut Vec<u8>,
 ) -> (View, View, View) {
     let n = group.member_indices.len();
+    let q_t = Vec3::new(q_translation[0], q_translation[1], q_translation[2]);
+    let q_s = Vec3::new(q_scale[0], q_scale[1], q_scale[2]);
 
-    // Translation
-    let t_offset = bin.len() as u32;
-    let mut t_scratch: Vec<(f32, f32, f32)> = Vec::with_capacity(n);
+    let mut t_scratch: Vec<Vec3> = Vec::with_capacity(n);
     let mut r_scratch: Vec<(f32, f32, f32, f32)> = Vec::with_capacity(n);
-    let mut s_scratch: Vec<(f32, f32, f32)> = Vec::with_capacity(n);
+    let mut s_scratch: Vec<Vec3> = Vec::with_capacity(n);
     for &i in &group.member_indices {
         let mesh = &meshes[i];
         let world = Mat4::from_cols_array(&mesh.world_transform);
         let inst = Mat4::from_cols_array(&mesh.parts[0].instance_transform);
         let m = world * inst;
         let (scale, rot, trans) = m.to_scale_rotation_translation();
-        t_scratch.push((trans.x, trans.y, trans.z));
-        r_scratch.push((rot.x, rot.y, rot.z, rot.w));
-        s_scratch.push((scale.x, scale.y, scale.z));
+        // Compose quant denorm INTO the instance TRS.
+        // T_new = T_inst + R_inst * (S_inst ⊙ T_quant)
+        let t_new = trans + rot * (scale * q_t);
+        // R_new = R_inst
+        let r_new = rot;
+        // S_new = S_inst ⊙ S_quant
+        let s_new = scale * q_s;
+        t_scratch.push(t_new);
+        r_scratch.push((r_new.x, r_new.y, r_new.z, r_new.w));
+        s_scratch.push(s_new);
     }
-    for &(x, y, z) in &t_scratch {
-        bin.extend_from_slice(&x.to_le_bytes());
-        bin.extend_from_slice(&y.to_le_bytes());
-        bin.extend_from_slice(&z.to_le_bytes());
+
+    let t_offset = bin.len() as u32;
+    for v in &t_scratch {
+        bin.extend_from_slice(&v.x.to_le_bytes());
+        bin.extend_from_slice(&v.y.to_le_bytes());
+        bin.extend_from_slice(&v.z.to_le_bytes());
     }
     let t_len = bin.len() as u32 - t_offset;
     pad4(bin);
@@ -559,10 +617,10 @@ fn pack_instance_trs(
     pad4(bin);
 
     let s_offset = bin.len() as u32;
-    for &(x, y, z) in &s_scratch {
-        bin.extend_from_slice(&x.to_le_bytes());
-        bin.extend_from_slice(&y.to_le_bytes());
-        bin.extend_from_slice(&z.to_le_bytes());
+    for v in &s_scratch {
+        bin.extend_from_slice(&v.x.to_le_bytes());
+        bin.extend_from_slice(&v.y.to_le_bytes());
+        bin.extend_from_slice(&v.z.to_le_bytes());
     }
     let s_len = bin.len() as u32 - s_offset;
     pad4(bin);
@@ -758,13 +816,12 @@ fn build_json(
         bv_idx += 1;
     }
     for v in &layout.instanced {
-        // Instanced shared mesh stays f32 — the per-instance TRS
-        // composes with the node's TRS, so naive quantization would
-        // multiply the per-instance transform by the (pre-decode)
-        // raw u16 vertex. Future: bake the quant denorm into the
-        // shared mesh + adjust instance TRS, or use a different
-        // primitive layout. For now: float positions, full precision.
-        push_accessor_positions(&mut s, &mut first, bv_idx, v.n_verts, v.min, v.max);
+        // Instanced shared mesh is quantized to u16 in local space;
+        // the per-instance TRS carries the quant denorm composed
+        // with the world placement (see `pack_instance_trs_quantized`).
+        // No per-node TRS is required for the instanced node — the
+        // composed instance TRS goes straight from u16 to world.
+        push_accessor_positions_quantized(&mut s, &mut first, bv_idx, v.n_verts, v.quant_u16_max);
         bv_idx += 1;
         push_accessor_indices(&mut s, &mut first, bv_idx, v.n_indices, v.idx_component);
         bv_idx += 1;
@@ -1029,41 +1086,6 @@ fn push_accessor_positions_quantized(
     s.push_str(&q_max[1].to_string());
     s.push(',');
     s.push_str(&q_max[2].to_string());
-    s.push_str("]}");
-}
-
-fn push_accessor_positions(
-    s: &mut String,
-    first: &mut bool,
-    bv_idx: u32,
-    n_verts: u32,
-    min: [f32; 3],
-    max: [f32; 3],
-) {
-    if !*first {
-        s.push(',');
-    }
-    *first = false;
-    s.push_str(r#"{"bufferView":"#);
-    s.push_str(&bv_idx.to_string());
-    s.push_str(r#","componentType":"#);
-    s.push_str(&F32.to_string());
-    s.push_str(r#","count":"#);
-    s.push_str(&n_verts.to_string());
-    s.push_str(r#","type":""#);
-    s.push_str(VEC3);
-    s.push_str(r#"","min":["#);
-    s.push_str(&format_f32(min[0]));
-    s.push(',');
-    s.push_str(&format_f32(min[1]));
-    s.push(',');
-    s.push_str(&format_f32(min[2]));
-    s.push_str(r#"],"max":["#);
-    s.push_str(&format_f32(max[0]));
-    s.push(',');
-    s.push_str(&format_f32(max[1]));
-    s.push(',');
-    s.push_str(&format_f32(max[2]));
     s.push_str("]}");
 }
 
