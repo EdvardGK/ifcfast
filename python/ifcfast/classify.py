@@ -1,7 +1,7 @@
 """Element-mode classification.
 
-Maps an IFC entity name (or a live ``ifcopenshell.entity_instance``) to
-an :class:`ElementMode` saying how it should contribute to a take-off:
+Maps an IFC entity name to an :class:`ElementMode` saying how it should
+contribute to a take-off:
 
 * ``COUNT``   — cataloged product, count instances (lamps, valves, doors).
 * ``MEASURE`` — bulk element, compute volume/area (walls, slabs, columns).
@@ -10,23 +10,18 @@ an :class:`ElementMode` saying how it should contribute to a take-off:
 
 The string-keyed variant ``classify_by_name`` is what the Rust tier-1
 indexer feeds through — it doesn't carry live ``ifcopenshell`` handles.
-Inheritance fallback uses the schema declaration lookup, which is
-available off ``ifcopenshell.schema_by_name`` without opening any file.
-
-If ``ifcopenshell`` isn't installed, the explicit-set checks still work;
-the inheritance fallback returns ``SKIP`` for unknown entities.
+Unknown entities fall through to an inheritance-chain walk via a static
+per-schema supertype map (extracted once at build time from
+``ifcopenshell``; see :mod:`ifcfast.data.schema_supertypes` and the
+codegen at ``scripts/gen_schema_supertypes.py``). No runtime
+``ifcopenshell`` dependency.
 """
 
 from __future__ import annotations
 
 from enum import Enum
 
-try:  # ifcopenshell is an optional dep; degrade gracefully if absent.
-    import ifcopenshell  # type: ignore
-    _HAVE_IFCOPENSHELL = True
-except ImportError:  # pragma: no cover
-    ifcopenshell = None  # type: ignore
-    _HAVE_IFCOPENSHELL = False
+from .data.schema_supertypes import SUPERTYPE
 
 
 class ElementMode(str, Enum):
@@ -123,32 +118,46 @@ _COUNT_PARENT_TYPES = frozenset({
 })
 
 
-# Cached ancestor chains per (entity, schema) — built once via
-# ifcopenshell.schema_by_name(...), no file open required.
+# Cached ancestor chains per (entity, schema) — built once by walking
+# the static `SUPERTYPE` table that ships with the wheel. No live IFC
+# library involved.
 _ANCESTORS_CACHE: dict[tuple[str, str], tuple[str, ...]] = {}
 
 
 def _ancestors(entity: str, schema: str) -> tuple[str, ...]:
-    """Resolve an entity's full ancestor chain. Returns ``(entity,)`` if
-    ``ifcopenshell`` is unavailable or the entity isn't in the schema."""
+    """Resolve an entity's full ancestor chain. Returns ``(entity,)``
+    when the schema isn't known or the entity isn't in it (which is
+    indistinguishable from a root-level entity — both terminate the
+    classifier's inheritance walk in the next step)."""
     key = (entity, schema)
     cached = _ANCESTORS_CACHE.get(key)
     if cached is not None:
         return cached
-    if not _HAVE_IFCOPENSHELL:
+
+    parents = SUPERTYPE.get(schema)
+    if parents is None:
+        # Unknown schema — most files declare IFC2X3/IFC4/IFC4X3 but
+        # variant casings ("Ifc4", "IFC4_ADD2") sneak through. Try a
+        # case-insensitive lookup against the keys we have.
+        for key_schema in SUPERTYPE:
+            if key_schema.casefold() == schema.casefold():
+                parents = SUPERTYPE[key_schema]
+                break
+    if parents is None:
         _ANCESTORS_CACHE[key] = (entity,)
         return (entity,)
-    try:
-        sch = ifcopenshell.schema_by_name(schema)
-        decl = sch.declaration_by_name(entity).as_entity()
-        chain: list[str] = []
-        cur = decl
-        while cur is not None:
-            chain.append(cur.name())
-            cur = cur.supertype()
-        result = tuple(chain)
-    except Exception:
-        result = (entity,)
+
+    chain: list[str] = [entity]
+    seen: set[str] = {entity}
+    cur = entity
+    while True:
+        nxt = parents.get(cur)
+        if nxt is None or nxt in seen:
+            break
+        chain.append(nxt)
+        seen.add(nxt)
+        cur = nxt
+    result = tuple(chain)
     _ANCESTORS_CACHE[key] = result
     return result
 
@@ -157,9 +166,9 @@ def classify_by_name(entity: str, schema: str = "IFC4") -> ElementMode:
     """Classify by entity-name string with schema-aware inheritance fallback.
 
     This is the primary classifier used by the Rust tier-1 path (which
-    doesn't carry ``ifcopenshell.entity_instance`` handles). Falls back
-    to ``SKIP`` for unknown entities when ``ifcopenshell`` isn't installed.
-    """
+    doesn't carry live element handles). Walks the static per-schema
+    supertype map shipped with the wheel — no runtime IFC library.
+    Returns ``SKIP`` for unknown entities."""
     if entity in SKIP_ENTITIES:
         return ElementMode.SKIP
     if entity in COUNT_ENTITIES:
@@ -176,32 +185,4 @@ def classify_by_name(entity: str, schema: str = "IFC4") -> ElementMode:
             return ElementMode.LINEAR
         if p == "IfcBuildingElement":
             return ElementMode.MEASURE
-    return ElementMode.SKIP
-
-
-def classify_element(element) -> ElementMode:  # type: ignore[no-untyped-def]
-    """Classify a live ``ifcopenshell.entity_instance``. Requires
-    ``ifcopenshell`` at runtime; raises if it's missing.
-    """
-    if not _HAVE_IFCOPENSHELL:
-        raise RuntimeError(
-            "classify_element requires ifcopenshell; install it or use "
-            "classify_by_name(entity_str)"
-        )
-    entity = element.is_a()
-    if entity in SKIP_ENTITIES:
-        return ElementMode.SKIP
-    if entity in COUNT_ENTITIES:
-        return ElementMode.COUNT
-    if entity in LINEAR_ENTITIES:
-        return ElementMode.LINEAR
-    if entity in MEASURE_ENTITIES:
-        return ElementMode.MEASURE
-    for parent in _COUNT_PARENT_TYPES:
-        if element.is_a(parent):
-            return ElementMode.COUNT
-    if element.is_a("IfcFlowSegment"):
-        return ElementMode.LINEAR
-    if element.is_a("IfcBuildingElement"):
-        return ElementMode.MEASURE
     return ElementMode.SKIP
