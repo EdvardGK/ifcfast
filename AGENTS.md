@@ -90,7 +90,7 @@ releases (additions only, never reorganisations).
 | Stream a point cloud in bounded-RAM chunks | `m.iter_point_cloud(per_m2=1000, chunk_points=1_000_000)` |
 | One-call viewer export to glTF binary | `m.to_gltf("out.glb")` (cuts on, instancing on, quant on) |
 | Geometric quantities (volume, area) | `m.mesh_qto()` |
-| Placement-vs-mesh sanity check | `m.drift` |
+| Placement-vs-mesh sanity check | `m.drift` (SI columns; check `m.world_coordinate_baked` for the file-level signal) |
 | "Which products live under this storey?" | `m.products_in(storey_guid)` |
 | "What's the building of this wall?" | `m.building_of(wall_guid)` |
 | Walk to project root from any guid | `m.ancestors(guid)` |
@@ -99,6 +99,9 @@ releases (additions only, never reorganisations).
 | Plan work without paying extract cost | `ifcfast schema FILE --json` |
 | Type catalogue (TypeBank-shaped) | `m.type_summary()` / `m.type_bank()` |
 | ifcopenshell-style `by_type` | `m.by_type("IfcWall")` |
+| Iterate every product as `ProductRow` | `for p in m:` (or `m.products`, `m.filter(entity=...)`) |
+| Count of products (matches `m.products`) | `len(m)` |
+| Same data as a pandas DataFrame | `m.products_df` |
 | What changed between v1 and v2? | `m.diff(other_path)` |
 
 ## Substrate output (DuckDB-queryable parquet)

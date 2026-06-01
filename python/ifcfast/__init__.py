@@ -100,7 +100,7 @@ __all__ = [
     "system_prompt",
 ]
 
-__version__ = "0.4.26"
+__version__ = "0.4.27"
 
 
 def example_path() -> Path:
@@ -155,7 +155,7 @@ Data layers (long-format pandas, lazy on first access):
 Geometry (no CAD kernel required):
     m.meshes()                  # per-product triangles: (guid, entity, vertices, faces)
     m.point_cloud(per_m2=1000)  # area-weighted surface samples + normals
-    m.mesh_qto()                # per-product volume, area, orientation buckets
+    m.mesh_qto()                # -> (products_df, per_surface_df); volume/area/orientation + planar surfaces
     # meshes() / point_cloud() take unit="m"|"mm"|"cm"|"ft"|"in" (default metres)
 
 Spatial-relationship graph:

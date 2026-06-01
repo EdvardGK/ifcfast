@@ -7,6 +7,73 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — tester-in-chief cross-validation batch (GH #29–#35)
+
+- **`m.products` is no longer silently empty on cache hits (GH #29).**
+  The attribute used to be a list backing the cold-parse path and was
+  left empty when the model came back from a parquet cache, so the
+  README's `for p in m.products:` quickstart yielded nothing. Now a
+  property: returns the materialised list either way, building it
+  lazily from `m.products_df` on cache-hit Models. `len(m)` and
+  `len(m.products)` agree. `iter(m)` also added — streams
+  `ProductRow` without materialising the list.
+- **CLI `ifcfast demo` no longer crashes on Windows cp1252 consoles
+  (GH #30).** `_force_utf8_stdio()` at the CLI entry reconfigures
+  stdout/stderr to UTF-8 so the em-dash and `→` glyphs in the pretty
+  output don't trip `UnicodeEncodeError`. `--json` paths were
+  already ASCII-safe; this only mattered for pretty mode and the
+  argparse `--help` banner.
+- **`m.drift` columns are SI-suffixed and the values match
+  `m.mesh_qto()` (GH #31).** The Rust drift extract now applies the
+  file's `unit_scale` before emitting, so columns are
+  `drift_distance_m`, `max_extent_m`, `surface_area_m2`,
+  `volume_abs_m3`, `aabb_volume_m3`, `placement_{x,y,z}_m`,
+  `centroid_{x,y,z}_m`. Joining `m.drift` against `m.mesh_qto()` no
+  longer needs an out-of-band rescale (used to be off by 10⁶–10⁹
+  on mm-unit files with no signal in the column names). Cache schema
+  v4 — old drift caches are rebuilt on next access.
+- **`m.contained_in` captures every spatial-container kind, not
+  just storey (GH #32).** The indexer no longer filters
+  `IfcRelContainedInSpatialStructure` to storey edges. The
+  DataFrame schema is now `(product_guid, container_guid,
+  container_kind)` with `container_kind ∈ {site, building, storey,
+  space}`. `m.parent(guid)` falls back to whichever spatial
+  container the element sits in; `m.storey_of(guid)` walks through
+  non-storey containers (e.g. an element contained in an
+  `IfcSpace` resolves to the space's storey); `m.building_of(guid)`
+  honours direct building containment in addition to
+  storey-then-building. Cache schema v5. Adds
+  `tests/fixtures/site_annotation.ifc` covering site- and
+  building-level containment.
+- **`drift_severity` no longer carpet-bombs world-coordinate-baked
+  models (GH #33).** Per-row severity recomputed against SI values
+  with a unit-independent 10 mm absolute threshold (the old `drift
+  < 10.0` test was 10 mm on mm-files but 10 m on metre-files —
+  over-strict in one direction, over-lenient in the other). New
+  file-level detector: when ≥ 80 % of meshed products are placed
+  at the origin within 1 mm, the file is flagged
+  `m.world_coordinate_baked == True` and the per-row severity of
+  origin-placed products is demoted to `info` so the file-level
+  fact is the actionable signal instead of N "errors". Adds the
+  `info` severity bucket; CLI `ifcfast drift` surfaces the flag.
+- **README/AGENTS/system_prompt mismatch fixes (GH #34).** Softened
+  the "NaN-not-None" invariant claim (materials/classifications
+  carry Python `None` in object-dtype columns; `pd.isna()` catches
+  both); documented `mesh_qto()` returning a `(products_df,
+  surfaces_df)` tuple in both `system_prompt()` and the README;
+  added an `iter(m)` row to the AGENTS.md decision tree; fleshed
+  out the `cache.py` module docstring (missing `segments.parquet`,
+  `voids.parquet`, `spaces.parquet`, `type_objects.parquet`).
+  `Model.__iter__` ships as part of the GH #29 fix.
+- **Quantity extractor now covered end-to-end against
+  `ifcopenshell` ground truth (GH #35).** Real-world test set the
+  tester used happened to lack `IfcElementQuantity` across all six
+  files. Adds `tests/fixtures/quantities.ifc` exercising every
+  `IfcQuantity*` subtype (Length, Area, Volume, Count, Weight,
+  Time) via `IfcRelDefinesByProperties` and a cross-check that
+  diffs `m.quantities` against `ifcopenshell.util.element.get_psets(
+  el, qtos_only=True)`.
+
 ### Added
 
 - **`m.meshes(cut_openings=True)` — net booleans on demand.** Opt-in

@@ -180,10 +180,10 @@ def _cmd_extract(args: argparse.Namespace) -> int:
 
 
 def _cmd_drift(args: argparse.Namespace) -> int:
-    from ifcfast.cache import extract_data_layers
+    import ifcfast
 
-    layers = extract_data_layers(args.file, include_drift=True)
-    df = layers.drift
+    m = ifcfast.open(args.file)
+    df = m.drift
     if df is None:
         msg = "drift unavailable: _core built without `mesh` feature"
         if getattr(args, "json", False):
@@ -196,23 +196,31 @@ def _cmd_drift(args: argparse.Namespace) -> int:
         "path": str(args.file),
         "products_with_geometry": int(len(df)),
         "severity_counts": {sev: counts.get(sev, 0) for sev in ("ok", "info", "warn", "error")},
+        "world_coordinate_baked": bool(m.world_coordinate_baked),
     }
     if args.top and counts.get("error", 0):
         top_errs = (
             df[df["drift_severity"] == "error"]
-            .nlargest(args.top, "drift_distance")
-            [["guid", "entity", "drift_distance", "max_extent", "drift_ratio"]]
+            .nlargest(args.top, "drift_distance_m")
+            [["guid", "entity", "drift_distance_m", "max_extent_m", "drift_ratio"]]
         )
         payload["top_errors"] = top_errs.to_dict(orient="records")
     pretty = [f"products with geometry: {payload['products_with_geometry']}"]
     for sev in ("ok", "info", "warn", "error"):
         pretty.append(f"  {sev:<6} {payload['severity_counts'][sev]}")
+    if payload["world_coordinate_baked"]:
+        pretty.append("")
+        pretty.append(
+            "note: world-coordinate-baked authoring detected — per-element "
+            "drift on origin-placed products demoted to 'info' (model-level "
+            "convention, not per-element bug)."
+        )
     if "top_errors" in payload:
         pretty.append("")
         pretty.append(
             df[df["drift_severity"] == "error"]
-            .nlargest(args.top, "drift_distance")
-            [["guid", "entity", "drift_distance", "max_extent", "drift_ratio"]]
+            .nlargest(args.top, "drift_distance_m")
+            [["guid", "entity", "drift_distance_m", "max_extent_m", "drift_ratio"]]
             .to_string(index=False)
         )
     _emit(payload, args, pretty_lines=pretty)
@@ -256,10 +264,28 @@ def _cmd_cache(args: argparse.Namespace) -> int:
 # ----------------------------------------------------------------------
 
 
+def _force_utf8_stdio() -> None:
+    """Reconfigure stdout/stderr to UTF-8 so non-ASCII glyphs in pretty
+    output don't crash on Windows consoles (cp1252 by default).
+
+    ``--json`` paths emit ASCII-only JSON and aren't affected; this
+    only matters for the pretty-print branches that contain em-dashes,
+    arrows, etc. Best-effort: silently noops on streams that don't
+    expose ``reconfigure`` (older Pythons, redirected pipes that
+    pre-set encoding).
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8")
+        except Exception:  # pragma: no cover
+            pass
+
+
 def main(argv: list[str] | None = None) -> int:
+    _force_utf8_stdio()
     p = argparse.ArgumentParser(
         prog="ifcfast",
-        description="Fast IFC parser CLI — agent-first, JSON-friendly.",
+        description="Fast IFC parser CLI - agent-first, JSON-friendly.",
     )
     sub = p.add_subparsers(dest="cmd", required=True)
 

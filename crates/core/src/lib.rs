@@ -651,6 +651,16 @@ mod python {
         catch_panic(|| {
         let t_total = Instant::now();
         let (mmap, _open_ms) = open_mmap(path)?;
+        // Unit scale (metres per model unit) for column rescaling.
+        // mm-unit files: 0.001; metre files: 1.0. We index up front
+        // because the drift consumer (Python) needs SI columns by
+        // contract — see `m.drift` docstring. ~indexer cost is small
+        // next to the mesh pass that follows.
+        let idx = py.allow_threads(|| indexer::index(&mmap));
+        let unit_scale = idx.unit_scale.unwrap_or(1.0) as f32;
+        let us_len = unit_scale;
+        let us_area = unit_scale * unit_scale;
+        let us_vol = unit_scale * unit_scale * unit_scale;
         let (meshes, mesh_stats) = py.allow_threads(|| crate::mesh::mesh_ifc(&mmap));
         let prod_stats: Vec<crate::mesh::stats::ProductStats> = meshes
             .iter()
@@ -672,50 +682,138 @@ mod python {
         let mut drift_distance = Vec::with_capacity(n);
         let mut max_extent = Vec::with_capacity(n);
         let mut drift_ratio = Vec::with_capacity(n);
-        let mut drift_severity = Vec::with_capacity(n);
+        let mut drift_severity: Vec<&'static str> = Vec::with_capacity(n);
         let mut aabb_volume = Vec::with_capacity(n);
         let mut mesh_quality = Vec::with_capacity(n);
+        // Placement-at-origin epsilon for the world-coordinate-baked
+        // pattern detector below — 1 mm in SI, which is well inside
+        // typical float round-trip noise even on far-from-origin
+        // models.
+        const PLACEMENT_ORIGIN_EPS_M: f32 = 1e-3;
+        let mut placement_at_origin = 0u32;
+        let mut meshed_total = 0u32;
         for s in &prod_stats {
+            let px_m = s.placement_x * us_len;
+            let py_m = s.placement_y * us_len;
+            let pz_m = s.placement_z * us_len;
+            let cx_m = ((s.xmin + s.xmax) * 0.5) * us_len;
+            let cy_m = ((s.ymin + s.ymax) * 0.5) * us_len;
+            let cz_m = ((s.zmin + s.zmax) * 0.5) * us_len;
+            let drift_m = s.drift_distance * us_len;
+            let extent_m = s.max_extent * us_len;
+            // Per-row severity, recomputed against SI values so the
+            // 10 mm absolute threshold is unit-independent (the old
+            // `drift < 10.0` rule against raw model units was 10 mm
+            // on mm-files but 10 m on metre-files — over-strict on
+            // mm files and over-lenient on metre files).
+            let severity: &'static str = if drift_m < 0.010 || s.drift_ratio <= 2.0 {
+                "ok"
+            } else if s.drift_ratio <= 10.0 {
+                "warn"
+            } else {
+                "error"
+            };
             guid.push(s.guid.clone());
             entity.push(s.entity.clone());
             source.push(s.source);
             tri_count.push(s.triangle_count);
-            surface_area.push(s.surface_area);
-            volume_abs.push(s.volume.abs());
-            px.push(s.placement_x);
-            py_v.push(s.placement_y);
-            pz.push(s.placement_z);
-            cx.push((s.xmin + s.xmax) * 0.5);
-            cy.push((s.ymin + s.ymax) * 0.5);
-            cz.push((s.zmin + s.zmax) * 0.5);
-            drift_distance.push(s.drift_distance);
-            max_extent.push(s.max_extent);
+            surface_area.push(s.surface_area * us_area);
+            volume_abs.push(s.volume.abs() * us_vol);
+            px.push(px_m);
+            py_v.push(py_m);
+            pz.push(pz_m);
+            cx.push(cx_m);
+            cy.push(cy_m);
+            cz.push(cz_m);
+            drift_distance.push(drift_m);
+            max_extent.push(extent_m);
             drift_ratio.push(s.drift_ratio);
-            drift_severity.push(s.drift_severity);
-            aabb_volume.push(s.aabb_volume);
+            drift_severity.push(severity);
+            aabb_volume.push(s.aabb_volume * us_vol);
             mesh_quality.push(s.mesh_quality);
+
+            // World-coord-baked detector — see post-loop block.
+            meshed_total += 1;
+            if px_m.abs() < PLACEMENT_ORIGIN_EPS_M
+                && py_m.abs() < PLACEMENT_ORIGIN_EPS_M
+                && pz_m.abs() < PLACEMENT_ORIGIN_EPS_M
+            {
+                placement_at_origin += 1;
+            }
+        }
+
+        // World-coordinate-baked authoring style is common on Tekla /
+        // IFC2X3 structural exports: every element has identity
+        // `IfcLocalPlacement` and its mesh is authored in world
+        // coordinates. Under the raw per-row rule that would surface
+        // ~half the model as `drift_severity == "error"`, drowning
+        // any genuine per-element drift in the noise (GH #33). When
+        // the model exhibits the pattern across most of its meshed
+        // products, demote the elements that share it to severity
+        // "info" and surface the file-level fact instead.
+        let world_coord_baked = meshed_total > 4
+            && (placement_at_origin as f32 / meshed_total as f32) >= 0.80;
+        if world_coord_baked {
+            for (i, sev) in drift_severity.iter_mut().enumerate() {
+                if *sev == "ok" {
+                    continue;
+                }
+                if px[i].abs() < PLACEMENT_ORIGIN_EPS_M
+                    && py_v[i].abs() < PLACEMENT_ORIGIN_EPS_M
+                    && pz[i].abs() < PLACEMENT_ORIGIN_EPS_M
+                {
+                    *sev = "info";
+                }
+            }
+        }
+
+        // Recount severity buckets post-demotion so file-level
+        // counts agree with what `drift_severity` actually emits.
+        let mut sev_ok = 0u32;
+        let mut sev_warn = 0u32;
+        let mut sev_error = 0u32;
+        let mut sev_info = 0u32;
+        for sev in &drift_severity {
+            match *sev {
+                "ok" => sev_ok += 1,
+                "warn" => sev_warn += 1,
+                "error" => sev_error += 1,
+                "info" => sev_info += 1,
+                _ => {}
+            }
         }
         out.set_item("guid", PyList::new_bound(py, guid))?;
         out.set_item("entity", PyList::new_bound(py, entity))?;
         out.set_item("source", PyList::new_bound(py, source))?;
         out.set_item("triangle_count", PyList::new_bound(py, tri_count))?;
-        out.set_item("surface_area", PyList::new_bound(py, surface_area))?;
-        out.set_item("volume_abs", PyList::new_bound(py, volume_abs))?;
-        out.set_item("placement_x", PyList::new_bound(py, px))?;
-        out.set_item("placement_y", PyList::new_bound(py, py_v))?;
-        out.set_item("placement_z", PyList::new_bound(py, pz))?;
-        out.set_item("centroid_x", PyList::new_bound(py, cx))?;
-        out.set_item("centroid_y", PyList::new_bound(py, cy))?;
-        out.set_item("centroid_z", PyList::new_bound(py, cz))?;
-        out.set_item("drift_distance", PyList::new_bound(py, drift_distance))?;
-        out.set_item("max_extent", PyList::new_bound(py, max_extent))?;
+        out.set_item("surface_area_m2", PyList::new_bound(py, surface_area))?;
+        out.set_item("volume_abs_m3", PyList::new_bound(py, volume_abs))?;
+        out.set_item("placement_x_m", PyList::new_bound(py, px))?;
+        out.set_item("placement_y_m", PyList::new_bound(py, py_v))?;
+        out.set_item("placement_z_m", PyList::new_bound(py, pz))?;
+        out.set_item("centroid_x_m", PyList::new_bound(py, cx))?;
+        out.set_item("centroid_y_m", PyList::new_bound(py, cy))?;
+        out.set_item("centroid_z_m", PyList::new_bound(py, cz))?;
+        out.set_item("drift_distance_m", PyList::new_bound(py, drift_distance))?;
+        out.set_item("max_extent_m", PyList::new_bound(py, max_extent))?;
         out.set_item("drift_ratio", PyList::new_bound(py, drift_ratio))?;
         out.set_item("drift_severity", PyList::new_bound(py, drift_severity))?;
-        out.set_item("aabb_volume", PyList::new_bound(py, aabb_volume))?;
+        out.set_item("aabb_volume_m3", PyList::new_bound(py, aabb_volume))?;
         out.set_item("mesh_quality", PyList::new_bound(py, mesh_quality))?;
-        out.set_item("drift_ok", file_stats.drift_ok)?;
-        out.set_item("drift_warn", file_stats.drift_warn)?;
-        out.set_item("drift_error", file_stats.drift_error)?;
+        out.set_item("unit_scale", unit_scale as f64)?;
+        // Use the SI-recomputed counts so file-level totals agree
+        // with the per-row severity actually emitted (after the
+        // world-coordinate-baked demotion, if any).
+        out.set_item("drift_ok", sev_ok)?;
+        out.set_item("drift_warn", sev_warn)?;
+        out.set_item("drift_error", sev_error)?;
+        out.set_item("drift_info", sev_info)?;
+        out.set_item("world_coordinate_baked", world_coord_baked)?;
+        // Silence the unused-binding warning on builds where these
+        // raw-unit FileStats counters aren't surfaced. They're still
+        // populated by `FileStats::from_products` and used by the
+        // CLI `analyse_drift` text path elsewhere.
+        let _ = (file_stats.drift_ok, file_stats.drift_warn, file_stats.drift_error);
 
         // Per-segment provenance — flat long-format columns, one row
         // per MeshSegment across all products. A product with a single

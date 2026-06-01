@@ -97,7 +97,7 @@ See [AGENTS.md](AGENTS.md) for the full agent guide and a copy-paste
 | Classifications | long-format `pandas.DataFrame` |
 | Per-product triangle meshes | `m.meshes()` → numpy `(vertices, faces)` |
 | Sampled point clouds (+ normals) | `m.point_cloud()` → `pandas.DataFrame` |
-| Geometric QTO (volume, area, orientation) | `m.mesh_qto()` |
+| Geometric QTO (volume, area, orientation) + per-planar-surface table | `m.mesh_qto()` → `(products_df, surfaces_df)` |
 | Triangle meshes (extrusion / mapped / face sets / BREP) | OBJ / glTF / CSV |
 | Placement-vs-mesh drift report | `pandas.DataFrame` |
 | Substrate (geometry + semantics) | GeoParquet (DuckDB-queryable) |
@@ -195,19 +195,22 @@ Disk footprint on a 200 MB Archicad IFC: **2.4 MB total** zstd-compressed.
 All extractors return long-format (one row per fact, no nested fields).
 Easy to join, easy to filter, easy to flatten to Excel.
 
-**Missing values:** string columns use pandas `StringDtype` with `nan`
-as the NULL sentinel (chosen for memory and pyarrow round-trip).
-Cells corresponding to a STEP `$` field hold `float('nan')`, **not**
-Python `None`. Use `.isna()` to test, not `== None` or `is None`:
+**Missing values:** STEP `$` fields surface as a missing-value sentinel
+— either `float('nan')` (the common case, for numeric columns and
+pyarrow-round-tripped string columns) or Python `None` (for some
+object-dtype columns where pandas preserves the raw extractor output).
+Both flavours are caught by `pd.isna()`; neither is caught by
+`== None` or `is None`. Always test with `pd.isna()` or `.isna()`:
 
 ```python
-m.classifications[m.classifications.identification.isna()]   # correct
+m.classifications[m.classifications.identification.isna()]   # correct, catches both
 m.classifications[m.classifications.identification == None]  # always False
-[r for r in m.classifications.itertuples() if r.identification is None]  # always False
+[r for r in m.classifications.itertuples() if r.identification is None]  # misses NaN cells
 ```
 
 If you're cross-checking against `ifcopenshell` (which returns `None`),
-normalise NaN→None on the comparison side.
+normalise NaN→None on the comparison side, or use
+`pd.isna()` on the ifcfast side.
 
 
 ### psets
@@ -256,19 +259,41 @@ normalise NaN→None on the comparison side.
 
 ### drift
 
+All length/area/volume columns are in SI (metres / square metres /
+cubic metres) — column names carry the unit suffix so `m.drift` joins
+to `m.mesh_qto()` results without any rescaling.
+
 | column | type | description |
 |---|---|---|
 | `guid`, `entity`, `source` | str | identification |
-| `triangle_count`, `surface_area`, `volume_abs` | int / float | geometric stats |
-| `placement_x/y/z` | float | what `IfcLocalPlacement` says |
-| `centroid_x/y/z` | float | where the mesh AABB centre actually is |
-| `drift_distance` | float | Euclidean distance, mm |
-| `max_extent` | float | largest AABB dimension |
-| `drift_ratio` | float | `drift_distance / max_extent` |
-| `drift_severity` | str | `ok` / `warn` / `error` |
+| `triangle_count` | int | triangles in the product mesh |
+| `surface_area_m2`, `volume_abs_m3`, `aabb_volume_m3` | float | geometric stats, SI |
+| `placement_x_m/y_m/z_m` | float | what `IfcLocalPlacement` says, metres |
+| `centroid_x_m/y_m/z_m` | float | where the mesh AABB centre actually is, metres |
+| `drift_distance_m` | float | Euclidean distance from placement to centroid, metres |
+| `max_extent_m` | float | largest AABB dimension, metres |
+| `drift_ratio` | float | `drift_distance_m / max_extent_m`, unitless |
+| `drift_severity` | str | `ok` / `info` / `warn` / `error` |
+| `mesh_quality` | str | `closed` / `open_shell` / `degenerate` |
 
-Severity rule: `ok` when `drift_ratio ≤ 2.0` or `drift_distance < 10
-mm`; `error` when `drift_ratio > 10.0` and `drift_distance > 10 mm`.
+Severity rule (computed against SI values — unit-independent):
+- `ok` when `drift_ratio ≤ 2.0` or `drift_distance_m < 0.010` (rounding noise)
+- `warn` when `2.0 < drift_ratio ≤ 10.0`
+- `error` when `drift_ratio > 10.0` and `drift_distance_m > 0.010`
+- `info` when the per-row drift was demoted by the world-coordinate-baked
+  detector (see below) — these rows would otherwise be `warn`/`error`
+  but are part of a model-wide authoring convention rather than per-element
+  bugs.
+
+**World-coordinate-baked detector.** Common on Tekla / IFC2X3
+structural exports: most products have identity `IfcLocalPlacement`
+and geometry authored directly in world coordinates. Under a naive
+per-row drift check this surfaces as model-wide "error". When ≥ 80 %
+of meshed products are placed at the origin (within 1 mm), the file
+is flagged `world_coordinate_baked=True` (queryable via
+`m.world_coordinate_baked`) and the per-row severity of the
+origin-placed products is demoted to `info`. The model-level fact is
+the actionable signal; per-element drift would just be noise.
 
 A 100 m wall placed at one end has ratio 0.5 (legitimate). A 50 mm sensor
 100 m from its placement has ratio 2000 (clear authoring bug).
@@ -283,7 +308,9 @@ directly into NetworkX, PyArrow or a custom three.js scene if you want.
 ```python
 m = ifcfast.open("model.ifc")
 
-m.contained_in     # IfcRelContainedInSpatialStructure (product → storey)
+m.contained_in     # IfcRelContainedInSpatialStructure (product → spatial container)
+                   # columns: product_guid, container_guid, container_kind
+                   #          (kind ∈ site / building / storey / space)
 m.aggregates       # IfcRelAggregates (child → parent, with parent_kind)
 m.storey_building  # storey → building (subset of aggregates)
 

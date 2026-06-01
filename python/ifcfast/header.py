@@ -163,7 +163,13 @@ _HASH_TAIL_BYTES = 4 * 1024 * 1024
 #       cross-model duplicate detection and broad-phase clash candidate
 #       filtering as DuckDB queries directly against the substrate,
 #       without recomputing midpoints/counts on every join.
-_CACHE_SCHEMA_VERSION = 5
+#   6 — v0.4.27: drift.parquet columns now SI-suffixed (GH #31) —
+#       `surface_area_m2`, `volume_abs_m3`, `aabb_volume_m3`,
+#       `placement_{x,y,z}_m`, `centroid_{x,y,z}_m`, `drift_distance_m`,
+#       `max_extent_m`. Values are scaled through the file's
+#       `unit_scale` before write, so the drift table joins to
+#       `m.mesh_qto()` without any rescaling on the consumer side.
+_CACHE_SCHEMA_VERSION = 6
 
 _FIELD_RE = re.compile(r"\(\s*(.*?)\s*\)\s*;", re.DOTALL)
 

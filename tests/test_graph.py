@@ -17,6 +17,7 @@ import ifcfast
 
 
 FIXTURE = Path(__file__).parent / "fixtures" / "minimal.ifc"
+SITE_ANNOTATION = Path(__file__).parent / "fixtures" / "site_annotation.ifc"
 SANNERGATA = Path(
     "/home/edkjo/workspace/inbox/ifc-workbench/data/samples/_big/"
     "Sannergata_bygg_ARK_E.ifc"
@@ -42,6 +43,15 @@ def minimal(fresh_cache):
 
 
 @pytest.fixture
+def site_annotation(fresh_cache):
+    """Tiny IFC4 fixture with three containment kinds — storey (a wall),
+    site (an IfcAnnotation), and building (an IfcDiscreteAccessory).
+    Exercises the GH #32 fix where non-storey containment used to be
+    silently dropped."""
+    return ifcfast.open(str(SITE_ANNOTATION), use_cache=False, write_cache=False)
+
+
+@pytest.fixture
 def sannergata(fresh_cache):
     if not SANNERGATA.exists():
         pytest.skip(f"missing fixture: {SANNERGATA}")
@@ -61,11 +71,58 @@ def duplex(fresh_cache):
 
 
 def test_relationship_dataframes_have_expected_columns(minimal):
-    assert list(minimal.contained_in.columns) == ["product_guid", "storey_guid"]
+    assert list(minimal.contained_in.columns) == [
+        "product_guid", "container_guid", "container_kind",
+    ]
     assert list(minimal.aggregates.columns) == [
         "child_guid", "parent_guid", "parent_kind",
     ]
     assert list(minimal.storey_building.columns) == ["storey_guid", "building_guid"]
+
+
+def test_contained_in_container_kinds_are_recognised(minimal):
+    """Every container_kind we emit is one of the four documented values."""
+    kinds = set(minimal.contained_in.container_kind.unique())
+    assert kinds.issubset({"site", "building", "storey", "space"})
+
+
+def test_non_storey_containment_surfaces_in_graph(site_annotation):
+    """GH #32: site-, building-, and space-level containment edges must
+    appear in `contained_in` and resolve via the spatial helpers — not
+    silently disappear because the old indexer hard-filtered to storey
+    structures only."""
+    m = site_annotation
+    ci = m.contained_in
+    assert set(ci.container_kind.unique()) == {"site", "building", "storey"}
+
+    ann = "SiteAnnotateGuidA0000000"      # IfcAnnotation in IfcSite
+    acc = "BldgAccessoryGuidA000000"      # IfcDiscreteAccessory in IfcBuilding
+    wall = "7XvctVUKr0kugbFTf53O9L"        # IfcWall in IfcBuildingStorey
+    site = "1XvctVUKr0kugbFTf53O9L"
+    building = "2XvctVUKr0kugbFTf53O9L"
+    storey = "3XvctVUKr0kugbFTf53O9L"
+
+    # contained_in records the right edge for each kind.
+    rows = {row.product_guid: (row.container_guid, row.container_kind)
+            for row in ci.itertuples(index=False)}
+    assert rows[ann] == (site, "site")
+    assert rows[acc] == (building, "building")
+    assert rows[wall] == (storey, "storey")
+
+    # parent() returns whatever container the element actually sits in.
+    assert m.parent(ann) == site
+    assert m.parent(acc) == building
+    assert m.parent(wall) == storey
+
+    # storey_of: only resolves for storey-or-below elements.
+    assert m.storey_of(wall) == storey
+    assert m.storey_of(acc) is None     # building has no storey above it
+    assert m.storey_of(ann) is None     # site has no storey above it
+
+    # building_of: walks via storey OR direct building containment.
+    assert m.building_of(wall) == building
+    assert m.building_of(acc) == building
+    assert m.building_of(ann) is None   # site has no building above it
 
 
 def test_building_children_are_storeys(sannergata):
@@ -82,9 +139,9 @@ def test_building_children_are_storeys(sannergata):
 
 def test_storey_products_cardinality_matches_contained_in(sannergata):
     """``products_in(storey)`` matches the contained_in row count for it."""
-    by_storey = (
-        sannergata.contained_in.groupby("storey_guid").size().to_dict()
-    )
+    ci = sannergata.contained_in
+    storey_edges = ci[ci.container_kind == "storey"]
+    by_storey = storey_edges.groupby("container_guid").size().to_dict()
     for storey in sannergata.storeys:
         expected = by_storey.get(storey.guid, 0)
         actual = len(sannergata.products_in(storey.guid))
@@ -124,10 +181,13 @@ def test_descendants_of_project_covers_contained_products(sannergata):
 
 
 def test_storey_of_matches_contained_in(sannergata):
-    """``storey_of(p)`` returns the same guid the contained_in table records."""
+    """``storey_of(p)`` returns the same guid the contained_in table records
+    for products contained directly in a storey."""
+    ci = sannergata.contained_in
+    storey_rows = ci[ci.container_kind == "storey"]
     for product, storey in zip(
-        sannergata.contained_in.product_guid.values[:50],
-        sannergata.contained_in.storey_guid.values[:50],
+        storey_rows.product_guid.values[:50],
+        storey_rows.container_guid.values[:50],
     ):
         assert sannergata.storey_of(product) == storey
 
@@ -138,9 +198,11 @@ def test_building_of_for_product_walks_via_storey(sannergata):
         sannergata.storey_building.storey_guid,
         sannergata.storey_building.building_guid,
     ))
+    ci = sannergata.contained_in
+    storey_rows = ci[ci.container_kind == "storey"]
     for product, storey in zip(
-        sannergata.contained_in.product_guid.values[:30],
-        sannergata.contained_in.storey_guid.values[:30],
+        storey_rows.product_guid.values[:30],
+        storey_rows.container_guid.values[:30],
     ):
         expected = sb.get(storey)
         if expected is None:

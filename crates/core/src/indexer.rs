@@ -682,22 +682,13 @@ pub fn index(buf: &[u8]) -> IndexedFile {
         }
     }
 
-    // Filter `contained_in` to storey-relating only. Filter in-place
-    // (write-index pattern) so we don't allocate two fresh Vecs the size
-    // of the unfiltered input — on ST28_RIV that's ~90K entries × 16 B.
-    let storey_ids: HashSet<u64> = out.storey_step_id.iter().copied().collect();
-    let n = out.contained_in_child.len();
-    let mut write = 0;
-    for read in 0..n {
-        let s = out.contained_in_structure[read];
-        if storey_ids.contains(&s) {
-            out.contained_in_child[write] = out.contained_in_child[read];
-            out.contained_in_structure[write] = s;
-            write += 1;
-        }
-    }
-    out.contained_in_child.truncate(write);
-    out.contained_in_structure.truncate(write);
+    // All IfcRelContainedInSpatialStructure edges pass through —
+    // structures can be Site, Building, Storey, or Space. The Python
+    // side resolves each `contained_in_structure` step id against
+    // site/building/storey/space tables to recover (container_guid,
+    // container_kind). Filtering to storey-only here used to drop
+    // ~5–15% of edges silently and made site/building-level
+    // containment invisible to the spatial graph (GH #32).
 
     // Resolve unit_scale (metres per model unit). Look through the
     // IfcUnitAssignment.Units list for a LENGTHUNIT SI unit, then map

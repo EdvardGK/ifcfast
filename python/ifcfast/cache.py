@@ -7,14 +7,20 @@ subsequent open). Layout per file:
         meta.json              — manifest
         index.parquet          — one row per IfcProduct (tier 1)
         storeys.parquet        — one row per IfcBuildingStorey
-        contained_in.parquet   — product → storey edges
+        spaces.parquet         — one row per IfcSpace
+        type_objects.parquet   — one row per IfcTypeObject subclass
+        contained_in.parquet   — product → spatial-container edges
+                                 (kind = site / building / storey / space)
         aggregates.parquet     — child → parent edges (decomposition)
         storey_building.parquet — storey → building edges
+        voids.parquet          — IfcRelVoidsElement (opening → host) edges
         psets.parquet          — long-format property sets
         quantities.parquet     — long-format base quantities
         materials.parquet      — material assignments
         classifications.parquet — classification references
         drift.parquet          — placement/mesh drift report (optional)
+        segments.parquet       — per-product placement / mesh segment
+                                 detail backing the drift report (optional)
 
 All parquet writes use zstd. Cache invalidates if cache_key, schema, or
 ``CACHE_VERSION`` change.
@@ -37,7 +43,18 @@ from .header import IFCHeader, native_path_for
 # v3 (2026-05-18): added spaces.parquet + voids.parquet; SpaceRow surfaces
 #                  IfcSpace as a first-class table, voids_df surfaces
 #                  IfcRelVoidsElement edges.
-CACHE_VERSION = 3
+# v4 (2026-06-01): drift.parquet now ships SI columns directly (GH #31) —
+#                  surface_area_m2, volume_abs_m3, aabb_volume_m3,
+#                  placement_{x,y,z}_m, centroid_{x,y,z}_m,
+#                  drift_distance_m, max_extent_m. Old caches must be
+#                  rebuilt; the unit-suffixed names match mesh_qto() so
+#                  the two tables join without unit-mismatch landmines.
+# v5 (2026-06-01): contained_in.parquet schema generalised (GH #32) —
+#                  columns are now (product_guid, container_guid,
+#                  container_kind). Site / Building / Storey / Space
+#                  containment all surface; previously only storey
+#                  edges were kept and the rest were silently dropped.
+CACHE_VERSION = 5
 
 CONTAINED_IN_FILE = "contained_in.parquet"
 AGGREGATES_FILE = "aggregates.parquet"
@@ -153,6 +170,13 @@ class DataLayers:
     classifications: Optional[object] = None
     drift: Optional[object] = None
     segments: Optional[object] = None
+    # File-level fact surfaced by the drift extractor: most of the
+    # meshed products are placed at the origin (identity placement)
+    # with their geometry authored in world coordinates. Common on
+    # Tekla / IFC2X3 structural exports. When True, per-row
+    # `drift_severity` is demoted to `"info"` for affected rows and
+    # the file-level fact is the actionable signal instead (GH #33).
+    world_coordinate_baked: bool = False
     timing_ms: dict = field(default_factory=dict)
 
 
@@ -221,6 +245,12 @@ def extract_data_layers(
             and (not include_drift or (out.drift is not None and out.segments is not None))
         )
         if all_cached:
+            # Surface the file-level world-coord-baked flag from the
+            # cache manifest. Falls back to False on older caches.
+            cached_manifest = _read_manifest(cache_dir) or {}
+            out.world_coordinate_baked = bool(
+                cached_manifest.get("world_coordinate_baked", False)
+            )
             out.timing_ms["total_ms"] = (time.perf_counter() - t_total) * 1000
             out.timing_ms["cold_parse"] = False
             return out
@@ -257,10 +287,10 @@ def extract_data_layers(
                 k: drift_raw[k]
                 for k in (
                     "guid", "entity", "source", "triangle_count",
-                    "surface_area", "volume_abs", "aabb_volume",
-                    "placement_x", "placement_y", "placement_z",
-                    "centroid_x", "centroid_y", "centroid_z",
-                    "drift_distance", "max_extent", "drift_ratio",
+                    "surface_area_m2", "volume_abs_m3", "aabb_volume_m3",
+                    "placement_x_m", "placement_y_m", "placement_z_m",
+                    "centroid_x_m", "centroid_y_m", "centroid_z_m",
+                    "drift_distance_m", "max_extent_m", "drift_ratio",
                     "drift_severity",
                     # Volume-validity classifier: "closed" / "open_shell"
                     # / "degenerate". Open-shell volumes are physically
@@ -271,6 +301,9 @@ def extract_data_layers(
                 )
             }
             out.drift = pd.DataFrame(df_cols)
+            out.world_coordinate_baked = bool(
+                drift_raw.get("world_coordinate_baked", False)
+            )
             seg_cols = {
                 "guid": drift_raw["seg_guid"],
                 "product_index": drift_raw["seg_product_index"],
@@ -351,6 +384,10 @@ def _patch_data_manifest(
         m["drift_warn_count"] = int(
             (out.drift["drift_severity"] == "warn").sum()
         )
+        m["drift_info_count"] = int(
+            (out.drift["drift_severity"] == "info").sum()
+        )
+        m["world_coordinate_baked"] = bool(out.world_coordinate_baked)
     if include_drift and out.segments is not None:
         m["has_segments"] = True
         m["segment_count"] = int(len(out.segments))
@@ -554,7 +591,7 @@ def read_index(hdr: IFCHeader):
         project_name=m.get("project_name"),
         authoring_app=m.get("authoring_app"),
         storeys=storeys,
-        products=[],
+        _products_list=[],
         spaces=spaces,
         type_objects=type_objects,
         type_counts=dict(m.get("type_counts", {})),

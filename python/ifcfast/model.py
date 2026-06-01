@@ -10,9 +10,9 @@ A Model bundles:
   cached on the instance.
 
 Open a model with :func:`ifcfast.open`; iterate over products via
-``model.products`` / ``model.filter()``; tap into the long-format data
-tables via ``model.psets``, ``model.quantities``, ``model.materials``,
-``model.classifications`` and ``model.drift``.
+``model.products`` / ``model.filter()`` / ``iter(model)``; tap into the
+long-format data tables via ``model.psets``, ``model.quantities``,
+``model.materials``, ``model.classifications`` and ``model.drift``.
 """
 
 from __future__ import annotations
@@ -150,10 +150,16 @@ class Model:
     """Parsed IFC index with lazy data-layer access.
 
     Tier-1 storage:
-      - Eager (cold parse): ``products`` is a fully-built list of ProductRow.
-      - Lazy (cache hit): ``products`` is empty and ``_products_df`` holds
-        the same data as a pandas DataFrame. Filters and lookups operate
-        on the DataFrame directly to keep cold-decode under 500 ms.
+      - Eager (cold parse): the ``ProductRow`` list is built up front.
+      - Lazy (cache hit): ``_products_df`` holds the same data as a
+        pandas DataFrame; the list is materialised on first access via
+        :attr:`products`. Filters and lookups operate on the DataFrame
+        directly to keep cold-decode under 500 ms.
+
+    Either path, the public surface is the same:
+    ``model.products`` returns a ``list[ProductRow]``,
+    ``iter(model)`` yields each row, ``len(model)`` and
+    ``len(model.products)`` agree.
 
     Relationship tables (``contained_in`` / ``aggregates`` /
     ``storey_building``) are long-format DataFrames built alongside the
@@ -169,7 +175,7 @@ class Model:
     project_name: Optional[str]
     authoring_app: Optional[str]
     storeys: list[StoreyRow]
-    products: list[ProductRow]
+    _products_list: list[ProductRow]
     spaces: list[SpaceRow]
     type_objects: list[TypeObjectRow]
     type_counts: dict[str, int]
@@ -238,7 +244,39 @@ class Model:
     def __len__(self) -> int:
         if self._products_df is not None:
             return len(self._products_df)
-        return len(self.products)
+        return len(self._products_list)
+
+    def __iter__(self):
+        """Iterate :class:`ProductRow` over all products.
+
+        Uses the in-memory DataFrame on cache hits (no list materialised)
+        and the eager list on cold parses. Equivalent to ``m.filter()``
+        with no constraints, exposed under the standard iteration
+        protocol so ``for p in m: ...`` works.
+        """
+        if self._products_df is not None:
+            for _, row in self._products_df.iterrows():
+                yield _row_to_product(row)
+            return
+        yield from self._products_list
+
+    @property
+    def products(self) -> list[ProductRow]:
+        """All products, as a ``list[ProductRow]``.
+
+        On a cache hit the list is built lazily from
+        :attr:`products_df` on first access (and cached). Use
+        ``iter(model)`` or ``model.filter(...)`` to avoid materialising
+        the list when you only need to scan.
+        """
+        if self._products_list:
+            return self._products_list
+        if self._products_df is not None and len(self._products_df) > 0:
+            self._products_list = [
+                _row_to_product(row)
+                for _, row in self._products_df.iterrows()
+            ]
+        return self._products_list
 
     def product(self, guid: str) -> Optional[ProductRow]:
         if self._products_df is not None:
@@ -250,7 +288,7 @@ class Model:
             if i is None:
                 return None
             return _row_to_product(self._products_df.iloc[i])
-        for p in self.products:
+        for p in self._products_list:
             if p.guid == guid:
                 return p
         return None
@@ -277,7 +315,7 @@ class Model:
             for _, row in sub.iterrows():
                 yield _row_to_product(row)
             return
-        for p in self.products:
+        for p in self._products_list:
             if entity is not None and p.entity != entity:
                 continue
             if mode is not None and p.mode != mode:
@@ -294,8 +332,10 @@ class Model:
 
         if self._products_df is not None:
             return self._products_df
-        if self.products:
-            self._products_df = pd.DataFrame([asdict(p) for p in self.products])
+        if self._products_list:
+            self._products_df = pd.DataFrame(
+                [asdict(p) for p in self._products_list]
+            )
         else:
             self._products_df = pd.DataFrame(
                 columns=[
@@ -332,7 +372,52 @@ class Model:
         return self._ensure_data().classifications
 
     @property
+    def world_coordinate_baked(self) -> bool:
+        """``True`` when the drift extract decided this file follows the
+        world-coordinate-baked authoring style.
+
+        Common on Tekla / IFC2X3 structural exports: most products have
+        identity ``IfcLocalPlacement`` and their geometry is authored
+        in world coordinates. Under a naive per-row drift check this
+        looks like a model-wide bug (every element flagged "error")
+        — see GH #33. When this flag is ``True``, the per-row
+        ``drift_severity`` of affected rows is demoted to ``"info"``
+        and the file-level fact is the actionable signal instead.
+
+        Forces a drift extract if drift isn't already loaded.
+        """
+        return bool(getattr(self._ensure_data(), "world_coordinate_baked", False))
+
+    @property
     def drift(self):
+        """Placement-vs-mesh drift report, in SI units.
+
+        Returns a DataFrame with one row per product that carries
+        geometry. Length-like columns are suffixed ``_m``, area columns
+        ``_m2``, volume columns ``_m3`` — matching the
+        :meth:`mesh_qto` convention so the two tables join cleanly
+        without unit-mismatch landmines. The Rust core applies the
+        file's ``unit_scale`` before emitting; metre-default fallback
+        when the file declares no SI length unit.
+
+        Columns:
+
+        * ``guid``, ``entity``, ``source`` — identification
+        * ``triangle_count`` — triangle total (unitless)
+        * ``surface_area_m2``, ``volume_abs_m3``, ``aabb_volume_m3``
+        * ``placement_x_m``, ``placement_y_m``, ``placement_z_m`` —
+          ``IfcLocalPlacement`` origin in metres
+        * ``centroid_x_m``, ``centroid_y_m``, ``centroid_z_m`` — mesh
+          AABB centre in metres
+        * ``drift_distance_m`` — distance between placement and
+          centroid (metres)
+        * ``max_extent_m`` — largest AABB span (metres)
+        * ``drift_ratio`` — ``drift_distance_m / max_extent_m``
+          (unitless)
+        * ``drift_severity`` — ``"ok"`` / ``"warn"`` / ``"error"``
+        * ``mesh_quality`` — ``"closed"`` / ``"open_shell"`` /
+          ``"degenerate"``
+        """
         return self._ensure_data().drift
 
     def mesh_qto(self):
@@ -920,7 +1005,7 @@ class Model:
             if self._products_df is not None:
                 product_guids = set(self._products_df["guid"].values)
             else:
-                product_guids = {p.guid for p in self.products}
+                product_guids = {p.guid for p in self._products_list}
             self._graph = _GraphIndex(
                 self.contained_in,
                 self.aggregates,
@@ -934,14 +1019,16 @@ class Model:
 
         Returns the ``IfcRelAggregates`` parent if one exists (typical
         for assemblies and the spatial chain storey→building→site→
-        project). Otherwise falls back to the spatial container — the
-        storey a product is in. ``None`` if neither.
+        project). Otherwise falls back to whichever spatial container
+        the element sits in via ``IfcRelContainedInSpatialStructure``
+        — a storey, but also a site / building / space when the file
+        uses non-storey containment (GH #32). ``None`` if neither.
         """
         g = self._graph_index()
         p = g.parent_of.get(guid)
         if p is not None:
             return p
-        return g.storey_of.get(guid)
+        return g.container_of.get(guid)
 
     def children(self, guid: str) -> list[str]:
         """Unified direct children.
@@ -1008,21 +1095,43 @@ class Model:
         return out
 
     def storey_of(self, guid: str) -> Optional[str]:
-        """Storey guid that contains ``guid`` (via spatial containment)."""
-        return self._graph_index().storey_of.get(guid)
+        """Storey guid that contains ``guid``, resolved through any
+        intermediate spatial container.
+
+        Resolution: if ``guid`` is contained directly in a storey, that
+        storey is returned. Otherwise the resolver walks through
+        non-storey containers (e.g. an element contained in an
+        ``IfcSpace`` resolves to that space's storey) and through
+        decomposition ancestors. Elements contained directly in an
+        ``IfcSite`` or ``IfcBuilding`` (with no intermediate storey)
+        return ``None``.
+        """
+        g = self._graph_index()
+        return _walk_to_storey(g, guid)
 
     def building_of(self, guid: str) -> Optional[str]:
         """Building guid for a product, storey, or itself.
 
-        Resolution order: storey→building map (fastest), then walk
-        ancestors looking for a guid that is itself a building.
+        Resolution order: returns ``guid`` itself if it's a building;
+        the storey→building map when ``guid`` is a storey; the resolved
+        storey's building when reachable through containment or
+        decomposition; finally walks ancestors looking for a building.
+        Elements contained directly in an ``IfcBuilding`` return that
+        building.
         """
         g = self._graph_index()
         if guid in g.storeys_in:  # already a building
             return guid
         if guid in g.building_of:  # guid is a storey
             return g.building_of[guid]
-        s = g.storey_of.get(guid)
+        # Direct building containment (element placed straight under a
+        # building via IfcRelContainedInSpatialStructure).
+        if (
+            g.container_kind_of.get(guid) == "building"
+            and guid in g.container_of
+        ):
+            return g.container_of[guid]
+        s = _walk_to_storey(g, guid)
         if s is not None and s in g.building_of:
             return g.building_of[s]
         for a in self.ancestors(guid):
@@ -1184,7 +1293,7 @@ class Model:
                 rec = dict(zip(fields, row))
                 _accumulate_type(per_type, rec, sample_guids)
         else:
-            for p in self.products:
+            for p in self._products_list:
                 rec = {
                     "entity": p.entity,
                     "guid": p.guid,
@@ -1235,7 +1344,7 @@ class Model:
             ):
                 guid_to_entity[guid] = ent
         else:
-            for p in self.products:
+            for p in self._products_list:
                 guid_to_entity[p.guid] = p.entity
 
         mats = self.materials  # triggers lazy extract
@@ -1417,7 +1526,7 @@ class Model:
                 for row in self._products_df.head(n).to_dict(orient="records"):
                     rows.append({k: _none_if_nan_simple(v) for k, v in row.items()})
             else:
-                for p in self.products[:n]:
+                for p in self._products_list[:n]:
                     rows.append(asdict(p))
             return rows
         if table == "storeys":
@@ -1475,16 +1584,30 @@ class _GraphIndex:
         "products_in",
         "building_of",
         "storeys_in",
+        "container_of",
+        "container_kind_of",
         "product_guids",
     )
 
     def __init__(self, contained_in, aggregates, storey_building, product_guids):
         self.parent_of: dict[str, str] = {}
         self.children_of: dict[str, list[str]] = {}
+        # Direct storey-containment only — populated for elements
+        # contained directly in an IfcBuildingStorey. Elements contained
+        # in a Site/Building/Space have no entry here; the resolved
+        # storey (if any) is computed lazily in `Model.storey_of` by
+        # walking through aggregates / non-storey containment.
         self.storey_of: dict[str, str] = {}
         self.products_in: dict[str, list[str]] = {}
         self.building_of: dict[str, str] = {}
         self.storeys_in: dict[str, list[str]] = {}
+        # Full containment map: element_guid -> container_guid for any
+        # IfcRelContainedInSpatialStructure edge. `container_kind_of`
+        # carries the kind ("site"/"building"/"storey"/"space"). Used
+        # by `storey_of` / `building_of` to resolve via non-storey
+        # containers.
+        self.container_of: dict[str, str] = {}
+        self.container_kind_of: dict[str, str] = {}
         self.product_guids: set[str] = product_guids
 
         if len(aggregates) > 0:
@@ -1498,14 +1621,32 @@ class _GraphIndex:
                 self.children_of.setdefault(parent, []).append(child)
 
         if len(contained_in) > 0:
-            for product, storey in zip(
+            has_kind = "container_kind" in contained_in.columns
+            container_col = (
+                "container_guid"
+                if "container_guid" in contained_in.columns
+                else "storey_guid"
+            )
+            for i, (product, container) in enumerate(zip(
                 contained_in["product_guid"].values,
-                contained_in["storey_guid"].values,
-            ):
-                if product is None or storey is None:
+                contained_in[container_col].values,
+            )):
+                if product is None or container is None:
                     continue
-                self.storey_of[product] = storey
-                self.products_in.setdefault(storey, []).append(product)
+                kind = (
+                    contained_in["container_kind"].values[i]
+                    if has_kind
+                    else "storey"
+                )
+                self.container_of[product] = container
+                self.container_kind_of[product] = kind
+                if kind == "storey":
+                    self.storey_of[product] = container
+                # `products_in` keyed by any container kind so
+                # `children(building)` / `children(site)` /
+                # `children(space)` surface elements that sit directly
+                # in those containers (GH #32).
+                self.products_in.setdefault(container, []).append(product)
 
         if len(storey_building) > 0:
             for storey, building in zip(
@@ -1516,6 +1657,45 @@ class _GraphIndex:
                     continue
                 self.building_of[storey] = building
                 self.storeys_in.setdefault(building, []).append(storey)
+
+
+def _walk_to_storey(g: "_GraphIndex", guid: str, _budget: int = 16) -> Optional[str]:
+    """Resolve the storey an element ultimately sits in.
+
+    Tries (in order): direct storey containment, then chains through
+    non-storey spatial containers (an ``IfcSpace`` contained in a
+    storey is the canonical case), then walks aggregate parents until
+    a storey is found. The depth budget guards against malformed
+    cyclic data in the wild.
+
+    Returns ``None`` for elements that genuinely have no storey above
+    them (e.g. an element placed directly under an ``IfcBuilding`` or
+    ``IfcSite`` with no storey in between).
+    """
+    direct = g.storey_of.get(guid)
+    if direct is not None:
+        return direct
+    seen: set[str] = set()
+    cur = guid
+    for _ in range(_budget):
+        if cur in seen:
+            return None
+        seen.add(cur)
+        container = g.container_of.get(cur)
+        if container is not None:
+            if g.container_kind_of.get(container) == "storey" or container in g.building_of:
+                # `building_of` is keyed on storey guids → if the
+                # container is in `building_of`, it is a storey.
+                return container
+            cur = container
+            continue
+        parent = g.parent_of.get(cur)
+        if parent is None:
+            return None
+        if parent in g.building_of:  # parent is a storey
+            return parent
+        cur = parent
+    return None
 
 
 # ----------------------------------------------------------------------
@@ -1613,7 +1793,11 @@ def _index_native(p: Path, hdr: IFCHeader, started: float) -> Model:
     for row, sid in zip(storeys, s["step_id"]):
         row.building_guid = storey_step_to_building_guid.get(int(sid))
 
-    # Containment: child step_id → storey guid.
+    # Containment: child step_id → storey guid (storey-only — used
+    # below to populate ProductRow.storey_guid as a denormalised
+    # accessor for the common case). The full containment table that
+    # includes site/building/space containers is built further down
+    # against `parent_step_to_guid`.
     contained_raw = raw["contained_in"]
     contained_in: dict[int, str] = {}
     for child, struct in zip(contained_raw["child"], contained_raw["structure"]):
@@ -1683,15 +1867,31 @@ def _index_native(p: Path, hdr: IFCHeader, started: float) -> Model:
             (cguid, pguid, parent_kind_by_step.get(parent_sid, "unknown"))
         )
 
-    # Build the long-format containment table. Use product-step-to-guid
-    # to filter out the rare case where a contained child isn't in our
-    # product table (e.g. an IfcSpace that ifcfast doesn't index).
-    contained_in_rows: list[tuple[str, str]] = []
+    # Build the long-format containment table. One row per
+    # IfcRelContainedInSpatialStructure edge, with `container_kind`
+    # indicating whether the structure is a site / building / storey
+    # / space. The unfiltered table lets agents reason about every
+    # spatial-containment edge — IFC2X3/IFC4 both permit non-storey
+    # containers and many real files use them (GH #32). Use
+    # product-step-to-guid to filter out the rare case where a
+    # contained child isn't in our product table.
+    contained_in_rows: list[tuple[str, str, str]] = []
     for child, struct in zip(contained_raw["child"], contained_raw["structure"]):
-        s_guid = storey_step_to_guid.get(int(struct))
+        struct_sid = int(struct)
+        container_guid = parent_step_to_guid.get(struct_sid)
+        container_kind = parent_kind_by_step.get(struct_sid)
         c_guid = product_step_to_guid.get(int(child))
-        if s_guid is not None and c_guid is not None:
-            contained_in_rows.append((c_guid, s_guid))
+        if (
+            container_guid is None
+            or container_kind is None
+            or c_guid is None
+            or container_kind == "product"
+        ):
+            # Drop edges to unknown containers and the impossible
+            # "container is a product" case (would only happen on a
+            # step-id collision).
+            continue
+        contained_in_rows.append((c_guid, container_guid, container_kind))
 
     # Storey name lookup (small list, linear scan is fine).
     storey_name_by_guid = {sr.guid: sr.name for sr in storeys}
@@ -1797,7 +1997,8 @@ def _index_native(p: Path, hdr: IFCHeader, started: float) -> Model:
     import pandas as pd
 
     contained_in_df = pd.DataFrame(
-        contained_in_rows, columns=["product_guid", "storey_guid"]
+        contained_in_rows,
+        columns=["product_guid", "container_guid", "container_kind"],
     )
     aggregates_df = pd.DataFrame(
         aggregates_rows, columns=["child_guid", "parent_guid", "parent_kind"]
@@ -1816,7 +2017,7 @@ def _index_native(p: Path, hdr: IFCHeader, started: float) -> Model:
         project_name=raw.get("project_name"),
         authoring_app=raw.get("authoring_app"),
         storeys=storeys,
-        products=products,
+        _products_list=products,
         spaces=spaces,
         type_objects=type_objects,
         type_counts=type_counts,
@@ -1940,7 +2141,7 @@ def _index_products_by_guid(m) -> dict[str, dict]:
     else:
         from dataclasses import asdict
 
-        for p in m.products:
+        for p in m._products_list:
             out[p.guid] = asdict(p)
     return out
 
