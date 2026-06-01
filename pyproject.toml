@@ -31,6 +31,8 @@ dependencies = [
 dev = [
     "pytest>=7.4.0",
     "openpyxl>=3.1.0",          # used by validate.py for Solibri ITO reads
+    "ifcopenshell>=0.8.0",      # codegen-only: regenerates python/ifcfast/data/schema_supertypes.py
+                                # via scripts/gen_schema_supertypes.py. NOT a runtime dep.
 ]
 mcp = [
     "mcp[cli]>=1.0",            # ifcfast-mcp server (Claude Desktop / Cursor / etc.)
