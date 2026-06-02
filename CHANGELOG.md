@@ -7,6 +7,69 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.29] - 2026-06-02
+
+### Fixed — pset / quantity extractor batch (GH #36, #38, #43, #45)
+
+- **`m.psets` now inherits type-level properties (GH #36).** Properties
+  carried on `IfcTypeObject.HasPropertySets` and bound via
+  `IfcRelDefinesByType` surface on every related instance, tagged
+  `source = "type"`. Instance-declared properties carry
+  `source = "instance"` and shadow same-named type properties on
+  collision (matches `ifcopenshell.util.element.get_psets(..., should_inherit=True)`).
+  Real-world payoff verified on G55_RIB.ifc: 17 `IfcBuildingElementProxy`
+  instances now show `Pset_ManufacturerTypeInformation.Manufacturer = 'Wurth'`
+  that were entirely absent pre-fix. Same GUIDs and manufacturer
+  values ifcopenshell returns. `m.psets` gains the `source` column.
+- **`m.quantities.unit_step_id` falls back to the project's
+  `IfcUnitAssignment` (GH #43).** When `IfcQuantity*.Unit` is null —
+  the common Revit / ArchiCAD authoring pattern — the column resolves
+  to the project's `IfcSIUnit` for the quantity's kind
+  (`Length`→`LENGTHUNIT`, `Area`→`AREAUNIT`, `Volume`→`VOLUMEUNIT`,
+  `Weight`→`MASSUNIT`, `Time`→`TIMEUNIT`; `Count` stays null —
+  dimensionless). Explicit per-quantity `Unit` refs still win.
+  `IfcConversionBasedUnit` and `IfcDerivedUnit` resolution stay out
+  of scope (separate feature). Verified on A4_RIB_B.ifc (16,742 qty
+  rows): pre-fix every `unit_step_id` was null; post-fix all four
+  resolved kinds match the IfcSIUnit step_ids ifcopenshell returns.
+- **`IfcPropertyTableValue` now surfaces as a row and unhandled
+  property classes emit a marker (GH #38).** `IfcPropertyTableValue`
+  parses to a single row with `value = "d1=>v1, d2=>v2, ..."`
+  pairing DefiningValues + DefinedValues; `value_type` takes the
+  DefinedValues axis type. Any `IfcSimpleProperty` subclass without
+  a per-class parser (`IfcPropertyReferenceValue`, future `*Value`
+  classes, authoring-tool customs) emits a marker row with
+  `value = None` and `value_type = "unhandled:IFCXXX"`. Enumerate
+  blind spots:
+  ```python
+  m.psets[m.psets.value_type.fillna("").str.startswith("unhandled:")]
+  ```
+- **`m.quantities` inherits type-attached `IfcElementQuantity`
+  (GH #45).** Mirrors the GH #36 pset path: types can carry
+  quantities the same way they carry psets because
+  `IfcTypeObject.HasPropertySets` accepts any
+  `IfcPropertySetDefinition` and `IfcElementQuantity` IS-A
+  `IfcPropertySetDefinition`. Inherited rows carry `source = "type"`,
+  deduped against instance ones on `(qto_name, quantity_name)`.
+  GH #43 unit fallback composes through — inherited rows still get
+  project-default `unit_step_id` resolution. Type-attached quantities
+  are rare in practice (0 hits across 81 real files in the sweep)
+  but the fix is principled and free at that cardinality.
+
+### Schema
+
+- `_CACHE_SCHEMA_VERSION` 6 → 10. Four bumps stacked across this
+  release (one per behavior change). Old caches re-extract on next
+  open.
+- Substrate `instances.parquet` nested `psets` struct gains
+  `source : string (not null)`.
+- Substrate `instances.parquet` nested `quantities` struct gains
+  `source : string (not null)`.
+- `m.psets` / `m.quantities` DataFrames gain a `source` column
+  with the same two values.
+
+## [_pre-0.4.29 unreleased]
+
 ### Fixed — tester-in-chief cross-validation batch (GH #29–#35)
 
 - **`m.products` is no longer silently empty on cache hits (GH #29).**
