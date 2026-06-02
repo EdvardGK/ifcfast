@@ -177,7 +177,16 @@ _HASH_TAIL_BYTES = 4 * 1024 * 1024
 #       default (instance shadows same-named type prop). Old caches
 #       miss type-level properties entirely (GH #36) — re-extract
 #       surfaces ~2% extra rows on type-heavy Revit/Tekla exports.
-_CACHE_SCHEMA_VERSION = 7
+#   8 — v0.4.29: quantities.parquet `unit_step_id` semantics changed
+#       — when `IfcQuantity*.Unit` is null, the column now resolves to
+#       the project's `IfcUnitAssignment` IfcSIUnit for that kind
+#       (Length→LENGTHUNIT, Area→AREAUNIT, Volume→VOLUMEUNIT,
+#       Weight→MASSUNIT, Time→TIMEUNIT; Count stays null —
+#       dimensionless). Old caches show every `unit_step_id` as null
+#       on the common Revit / ArchiCAD authoring pattern that omits
+#       the explicit per-quantity Unit slot (GH #43); re-extract makes
+#       the column usable on those files.
+_CACHE_SCHEMA_VERSION = 8
 
 _FIELD_RE = re.compile(r"\(\s*(.*?)\s*\)\s*;", re.DOTALL)
 

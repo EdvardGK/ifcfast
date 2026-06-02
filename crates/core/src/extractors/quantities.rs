@@ -54,6 +54,23 @@ pub fn build(
     let mut qtos: HashMap<u64, (String, Vec<u64>)> = HashMap::with_capacity(1024);
     let mut quantities: HashMap<u64, Quantity> = HashMap::with_capacity(8192);
     let mut rel_pairs: Vec<(u64, u64)> = Vec::with_capacity(8192);
+    // Project-default unit fallback (GH #43). Real-world Revit/ArchiCAD
+    // exports almost always leave the per-quantity `Unit` slot as `$`
+    // and rely on the IfcUnitAssignment to disambiguate. Without this
+    // map every `unit_step_id` column on `m.quantities` is None, which
+    // forces consumers either to re-parse the IFC for units or assume
+    // a fixed interpretation (the canonical "are these volumes in m3
+    // or mm3?" trap). Resolution path is intentionally narrow: walk
+    // the file's IfcUnitAssignment refs, intersect with IfcSIUnit
+    // records, and read their UnitType enum. IfcConversionBasedUnit
+    // and IfcDerivedUnit are out of scope here — they're a separate
+    // resolver because conversion factors have to be threaded too.
+    let mut project_unit_refs: std::collections::HashSet<u64> =
+        std::collections::HashSet::with_capacity(16);
+    // `unit_type` is the raw enum body without dots, uppercased
+    // (e.g. `LENGTHUNIT`, `AREAUNIT`). Matched against the
+    // `quantity_kind → unit_type` table below.
+    let mut si_unit_by_type: HashMap<String, u64> = HashMap::with_capacity(16);
 
     for (step_id, type_name, args) in table.iter() {
         if type_name.eq_ignore_ascii_case(b"IFCELEMENTQUANTITY") {
@@ -90,6 +107,46 @@ pub fn build(
             for obj_id in relateds {
                 rel_pairs.push((obj_id, rel_obj));
             }
+        } else if type_name.eq_ignore_ascii_case(b"IFCUNITASSIGNMENT") {
+            // (Units : SET [1:?] OF IfcUnit). One arg, a list of refs.
+            // Most files have exactly one IfcUnitAssignment; legal but
+            // unusual files may have several. We union them all — any
+            // SIUnit reachable from any assignment counts as a
+            // project default candidate.
+            let fields = split_top_level_args(args);
+            for unit_id in ref_list_at(&fields, 0) {
+                project_unit_refs.insert(unit_id);
+            }
+        } else if type_name.eq_ignore_ascii_case(b"IFCSIUNIT") {
+            // (Dimensions, UnitType, Prefix, Name). Slot 1 is the
+            // UnitType enum (`.LENGTHUNIT.`, `.AREAUNIT.`, …). Capture
+            // every SIUnit's type here; project-membership filtering
+            // happens after pass 1 so we don't have to revisit the
+            // table once we know which units are in `project_unit_refs`.
+            let fields = split_top_level_args(args);
+            if let Some(raw) = fields.get(1).copied() {
+                if let Some(unit_type) = parse_enum_uppercase(raw) {
+                    // last-write-wins on collisions. A well-formed
+                    // file has at most one SIUnit per UnitType.
+                    si_unit_by_type.insert(unit_type, step_id);
+                }
+            }
+        }
+    }
+
+    // Build the (UnitType → step_id) project-default map. Only SIUnits
+    // referenced by an IfcUnitAssignment count — a stray SIUnit
+    // declared inside an IfcConversionBasedUnit shouldn't masquerade
+    // as a project default.
+    let mut project_default_unit: HashMap<&'static str, u64> = HashMap::with_capacity(8);
+    if !project_unit_refs.is_empty() {
+        for (unit_type, step_id) in &si_unit_by_type {
+            if !project_unit_refs.contains(step_id) {
+                continue;
+            }
+            if let Some(canonical) = canonical_unit_type(unit_type) {
+                project_default_unit.insert(canonical, *step_id);
+            }
         }
     }
 
@@ -111,12 +168,19 @@ pub fn build(
                 Some(q) => q,
                 None => continue,
             };
+            // Fall back to the project default for this quantity kind
+            // when the explicit per-quantity Unit slot is null. Count
+            // is dimensionless and has no fallback target.
+            let unit = q.unit_step_id.or_else(|| {
+                unit_type_for_quantity_kind(q.kind)
+                    .and_then(|ut| project_default_unit.get(ut).copied())
+            });
             out.guid.push(guid.clone());
             out.qto_name.push(qto_name.clone());
             out.quantity_name.push(q.name.clone());
             out.value.push(q.value.clone());
             out.quantity_type.push(q.kind.to_string());
-            out.unit_step_id.push(q.unit_step_id);
+            out.unit_step_id.push(unit);
         }
     }
 
@@ -146,6 +210,64 @@ fn quantity_kind(type_name: &[u8]) -> Option<&'static str> {
     } else {
         None
     }
+}
+
+/// Map a `quantity_type` string (the column written to parquet) back
+/// to the canonical `IfcUnitEnum` literal used by `IfcSIUnit.UnitType`.
+/// `Count` is dimensionless — it has no fallback target, so a null
+/// `unit_step_id` is the correct, terminal answer.
+fn unit_type_for_quantity_kind(kind: &str) -> Option<&'static str> {
+    match kind {
+        "Length" => Some("LENGTHUNIT"),
+        "Area" => Some("AREAUNIT"),
+        "Volume" => Some("VOLUMEUNIT"),
+        "Weight" => Some("MASSUNIT"),
+        "Time" => Some("TIMEUNIT"),
+        _ => None,
+    }
+}
+
+/// Pin every `IfcUnitEnum` literal we accept as a fallback target to
+/// a `&'static str` so the project-default map keys don't carry
+/// allocations. Anything outside this set is irrelevant to quantity
+/// resolution and is intentionally dropped.
+fn canonical_unit_type(uppercase: &str) -> Option<&'static str> {
+    match uppercase {
+        "LENGTHUNIT" => Some("LENGTHUNIT"),
+        "AREAUNIT" => Some("AREAUNIT"),
+        "VOLUMEUNIT" => Some("VOLUMEUNIT"),
+        "MASSUNIT" => Some("MASSUNIT"),
+        "TIMEUNIT" => Some("TIMEUNIT"),
+        _ => None,
+    }
+}
+
+/// Parse a STEP enum field (`.LENGTHUNIT.` → `"LENGTHUNIT"`). Strips
+/// surrounding dots, uppercases, returns None on shapes that don't
+/// match the enum-literal pattern.
+fn parse_enum_uppercase(raw: &[u8]) -> Option<String> {
+    let trimmed = trim_bytes(raw);
+    if trimmed.len() < 2 {
+        return None;
+    }
+    if trimmed.first() != Some(&b'.') || trimmed.last() != Some(&b'.') {
+        return None;
+    }
+    let inner = &trimmed[1..trimmed.len() - 1];
+    let s = std::str::from_utf8(inner).ok()?;
+    Some(s.to_ascii_uppercase())
+}
+
+fn trim_bytes(s: &[u8]) -> &[u8] {
+    let mut start = 0;
+    while start < s.len() && (s[start] as char).is_whitespace() {
+        start += 1;
+    }
+    let mut end = s.len();
+    while end > start && (s[end - 1] as char).is_whitespace() {
+        end -= 1;
+    }
+    &s[start..end]
 }
 
 fn format_number(n: f64) -> String {
@@ -313,5 +435,171 @@ END-ISO-10303-21;
         assert_eq!(t.len(), 1);
         assert_eq!(t.value[0], None);
         assert_eq!(t.quantity_type[0], "Area");
+    }
+
+    /// Build a synthetic fixture that declares an IfcUnitAssignment
+    /// with the five physical SIUnits relevant to quantity fallback
+    /// (length / area / volume / mass / time). `extra_data` adds the
+    /// quantity records under test.
+    fn make_buf_with_units(extra_data: &str) -> String {
+        format!(
+            r#"ISO-10303-21;
+HEADER;
+FILE_DESCRIPTION(('ViewDefinition [ReferenceView]'),'2;1');
+FILE_NAME('qto_test.ifc','2026-06-02T00:00:00',('test'),('test'),'ifcfast','ifcfast','');
+FILE_SCHEMA(('IFC4'));
+ENDSEC;
+DATA;
+#1=IFCPROJECT('0Test000000000000000001',$,'p',$,$,$,$,(#5),#2);
+#2=IFCUNITASSIGNMENT((#3,#90,#91,#92,#93));
+#3=IFCSIUNIT(*,.LENGTHUNIT.,.MILLI.,.METRE.);
+#90=IFCSIUNIT(*,.AREAUNIT.,$,.SQUARE_METRE.);
+#91=IFCSIUNIT(*,.VOLUMEUNIT.,$,.CUBIC_METRE.);
+#92=IFCSIUNIT(*,.MASSUNIT.,.KILO.,.GRAM.);
+#93=IFCSIUNIT(*,.TIMEUNIT.,$,.SECOND.);
+#5=IFCGEOMETRICREPRESENTATIONCONTEXT($,'Model',3,1.0E-5,#6,$);
+#6=IFCAXIS2PLACEMENT3D(#7,$,$);
+#7=IFCCARTESIANPOINT((0.,0.,0.));
+#10=IFCWALL('1Wall00000000000000001',$,'W',$,$,$,$,'t',.STANDARD.);
+{extra_data}
+ENDSEC;
+END-ISO-10303-21;
+"#
+        )
+    }
+
+    #[test]
+    fn null_quantity_unit_falls_back_to_project_default_per_kind() {
+        // GH #43 baseline: every quantity declares `$` for Unit. The
+        // project's IfcUnitAssignment defines one SIUnit per
+        // UnitType; each quantity row's `unit_step_id` should
+        // resolve to the matching SIUnit's step_id.
+        //
+        // Mapping under test:
+        //   Length → #3   (LENGTHUNIT)
+        //   Area   → #90  (AREAUNIT)
+        //   Volume → #91  (VOLUMEUNIT)
+        //   Weight → #92  (MASSUNIT)
+        //   Time   → #93  (TIMEUNIT)
+        //   Count  → None (dimensionless, no fallback)
+        let buf = make_buf_with_units(
+            r#"
+#41=IFCQUANTITYLENGTH('Length',$,$,3.0);
+#42=IFCQUANTITYAREA('NetArea',$,$,7.5);
+#43=IFCQUANTITYVOLUME('Volume',$,$,1.275);
+#44=IFCQUANTITYWEIGHT('Weight',$,$,3060.);
+#45=IFCQUANTITYTIME('InstallSeconds',$,$,1800.);
+#46=IFCQUANTITYCOUNT('Bolts',$,$,12.);
+#47=IFCELEMENTQUANTITY('2Qto000000000000000001',$,'Qto_All',$,$,(#41,#42,#43,#44,#45,#46));
+#48=IFCRELDEFINESBYPROPERTIES('3Rel000000000000000001',$,$,$,(#10),#47);
+"#,
+        );
+        let t = run(&buf);
+        assert_eq!(t.len(), 6);
+        let by_name: std::collections::HashMap<&str, (&str, Option<u64>)> = (0..t.len())
+            .map(|i| {
+                (
+                    t.quantity_name[i].as_str(),
+                    (t.quantity_type[i].as_str(), t.unit_step_id[i]),
+                )
+            })
+            .collect();
+        assert_eq!(by_name.get("Length"), Some(&("Length", Some(3))));
+        assert_eq!(by_name.get("NetArea"), Some(&("Area", Some(90))));
+        assert_eq!(by_name.get("Volume"), Some(&("Volume", Some(91))));
+        assert_eq!(by_name.get("Weight"), Some(&("Weight", Some(92))));
+        assert_eq!(by_name.get("InstallSeconds"), Some(&("Time", Some(93))));
+        // Count is dimensionless — no SIUnit fallback target exists
+        // even though the project declares LENGTHUNIT etc.
+        assert_eq!(by_name.get("Bolts"), Some(&("Count", None)));
+    }
+
+    #[test]
+    fn explicit_unit_overrides_project_default_fallback() {
+        // When IfcQuantity*.Unit is explicitly set, the fallback
+        // doesn't fire — the quantity's own ref wins, even if the
+        // project's IfcUnitAssignment has a different SIUnit for
+        // the same UnitType.
+        let buf = make_buf_with_units(
+            r#"
+#80=IFCSIUNIT(*,.AREAUNIT.,$,.SQUARE_METRE.);
+#41=IFCQUANTITYAREA('NetArea',$,#80,7.5);
+#47=IFCELEMENTQUANTITY('2Qto000000000000000001',$,'Qto_X',$,$,(#41));
+#48=IFCRELDEFINESBYPROPERTIES('3Rel000000000000000001',$,$,$,(#10),#47);
+"#,
+        );
+        let t = run(&buf);
+        assert_eq!(t.len(), 1);
+        // The quantity's own #80 ref must win, not the project's #90.
+        assert_eq!(t.unit_step_id[0], Some(80));
+    }
+
+    #[test]
+    fn fallback_is_silent_when_project_has_no_matching_unit() {
+        // File declares LENGTHUNIT but no MASSUNIT in the
+        // IfcUnitAssignment. A QuantityWeight with null Unit has no
+        // legitimate fallback target — stay None instead of
+        // misattributing.
+        let buf = format!(
+            r#"ISO-10303-21;
+HEADER;
+FILE_DESCRIPTION(('ViewDefinition [ReferenceView]'),'2;1');
+FILE_NAME('qto_test.ifc','2026-06-02T00:00:00',('test'),('test'),'ifcfast','ifcfast','');
+FILE_SCHEMA(('IFC4'));
+ENDSEC;
+DATA;
+#1=IFCPROJECT('0Test000000000000000001',$,'p',$,$,$,$,(#5),#2);
+#2=IFCUNITASSIGNMENT((#3));
+#3=IFCSIUNIT(*,.LENGTHUNIT.,$,.METRE.);
+#5=IFCGEOMETRICREPRESENTATIONCONTEXT($,'Model',3,1.0E-5,#6,$);
+#6=IFCAXIS2PLACEMENT3D(#7,$,$);
+#7=IFCCARTESIANPOINT((0.,0.,0.));
+#10=IFCWALL('1Wall00000000000000001',$,'W',$,$,$,$,'t',.STANDARD.);
+#41=IFCQUANTITYWEIGHT('Weight',$,$,42.);
+#47=IFCELEMENTQUANTITY('2Qto000000000000000001',$,'Qto_X',$,$,(#41));
+#48=IFCRELDEFINESBYPROPERTIES('3Rel000000000000000001',$,$,$,(#10),#47);
+ENDSEC;
+END-ISO-10303-21;
+"#
+        );
+        let t = run(&buf);
+        assert_eq!(t.len(), 1);
+        assert_eq!(t.unit_step_id[0], None);
+    }
+
+    #[test]
+    fn unassigned_si_unit_does_not_leak_as_project_default() {
+        // A file that declares an SIUnit but doesn't reference it from
+        // any IfcUnitAssignment (e.g. a dangling SIUnit nested inside
+        // a never-resolved IfcConversionBasedUnit). That SIUnit must
+        // NOT silently become the project default — fallback stays
+        // None.
+        let buf = format!(
+            r#"ISO-10303-21;
+HEADER;
+FILE_DESCRIPTION(('ViewDefinition [ReferenceView]'),'2;1');
+FILE_NAME('qto_test.ifc','2026-06-02T00:00:00',('test'),('test'),'ifcfast','ifcfast','');
+FILE_SCHEMA(('IFC4'));
+ENDSEC;
+DATA;
+#1=IFCPROJECT('0Test000000000000000001',$,'p',$,$,$,$,(#5),$);
+#3=IFCSIUNIT(*,.LENGTHUNIT.,$,.METRE.);
+#5=IFCGEOMETRICREPRESENTATIONCONTEXT($,'Model',3,1.0E-5,#6,$);
+#6=IFCAXIS2PLACEMENT3D(#7,$,$);
+#7=IFCCARTESIANPOINT((0.,0.,0.));
+#10=IFCWALL('1Wall00000000000000001',$,'W',$,$,$,$,'t',.STANDARD.);
+#41=IFCQUANTITYLENGTH('Length',$,$,3.0);
+#47=IFCELEMENTQUANTITY('2Qto000000000000000001',$,'Qto_X',$,$,(#41));
+#48=IFCRELDEFINESBYPROPERTIES('3Rel000000000000000001',$,$,$,(#10),#47);
+ENDSEC;
+END-ISO-10303-21;
+"#
+        );
+        let t = run(&buf);
+        assert_eq!(t.len(), 1);
+        // SIUnit #3 exists but isn't referenced by any
+        // IfcUnitAssignment, so it doesn't qualify as a project
+        // default for fallback.
+        assert_eq!(t.unit_step_id[0], None);
     }
 }

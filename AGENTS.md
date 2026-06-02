@@ -268,6 +268,16 @@ the project's unit scale as parquet schema metadata
   the pre-v0.4.29 shape. Common payoff: manufacturer / type marks /
   fire ratings on Revit / Tekla / Archicad exports that live at the
   type level were silently dropped before this fix (GH #36).
+- **`m.quantities.unit_step_id` falls back to project defaults**
+  (since v0.4.29, cache schema v8). When `IfcQuantity*.Unit` is null
+  — the common Revit / ArchiCAD authoring pattern — the column now
+  resolves to the project's `IfcUnitAssignment` `IfcSIUnit` for the
+  quantity's kind (`Length`→`LENGTHUNIT`, `Area`→`AREAUNIT`,
+  `Volume`→`VOLUMEUNIT`, `Weight`→`MASSUNIT`, `Time`→`TIMEUNIT`).
+  `Count` stays null — it's dimensionless. Explicit per-quantity
+  `Unit` refs still win (no fallback fires when the slot is set).
+  Resolution is `IfcSIUnit`-only; `IfcConversionBasedUnit` /
+  `IfcDerivedUnit` resolution is a separate feature (GH #43).
 
 ## Streaming point cloud (`m.iter_point_cloud(...)`)
 
