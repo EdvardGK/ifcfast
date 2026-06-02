@@ -24,6 +24,7 @@ pub mod curveset;
 pub mod extrusion;
 pub mod faceset;
 pub mod gltf;
+pub mod indexed_curve;
 pub mod mapped;
 pub mod obj;
 pub mod placement;

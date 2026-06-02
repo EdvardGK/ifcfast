@@ -247,11 +247,23 @@ fn bounded_curve_points(table: &EntityTable, id: u64) -> Option<Vec<Vec2>> {
             Field::Ref(pid) => pid,
             _ => return None,
         };
-        let pts = cartesian_point_list_2d(table, pts_id)?;
-        // Segments may be $; if so, take the points in order.
-        let pts_out = pts;
-        if pts_out.len() >= 3 {
-            return Some(pts_out);
+        let raw_pts = cartesian_point_list_2d(table, pts_id)?;
+        // Evaluate IfcArcIndex / IfcLineIndex segments when present —
+        // otherwise booleans on curved profiles collapse to polygonal
+        // chords (GH #48).
+        if let Some(Field::List(seg_body)) =
+            fields.get(1).copied().map(parse_field)
+        {
+            if let Some(poly) =
+                crate::mesh::indexed_curve::eval_segments_2d(&raw_pts, seg_body)
+            {
+                if poly.len() >= 3 {
+                    return Some(poly);
+                }
+            }
+        }
+        if raw_pts.len() >= 3 {
+            return Some(raw_pts);
         }
     }
     None

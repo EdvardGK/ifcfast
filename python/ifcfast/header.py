@@ -208,7 +208,17 @@ _HASH_TAIL_BYTES = 4 * 1024 * 1024
 #       component-library exports (one IfcElementQuantity stamped on
 #       the type, fanned out across N occurrences). Old caches miss
 #       these entirely.
-_CACHE_SCHEMA_VERSION = 10
+#  11 — v0.4.30: IfcArcIndex segments inside IfcIndexedPolyCurve
+#       are now tessellated to the same per-turn budget as
+#       IfcCircleProfileDef (32 chord segments per full circle); old
+#       caches treated arcs as straight chords between the indexed
+#       points, collapsing Revit MEP pipes / ducts to square prisms
+#       with -78% volume (GH #48). Cross-section fingerprint columns
+#       (centroid_xyz, vertex_count, triangle_count) and mesh_qto
+#       outputs shift accordingly on any product authored via
+#       IfcArbitraryProfileDef(WithVoids) + IfcIndexedPolyCurve. Old
+#       caches must be re-extracted on any RIV / HVAC model.
+_CACHE_SCHEMA_VERSION = 11
 
 _FIELD_RE = re.compile(r"\(\s*(.*?)\s*\)\s*;", re.DOTALL)
 

@@ -309,7 +309,25 @@ fn curve_to_polyline(table: &EntityTable, curve_id: u64) -> Option<Vec<Vec2>> {
             Field::Ref(id) => id,
             _ => return None,
         };
-        return point_list_2d(table, pts_id);
+        let raw_pts = point_list_2d_raw(table, pts_id)?;
+        // Segments is optional — when present, evaluate IfcArcIndex /
+        // IfcLineIndex against the raw point list. Without this every
+        // Revit MEP pipe (4 points + 2 IfcArcIndex semicircles)
+        // collapses to a 4-sided prism — GH #48.
+        if let Some(seg_body) = list_body(fields.get(1).copied()) {
+            if let Some(poly) =
+                crate::mesh::indexed_curve::eval_segments_2d(&raw_pts, seg_body)
+            {
+                return Some(poly);
+            }
+        }
+        // Segments = $ (or unrecognised): connect raw points in order,
+        // dropping the optional trailing close vertex.
+        let mut pts = raw_pts;
+        if pts.len() > 2 && pts.first() == pts.last() {
+            pts.pop();
+        }
+        return Some(pts);
     }
     if type_name.eq_ignore_ascii_case(b"IFCCOMPOSITECURVE") {
         // (Segments: LIST OF IfcCompositeCurveSegment, SelfIntersect)
@@ -444,7 +462,11 @@ fn composite_curve(table: &EntityTable, fields: &[&[u8]]) -> Option<Vec<Vec2>> {
     Some(out)
 }
 
-fn point_list_2d(table: &EntityTable, id: u64) -> Option<Vec<Vec2>> {
+/// Raw 2D point list from an `IfcCartesianPointList2D` entity — no
+/// trailing-close dedup, since callers may need the raw indices
+/// (`IfcIndexedPolyCurve` segments are 1-based and any vertex may be
+/// referenced).
+fn point_list_2d_raw(table: &EntityTable, id: u64) -> Option<Vec<Vec2>> {
     let (type_name, args) = table.get(id)?;
     if !type_name.eq_ignore_ascii_case(b"IFCCARTESIANPOINTLIST2D") {
         return None;
@@ -470,10 +492,17 @@ fn point_list_2d(table: &EntityTable, id: u64) -> Option<Vec<Vec2>> {
             }
         }
     }
-    if pts.len() > 2 && pts.first() == pts.last() {
-        pts.pop();
-    }
     Some(pts)
+}
+
+/// Extract the inner list bytes from an optional `Field::List` field,
+/// returning `None` for null/star/missing fields. Used to thread the
+/// `IfcIndexedPolyCurve.Segments` raw bytes into the segment evaluator.
+fn list_body(field: Option<&[u8]>) -> Option<&[u8]> {
+    match parse_field(field?) {
+        Field::List(b) => Some(b),
+        _ => None,
+    }
 }
 
 fn cartesian_point_2d(table: &EntityTable, id: u64) -> Option<Vec2> {
