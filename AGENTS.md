@@ -278,6 +278,18 @@ the project's unit scale as parquet schema metadata
   `Unit` refs still win (no fallback fires when the slot is set).
   Resolution is `IfcSIUnit`-only; `IfcConversionBasedUnit` /
   `IfcDerivedUnit` resolution is a separate feature (GH #43).
+- **`m.psets` marks unrecognised property classes instead of
+  dropping them** (since v0.4.29, cache schema v9). Any
+  `IfcSimpleProperty` subclass ifcfast doesn't have a per-class
+  parser for surfaces as a row with `value = None` and
+  `value_type = "unhandled:IFCXXX"` (e.g.
+  `"unhandled:IFCPROPERTYREFERENCEVALUE"`). Enumerate gaps with
+  `m.psets[m.psets.value_type.fillna("").str.startswith("unhandled:")]`.
+  Same release also adds `IfcPropertyTableValue` as a recognised
+  class — its row carries
+  `value = "defining1=>defined1, defining2=>defined2, ..."`,
+  `value_type` taking the DefinedValues axis type. Both changes
+  trace to GH #38.
 
 ## Streaming point cloud (`m.iter_point_cloud(...)`)
 

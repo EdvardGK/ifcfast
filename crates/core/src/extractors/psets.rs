@@ -75,6 +75,15 @@ pub fn build(
     // Captured for any IfcXxxType entity (suffix-detected so new schema
     // additions surface automatically, same convention as the indexer).
     let mut type_psets: HashMap<u64, Vec<u64>> = HashMap::with_capacity(256);
+    // Reveal-all marker for IfcProperty* subclasses we don't know how
+    // to parse. Pre-GH-#38 such properties were silently dropped — an
+    // agent calling `m.psets` couldn't tell whether a pset was empty
+    // by author intent or because ifcfast had a blind spot. Capturing
+    // every unrecognised `IfcProperty*` here and emitting a marker
+    // row tagged `value_type = "unhandled:IFCXXX"` makes the loss
+    // visible. The shape mirrors a real Prop so the existing pass-2
+    // recursion can emit it without a special path.
+    let mut unhandled_props: HashMap<u64, UnhandledProp> = HashMap::with_capacity(64);
 
     for (step_id, type_name, args) in table.iter() {
         if type_name.eq_ignore_ascii_case(b"IFCPROPERTYSET") {
@@ -125,6 +134,44 @@ pub fn build(
             let (setpoint_val, _) = parse_nominal_value(fields.get(5).copied());
             let val_str = format_bounded(lower_val.as_deref(), upper_val.as_deref(), setpoint_val.as_deref());
             props.insert(step_id, Prop { name, value: val_str, value_type: upper_type });
+        } else if type_name.eq_ignore_ascii_case(b"IFCPROPERTYTABLEVALUE") {
+            // (Name, Description, DefiningValues, DefinedValues,
+            //  Expression, DefiningUnit, DefinedUnit, CurveInterpolation)
+            // Two parallel `LIST OF IfcValue`s form a lookup table —
+            // e.g. (temperature → pressure) curves on MEP fittings or
+            // (depth → bearing capacity) on geotechnical reports.
+            //
+            // Serialised as `"d1=>v1, d2=>v2, ..."` so the row stays
+            // queryable by `prop_name` (the table's name as-authored)
+            // while the value preserves the full table for consumers
+            // that need both axes. value_type takes the DefinedValues
+            // type (the dependent axis) — that's the type of the
+            // looked-up payload. Same convention as bounded/enumerated:
+            // one row, value-as-string, type from the payload axis.
+            let fields = split_top_level_args(args);
+            let name = string_at(&fields, 0).unwrap_or_default();
+            let defining_vals = parse_value_list_raw(fields.get(2).copied());
+            let (defined_vals, defined_type) =
+                parse_value_list_with_each(fields.get(3).copied());
+            let val_str = if defining_vals.is_empty() && defined_vals.is_empty() {
+                None
+            } else {
+                let pairs: Vec<String> = defining_vals
+                    .iter()
+                    .zip(defined_vals.iter())
+                    .map(|(d, v)| {
+                        let ds = d.as_deref().unwrap_or("?");
+                        let vs = v.as_deref().unwrap_or("?");
+                        format!("{ds}=>{vs}")
+                    })
+                    .collect();
+                if pairs.is_empty() {
+                    None
+                } else {
+                    Some(pairs.join(", "))
+                }
+            };
+            props.insert(step_id, Prop { name, value: val_str, value_type: defined_type });
         } else if type_name.eq_ignore_ascii_case(b"IFCCOMPLEXPROPERTY") {
             // (Name, Description, UsageName, HasProperties)
             // Note: IfcComplexProperty does NOT inherit IfcRoot — no
@@ -169,6 +216,27 @@ pub fn build(
             for obj_id in relateds {
                 product_to_type.insert(obj_id, type_id);
             }
+        } else if is_unhandled_simple_property(type_name) {
+            // Any IFCPROPERTY*VALUE we didn't match above. The
+            // `*VALUE` suffix filter restricts to IfcSimpleProperty
+            // leaves (single / enumerated / list / bounded / table /
+            // reference / future *Value classes) — IfcPropertySet,
+            // IfcPropertySetTemplate, IfcPropertyEnumeration, etc.
+            // are not properties and never reach this arm. Capturing
+            // these as marker rows means an agent calling `m.psets`
+            // can distinguish "this pset has no value for Foo" from
+            // "ifcfast doesn't know how to parse this property class
+            // yet". value_type carries `unhandled:IFCXXX` so the
+            // distinction is queryable.
+            let fields = split_top_level_args(args);
+            let name = string_at(&fields, 0).unwrap_or_default();
+            let marker = format!(
+                "unhandled:{}",
+                std::str::from_utf8(type_name)
+                    .map(|s| s.to_ascii_uppercase())
+                    .unwrap_or_else(|_| "IFCPROPERTY?".to_string())
+            );
+            unhandled_props.insert(step_id, UnhandledProp { name, marker });
         } else if is_type_object(type_name) {
             // IfcTypeObject + every IfcXxxType subclass (suffix match,
             // mirrors `indexer::index`'s TypeObject classifier). The
@@ -230,6 +298,7 @@ pub fn build(
                 "instance",
                 &props,
                 &complex_props,
+                &unhandled_props,
                 &mut out,
                 &mut emitted_names,
                 0,
@@ -275,6 +344,7 @@ pub fn build(
                         "type",
                         &props,
                         &complex_props,
+                        &unhandled_props,
                         &mut out,
                         already_seen,
                         0,
@@ -292,6 +362,28 @@ struct Prop {
     name: String,
     value: Option<String>,
     value_type: Option<String>,
+}
+
+/// Marker payload for an IfcSimpleProperty leaf that ifcfast doesn't
+/// have a per-class parser for yet. Emitted as a row with
+/// `value = None` and `value_type = "unhandled:IFCXXX"` so the
+/// blind spot is visible without breaking the long-format shape.
+#[derive(Debug)]
+struct UnhandledProp {
+    name: String,
+    marker: String,
+}
+
+/// Detect any IfcSimpleProperty subclass we didn't explicitly handle
+/// above. The IFC schema names every IfcSimpleProperty concrete leaf
+/// with a `…Value` suffix (`IfcPropertySingleValue`,
+/// `IfcPropertyTableValue`, future additions), and that suffix is
+/// shared by no other entity in the IFC schema family, which is what
+/// makes it a safe "is this a property we missed" probe.
+fn is_unhandled_simple_property(type_name: &[u8]) -> bool {
+    type_name.len() > 16
+        && type_name[..11].eq_ignore_ascii_case(b"IFCPROPERTY")
+        && type_name[type_name.len() - 5..].eq_ignore_ascii_case(b"VALUE")
 }
 
 /// Cap on IfcComplexProperty nesting depth. The schema allows
@@ -323,6 +415,7 @@ fn emit_property(
     source: &str,
     props: &HashMap<u64, Prop>,
     complex_props: &HashMap<u64, (String, Vec<u64>)>,
+    unhandled_props: &HashMap<u64, UnhandledProp>,
     out: &mut PsetTable,
     emitted_names: &mut Vec<String>,
     depth: usize,
@@ -356,11 +449,31 @@ fn emit_property(
                 source,
                 props,
                 complex_props,
+                unhandled_props,
                 out,
                 emitted_names,
                 depth + 1,
             );
         }
+        return;
+    }
+    if let Some(unhandled) = unhandled_props.get(pid) {
+        // Marker row for an IfcSimpleProperty subclass ifcfast doesn't
+        // know how to parse. value stays None (we'd be guessing
+        // otherwise); value_type carries the `unhandled:IFCXXX` tag
+        // so consumers can filter / detect blind spots.
+        let name = if prefix.is_empty() {
+            unhandled.name.clone()
+        } else {
+            format!("{prefix}{}", unhandled.name)
+        };
+        out.guid.push(guid.to_string());
+        out.pset_name.push(pset_name.to_string());
+        out.prop_name.push(name.clone());
+        out.value.push(None);
+        out.value_type.push(Some(unhandled.marker.clone()));
+        out.source.push(source.to_string());
+        emitted_names.push(name);
     }
 }
 
@@ -379,6 +492,7 @@ fn emit_property_dedup(
     source: &str,
     props: &HashMap<u64, Prop>,
     complex_props: &HashMap<u64, (String, Vec<u64>)>,
+    unhandled_props: &HashMap<u64, UnhandledProp>,
     out: &mut PsetTable,
     already_seen: &std::collections::HashSet<String>,
     depth: usize,
@@ -415,11 +529,33 @@ fn emit_property_dedup(
                 source,
                 props,
                 complex_props,
+                unhandled_props,
                 out,
                 already_seen,
                 depth + 1,
             );
         }
+        return;
+    }
+    if let Some(unhandled) = unhandled_props.get(pid) {
+        // Type-side marker. Same dedup rule: if the instance side
+        // already emitted any row (handled or marker) at this
+        // (pset_name, prop_name), the type's marker is suppressed.
+        let name = if prefix.is_empty() {
+            unhandled.name.clone()
+        } else {
+            format!("{prefix}{}", unhandled.name)
+        };
+        let key = format!("{pset_name}\t{name}");
+        if already_seen.contains(&key) {
+            return;
+        }
+        out.guid.push(guid.to_string());
+        out.pset_name.push(pset_name.to_string());
+        out.prop_name.push(name);
+        out.value.push(None);
+        out.value_type.push(Some(unhandled.marker.clone()));
+        out.source.push(source.to_string());
     }
 }
 
@@ -512,6 +648,59 @@ fn parse_value_list(raw: Option<&[u8]>) -> (Option<String>, Option<String>) {
     } else {
         (Some(values.join(", ")), value_type)
     }
+}
+
+/// Parse a `LIST OF IfcValue` like `parse_value_list` but return the
+/// elements as `Vec<Option<String>>` so a caller can match them up
+/// positionally against a parallel list (e.g. `IfcPropertyTableValue`
+/// pairs the `DefiningValues` and `DefinedValues` lists element-by-
+/// element).
+fn parse_value_list_raw(raw: Option<&[u8]>) -> Vec<Option<String>> {
+    let raw = match raw {
+        Some(r) => r,
+        None => return Vec::new(),
+    };
+    let trimmed = trim(raw);
+    if trimmed.is_empty() || trimmed == b"$" || trimmed == b"*" {
+        return Vec::new();
+    }
+    let inner = match (trimmed.first(), trimmed.last()) {
+        (Some(&b'('), Some(&b')')) if trimmed.len() >= 2 => &trimmed[1..trimmed.len() - 1],
+        _ => return Vec::new(),
+    };
+    split_top_level_args(inner)
+        .into_iter()
+        .map(|item| parse_nominal_value(Some(item)).0)
+        .collect()
+}
+
+/// Variant that also returns the homogeneous value_type taken from the
+/// first non-null member. Same use case as `parse_value_list_raw` but
+/// for the side of the table whose type defines the row's
+/// `value_type` column.
+fn parse_value_list_with_each(raw: Option<&[u8]>) -> (Vec<Option<String>>, Option<String>) {
+    let raw = match raw {
+        Some(r) => r,
+        None => return (Vec::new(), None),
+    };
+    let trimmed = trim(raw);
+    if trimmed.is_empty() || trimmed == b"$" || trimmed == b"*" {
+        return (Vec::new(), None);
+    }
+    let inner = match (trimmed.first(), trimmed.last()) {
+        (Some(&b'('), Some(&b')')) if trimmed.len() >= 2 => &trimmed[1..trimmed.len() - 1],
+        _ => return (Vec::new(), None),
+    };
+    let mut values: Vec<Option<String>> = Vec::new();
+    let mut value_type: Option<String> = None;
+    for item in split_top_level_args(inner) {
+        let (v, t) = parse_nominal_value(Some(item));
+        if value_type.is_none() {
+            value_type = t;
+        }
+        values.push(v);
+    }
+    (values, value_type)
 }
 
 /// Format an `IfcPropertyBoundedValue`'s (lower, upper, setpoint) tuple
@@ -1129,6 +1318,98 @@ END-ISO-10303-21;
             assert_eq!(t.source[i], "type");
             assert_eq!(t.prop_name[i], "FireRating");
         }
+    }
+
+    #[test]
+    fn property_table_value_serialises_paired_columns() {
+        // IfcPropertyTableValue carries two parallel `LIST OF
+        // IfcValue`s — DefiningValues (the lookup axis) and
+        // DefinedValues (the payload axis). Pre-GH-#38 the whole
+        // entity was silently dropped. Post-fix, one row per
+        // `(prop_name)` with the table serialised as
+        // `"d1=>v1, d2=>v2, ..."` and value_type carrying the payload
+        // axis type (DefinedValues — what the consumer asked for).
+        //
+        // Real-world use: MEP fitting curves (flow rate → pressure
+        // drop), geotechnical reports (depth → bearing capacity).
+        let buf = make_buf(
+            r#"
+#20=IFCPROPERTYTABLEVALUE('PressureDrop',$,(IFCREAL(0.1),IFCREAL(0.2),IFCREAL(0.4)),(IFCREAL(5.),IFCREAL(20.),IFCREAL(80.)),$,$,$,$);
+#21=IFCPROPERTYSET('2Pset00000000000000001',$,'Pset_DuctFitting',$,(#20));
+#22=IFCRELDEFINESBYPROPERTIES('3Rel000000000000000001',$,$,$,(#10),#21);
+"#,
+        );
+        let t = run(&buf);
+        assert_eq!(t.len(), 1);
+        assert_eq!(t.prop_name[0], "PressureDrop");
+        assert_eq!(t.value[0].as_deref(), Some("0.1=>5, 0.2=>20, 0.4=>80"));
+        // value_type follows the payload axis (DefinedValues) — what
+        // a downstream consumer would actually read out of the
+        // lookup.
+        assert_eq!(t.value_type[0].as_deref(), Some("IfcReal"));
+    }
+
+    #[test]
+    fn unknown_property_class_surfaces_as_unhandled_marker() {
+        // GH #38 spec: a property class ifcfast doesn't know how to
+        // parse must NOT be silently dropped — emit a row tagged
+        // `value_type = "unhandled:IFCXXX"` so consumers can detect
+        // the blind spot and (eventually) report or work around it.
+        //
+        // IfcPropertyReferenceValue is a real IFC4 IfcSimpleProperty
+        // subclass that ifcfast doesn't yet parse — used by structural
+        // exports to point at a named curve / list / table. It matches
+        // the `IFCPROPERTY*VALUE` shape that triggers the unhandled
+        // arm.
+        let buf = make_buf(
+            r#"
+#20=IFCPROPERTYREFERENCEVALUE('CurveRef',$,$,#5);
+#21=IFCPROPERTYSET('2Pset00000000000000001',$,'Pset_Custom',$,(#20));
+#22=IFCRELDEFINESBYPROPERTIES('3Rel000000000000000001',$,$,$,(#10),#21);
+"#,
+        );
+        let t = run(&buf);
+        assert_eq!(t.len(), 1);
+        assert_eq!(t.prop_name[0], "CurveRef");
+        assert_eq!(t.value[0], None);
+        assert_eq!(
+            t.value_type[0].as_deref(),
+            Some("unhandled:IFCPROPERTYREFERENCEVALUE")
+        );
+        assert_eq!(t.source[0], "instance");
+    }
+
+    #[test]
+    fn ifcpropertysettemplate_does_not_misclassify_as_unhandled() {
+        // The unhandled fallback's filter is `IFCPROPERTY*` prefix +
+        // `VALUE` suffix. IfcPropertySetTemplate / IfcPropertyTemplate
+        // / IfcPropertyEnumeration etc. share the prefix but aren't
+        // properties — they must NOT trigger a marker row even if
+        // they happen to appear in a file. This test pins the
+        // `*VALUE` suffix rule by introducing an
+        // IfcPropertySetTemplate next to a real handled property.
+        let buf = make_buf(
+            r#"
+#15=IFCPROPERTYSETTEMPLATE('4Tpl000000000000000001',$,'Pset_WallCommon_Template',.PSET_TYPEDRIVENONLY.,'IfcWall',$,$);
+#20=IFCPROPERTYSINGLEVALUE('IsExternal',$,IFCBOOLEAN(.T.),$);
+#21=IFCPROPERTYSET('2Pset00000000000000001',$,'Pset_WallCommon',$,(#20));
+#22=IFCRELDEFINESBYPROPERTIES('3Rel000000000000000001',$,$,$,(#10),#21);
+"#,
+        );
+        let t = run(&buf);
+        // Exactly one row from the IfcPropertySingleValue — the
+        // IfcPropertySetTemplate must not produce a phantom unhandled
+        // marker row.
+        assert_eq!(t.len(), 1);
+        assert_eq!(t.prop_name[0], "IsExternal");
+        assert!(
+            !t.value_type[0]
+                .as_deref()
+                .unwrap_or("")
+                .starts_with("unhandled:"),
+            "got unexpected unhandled marker: {:?}",
+            t.value_type[0]
+        );
     }
 
     #[test]

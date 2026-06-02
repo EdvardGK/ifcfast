@@ -186,7 +186,18 @@ _HASH_TAIL_BYTES = 4 * 1024 * 1024
 #       on the common Revit / ArchiCAD authoring pattern that omits
 #       the explicit per-quantity Unit slot (GH #43); re-extract makes
 #       the column usable on those files.
-_CACHE_SCHEMA_VERSION = 8
+#   9 — v0.4.29: psets.parquet row set expands (GH #38). Two changes:
+#       (a) IfcPropertyTableValue now surfaces as a single row whose
+#       `value` is `"d1=>v1, d2=>v2, ..."` (paired DefiningValues +
+#       DefinedValues) and `value_type` is the DefinedValues axis
+#       type. Pre-fix these were silently dropped. (b) Any
+#       IfcSimpleProperty subclass ifcfast doesn't recognise (e.g.
+#       IfcPropertyReferenceValue, future *Value classes) now emits a
+#       marker row with `value = None` and
+#       `value_type = "unhandled:IFCXXX"` so the blind spot is
+#       visible. Filter `m.psets[m.psets.value_type.fillna("").str.startswith("unhandled:")]`
+#       to enumerate gaps.
+_CACHE_SCHEMA_VERSION = 9
 
 _FIELD_RE = re.compile(r"\(\s*(.*?)\s*\)\s*;", re.DOTALL)
 
