@@ -227,6 +227,43 @@ def _cmd_drift(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_bundle(args: argparse.Namespace) -> int:
+    """Write the parquet substrate (`ifcfast.clash` input) from an IFC file."""
+    import ifcfast
+
+    info = ifcfast.bundle(args.file, args.out_dir)
+    ratio = (
+        float(info["instances_written"]) / float(info["unique_reps_written"])
+        if info["unique_reps_written"] > 0
+        else 0.0
+    )
+    total_mb = (
+        float(info["instances_parquet_bytes"]) + float(info["representations_parquet_bytes"])
+    ) / 1e6
+    pretty = [
+        f"path:                {args.file}",
+        f"bundle dir:          {info['bundle_dir']}",
+        f"products seen:       {info['products_seen']}",
+        f"products meshed:     {info['products_meshed']}  (deferred {info['products_deferred']})",
+        f"triangles emitted:   {info['triangles']}",
+        f"instances written:   {info['instances_written']}",
+        f"unique reps written: {info['unique_reps_written']}  (instance/rep {ratio:.2f}x)",
+        f"substrate size:      {total_mb:.1f} MB",
+        f"open:                {info['open_ms']:.1f} ms",
+        f"semantic pre-pass:   {info['bundle_ms']:.1f} ms",
+        f"streaming mesh:      {info['stream_ms']:.1f} ms",
+        "",
+        "Files:",
+        f"  {info['instances_parquet']}",
+        f"  {info['representations_parquet']}",
+        f"  {info['view_sql']}",
+        "",
+        f"Next: import ifcfast; ifcfast.clash({info['bundle_dir']!r})",
+    ]
+    _emit(info, args, pretty_lines=pretty)
+    return 0
+
+
 def _cmd_cache(args: argparse.Namespace) -> int:
     from ifcfast.cache import cache_dir_for, has_data_cached, is_index_cached
     from ifcfast.header import header as _hdr
@@ -350,8 +387,31 @@ def main(argv: list[str] | None = None) -> int:
     _add_json(pc)
     pc.set_defaults(func=_cmd_cache)
 
+    pb = sub.add_parser(
+        "bundle",
+        help="write the parquet substrate (instances/representations) for ifcfast.clash",
+    )
+    pb.add_argument("file", type=Path, help="path to IFC (.ifc or .ifczip)")
+    pb.add_argument(
+        "out_dir",
+        type=Path,
+        nargs="?",
+        default=None,
+        help="output directory; defaults to {stem}.bundle/ next to FILE",
+    )
+    _add_json(pb)
+    pb.set_defaults(func=_cmd_bundle)
+
     args = p.parse_args(argv)
-    return args.func(args)
+    try:
+        return args.func(args)
+    except FileNotFoundError as e:
+        # Clean message to stderr; no traceback. GH #42.
+        print(f"ifcfast: {e}", file=sys.stderr)
+        return 1
+    except (PermissionError, IsADirectoryError) as e:
+        print(f"ifcfast: {type(e).__name__}: {e}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":

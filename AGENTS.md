@@ -89,7 +89,7 @@ releases (additions only, never reorganisations).
 | Sample a labeled point cloud (+ normals) | `m.point_cloud(per_m2=1000)` |
 | Stream a point cloud in bounded-RAM chunks | `m.iter_point_cloud(per_m2=1000, chunk_points=1_000_000)` |
 | One-call viewer export to glTF binary | `m.to_gltf("out.glb")` (cuts on, instancing on, quant on) |
-| Geometric quantities (volume, area) | `m.mesh_qto()` |
+| Geometric quantities (volume, area) | `m.mesh_qto()` (cut_openings=True by default since v0.4.28) |
 | Placement-vs-mesh sanity check | `m.drift` (SI columns; check `m.world_coordinate_baked` for the file-level signal) |
 | "Which products live under this storey?" | `m.products_in(storey_guid)` |
 | "What's the building of this wall?" | `m.building_of(wall_guid)` |
@@ -107,12 +107,19 @@ releases (additions only, never reorganisations).
 ## Substrate output (DuckDB-queryable parquet)
 
 For multi-file / cross-session / pipeline workflows, the in-memory
-Python API isn't always the right shape. `ifcfast-bundle` emits a
+Python API isn't always the right shape. The `bundle` step emits a
 **two-table parquet substrate** you can query with DuckDB, polars, or
-any arrow-aware tool:
+any arrow-aware tool. Drive it from Python or the CLI:
+
+```python
+import ifcfast
+info = ifcfast.bundle("model.ifc")             # -> model.bundle/
+info = ifcfast.bundle("model.ifc", "out/")     # explicit out_dir
+```
 
 ```bash
-ifcfast-bundle path/to/model.ifc out/
+ifcfast bundle path/to/model.ifc               # -> path/to/model.bundle/
+ifcfast bundle path/to/model.ifc out/          # explicit out_dir
 # writes:
 #   out/instances.parquet        (one row per IfcProduct)
 #   out/representations.parquet  (one row per unique mesh shape, dedup'd)
@@ -297,6 +304,11 @@ per product tagged `cut_openings`. The substrate stays reveal-all —
 this flag only affects `m.meshes()` / `m.iter_meshes()` callers,
 not `instances.parquet` / `representations.parquet`. Requires a
 wheel built with the `csg` feature (raises `RuntimeError` otherwise).
+
+**`m.mesh_qto(cut_openings=True)` is the default since v0.4.28** —
+authored `Qto_*Volume` values are net (openings subtracted), and so
+is the new geometric default. Pass `cut_openings=False` if you want
+the gross (uncut) host volume.
 Both opening patterns are covered: **in-representation** booleans
 (`IfcBooleanClippingResult(host, opening)`) AND **cross-product**
 openings (`IfcRelVoidsElement` linking a separately-modelled
@@ -433,15 +445,16 @@ ifcfast schema  FILE  --json       # column-level schema introspection
 ifcfast extract FILE  --json       # data-layer extraction
 ifcfast drift   FILE  --json       # placement-vs-mesh report
 ifcfast cache   FILE  --json       # inspect / clear cache
-
-# Substrate emit (separate binary — see "Substrate output" above).
-ifcfast-bundle FILE OUT_DIR        # writes instances.parquet +
+ifcfast bundle  FILE [OUT_DIR]     # parquet substrate (see "Substrate output")
+                                   # writes instances.parquet +
                                    # representations.parquet + view.sql
 
-# Narrow-phase clash against a bundle. Writes clashes.parquet next
-# to instances/representations. --tolerance is in metres regardless
-# of the source file's linear unit.
-ifcfast-clash  BUNDLE_DIR  [--tolerance 0.05]  [--out file.parquet]
+# Narrow-phase clash against a bundle directory. From Python:
+#   ifcfast.clash(bundle_dir, tolerance_m=0.0)
+# A standalone `ifcfast-clash` binary is also built from the core
+# crate (`cargo build --release --bin ifcfast-clash`), but it is
+# NOT shipped on PyPI — driving clash from Python is the supported
+# wheel-side path.
 ```
 
 ## Reporting issues from an agent

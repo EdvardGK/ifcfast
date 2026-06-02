@@ -514,11 +514,27 @@ mod python {
     /// truth that survives when authors omit Qto_* sets.
     #[cfg(feature = "mesh")]
     #[pyfunction]
-    pub fn mesh_qto<'py>(py: Python<'py>, path: &str) -> PyResult<Bound<'py, PyDict>> {
+    #[pyo3(signature = (path, cut_openings = false))]
+    pub fn mesh_qto<'py>(
+        py: Python<'py>,
+        path: &str,
+        cut_openings: bool,
+    ) -> PyResult<Bound<'py, PyDict>> {
         catch_panic(|| {
         use crate::mesh::{
             mesh_ifc_streaming_framed, qto, BakeFrame, ProductMesh, ProductSink,
         };
+
+        // cut_openings requires the `csg` feature — surface a clear
+        // error rather than silently ignoring the flag (same pattern as
+        // extract_meshes).
+        #[cfg(not(feature = "csg"))]
+        if cut_openings {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "mesh_qto(cut_openings=True) requires the `csg` Cargo feature; \
+                 this wheel was built without it.",
+            ));
+        }
 
         let t_total = Instant::now();
         let (mmap, _open_ms) = open_mmap(path)?;
@@ -538,6 +554,7 @@ mod python {
         // — drops each ProductMesh after computing its QTO.
         struct QtoSink {
             unit_scale: f32,
+            cut_openings: bool,
             guid: Vec<String>,
             entity: Vec<String>,
             volume_m3: Vec<f32>,
@@ -557,9 +574,22 @@ mod python {
             s_nx: Vec<f32>,
             s_ny: Vec<f32>,
             s_nz: Vec<f32>,
+            cut_stats_cut: usize,
+            cut_stats_passthrough: usize,
+            cut_stats_fallback: usize,
+            // Cross-product IfcRelVoidsElement buffer — same pattern as
+            // extract_meshes. Only `Some` when cut_openings && at least
+            // one void relation exists; else the hot path is identical
+            // to the no-cut version.
+            #[cfg(feature = "csg")]
+            cross: Option<crate::mesh::cut_openings::CrossProductCut>,
         }
-        impl ProductSink for QtoSink {
-            fn on_product(&mut self, mesh: ProductMesh) {
+        impl QtoSink {
+            /// Compute QTO for a (cut-applied or unchanged) mesh and
+            /// push its row + per-surface rows. Shared between the
+            /// streaming `on_product` and the post-stream cross-product
+            /// flush.
+            fn record(&mut self, mesh: ProductMesh) {
                 let q = qto::compute(&mesh.vertices, &mesh.indices, self.unit_scale);
                 self.guid.push(mesh.guid.clone());
                 self.entity.push(mesh.entity.clone());
@@ -582,9 +612,60 @@ mod python {
                     self.s_nz.push(s.nz);
                 }
             }
+
+            #[cfg(feature = "csg")]
+            fn bump_outcome(&mut self, outcome: crate::mesh::cut_openings::Outcome) {
+                use crate::mesh::cut_openings::Outcome;
+                match outcome {
+                    Outcome::Cut => self.cut_stats_cut += 1,
+                    Outcome::Passthrough => self.cut_stats_passthrough += 1,
+                    Outcome::Fallback => self.cut_stats_fallback += 1,
+                }
+            }
         }
+        impl ProductSink for QtoSink {
+            #[cfg_attr(not(feature = "csg"), allow(unused_mut))]
+            fn on_product(&mut self, mut mesh: ProductMesh) {
+                if mesh.indices.is_empty() || mesh.vertices.is_empty() {
+                    return;
+                }
+                #[cfg(feature = "csg")]
+                if self.cut_openings {
+                    // Cross-product routing first: suppress openings,
+                    // hold hosts for flush, pass-through the rest into
+                    // the in-rep apply.
+                    if let Some(cross) = self.cross.as_mut() {
+                        use crate::mesh::cut_openings::Routed;
+                        match cross.route(mesh) {
+                            Routed::Suppressed | Routed::Held => return,
+                            Routed::PassThrough(m) => mesh = m,
+                        }
+                    }
+                    let outcome = crate::mesh::cut_openings::apply(&mut mesh);
+                    self.bump_outcome(outcome);
+                    if mesh.indices.is_empty() || mesh.vertices.is_empty() {
+                        return;
+                    }
+                }
+                #[cfg(not(feature = "csg"))]
+                let _ = self.cut_openings;
+
+                self.record(mesh);
+            }
+        }
+        #[cfg(feature = "csg")]
+        let cross = if cut_openings {
+            let c = crate::mesh::cut_openings::CrossProductCut::from_indexer(
+                &idx.voids_opening,
+                &idx.voids_host,
+            );
+            if c.is_empty() { None } else { Some(c) }
+        } else {
+            None
+        };
         let mut sink = QtoSink {
             unit_scale,
+            cut_openings,
             guid: Vec::with_capacity(idx.product_step_id.len()),
             entity: Vec::with_capacity(idx.product_step_id.len()),
             volume_m3: Vec::with_capacity(idx.product_step_id.len()),
@@ -603,6 +684,11 @@ mod python {
             s_nx: Vec::new(),
             s_ny: Vec::new(),
             s_nz: Vec::new(),
+            cut_stats_cut: 0,
+            cut_stats_passthrough: 0,
+            cut_stats_fallback: 0,
+            #[cfg(feature = "csg")]
+            cross,
         };
 
         let t_mesh = Instant::now();
@@ -613,6 +699,20 @@ mod python {
         // surface_count = 0.
         let mesh_stats =
             py.allow_threads(|| mesh_ifc_streaming_framed(&mmap, &mut sink, BakeFrame::Local));
+
+        // Cross-product flush — mirror extract_meshes. Fold every
+        // buffered host with its arrived openings and run the folded
+        // mesh through the same QTO recorder.
+        #[cfg(feature = "csg")]
+        if let Some(mut cross) = sink.cross.take() {
+            for (folded, outcome) in cross.flush() {
+                sink.bump_outcome(outcome);
+                if folded.indices.is_empty() || folded.vertices.is_empty() {
+                    continue;
+                }
+                sink.record(folded);
+            }
+        }
         let mesh_ms = t_mesh.elapsed().as_secs_f64() * 1000.0;
 
         let out = PyDict::new_bound(py);
@@ -641,6 +741,10 @@ mod python {
         out.set_item("total_ms", t_total.elapsed().as_secs_f64() * 1000.0)?;
         out.set_item("products_meshed", mesh_stats.products_meshed)?;
         out.set_item("size_bytes", mmap.len() as u64)?;
+        out.set_item("cut_openings", cut_openings)?;
+        out.set_item("cut_openings_cut", sink.cut_stats_cut as u64)?;
+        out.set_item("cut_openings_passthrough", sink.cut_stats_passthrough as u64)?;
+        out.set_item("cut_openings_fallback", sink.cut_stats_fallback as u64)?;
         Ok(out)
         })
     }
@@ -1905,6 +2009,114 @@ mod python {
         })
     }
 
+    // ----- bundle -------------------------------------------------------
+
+    /// Build the parquet substrate (`instances.parquet` +
+    /// `representations.parquet` + `view.sql`) consumed by
+    /// [`clash`]. Mirrors the standalone `ifcfast-bundle` binary,
+    /// available in-process so the wheel can ship this without a
+    /// separate native executable.
+    ///
+    /// Returns a dict of (paths, counts, timings) — the caller
+    /// re-shapes it into whatever surface they want.
+    #[cfg(feature = "bundle")]
+    #[pyfunction]
+    #[pyo3(signature = (ifc_path, out_dir = None))]
+    fn bundle<'py>(
+        py: Python<'py>,
+        ifc_path: &str,
+        out_dir: Option<&str>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        use crate::bundle::parquet_sink::ParquetSink;
+        use crate::bundle::Bundle;
+        use crate::mesh::mesh_ifc_streaming;
+
+        const VIEW_SQL: &str = include_str!("bundle/view.sql");
+
+        let in_path = Path::new(ifc_path).to_path_buf();
+        let out_dir_path = match out_dir {
+            Some(o) => std::path::PathBuf::from(o),
+            None => {
+                let stem = in_path
+                    .file_stem()
+                    .map(|s| s.to_owned())
+                    .unwrap_or_default();
+                let mut p = in_path.clone();
+                p.set_file_name(format!("{}.bundle", stem.to_string_lossy()));
+                p
+            }
+        };
+        std::fs::create_dir_all(&out_dir_path).map_err(|e| {
+            pyo3::exceptions::PyIOError::new_err(format!(
+                "mkdir {}: {e}",
+                out_dir_path.display()
+            ))
+        })?;
+
+        let (src, open_ms) = open_mmap(ifc_path)?;
+        let buf: &[u8] = &src;
+
+        let t_bundle = Instant::now();
+        let bundle = py.allow_threads(|| Bundle::build(buf));
+        let bundle_ms = t_bundle.elapsed().as_secs_f64() * 1000.0;
+        let sem = bundle.semantic_stats();
+
+        let mut sink = ParquetSink::create_in_dir(&out_dir_path, &bundle).map_err(|e| {
+            pyo3::exceptions::PyIOError::new_err(format!(
+                "create sink in {}: {e}",
+                out_dir_path.display()
+            ))
+        })?;
+
+        let t_stream = Instant::now();
+        let stats = py.allow_threads(|| mesh_ifc_streaming(buf, &mut sink));
+        let stream_ms = t_stream.elapsed().as_secs_f64() * 1000.0;
+
+        let (instances_written, reps_written) = sink.finish().map_err(|e| {
+            pyo3::exceptions::PyIOError::new_err(format!(
+                "finish substrate write in {}: {e}",
+                out_dir_path.display()
+            ))
+        })?;
+
+        let view_path = out_dir_path.join("view.sql");
+        std::fs::write(&view_path, VIEW_SQL).map_err(|e| {
+            pyo3::exceptions::PyIOError::new_err(format!(
+                "write {}: {e}",
+                view_path.display()
+            ))
+        })?;
+
+        let rep_path = out_dir_path.join("representations.parquet");
+        let inst_path = out_dir_path.join("instances.parquet");
+        let rep_bytes = std::fs::metadata(&rep_path).map(|m| m.len()).unwrap_or(0);
+        let inst_bytes = std::fs::metadata(&inst_path).map(|m| m.len()).unwrap_or(0);
+
+        let out = PyDict::new_bound(py);
+        out.set_item("bundle_dir", out_dir_path.to_string_lossy().to_string())?;
+        out.set_item("instances_parquet", inst_path.to_string_lossy().to_string())?;
+        out.set_item("representations_parquet", rep_path.to_string_lossy().to_string())?;
+        out.set_item("view_sql", view_path.to_string_lossy().to_string())?;
+        out.set_item("products_indexed", sem.products_indexed as u64)?;
+        out.set_item("pset_rows", sem.pset_rows as u64)?;
+        out.set_item("material_rows", sem.material_rows as u64)?;
+        out.set_item("quantity_rows", sem.quantity_rows as u64)?;
+        out.set_item("classification_rows", sem.classification_rows as u64)?;
+        out.set_item("products_seen", stats.products_seen as u64)?;
+        out.set_item("products_meshed", stats.products_meshed as u64)?;
+        out.set_item("products_deferred", stats.products_deferred as u64)?;
+        out.set_item("triangles", stats.triangles as u64)?;
+        out.set_item("instances_written", instances_written as u64)?;
+        out.set_item("unique_reps_written", reps_written as u64)?;
+        out.set_item("instances_parquet_bytes", inst_bytes)?;
+        out.set_item("representations_parquet_bytes", rep_bytes)?;
+        out.set_item("open_ms", open_ms)?;
+        out.set_item("bundle_ms", bundle_ms)?;
+        out.set_item("entity_table_build_ms", stats.entity_table_build_ms)?;
+        out.set_item("stream_ms", stream_ms)?;
+        Ok(out)
+    }
+
     // ----- clash --------------------------------------------------------
 
     #[cfg(feature = "clash")]
@@ -2019,6 +2231,8 @@ mod python {
         m.add_function(wrap_pyfunction!(extract_meshes, m)?)?;
         #[cfg(feature = "mesh")]
         m.add_function(wrap_pyfunction!(write_gltf, m)?)?;
+        #[cfg(feature = "bundle")]
+        m.add_function(wrap_pyfunction!(bundle, m)?)?;
         #[cfg(feature = "clash")]
         m.add_function(wrap_pyfunction!(clash, m)?)?;
         m.add("__version__", env!("CARGO_PKG_VERSION"))?;

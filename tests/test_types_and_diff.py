@@ -67,3 +67,24 @@ def test_diff_shape_is_json_friendly(tmp_path, monkeypatch):
     m = ifcfast.open(ifcfast.example_path(), use_cache=False, write_cache=False)
     d = m.diff(m)
     json.dumps(d, default=str)
+
+
+def test_diff_nan_equal_nan(tmp_path, monkeypatch):
+    """Self-diff must report zero changes even when watched fields are
+    NaN on both sides (GH #40).
+
+    Before the fix, `lv != rv` evaluated `nan != nan` → True, so every
+    product with a missing `predefined_type` / `storey_name` /
+    `storey_guid` (typical on IfcCurtainWall, openings, etc.) showed up
+    as "changed" against itself.
+    """
+    from ifcfast.model import _values_equal
+
+    nan = float("nan")
+    assert _values_equal(nan, nan) is True
+    assert _values_equal(None, None) is True
+    assert _values_equal("Wall", "Wall") is True
+    assert _values_equal(nan, "Wall") is False
+    assert _values_equal("Wall", nan) is False
+    assert _values_equal(None, "Wall") is False
+    assert _values_equal("a", "b") is False

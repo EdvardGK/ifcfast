@@ -420,11 +420,24 @@ class Model:
         """
         return self._ensure_data().drift
 
-    def mesh_qto(self):
+    def mesh_qto(self, *, cut_openings: bool = True):
         """Per-product geometric QTO — volume, area, orientation-bucketed
         area, and the full set of distinct planar surfaces, computed in
         one O(triangles) pass over the mesh. Output is always in
         m² / m³ regardless of the source file's linear unit.
+
+        Args:
+            cut_openings: when ``True`` (default), windows / doors /
+                penetrations are subtracted from their host element
+                before QTO computation, so ``volume_m3`` matches the
+                net cut volume an authored ``Qto_*Volume`` would
+                report. When ``False``, the uncut mesh is used and
+                ``volume_m3`` is gross — over-reported on any element
+                with an opening. Default changed from ``False`` to
+                ``True`` in v0.4.28 (GH #37) — the uncut numbers were
+                wrong by 70–262% on opened walls/slabs in real models,
+                and authored geometry is net. Requires the ``csg``
+                feature (shipped by default since v0.4.25).
 
         Returns a tuple ``(products_df, surfaces_df)``:
 
@@ -452,7 +465,10 @@ class Model:
         from . import _core  # local import keeps top-level fast
         import pandas as pd
 
-        d = _core.mesh_qto(str(native_path_for(self.header.path)))
+        d = _core.mesh_qto(
+            str(native_path_for(self.header.path)),
+            bool(cut_openings),
+        )
         products_df = pd.DataFrame({
             "guid": d["guid"],
             "entity": d["entity"],
@@ -1447,7 +1463,7 @@ class Model:
             field_changes: dict[str, list] = {}
             for f in watched_fields:
                 lv, rv = l.get(f), r.get(f)
-                if lv != rv:
+                if not _values_equal(lv, rv):
                     field_changes[f] = [lv, rv]
             if field_changes:
                 changed.append({
@@ -2123,6 +2139,26 @@ def _data_layer_meta(data_layers, name: str) -> dict:
         "columns": list(df.columns),
         "loaded": True,
     }
+
+
+def _values_equal(a, b) -> bool:
+    """Field equality for `Model.diff`. Treats NaN==NaN and None==None
+    as equal so a model diffed against itself reports zero changes
+    (GH #40). Plain `==` falls back to Python semantics where NaN is
+    famously not equal to itself — diff() rows arrive from pandas
+    DataFrames, so missing string fields routinely materialise as
+    `nan` (`pd.NA` / `float('nan')` depending on dtype) on both sides
+    of a self-diff.
+    """
+    if a is b:
+        return True
+    a_nan = isinstance(a, float) and a != a
+    b_nan = isinstance(b, float) and b != b
+    if a_nan and b_nan:
+        return True
+    if a_nan or b_nan:
+        return False
+    return a == b
 
 
 def _index_products_by_guid(m) -> dict[str, dict]:

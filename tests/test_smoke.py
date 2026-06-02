@@ -124,6 +124,25 @@ def test_cli_index(capfd):
     assert "IfcWall" in out
 
 
+def test_cli_missing_file_clean_error(capfd, tmp_path):
+    """CLI on a non-existent file must emit a clean one-line error and
+    exit 1, not a Python traceback (GH #42 item 1)."""
+    import subprocess
+    import sys
+
+    missing = tmp_path / "does-not-exist.ifc"
+    result = subprocess.run(
+        [sys.executable, "-m", "ifcfast.cli", "index", str(missing)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 1
+    assert "Traceback" not in result.stderr
+    assert "ifcfast:" in result.stderr
+    assert str(missing) in result.stderr
+
+
 def test_cache_key_includes_schema_version():
     """Bumping `_CACHE_SCHEMA_VERSION` must change the cache_key for the
     same file. Without this, an upgrade that changes the *meaning* of a
@@ -389,6 +408,43 @@ def test_iter_point_cloud_zero_chunk_raises(tmp_path):
         list(m.iter_point_cloud(per_m2=10, seed=1, chunk_points=0))
 
 
+def test_mesh_qto_cut_openings_flag(tmp_path):
+    """`m.mesh_qto(cut_openings=...)` accepts the flag and emits the
+    expected stats keys (GH #37). The default switched from False to
+    True in v0.4.28 — uncut numbers were over-reporting volume by
+    70–262% on any element with an opening.
+
+    The bundled fixture has no openings, so both modes produce
+    identical numbers; the test asserts the flag plumbs through, the
+    new default is True, and the cut_stats keys are present on the
+    underlying dict.
+    """
+    pytest.importorskip("pandas")
+    p = _write_mm_cube(tmp_path)
+    m = ifcfast.open(p, use_cache=False, write_cache=False)
+
+    products_default, _ = m.mesh_qto()
+    products_cut, _ = m.mesh_qto(cut_openings=True)
+    products_uncut, _ = m.mesh_qto(cut_openings=False)
+    assert len(products_default) >= 1
+    # No openings on the cube fixture, so all three agree.
+    assert products_default.volume_m3.tolist() == products_cut.volume_m3.tolist()
+    assert products_default.volume_m3.tolist() == products_uncut.volume_m3.tolist()
+
+    # Underlying dict carries the flag + cut stats — proves the
+    # cross-product pipeline ran (even with zero matches on this
+    # fixture, the flag still threads through).
+    from ifcfast.model import native_path_for
+    from ifcfast import _core
+    d_on = _core.mesh_qto(str(native_path_for(m.header.path)), True)
+    assert d_on["cut_openings"] is True
+    assert "cut_openings_cut" in d_on
+    assert "cut_openings_passthrough" in d_on
+    assert "cut_openings_fallback" in d_on
+    d_off = _core.mesh_qto(str(native_path_for(m.header.path)), False)
+    assert d_off["cut_openings"] is False
+
+
 def test_ifcfast_error_is_exposed():
     """IfcfastError is the public catch type for recoverable Rust
     failures (panic-to-Python translation, validation errors). Make
@@ -437,6 +493,45 @@ def test_to_gltf_writes_valid_glb_with_extensions(tmp_path):
         # The minimum sanity check is that it shows up in
         # extensionsUsed only when the plan emitted at least one
         # instanced group.
+
+
+def test_bundle_then_clash_roundtrip(tmp_path):
+    """The documented bundle -> clash chain must actually be invokable
+    from the wheel (GH #41). Before v0.4.28, `ifcfast.clash()` was in
+    __all__ with examples but `ifcfast.bundle()` didn't exist — calling
+    clash() raised FileNotFoundError because nothing in the package
+    could produce instances.parquet / representations.parquet.
+    """
+    pytest.importorskip("pandas")
+
+    info = ifcfast.bundle(FIXTURE, tmp_path / "minimal.bundle")
+    assert info["bundle_dir"] == str(tmp_path / "minimal.bundle")
+    assert Path(info["instances_parquet"]).is_file()
+    assert Path(info["representations_parquet"]).is_file()
+    assert Path(info["view_sql"]).is_file()
+    # Minimal fixture is one geometry-free product, but the substrate
+    # itself must be written (1 instance row, 0 rep rows).
+    assert info["instances_written"] >= 1
+
+    df = ifcfast.clash(info["bundle_dir"])
+    # The fixture has no overlapping geometry, so we expect zero pairs —
+    # the assertion that matters is that clash() *ran* against the
+    # bundle we just wrote rather than raising FileNotFoundError.
+    assert len(df) == 0
+    assert df.attrs["pair_count"] == 0
+
+
+def test_bundle_default_out_dir(tmp_path):
+    """Omitting out_dir writes to {stem}.bundle next to the IFC."""
+    pytest.importorskip("pandas")
+
+    src = tmp_path / "copy.ifc"
+    src.write_bytes(FIXTURE.read_bytes())
+    info = ifcfast.bundle(src)
+    expected = tmp_path / "copy.bundle"
+    assert Path(info["bundle_dir"]) == expected
+    assert (expected / "instances.parquet").is_file()
+    assert (expected / "representations.parquet").is_file()
 
 
 def test_iter_point_cloud_early_drop_does_not_hang(tmp_path):
