@@ -90,6 +90,9 @@ pub struct QuantityEntry {
     pub value: Option<String>,
     pub quantity_type: Arc<str>,
     pub unit_step_id: Option<u64>,
+    /// `"instance"` or `"type"`, mirroring `PsetValue.source`. See
+    /// `extractors::quantities` for the inheritance contract.
+    pub source: Arc<str>,
 }
 
 /// One classification reference on a product. Every field is low-
@@ -432,8 +435,10 @@ impl Bundle {
             .zip(qty_table.quantity_name)
             .zip(qty_table.value)
             .zip(qty_table.quantity_type)
-            .zip(qty_table.unit_step_id);
-        for (((((guid, qto_name), quantity_name), value), quantity_type), unit_step_id) in qty_iter
+            .zip(qty_table.unit_step_id)
+            .zip(qty_table.source);
+        for ((((((guid, qto_name), quantity_name), value), quantity_type), unit_step_id), source) in
+            qty_iter
         {
             quantities_by_guid
                 .entry(guid)
@@ -444,6 +449,7 @@ impl Bundle {
                     value,
                     quantity_type: intern(&mut str_cache, quantity_type),
                     unit_step_id,
+                    source: intern(&mut str_cache, source),
                 });
         }
 

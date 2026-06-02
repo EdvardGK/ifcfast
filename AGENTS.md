@@ -148,10 +148,10 @@ describing via `pq.read_schema(...)`):
   `"degenerate"`).
 - Semantic payload: `materials`, `psets`, `quantities`,
   `classifications` (list-of-struct columns — `UNNEST` in DuckDB).
-  Each `psets` struct carries `source` (`"instance"` or `"type"`) so
-  consumers can distinguish a property declared directly on the
-  product from one inherited via `IfcRelDefinesByType` (since
-  v0.4.29, cache schema v7 — see Conventions).
+  Each `psets` and `quantities` struct carries `source`
+  (`"instance"` or `"type"`) so consumers can distinguish a value
+  declared directly on the product from one inherited via
+  `IfcRelDefinesByType` (since v0.4.29 — see Conventions).
 - Per-face stream: `surfaces` (one entry per distinct planar face).
 
 **Why the fingerprint columns matter for agents:** they let you
@@ -278,6 +278,18 @@ the project's unit scale as parquet schema metadata
   `Unit` refs still win (no fallback fires when the slot is set).
   Resolution is `IfcSIUnit`-only; `IfcConversionBasedUnit` /
   `IfcDerivedUnit` resolution is a separate feature (GH #43).
+- **`m.quantities` inherits type-attached quantities by default**
+  (since v0.4.29, cache schema v10). Mirrors the `m.psets` story
+  (`IfcTypeObject.HasPropertySets` accepts ANY
+  `IfcPropertySetDefinition` — `IfcElementQuantity` is one such
+  subtype). Type-attached quantities surface on every related
+  instance tagged `source = "type"`; instance-declared quantities
+  carry `source = "instance"` and shadow same-named type quantities
+  on `(qto_name, quantity_name)` collision. Unit fallback from the
+  v0.4.29 #43 fix runs on inherited rows too, so the
+  `unit_step_id` column is usable even when the type-side quantity
+  omits the explicit Unit slot. Filter `m.quantities[m.quantities.source == "instance"]`
+  for pre-v0.4.29-shape behaviour (GH #45).
 - **`m.psets` marks unrecognised property classes instead of
   dropping them** (since v0.4.29, cache schema v9). Any
   `IfcSimpleProperty` subclass ifcfast doesn't have a per-class

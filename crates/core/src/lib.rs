@@ -307,6 +307,7 @@ mod python {
         out.set_item("value", PyList::new_bound(py, &qto.value))?;
         out.set_item("quantity_type", PyList::new_bound(py, &qto.quantity_type))?;
         out.set_item("unit_step_id", PyList::new_bound(py, &qto.unit_step_id))?;
+        out.set_item("source", PyList::new_bound(py, &qto.source))?;
         out.set_item("open_ms", open_ms)?;
         out.set_item("entity_table_ms", table_ms)?;
         out.set_item("guid_index_ms", guid_ms)?;
@@ -450,6 +451,7 @@ mod python {
             d.set_item("value", PyList::new_bound(py, &quantities.value))?;
             d.set_item("quantity_type", PyList::new_bound(py, &quantities.quantity_type))?;
             d.set_item("unit_step_id", PyList::new_bound(py, &quantities.unit_step_id))?;
+            d.set_item("source", PyList::new_bound(py, &quantities.source))?;
             out.set_item("quantities", d)?;
         }
         {

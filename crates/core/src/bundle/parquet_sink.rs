@@ -334,6 +334,10 @@ fn build_instance_schema() -> Schema {
         Field::new("value", DataType::Utf8, true),
         Field::new("quantity_type", DataType::Utf8, false),
         Field::new("unit_step_id", DataType::UInt64, true),
+        // Provenance: "instance" or "type", same convention as the
+        // `psets` nested struct. See GH #45 and
+        // `extractors::quantities::QuantityTable::source`.
+        Field::new("source", DataType::Utf8, false),
     ]);
     let classification_fields = Fields::from(vec![
         Field::new("system_name", DataType::Utf8, true),
@@ -668,6 +672,7 @@ fn build_instance_batch(
                     Some(v) => u.append_value(v),
                     None => u.append_null(),
                 }
+                q.field_builder::<StringBuilder>(5).unwrap().append_value(&entry.source);
                 q.append(true);
             }
             quantities.append(true);

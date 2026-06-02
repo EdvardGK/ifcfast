@@ -197,7 +197,18 @@ _HASH_TAIL_BYTES = 4 * 1024 * 1024
 #       `value_type = "unhandled:IFCXXX"` so the blind spot is
 #       visible. Filter `m.psets[m.psets.value_type.fillna("").str.startswith("unhandled:")]`
 #       to enumerate gaps.
-_CACHE_SCHEMA_VERSION = 9
+#  10 — v0.4.29: quantities.parquet gains `source` column (Utf8,
+#       non-null) and inherits type-attached IfcElementQuantity rows
+#       (GH #45). Same convention as the pset side (GH #36):
+#       `source = "instance"` for IfcRelDefinesByProperties,
+#       `source = "type"` for IfcRelDefinesByType →
+#       RelatingType.HasPropertySets quantities, instance shadows
+#       same-named type quantities on `(qto_name, quantity_name)`
+#       collision. Type-attached quantities are common in
+#       component-library exports (one IfcElementQuantity stamped on
+#       the type, fanned out across N occurrences). Old caches miss
+#       these entirely.
+_CACHE_SCHEMA_VERSION = 10
 
 _FIELD_RE = re.compile(r"\(\s*(.*?)\s*\)\s*;", re.DOTALL)
 

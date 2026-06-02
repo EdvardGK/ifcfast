@@ -9,7 +9,7 @@
 //! a wall, with openings subtracted on the latter).
 //!
 //! Long-format output:
-//!     (guid, qto_name, quantity_name, value, quantity_type, unit)
+//!     (guid, qto_name, quantity_name, value, quantity_type, unit, source)
 //!
 //! Where:
 //!   `qto_name`       = e.g. "Qto_WallBaseQuantities"
@@ -19,6 +19,14 @@
 //!                      "Weight" | "Time"
 //!   `unit`           = step_id of the IfcUnit (often null; the project's
 //!                      default unit assignment applies)
+//!   `source`         = "instance" (declared directly on the product via
+//!                      IfcRelDefinesByProperties) or "type" (inherited
+//!                      from IfcRelDefinesByType → RelatingType's
+//!                      HasPropertySets). Mirrors `psets.source`. The
+//!                      schema's HasPropertySets slot accepts ANY
+//!                      IfcPropertySetDefinition — IfcElementQuantity
+//!                      is one such subtype — so types can carry
+//!                      authored quantities exactly like psets.
 
 use std::collections::HashMap;
 
@@ -33,6 +41,7 @@ pub struct QuantityTable {
     pub value: Vec<Option<String>>,
     pub quantity_type: Vec<String>,
     pub unit_step_id: Vec<Option<u64>>,
+    pub source: Vec<String>,
 }
 
 impl QuantityTable {
@@ -71,6 +80,21 @@ pub fn build(
     // (e.g. `LENGTHUNIT`, `AREAUNIT`). Matched against the
     // `quantity_kind → unit_type` table below.
     let mut si_unit_by_type: HashMap<String, u64> = HashMap::with_capacity(16);
+    // Type inheritance (GH #45) — mirror of the GH #36 path in
+    // extractors/psets.rs. Types can carry quantities the same way
+    // they carry psets because `IfcTypeObject.HasPropertySets` is
+    // typed `SET OF IfcPropertySetDefinition` and IfcElementQuantity
+    // IS-A IfcPropertySetDefinition. Captured here so type-attached
+    // quantities surface on every instance bound via
+    // IfcRelDefinesByType.
+    let mut product_to_type: HashMap<u64, u64> = HashMap::with_capacity(16_384);
+    // (type_step_id → [qto_step_id]). We re-use the same arg-5 read
+    // psets.rs does (HasPropertySets is at attribute 6 / index 5 on
+    // IfcTypeObject and every subtype); the `qtos` map captures
+    // step ids regardless of which `IfcPropertySetDefinition` subtype
+    // a ref points at, so pset refs that slip in here just don't
+    // resolve in pass 2 and get skipped silently.
+    let mut type_qtos: HashMap<u64, Vec<u64>> = HashMap::with_capacity(256);
 
     for (step_id, type_name, args) in table.iter() {
         if type_name.eq_ignore_ascii_case(b"IFCELEMENTQUANTITY") {
@@ -106,6 +130,36 @@ pub fn build(
             };
             for obj_id in relateds {
                 rel_pairs.push((obj_id, rel_obj));
+            }
+        } else if type_name.eq_ignore_ascii_case(b"IFCRELDEFINESBYTYPE") {
+            // (GlobalId, OwnerHistory, Name, Description,
+            //  RelatedObjects, RelatingType). Same shape as the
+            // properties variant — fan out N products per relation.
+            let fields = split_top_level_args(args);
+            let type_id = match fields.get(5).copied().map(parse_field) {
+                Some(Field::Ref(id)) => id,
+                _ => continue,
+            };
+            let relateds = match fields.get(4).copied().map(parse_field) {
+                Some(Field::List(body)) => parse_ref_list(body),
+                Some(Field::Ref(id)) => vec![id],
+                _ => continue,
+            };
+            for obj_id in relateds {
+                product_to_type.insert(obj_id, type_id);
+            }
+        } else if is_type_object(type_name) {
+            // IfcTypeObject + every IfcXxxType subclass. Attribute 6
+            // (index 5) is HasPropertySets on IfcTypeObject and every
+            // subtype — same positional read psets.rs uses. The list
+            // may contain IfcPropertySet refs (pset side, handled by
+            // extractors/psets.rs) AND IfcElementQuantity refs (qto
+            // side, handled here). We capture every ref; pass 2's
+            // `qtos.get(qto_id)` filters to the ones that resolve.
+            let fields = split_top_level_args(args);
+            let candidate_ids = ref_list_at(&fields, 5);
+            if !candidate_ids.is_empty() {
+                type_qtos.insert(step_id, candidate_ids);
             }
         } else if type_name.eq_ignore_ascii_case(b"IFCUNITASSIGNMENT") {
             // (Units : SET [1:?] OF IfcUnit). One arg, a list of refs.
@@ -151,40 +205,164 @@ pub fn build(
     }
 
     let mut out = QuantityTable::default();
-    for (obj_step_id, rel_obj_id) in rel_pairs {
+
+    // (guid → set of "qto_name\tquantity_name" keys already emitted
+    // from the instance side). Used to suppress same-named type
+    // quantities on collision so instance values win, matching the
+    // ifcopenshell `should_inherit=True` semantics replicated in
+    // extractors/psets.rs (GH #36 / #45).
+    let mut seen_per_product: HashMap<&str, std::collections::HashSet<String>> =
+        HashMap::with_capacity(product_step_to_guid.len());
+
+    // Instance pass.
+    for (obj_step_id, rel_obj_id) in &rel_pairs {
         // Only act on rels that point at IfcElementQuantity (the same
         // rel type also points at IfcPropertySet — we filter via the
         // qtos table).
-        let (qto_name, qty_ids) = match qtos.get(&rel_obj_id) {
+        let (qto_name, qty_ids) = match qtos.get(rel_obj_id) {
             Some(x) => x,
             None => continue,
         };
-        let guid = match product_step_to_guid.get(&obj_step_id) {
-            Some(g) => g,
+        let guid = match product_step_to_guid.get(obj_step_id) {
+            Some(g) => g.as_str(),
             None => continue,
         };
         for qid in qty_ids {
-            let q = match quantities.get(qid) {
-                Some(q) => q,
+            if let Some(name) = emit_quantity(
+                qid,
+                guid,
+                qto_name,
+                "instance",
+                &quantities,
+                &project_default_unit,
+                &mut out,
+            ) {
+                seen_per_product
+                    .entry(guid)
+                    .or_default()
+                    .insert(format!("{qto_name}\t{name}"));
+            }
+        }
+    }
+
+    // Type-inheritance pass. Quantity inheritance is silent unless
+    // BOTH there's a product↔type relation AND at least one type
+    // carries quantity refs.
+    if !type_qtos.is_empty() && !product_to_type.is_empty() {
+        for (product_step_id, type_step_id) in &product_to_type {
+            let guid = match product_step_to_guid.get(product_step_id) {
+                Some(g) => g.as_str(),
                 None => continue,
             };
-            // Fall back to the project default for this quantity kind
-            // when the explicit per-quantity Unit slot is null. Count
-            // is dimensionless and has no fallback target.
-            let unit = q.unit_step_id.or_else(|| {
-                unit_type_for_quantity_kind(q.kind)
-                    .and_then(|ut| project_default_unit.get(ut).copied())
-            });
-            out.guid.push(guid.clone());
-            out.qto_name.push(qto_name.clone());
-            out.quantity_name.push(q.name.clone());
-            out.value.push(q.value.clone());
-            out.quantity_type.push(q.kind.to_string());
-            out.unit_step_id.push(unit);
+            let candidate_qto_ids = match type_qtos.get(type_step_id) {
+                Some(v) => v,
+                None => continue,
+            };
+            let empty = std::collections::HashSet::new();
+            let already_seen = seen_per_product.get(guid).unwrap_or(&empty);
+            for qto_id in candidate_qto_ids {
+                // Same filter as the instance side: a qto_id from
+                // HasPropertySets that doesn't resolve in `qtos` is
+                // an IfcPropertySet ref, handled by extractors/psets.rs.
+                let (qto_name, qty_ids) = match qtos.get(qto_id) {
+                    Some(x) => x,
+                    None => continue,
+                };
+                for qid in qty_ids {
+                    emit_quantity_dedup(
+                        qid,
+                        guid,
+                        qto_name,
+                        "type",
+                        &quantities,
+                        &project_default_unit,
+                        &mut out,
+                        already_seen,
+                    );
+                }
+            }
         }
     }
 
     out
+}
+
+/// Append one quantity row to `out`. Returns the resolved quantity
+/// name (the dedup-set key, sans qto_name prefix) when the row is
+/// actually written so the caller can stamp `seen_per_product` for the
+/// type-inheritance pass.
+fn emit_quantity(
+    qid: &u64,
+    guid: &str,
+    qto_name: &str,
+    source: &str,
+    quantities: &HashMap<u64, Quantity>,
+    project_default_unit: &HashMap<&'static str, u64>,
+    out: &mut QuantityTable,
+) -> Option<String> {
+    let q = quantities.get(qid)?;
+    let unit = q.unit_step_id.or_else(|| {
+        unit_type_for_quantity_kind(q.kind)
+            .and_then(|ut| project_default_unit.get(ut).copied())
+    });
+    out.guid.push(guid.to_string());
+    out.qto_name.push(qto_name.to_string());
+    out.quantity_name.push(q.name.clone());
+    out.value.push(q.value.clone());
+    out.quantity_type.push(q.kind.to_string());
+    out.unit_step_id.push(unit);
+    out.source.push(source.to_string());
+    Some(q.name.clone())
+}
+
+/// Dedup-aware variant. Skips emit when the instance side already
+/// surfaced a row at `(qto_name, q.name)`. Same shape contract as the
+/// pset-side `emit_property_dedup` — instance wins on collision.
+#[allow(clippy::too_many_arguments)]
+fn emit_quantity_dedup(
+    qid: &u64,
+    guid: &str,
+    qto_name: &str,
+    source: &str,
+    quantities: &HashMap<u64, Quantity>,
+    project_default_unit: &HashMap<&'static str, u64>,
+    out: &mut QuantityTable,
+    already_seen: &std::collections::HashSet<String>,
+) {
+    let q = match quantities.get(qid) {
+        Some(q) => q,
+        None => return,
+    };
+    let key = format!("{qto_name}\t{}", q.name);
+    if already_seen.contains(&key) {
+        return;
+    }
+    let unit = q.unit_step_id.or_else(|| {
+        unit_type_for_quantity_kind(q.kind)
+            .and_then(|ut| project_default_unit.get(ut).copied())
+    });
+    out.guid.push(guid.to_string());
+    out.qto_name.push(qto_name.to_string());
+    out.quantity_name.push(q.name.clone());
+    out.value.push(q.value.clone());
+    out.quantity_type.push(q.kind.to_string());
+    out.unit_step_id.push(unit);
+    out.source.push(source.to_string());
+}
+
+/// Detect an IfcTypeObject / IfcXxxType subclass by entity-name
+/// suffix. Mirrors the identical rule in `extractors/psets.rs` and
+/// `indexer::index` so the three loops agree on what counts as a
+/// type. The IFC2x3 collapsed `IfcDoorStyle` / `IfcWindowStyle`
+/// classes don't follow the `*Type` suffix but ARE valid
+/// `IfcRelDefinesByType.RelatingType` targets on 2x3 files.
+fn is_type_object(t: &[u8]) -> bool {
+    let suffix_ok = t.len() > 7
+        && t[..3].eq_ignore_ascii_case(b"IFC")
+        && t[t.len() - 4..].eq_ignore_ascii_case(b"TYPE");
+    let ifc2x3_style = t.eq_ignore_ascii_case(b"IFCDOORSTYLE")
+        || t.eq_ignore_ascii_case(b"IFCWINDOWSTYLE");
+    suffix_ok || ifc2x3_style
 }
 
 struct Quantity {
@@ -565,6 +743,133 @@ END-ISO-10303-21;
         let t = run(&buf);
         assert_eq!(t.len(), 1);
         assert_eq!(t.unit_step_id[0], None);
+    }
+
+    #[test]
+    fn instance_quantity_rows_are_marked_source_instance() {
+        // Baseline: existing-path rows now carry source="instance".
+        let buf = make_buf(
+            r#"
+#20=IFCQUANTITYAREA('NetArea',$,$,12.5);
+#21=IFCELEMENTQUANTITY('2Qto000000000000000001',$,'Qto_X',$,$,(#20));
+#22=IFCRELDEFINESBYPROPERTIES('3Rel000000000000000001',$,$,$,(#10),#21);
+"#,
+        );
+        let t = run(&buf);
+        assert_eq!(t.len(), 1);
+        assert_eq!(t.source[0], "instance");
+    }
+
+    #[test]
+    fn type_attached_quantity_surfaces_on_instance_with_source_type() {
+        // GH #45 — quantity-side equivalent of GH #36. IfcElementQuantity
+        // sitting in IfcTypeObject.HasPropertySets must inherit to every
+        // related instance, tagged source="type". Real-world payload:
+        // component-library exports stamp Qto_xxxBaseQuantities on the
+        // type so all 200 occurrences share one numeric record.
+        let buf = make_buf(
+            r#"
+#30=IFCQUANTITYWEIGHT('GrossWeight',$,$,42.5);
+#31=IFCELEMENTQUANTITY('4Qto0000000000000001',$,'Qto_TypeBase',$,$,(#30));
+#32=IFCWALLTYPE('5Type0000000000000001',$,'200mm Concrete',$,$,(#31),$,$,$,.STANDARD.);
+#33=IFCRELDEFINESBYTYPE('6RelType000000000000001',$,$,$,(#10),#32);
+"#,
+        );
+        let t = run(&buf);
+        assert_eq!(t.len(), 1, "expected one inherited quantity, got {}", t.len());
+        assert_eq!(t.guid[0], "1Wall00000000000000001");
+        assert_eq!(t.qto_name[0], "Qto_TypeBase");
+        assert_eq!(t.quantity_name[0], "GrossWeight");
+        assert_eq!(t.value[0].as_deref(), Some("42.5"));
+        assert_eq!(t.source[0], "type");
+    }
+
+    #[test]
+    fn instance_quantity_shadows_same_named_type_quantity() {
+        // Same dedup contract as psets — instance wins on collision.
+        // The (qto_name, quantity_name) tuple is the dedup key.
+        let buf = make_buf(
+            r#"
+#20=IFCQUANTITYAREA('NetArea',$,$,12.5);
+#21=IFCELEMENTQUANTITY('2Qto000000000000000001',$,'Qto_WallBaseQuantities',$,$,(#20));
+#22=IFCRELDEFINESBYPROPERTIES('3Rel000000000000000001',$,$,$,(#10),#21);
+#30=IFCQUANTITYAREA('NetArea',$,$,9.9);
+#31=IFCELEMENTQUANTITY('4Qto0000000000000001',$,'Qto_WallBaseQuantities',$,$,(#30));
+#32=IFCWALLTYPE('5Type0000000000000001',$,'Concrete',$,$,(#31),$,$,$,.STANDARD.);
+#33=IFCRELDEFINESBYTYPE('6RelType000000000000001',$,$,$,(#10),#32);
+"#,
+        );
+        let t = run(&buf);
+        assert_eq!(t.len(), 1);
+        assert_eq!(t.value[0].as_deref(), Some("12.5"));
+        assert_eq!(t.source[0], "instance");
+    }
+
+    #[test]
+    fn type_qto_inherits_to_all_related_instances_with_unit_fallback() {
+        // Combined inheritance + unit fallback. Type carries the qto,
+        // qto's quantities leave Unit as `$`, and the project's
+        // IfcUnitAssignment supplies the SIUnit. Each inherited row
+        // should still benefit from the GH #43 fallback so consumers
+        // see usable unit_step_id values on a type-only qto.
+        let buf = format!(
+            r#"ISO-10303-21;
+HEADER;
+FILE_DESCRIPTION(('ViewDefinition [ReferenceView]'),'2;1');
+FILE_NAME('qto_test.ifc','2026-06-02T00:00:00',('test'),('test'),'ifcfast','ifcfast','');
+FILE_SCHEMA(('IFC4'));
+ENDSEC;
+DATA;
+#1=IFCPROJECT('0Test000000000000000001',$,'p',$,$,$,$,(#5),#2);
+#2=IFCUNITASSIGNMENT((#3,#90));
+#3=IFCSIUNIT(*,.LENGTHUNIT.,.MILLI.,.METRE.);
+#90=IFCSIUNIT(*,.MASSUNIT.,.KILO.,.GRAM.);
+#5=IFCGEOMETRICREPRESENTATIONCONTEXT($,'Model',3,1.0E-5,#6,$);
+#6=IFCAXIS2PLACEMENT3D(#7,$,$);
+#7=IFCCARTESIANPOINT((0.,0.,0.));
+#10=IFCWALL('1Wall00000000000000001',$,'W1',$,$,$,$,'t1',.STANDARD.);
+#11=IFCWALL('1Wall00000000000000002',$,'W2',$,$,$,$,'t2',.STANDARD.);
+#30=IFCQUANTITYWEIGHT('GrossWeight',$,$,42.5);
+#31=IFCELEMENTQUANTITY('4Qto0000000000000001',$,'Qto_TypeBase',$,$,(#30));
+#32=IFCWALLTYPE('5Type0000000000000001',$,'Concrete',$,$,(#31),$,$,$,.STANDARD.);
+#33=IFCRELDEFINESBYTYPE('6RelType000000000000001',$,$,$,(#10,#11),#32);
+ENDSEC;
+END-ISO-10303-21;
+"#
+        );
+        let t = run(&buf);
+        assert_eq!(t.len(), 2);
+        let guids: std::collections::HashSet<&str> =
+            t.guid.iter().map(String::as_str).collect();
+        assert!(guids.contains("1Wall00000000000000001"));
+        assert!(guids.contains("1Wall00000000000000002"));
+        for i in 0..t.len() {
+            assert_eq!(t.source[i], "type");
+            assert_eq!(t.quantity_type[i], "Weight");
+            // GH #43 fallback firing on an inherited row — the
+            // project's MASSUNIT step_id surfaces here.
+            assert_eq!(t.unit_step_id[i], Some(90));
+        }
+    }
+
+    #[test]
+    fn type_object_with_only_pset_refs_emits_no_quantity_rows() {
+        // IfcTypeObject.HasPropertySets accepts both IfcPropertySet
+        // AND IfcElementQuantity refs. When a type only carries
+        // psets (the common case — Pset_ManufacturerTypeInformation
+        // etc.), the quantity extractor must NOT invent rows.
+        // Verified by setting up a type whose HasPropertySets points
+        // ONLY at an IfcPropertySet, no IfcElementQuantity.
+        let buf = make_buf(
+            r#"
+#30=IFCPROPERTYSINGLEVALUE('Manufacturer',$,IFCLABEL('Wurth'),$);
+#31=IFCPROPERTYSET('4PsetType00000000000001',$,'Pset_Manuf',$,(#30));
+#32=IFCWALLTYPE('5Type0000000000000001',$,'X',$,$,(#31),$,$,$,.STANDARD.);
+#33=IFCRELDEFINESBYTYPE('6RelType000000000000001',$,$,$,(#10),#32);
+"#,
+        );
+        let t = run(&buf);
+        assert_eq!(t.len(), 0);
     }
 
     #[test]
