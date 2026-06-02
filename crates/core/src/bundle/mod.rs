@@ -58,6 +58,11 @@ pub struct PsetValue {
     pub name: Arc<str>,
     pub value: Option<String>,
     pub value_type: Option<Arc<str>>,
+    /// `"instance"` if declared directly on the product via
+    /// `IfcRelDefinesByProperties`, `"type"` if inherited from the
+    /// product's `IfcTypeObject`. Interned because the cardinality is
+    /// 2 (the static strings live as `Arc<str>` clones in the cache).
+    pub source: Arc<str>,
 }
 
 /// One material layer or material assignment on a product. `name` and
@@ -384,13 +389,15 @@ impl Bundle {
             .zip(psets_table.pset_name)
             .zip(psets_table.prop_name)
             .zip(psets_table.value)
-            .zip(psets_table.value_type);
-        for ((((guid, set_name), prop_name), value), value_type) in pset_iter {
+            .zip(psets_table.value_type)
+            .zip(psets_table.source);
+        for (((((guid, set_name), prop_name), value), value_type), source) in pset_iter {
             psets_by_guid.entry(guid).or_default().push(PsetValue {
                 set_name: intern(&mut str_cache, set_name),
                 name: intern(&mut str_cache, prop_name),
                 value,
                 value_type: intern_opt(&mut str_cache, value_type),
+                source: intern(&mut str_cache, source),
             });
         }
 

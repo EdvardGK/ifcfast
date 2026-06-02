@@ -169,7 +169,15 @@ _HASH_TAIL_BYTES = 4 * 1024 * 1024
 #       `max_extent_m`. Values are scaled through the file's
 #       `unit_scale` before write, so the drift table joins to
 #       `m.mesh_qto()` without any rescaling on the consumer side.
-_CACHE_SCHEMA_VERSION = 6
+#   7 — v0.4.29: psets.parquet gains `source` column (Utf8, non-null) —
+#       `"instance"` for properties declared directly on the product via
+#       `IfcRelDefinesByProperties`, `"type"` for properties inherited
+#       from `IfcRelDefinesByType → RelatingType.HasPropertySets`. Type
+#       inheritance matches ifcopenshell's `should_inherit=True`
+#       default (instance shadows same-named type prop). Old caches
+#       miss type-level properties entirely (GH #36) — re-extract
+#       surfaces ~2% extra rows on type-heavy Revit/Tekla exports.
+_CACHE_SCHEMA_VERSION = 7
 
 _FIELD_RE = re.compile(r"\(\s*(.*?)\s*\)\s*;", re.DOTALL)
 

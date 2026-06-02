@@ -274,6 +274,7 @@ mod python {
         out.set_item("prop_name", PyList::new_bound(py, &psets.prop_name))?;
         out.set_item("value", PyList::new_bound(py, &psets.value))?;
         out.set_item("value_type", PyList::new_bound(py, &psets.value_type))?;
+        out.set_item("source", PyList::new_bound(py, &psets.source))?;
         out.set_item("open_ms", open_ms)?;
         out.set_item("entity_table_ms", table_ms)?;
         out.set_item("guid_index_ms", guid_ms)?;
@@ -438,6 +439,7 @@ mod python {
             d.set_item("prop_name", PyList::new_bound(py, &psets.prop_name))?;
             d.set_item("value", PyList::new_bound(py, &psets.value))?;
             d.set_item("value_type", PyList::new_bound(py, &psets.value_type))?;
+            d.set_item("source", PyList::new_bound(py, &psets.source))?;
             out.set_item("psets", d)?;
         }
         {

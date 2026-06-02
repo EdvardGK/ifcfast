@@ -21,6 +21,14 @@ use crate::entity_table::EntityTable;
 use crate::lexer::{parse_field, split_top_level_args, Field};
 
 /// Long-format pset rows in column-major layout.
+///
+/// `source` is `"instance"` for properties declared directly on a
+/// product via `IfcRelDefinesByProperties`, and `"type"` for properties
+/// inherited from the product's `IfcTypeObject` via `IfcRelDefinesByType
+/// → RelatingType.HasPropertySets`. Inheritance matches ifcopenshell's
+/// `should_inherit=True` default: an instance-declared property
+/// shadows a same-named type property (instance wins on collision; no
+/// `source="type"` row is emitted in that case).
 #[derive(Debug, Default)]
 pub struct PsetTable {
     pub guid: Vec<String>,
@@ -28,6 +36,7 @@ pub struct PsetTable {
     pub prop_name: Vec<String>,
     pub value: Vec<Option<String>>,
     pub value_type: Vec<Option<String>>,
+    pub source: Vec<String>,
 }
 
 impl PsetTable {
@@ -59,6 +68,13 @@ pub fn build(
     // Pass 2 input: (related_object_step_ids, pset_step_id) — many rels share
     // a single pset, and many objects share a single rel.
     let mut rel_pairs: Vec<(u64, u64)> = Vec::with_capacity(16_384);
+    // IfcRelDefinesByType: (product_step_id → type_step_id). One type
+    // per product; the relation fans out N products per type.
+    let mut product_to_type: HashMap<u64, u64> = HashMap::with_capacity(16_384);
+    // IfcTypeObject.HasPropertySets: (type_step_id → [pset_step_id]).
+    // Captured for any IfcXxxType entity (suffix-detected so new schema
+    // additions surface automatically, same convention as the indexer).
+    let mut type_psets: HashMap<u64, Vec<u64>> = HashMap::with_capacity(256);
 
     for (step_id, type_name, args) in table.iter() {
         if type_name.eq_ignore_ascii_case(b"IFCPROPERTYSET") {
@@ -134,25 +150,67 @@ pub fn build(
             for obj_id in relateds {
                 rel_pairs.push((obj_id, pset_id));
             }
+        } else if type_name.eq_ignore_ascii_case(b"IFCRELDEFINESBYTYPE") {
+            // (GlobalId, OwnerHistory, Name, Description, RelatedObjects, RelatingType)
+            // Same shape as RelDefinesByProperties but the trailing ref
+            // is an IfcTypeObject (instead of a pset definition). We
+            // need this to look up type-inherited psets per product in
+            // pass 2.
+            let fields = split_top_level_args(args);
+            let type_id = match fields.get(5).copied().map(parse_field) {
+                Some(Field::Ref(id)) => id,
+                _ => continue,
+            };
+            let relateds = match fields.get(4).copied().map(parse_field) {
+                Some(Field::List(body)) => parse_ref_list(body),
+                Some(Field::Ref(id)) => vec![id],
+                _ => continue,
+            };
+            for obj_id in relateds {
+                product_to_type.insert(obj_id, type_id);
+            }
+        } else if is_type_object(type_name) {
+            // IfcTypeObject + every IfcXxxType subclass (suffix match,
+            // mirrors `indexer::index`'s TypeObject classifier). The
+            // schema places `HasPropertySets : SET OF IfcPropertySet`
+            // at attribute 6 (index 5) on IfcTypeObject — every subtype
+            // inherits this slot at the same index, so a positional
+            // read works across IFC2x3 and IFC4. Empty / `$` means the
+            // type has no psets, which is fine (most don't).
+            let fields = split_top_level_args(args);
+            let pset_ids = ref_list_at(&fields, 5);
+            if !pset_ids.is_empty() {
+                type_psets.insert(step_id, pset_ids);
+            }
         }
     }
 
     // Pass 2: for each (object, pset) pair, expand to one row per
-    //         property in the pset.
+    //         property in the pset. Instance-declared psets first; then
+    //         walk products with an associated IfcTypeObject and emit
+    //         any type-side properties that don't collide.
     let mut out = PsetTable::default();
-    let est = rel_pairs.len() * 8;
+    let est = rel_pairs.len() * 8 + product_to_type.len() * 4;
     out.guid.reserve(est);
     out.pset_name.reserve(est);
     out.prop_name.reserve(est);
     out.value.reserve(est);
     out.value_type.reserve(est);
+    out.source.reserve(est);
 
-    for (obj_step_id, pset_step_id) in rel_pairs {
-        let guid = match product_step_to_guid.get(&obj_step_id) {
-            Some(g) => g,
+    // (guid → set of "pset_name\tprop_name" keys already emitted from
+    // the instance side). Used to suppress same-named type psets so
+    // instance values win on collision, matching ifcopenshell's
+    // `should_inherit=True` semantics.
+    let mut seen_per_product: HashMap<&str, std::collections::HashSet<String>> =
+        HashMap::with_capacity(product_step_to_guid.len());
+
+    for (obj_step_id, pset_step_id) in &rel_pairs {
+        let guid = match product_step_to_guid.get(obj_step_id) {
+            Some(g) => g.as_str(),
             None => continue, // rel pointed at a non-product (type, group, etc.)
         };
-        let (pset_name, prop_ids) = match psets.get(&pset_step_id) {
+        let (pset_name, prop_ids) = match psets.get(pset_step_id) {
             Some(x) => x,
             None => continue,
         };
@@ -162,17 +220,67 @@ pub fn build(
         //   - An IfcComplexProperty wrapping more inner property refs
         //     → in `complex_props` → recurse, prefixing each leaf name
         //       with the complex's own name joined by `.`.
+        let mut emitted_names: Vec<String> = Vec::new();
         for pid in prop_ids {
             emit_property(
                 pid,
                 "",
                 guid,
                 pset_name,
+                "instance",
                 &props,
                 &complex_props,
                 &mut out,
+                &mut emitted_names,
                 0,
             );
+        }
+        if !emitted_names.is_empty() {
+            let set = seen_per_product.entry(guid).or_default();
+            for n in emitted_names {
+                set.insert(format!("{pset_name}\t{n}"));
+            }
+        }
+    }
+
+    // Type inheritance pass. Skip silently if either map is empty —
+    // a file with no IfcTypeObjects or no IfcRelDefinesByType has
+    // nothing to inherit.
+    if !type_psets.is_empty() && !product_to_type.is_empty() {
+        for (product_step_id, type_step_id) in &product_to_type {
+            let guid = match product_step_to_guid.get(product_step_id) {
+                Some(g) => g.as_str(),
+                None => continue,
+            };
+            let type_pset_ids = match type_psets.get(type_step_id) {
+                Some(v) => v,
+                None => continue,
+            };
+            // Default `seen` to an empty set: the product may have had
+            // zero instance-declared properties, in which case there's
+            // no possibility of collision.
+            let empty = std::collections::HashSet::new();
+            let already_seen = seen_per_product.get(guid).unwrap_or(&empty);
+            for pset_id in type_pset_ids {
+                let (pset_name, prop_ids) = match psets.get(pset_id) {
+                    Some(x) => x,
+                    None => continue,
+                };
+                for pid in prop_ids {
+                    emit_property_dedup(
+                        pid,
+                        "",
+                        guid,
+                        pset_name,
+                        "type",
+                        &props,
+                        &complex_props,
+                        &mut out,
+                        already_seen,
+                        0,
+                    );
+                }
+            }
         }
     }
 
@@ -200,15 +308,23 @@ const COMPLEX_PROP_MAX_DEPTH: usize = 8;
 ///   prefix `"{prefix}{complex.name}."`.
 /// - Anything else (unknown ref target) → silently dropped, same as
 ///   pre-fix behaviour for leaf-only lookups.
+///
+/// `source` is stamped on every emitted row ("instance" or "type").
+/// `emitted_names` is appended with the final `prop_name` (post-prefix)
+/// for each leaf row written — callers use it to populate the
+/// instance-side dedup set that suppresses colliding type-inherited
+/// rows in the inheritance pass.
 #[allow(clippy::too_many_arguments)]
 fn emit_property(
     pid: &u64,
     prefix: &str,
     guid: &str,
     pset_name: &str,
+    source: &str,
     props: &HashMap<u64, Prop>,
     complex_props: &HashMap<u64, (String, Vec<u64>)>,
     out: &mut PsetTable,
+    emitted_names: &mut Vec<String>,
     depth: usize,
 ) {
     if let Some(prop) = props.get(pid) {
@@ -219,9 +335,11 @@ fn emit_property(
         };
         out.guid.push(guid.to_string());
         out.pset_name.push(pset_name.to_string());
-        out.prop_name.push(name);
+        out.prop_name.push(name.clone());
         out.value.push(prop.value.clone());
         out.value_type.push(prop.value_type.clone());
+        out.source.push(source.to_string());
+        emitted_names.push(name);
         return;
     }
     if let Some((complex_name, inner_ids)) = complex_props.get(pid) {
@@ -235,13 +353,88 @@ fn emit_property(
                 &new_prefix,
                 guid,
                 pset_name,
+                source,
                 props,
                 complex_props,
                 out,
+                emitted_names,
                 depth + 1,
             );
         }
     }
+}
+
+/// Type-inheritance variant of `emit_property`. Skips any leaf whose
+/// `(pset_name, prop_name)` already appeared on the instance side
+/// (instance wins on collision, per ifcopenshell). Always recurses
+/// through complex wrappers — collisions are checked leaf-by-leaf so a
+/// type's `Group.A` can still surface even if the instance shadowed
+/// `Group.B`.
+#[allow(clippy::too_many_arguments)]
+fn emit_property_dedup(
+    pid: &u64,
+    prefix: &str,
+    guid: &str,
+    pset_name: &str,
+    source: &str,
+    props: &HashMap<u64, Prop>,
+    complex_props: &HashMap<u64, (String, Vec<u64>)>,
+    out: &mut PsetTable,
+    already_seen: &std::collections::HashSet<String>,
+    depth: usize,
+) {
+    if let Some(prop) = props.get(pid) {
+        let name = if prefix.is_empty() {
+            prop.name.clone()
+        } else {
+            format!("{prefix}{}", prop.name)
+        };
+        let key = format!("{pset_name}\t{name}");
+        if already_seen.contains(&key) {
+            return;
+        }
+        out.guid.push(guid.to_string());
+        out.pset_name.push(pset_name.to_string());
+        out.prop_name.push(name);
+        out.value.push(prop.value.clone());
+        out.value_type.push(prop.value_type.clone());
+        out.source.push(source.to_string());
+        return;
+    }
+    if let Some((complex_name, inner_ids)) = complex_props.get(pid) {
+        if depth >= COMPLEX_PROP_MAX_DEPTH {
+            return;
+        }
+        let new_prefix = format!("{prefix}{complex_name}.");
+        for inner in inner_ids {
+            emit_property_dedup(
+                inner,
+                &new_prefix,
+                guid,
+                pset_name,
+                source,
+                props,
+                complex_props,
+                out,
+                already_seen,
+                depth + 1,
+            );
+        }
+    }
+}
+
+/// Detect an IfcTypeObject or any subclass by name. Mirrors the same
+/// "IFCxxxTYPE" suffix rule + IFC2x3 IfcDoorStyle / IfcWindowStyle
+/// exceptions that `indexer::index` uses for its `EntityKind::TypeObject`
+/// classifier — anything that can be the target of `IfcRelDefinesByType
+/// .RelatingType` qualifies.
+fn is_type_object(t: &[u8]) -> bool {
+    let suffix_ok = t.len() > 7
+        && t[..3].eq_ignore_ascii_case(b"IFC")
+        && t[t.len() - 4..].eq_ignore_ascii_case(b"TYPE");
+    let ifc2x3_style = t.eq_ignore_ascii_case(b"IFCDOORSTYLE")
+        || t.eq_ignore_ascii_case(b"IFCWINDOWSTYLE");
+    suffix_ok || ifc2x3_style
 }
 
 /// Parse an `IfcValue` field. STEP wraps these with a type tag:
@@ -782,5 +975,197 @@ END-ISO-10303-21;
         let t = run(&buf);
         assert_eq!(t.len(), 1);
         assert_eq!(t.value[0].as_deref(), Some("18..22@20"));
+    }
+
+    #[test]
+    fn instance_pset_row_is_marked_source_instance() {
+        // Baseline: every row from the pre-#36 RelDefinesByProperties
+        // path now carries `source = "instance"`.
+        let buf = make_buf(
+            r#"
+#20=IFCPROPERTYSINGLEVALUE('LoadBearing',$,IFCBOOLEAN(.T.),$);
+#21=IFCPROPERTYSET('2Pset00000000000000001',$,'Pset_WallCommon',$,(#20));
+#22=IFCRELDEFINESBYPROPERTIES('3Rel000000000000000001',$,$,$,(#10),#21);
+"#,
+        );
+        let t = run(&buf);
+        assert_eq!(t.len(), 1);
+        assert_eq!(t.source[0], "instance");
+    }
+
+    #[test]
+    fn type_inherited_pset_surfaces_on_instance_with_source_type() {
+        // The GH #36 repro: a type's HasPropertySets must be attached
+        // to every IfcRelDefinesByType-related instance, tagged
+        // `source = "type"` so consumers can distinguish provenance.
+        //
+        // IfcBuildingElementProxy on a proxy type that carries
+        // Pset_ManufacturerTypeInformation — the canonical Revit /
+        // Tekla "manufacturer lives on the type" pattern.
+        let buf = make_buf(
+            r#"
+#30=IFCPROPERTYSINGLEVALUE('Manufacturer',$,IFCLABEL('Wurth'),$);
+#31=IFCPROPERTYSET('4PsetType00000000000001',$,'Pset_ManufacturerTypeInformation',$,(#30));
+#32=IFCBUILDINGELEMENTPROXYTYPE('5Type0000000000000001',$,'Wedge Anchor W-FAZ',$,$,(#31),$,$,$,$);
+#33=IFCRELDEFINESBYTYPE('6RelType000000000000001',$,$,$,(#10),#32);
+"#,
+        );
+        let t = run(&buf);
+        assert_eq!(t.len(), 1, "expected 1 inherited row, got {}", t.len());
+        assert_eq!(t.guid[0], "1Wall00000000000000001");
+        assert_eq!(t.pset_name[0], "Pset_ManufacturerTypeInformation");
+        assert_eq!(t.prop_name[0], "Manufacturer");
+        assert_eq!(t.value[0].as_deref(), Some("Wurth"));
+        assert_eq!(t.source[0], "type");
+    }
+
+    #[test]
+    fn instance_value_shadows_same_named_type_property() {
+        // ifcopenshell's `should_inherit=True` semantics: when the
+        // instance declares the same (pset_name, prop_name) as its
+        // type, the instance value wins. The type row is suppressed
+        // (NOT emitted alongside) so consumers see exactly one row
+        // per logical property.
+        let buf = make_buf(
+            r#"
+#20=IFCPROPERTYSINGLEVALUE('Manufacturer',$,IFCLABEL('Hilti'),$);
+#21=IFCPROPERTYSET('2Pset00000000000000001',$,'Pset_ManufacturerTypeInformation',$,(#20));
+#22=IFCRELDEFINESBYPROPERTIES('3Rel000000000000000001',$,$,$,(#10),#21);
+#30=IFCPROPERTYSINGLEVALUE('Manufacturer',$,IFCLABEL('Wurth'),$);
+#31=IFCPROPERTYSET('4PsetType00000000000001',$,'Pset_ManufacturerTypeInformation',$,(#30));
+#32=IFCBUILDINGELEMENTPROXYTYPE('5Type0000000000000001',$,'Wedge Anchor W-FAZ',$,$,(#31),$,$,$,$);
+#33=IFCRELDEFINESBYTYPE('6RelType000000000000001',$,$,$,(#10),#32);
+"#,
+        );
+        let t = run(&buf);
+        assert_eq!(t.len(), 1, "instance must shadow type, got {} rows", t.len());
+        assert_eq!(t.value[0].as_deref(), Some("Hilti"));
+        assert_eq!(t.source[0], "instance");
+    }
+
+    #[test]
+    fn instance_and_type_pset_with_distinct_props_both_surface() {
+        // Distinct (pset_name, prop_name) tuples don't collide.
+        // Instance row carries source="instance", type row
+        // source="type". Order is instance-first by construction.
+        let buf = make_buf(
+            r#"
+#20=IFCPROPERTYSINGLEVALUE('LoadBearing',$,IFCBOOLEAN(.T.),$);
+#21=IFCPROPERTYSET('2Pset00000000000000001',$,'Pset_WallCommon',$,(#20));
+#22=IFCRELDEFINESBYPROPERTIES('3Rel000000000000000001',$,$,$,(#10),#21);
+#30=IFCPROPERTYSINGLEVALUE('Manufacturer',$,IFCLABEL('Wurth'),$);
+#31=IFCPROPERTYSET('4PsetType00000000000001',$,'Pset_ManufacturerTypeInformation',$,(#30));
+#32=IFCBUILDINGELEMENTPROXYTYPE('5Type0000000000000001',$,'Wedge Anchor W-FAZ',$,$,(#31),$,$,$,$);
+#33=IFCRELDEFINESBYTYPE('6RelType000000000000001',$,$,$,(#10),#32);
+"#,
+        );
+        let t = run(&buf);
+        assert_eq!(t.len(), 2);
+        let by_name: std::collections::HashMap<&str, (&str, &str)> = (0..t.len())
+            .map(|i| {
+                (
+                    t.prop_name[i].as_str(),
+                    (t.value[i].as_deref().unwrap_or(""), t.source[i].as_str()),
+                )
+            })
+            .collect();
+        assert_eq!(by_name.get("LoadBearing"), Some(&("True", "instance")));
+        assert_eq!(by_name.get("Manufacturer"), Some(&("Wurth", "type")));
+    }
+
+    #[test]
+    fn type_with_no_associated_products_emits_no_rows() {
+        // An IfcTypeObject with psets but no IfcRelDefinesByType
+        // pointing to a product is a no-op. Don't invent rows keyed
+        // on the type's GUID — types aren't products.
+        let buf = make_buf(
+            r#"
+#30=IFCPROPERTYSINGLEVALUE('Manufacturer',$,IFCLABEL('Wurth'),$);
+#31=IFCPROPERTYSET('4PsetType00000000000001',$,'Pset_ManufacturerTypeInformation',$,(#30));
+#32=IFCBUILDINGELEMENTPROXYTYPE('5Type0000000000000001',$,'Orphan Type',$,$,(#31),$,$,$,$);
+"#,
+        );
+        let t = run(&buf);
+        assert_eq!(t.len(), 0);
+    }
+
+    #[test]
+    fn type_inheritance_fans_out_across_multiple_related_instances() {
+        // One IfcRelDefinesByType with two RelatedObjects: both
+        // products must inherit the type's psets. This is the bulk
+        // case on real exports — one IfcWallType backing 200 wall
+        // instances.
+        let buf = format!(
+            r#"ISO-10303-21;
+HEADER;
+FILE_DESCRIPTION(('ViewDefinition [ReferenceView]'),'2;1');
+FILE_NAME('psets_test.ifc','2026-05-26T00:00:00',('test'),('test'),'ifcfast','ifcfast','');
+FILE_SCHEMA(('IFC4'));
+ENDSEC;
+DATA;
+#1=IFCPROJECT('0Test000000000000000001',$,'p',$,$,$,$,(#5),#2);
+#2=IFCUNITASSIGNMENT((#3));
+#3=IFCSIUNIT(*,.LENGTHUNIT.,.MILLI.,.METRE.);
+#5=IFCGEOMETRICREPRESENTATIONCONTEXT($,'Model',3,1.0E-5,#6,$);
+#6=IFCAXIS2PLACEMENT3D(#7,$,$);
+#7=IFCCARTESIANPOINT((0.,0.,0.));
+#10=IFCWALL('1Wall00000000000000001',$,'W1',$,$,$,$,'t1',.STANDARD.);
+#11=IFCWALL('1Wall00000000000000002',$,'W2',$,$,$,$,'t2',.STANDARD.);
+#30=IFCPROPERTYSINGLEVALUE('FireRating',$,IFCLABEL('R60'),$);
+#31=IFCPROPERTYSET('4PsetType00000000000001',$,'Pset_WallTypeCommon',$,(#30));
+#32=IFCWALLTYPE('5Type0000000000000001',$,'200mm Concrete',$,$,(#31),$,$,$,.STANDARD.);
+#33=IFCRELDEFINESBYTYPE('6RelType000000000000001',$,$,$,(#10,#11),#32);
+ENDSEC;
+END-ISO-10303-21;
+"#
+        );
+        let t = run(&buf);
+        assert_eq!(t.len(), 2);
+        let guids: std::collections::HashSet<&str> =
+            t.guid.iter().map(String::as_str).collect();
+        assert!(guids.contains("1Wall00000000000000001"));
+        assert!(guids.contains("1Wall00000000000000002"));
+        for i in 0..t.len() {
+            assert_eq!(t.source[i], "type");
+            assert_eq!(t.prop_name[i], "FireRating");
+        }
+    }
+
+    #[test]
+    fn type_inheritance_works_on_ifc2x3_doorstyle() {
+        // IFC2x3 collapsed `IfcDoorType` into `IfcDoorStyle` (and
+        // similarly for windows). These don't follow the "IFCxxxTYPE"
+        // suffix rule but ARE valid RelatingType targets on 2x3 files.
+        // The indexer's TypeObject classifier has a special case for
+        // them; the pset extractor must mirror it or 100% of door/window
+        // typing leaks silently on the IFC2x3 long-tail.
+        let buf = format!(
+            r#"ISO-10303-21;
+HEADER;
+FILE_DESCRIPTION(('ViewDefinition [CoordinationView]'),'2;1');
+FILE_NAME('psets_test.ifc','2026-05-26T00:00:00',('test'),('test'),'ifcfast','ifcfast','');
+FILE_SCHEMA(('IFC2X3'));
+ENDSEC;
+DATA;
+#1=IFCPROJECT('0Test000000000000000001',$,'p',$,$,$,$,(#5),#2);
+#2=IFCUNITASSIGNMENT((#3));
+#3=IFCSIUNIT(*,.LENGTHUNIT.,.MILLI.,.METRE.);
+#5=IFCGEOMETRICREPRESENTATIONCONTEXT($,'Model',3,1.0E-5,#6,$);
+#6=IFCAXIS2PLACEMENT3D(#7,$,$);
+#7=IFCCARTESIANPOINT((0.,0.,0.));
+#10=IFCDOOR('1Door00000000000000001',$,'D',$,$,$,$,'t',2100.,900.);
+#30=IFCPROPERTYSINGLEVALUE('FireRating',$,IFCLABEL('EI60'),$);
+#31=IFCPROPERTYSET('4PsetType00000000000001',$,'Pset_DoorCommon',$,(#30));
+#32=IFCDOORSTYLE('5Type0000000000000001',$,'Office Door',$,$,(#31),$,$,.NOTDEFINED.,.NOTDEFINED.,.F.,.F.);
+#33=IFCRELDEFINESBYTYPE('6RelType000000000000001',$,$,$,(#10),#32);
+ENDSEC;
+END-ISO-10303-21;
+"#
+        );
+        let t = run(&buf);
+        assert_eq!(t.len(), 1);
+        assert_eq!(t.guid[0], "1Door00000000000000001");
+        assert_eq!(t.value[0].as_deref(), Some("EI60"));
+        assert_eq!(t.source[0], "type");
     }
 }

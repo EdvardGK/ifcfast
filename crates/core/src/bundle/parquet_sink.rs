@@ -322,6 +322,11 @@ fn build_instance_schema() -> Schema {
         Field::new("name", DataType::Utf8, false),
         Field::new("value", DataType::Utf8, true),
         Field::new("value_type", DataType::Utf8, true),
+        // Provenance: "instance" (declared directly on the product) or
+        // "type" (inherited from IfcTypeObject). Non-null — every pset
+        // row knows where it came from. See GH #36 and
+        // `extractors::psets::PsetTable::source`.
+        Field::new("source", DataType::Utf8, false),
     ]);
     let quantity_fields = Fields::from(vec![
         Field::new("set_name", DataType::Utf8, false),
@@ -642,6 +647,7 @@ fn build_instance_batch(
                     p.field_builder::<StringBuilder>(3).unwrap(),
                     entry.value_type.as_deref(),
                 );
+                p.field_builder::<StringBuilder>(4).unwrap().append_value(&entry.source);
                 p.append(true);
             }
             psets.append(true);

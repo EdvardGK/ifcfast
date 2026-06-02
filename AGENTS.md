@@ -148,6 +148,10 @@ describing via `pq.read_schema(...)`):
   `"degenerate"`).
 - Semantic payload: `materials`, `psets`, `quantities`,
   `classifications` (list-of-struct columns — `UNNEST` in DuckDB).
+  Each `psets` struct carries `source` (`"instance"` or `"type"`) so
+  consumers can distinguish a property declared directly on the
+  product from one inherited via `IfcRelDefinesByType` (since
+  v0.4.29, cache schema v7 — see Conventions).
 - Per-face stream: `surfaces` (one entry per distinct planar face).
 
 **Why the fingerprint columns matter for agents:** they let you
@@ -252,6 +256,18 @@ the project's unit scale as parquet schema metadata
   `pyo3_runtime.PanicException`. Wrap geometry calls in
   `try: ... except ifcfast.IfcfastError: ...` if you need per-file
   resilience in a corpus pipeline.
+- **`m.psets` inherits type-level properties by default** (since
+  v0.4.29, cache schema v7). Properties carried on an
+  `IfcTypeObject.HasPropertySets` and bound via
+  `IfcRelDefinesByType` surface on every related instance, tagged
+  `source = "type"`. Properties declared directly on the instance
+  via `IfcRelDefinesByProperties` carry `source = "instance"` and
+  shadow same-named type properties (instance wins on collision —
+  matches `ifcopenshell.util.element.get_psets(..., should_inherit=True)`).
+  Filter with `m.psets[m.psets.source == "instance"]` if you need
+  the pre-v0.4.29 shape. Common payoff: manufacturer / type marks /
+  fire ratings on Revit / Tekla / Archicad exports that live at the
+  type level were silently dropped before this fix (GH #36).
 
 ## Streaming point cloud (`m.iter_point_cloud(...)`)
 
