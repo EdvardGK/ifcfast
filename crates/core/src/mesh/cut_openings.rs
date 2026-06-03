@@ -23,8 +23,10 @@
 
 use std::collections::{HashMap, HashSet};
 
+use glam::Vec3;
+
 use crate::geom::csg::{self, CsgKernelError};
-use crate::mesh::{MeshSegment, ProductMesh};
+use crate::mesh::{halfspace_clip, MeshSegment, ProductMesh};
 
 /// Outcome counters from a cut pass. Aggregate across products in
 /// the caller's loop for a top-line "n products had their openings
@@ -67,7 +69,7 @@ pub fn apply(mesh: &mut ProductMesh) -> Outcome {
     // segments. For a typical wall with `IfcBooleanClippingResult` of
     // one extrusion and one void, that's just the single
     // `"boolean_first_operand|extrusion"` segment.
-    let host = match assemble_submesh(&mesh.vertices, &mesh.indices, &host_segs) {
+    let mut host = match assemble_submesh(&mesh.vertices, &mesh.indices, &host_segs) {
         Some(h) => h,
         // No host triangles at all — nothing meaningful to cut.
         // Treat as passthrough so the caller doesn't lose the cutter
@@ -75,39 +77,155 @@ pub fn apply(mesh: &mut ProductMesh) -> Outcome {
         None => return Outcome::Passthrough,
     };
 
-    let cutter_meshes: Vec<(Vec<f32>, Vec<u32>)> = cutter_segs
-        .iter()
-        .filter_map(|s| assemble_submesh(&mesh.vertices, &mesh.indices, &[*s]))
-        .collect();
+    // Partition cutters into half-space slabs and real solid cutters.
+    // Half-spaces don't go through Manifold (GH #39 — Manifold's
+    // boolean propagates a bbox-derived tolerance from oversized
+    // half-space cutters and collapses the result to empty); instead
+    // we clip the host directly against the slab's plane via
+    // `mesh::halfspace_clip`. Solid cutters (real opening
+    // extrusions, csg primitives) still go through `subtract_many`.
+    let mut halfspace_planes: Vec<(Vec3, Vec3)> = Vec::new();
+    let mut solid_cutters: Vec<(Vec<f32>, Vec<u32>)> = Vec::new();
+    for seg in &cutter_segs {
+        let Some(submesh) = assemble_submesh(&mesh.vertices, &mesh.indices, &[*seg]) else {
+            continue;
+        };
+        if is_halfspace_cutter(&seg.source) {
+            // Derive the plane (point on plane + agreement-direction
+            // normal) from the thin slab geometry. The slab's first
+            // triangle is a top-cap triangle whose CCW winding gives
+            // a normal in the agreement direction. The slab's
+            // centroid is essentially on the plane (the slab is
+            // ≤ 1 mm thick).
+            if let Some(plane) = derive_plane_from_slab(&submesh.0, &submesh.1) {
+                halfspace_planes.push(plane);
+            }
+        } else {
+            solid_cutters.push(submesh);
+        }
+    }
 
-    if cutter_meshes.is_empty() {
+    if halfspace_planes.is_empty() && solid_cutters.is_empty() {
         return Outcome::Passthrough;
     }
 
-    let cutter_refs: Vec<(&[f32], &[u32])> = cutter_meshes
-        .iter()
-        .map(|(v, i)| (v.as_slice(), i.as_slice()))
-        .collect();
-
-    match csg::subtract_many(&host.0, &host.1, &cutter_refs) {
-        Ok((verts, idx)) => {
-            let triangle_count = (idx.len() / 3) as u32;
-            mesh.vertices = verts;
-            mesh.indices = idx;
-            mesh.segments = vec![MeshSegment {
-                index_start: 0,
-                index_count: triangle_count * 3,
-                source: "cut_openings".to_string(),
-            }];
-            // The per-fragment instance dedup payload is no longer
-            // valid after a cut — clear it. Substrate writers don't
-            // invoke this path; consumers that care about parts
-            // (only ParquetSink today) don't see cut meshes.
-            mesh.parts.clear();
-            Outcome::Cut
+    // Apply half-space clips sequentially. Each clip reduces the
+    // host; if the host empties part-way we're done — the remaining
+    // half-spaces and solid cutters would just confirm the empty.
+    for (plane_point, plane_normal) in &halfspace_planes {
+        if host.1.is_empty() {
+            break;
         }
-        Err(_e) => Outcome::Fallback,
+        let (new_v, new_i) = halfspace_clip::clip_by_plane(
+            &host.0,
+            &host.1,
+            *plane_point,
+            *plane_normal,
+        );
+        host = (new_v, new_i);
     }
+
+    // Run remaining solid cutters (real opening extrusions, etc.)
+    // through Manifold. If the host has been emptied by the
+    // half-space clips alone, skip the boolean step entirely.
+    let (final_v, final_i) = if solid_cutters.is_empty() {
+        host
+    } else if host.1.is_empty() {
+        host
+    } else {
+        let cutter_refs: Vec<(&[f32], &[u32])> = solid_cutters
+            .iter()
+            .map(|(v, i)| (v.as_slice(), i.as_slice()))
+            .collect();
+        match csg::subtract_many(&host.0, &host.1, &cutter_refs) {
+            Ok(out) => out,
+            Err(_e) => return Outcome::Fallback,
+        }
+    };
+
+    let triangle_count = (final_i.len() / 3) as u32;
+    mesh.vertices = final_v;
+    mesh.indices = final_i;
+    mesh.segments = vec![MeshSegment {
+        index_start: 0,
+        index_count: triangle_count * 3,
+        source: "cut_openings".to_string(),
+    }];
+    // The per-fragment instance dedup payload is no longer valid
+    // after a cut — clear it. Substrate writers don't invoke this
+    // path; consumers that care about parts (only ParquetSink today)
+    // don't see cut meshes.
+    mesh.parts.clear();
+    Outcome::Cut
+}
+
+/// Recognise a half-space cutter segment by its source-tag chain.
+/// Tags are emitted by `mesh::boolean::halfspace_solid` and
+/// `polygonal_bounded_halfspace` with an `:agree` / `:disagree`
+/// suffix; the suffix doesn't affect cut_openings — the plane
+/// geometry (slab's first-triangle normal) already encodes the
+/// agreement direction in world coords.
+fn is_halfspace_cutter(source: &str) -> bool {
+    source.split('|').any(|link| {
+        link == "halfspace_plane:agree"
+            || link == "halfspace_plane:disagree"
+            || link == "halfspace_bounded:agree"
+            || link == "halfspace_bounded:disagree"
+    })
+}
+
+/// Derive `(plane_point, plane_normal_into_halfspace)` from a thin
+/// half-space slab's geometry. The slab is built by
+/// `boolean::halfspace_solid` / `polygonal_bounded_halfspace` as a
+/// one-sided extrusion of a polygon, with the first triangle a
+/// top-cap CCW triangle whose normal points along the agreement
+/// direction. Returns `None` if the slab is degenerate (zero-area
+/// first triangle or empty vertex buffer).
+fn derive_plane_from_slab(vertices: &[f32], indices: &[u32]) -> Option<(Vec3, Vec3)> {
+    if indices.len() < 3 || vertices.len() < 9 {
+        return None;
+    }
+    let i0 = indices[0] as usize;
+    let i1 = indices[1] as usize;
+    let i2 = indices[2] as usize;
+    if (i0 * 3 + 2).max(i1 * 3 + 2).max(i2 * 3 + 2) >= vertices.len() {
+        return None;
+    }
+    let v0 = Vec3::new(
+        vertices[i0 * 3],
+        vertices[i0 * 3 + 1],
+        vertices[i0 * 3 + 2],
+    );
+    let v1 = Vec3::new(
+        vertices[i1 * 3],
+        vertices[i1 * 3 + 1],
+        vertices[i1 * 3 + 2],
+    );
+    let v2 = Vec3::new(
+        vertices[i2 * 3],
+        vertices[i2 * 3 + 1],
+        vertices[i2 * 3 + 2],
+    );
+    let raw_normal = (v1 - v0).cross(v2 - v0);
+    if raw_normal.length_squared() < 1e-12 {
+        return None;
+    }
+    let agree = raw_normal.normalize();
+
+    // Plane point: centroid of all slab vertices. The slab is thin
+    // (≤ 1 mm in the agree direction), so the centroid is on (or
+    // within half a thickness of) the plane — well below
+    // building-element tolerance.
+    let mut sum = Vec3::ZERO;
+    let n = (vertices.len() / 3) as f32;
+    if n < 4.0 {
+        return None;
+    }
+    for chunk in vertices.chunks_exact(3) {
+        sum += Vec3::new(chunk[0], chunk[1], chunk[2]);
+    }
+    let plane_point = sum / n;
+    Some((plane_point, agree))
 }
 
 /// Outcome of one cut attempt on a single product.

@@ -137,6 +137,187 @@ fn cut_openings_produces_single_segment_and_reduced_volume() {
     );
 }
 
+/// Single-clip case: wall clipped by an `IfcHalfSpaceSolid` with
+/// `AgreementFlag = .F.`. Under the de-facto IFC convention (what
+/// ifcopenshell / Revit emit and consume), `.F.` keeps the -normal
+/// side, so the upper half of the wall (z > 1500 mm) is removed and
+/// the lower half remains. Expected post-cut volume:
+/// 1000 × 200 × 1500 mm³ = 0.3 m³ (half of the original 0.6 m³
+/// extrusion). Pre-fix this returned ~0.6 m³ because the half-space
+/// cutter was a 0.01 mm-thick visual stand-in; now it goes through
+/// `mesh::halfspace_clip`.
+const WALL_WITH_HALFSPACE_CLIP: &str = r#"ISO-10303-21;
+HEADER;
+FILE_DESCRIPTION(('ViewDefinition [ReferenceView]'),'2;1');
+FILE_NAME('hs.ifc','2026-06-03T00:00:00',('test'),('skiplum'),'ifcfast','ifcfast','');
+FILE_SCHEMA(('IFC4'));
+ENDSEC;
+DATA;
+#1=IFCPROJECT('0Test000000000000000001',$,'p',$,$,$,$,(#5),#2);
+#2=IFCUNITASSIGNMENT((#3,#4));
+#3=IFCSIUNIT(*,.LENGTHUNIT.,.MILLI.,.METRE.);
+#4=IFCSIUNIT(*,.PLANEANGLEUNIT.,$,.RADIAN.);
+#5=IFCGEOMETRICREPRESENTATIONCONTEXT($,'Model',3,1.0E-5,#6,$);
+#6=IFCAXIS2PLACEMENT3D(#7,$,$);
+#7=IFCCARTESIANPOINT((0.,0.,0.));
+#10=IFCSITE('1Site000000000000000001',$,'s',$,$,#15,$,$,.ELEMENT.,$,$,$,$,$);
+#11=IFCBUILDING('2Bldg000000000000000001',$,'b',$,$,#15,$,$,.ELEMENT.,$,$,$);
+#12=IFCBUILDINGSTOREY('3Stor000000000000000001',$,'L1',$,$,#15,$,$,.ELEMENT.,0.0);
+#15=IFCLOCALPLACEMENT($,#6);
+#16=IFCLOCALPLACEMENT(#15,#6);
+#20=IFCRELAGGREGATES('4Agg000000000000000001',$,$,$,#1,(#10));
+#21=IFCRELAGGREGATES('5Agg000000000000000001',$,$,$,#10,(#11));
+#22=IFCRELAGGREGATES('6Agg000000000000000001',$,$,$,#11,(#12));
+#30=IFCRECTANGLEPROFILEDEF(.AREA.,'WallRect',#31,1000.,200.);
+#31=IFCAXIS2PLACEMENT2D(#7,$);
+#32=IFCDIRECTION((0.,0.,1.));
+#33=IFCEXTRUDEDAREASOLID(#30,#6,#32,3000.);
+#50=IFCCARTESIANPOINT((0.,0.,1500.));
+#51=IFCAXIS2PLACEMENT3D(#50,$,$);
+#52=IFCPLANE(#51);
+#53=IFCHALFSPACESOLID(#52,.F.);
+#60=IFCBOOLEANCLIPPINGRESULT(.DIFFERENCE.,#33,#53);
+#70=IFCSHAPEREPRESENTATION(#5,'Body','Clipping',(#60));
+#71=IFCPRODUCTDEFINITIONSHAPE($,$,(#70));
+#80=IFCWALL('7Wall00000000000000001',$,'Clipped',$,$,#16,#71,'tag',.STANDARD.);
+#90=IFCRELCONTAINEDINSPATIALSTRUCTURE('8Rel000000000000000001',$,$,$,(#80),#12);
+ENDSEC;
+END-ISO-10303-21;
+"#;
+
+#[test]
+fn halfspace_clip_with_agreement_false_keeps_lower_half() {
+    let mut sink = CaptureSink {
+        products: Vec::new(),
+    };
+    let _ = mesh_ifc_streaming(WALL_WITH_HALFSPACE_CLIP.as_bytes(), &mut sink);
+    let mut mesh = sink
+        .products
+        .into_iter()
+        .find(|m| m.entity == "IfcWall")
+        .expect("clipped wall must reach the sink");
+
+    let outcome = apply(&mut mesh);
+    assert_eq!(outcome, Outcome::Cut);
+    let m = csg::build_manifold(&mesh.vertices, &mesh.indices)
+        .expect("post-clip wall must be a closed manifold");
+    let vol = m.volume() * 1.0e-9_f64;
+    assert!(
+        (vol - 0.3).abs() < 0.02,
+        "expected ~0.3 m³ (lower half), got {vol} m³"
+    );
+    // Bbox check: surviving half must be z ∈ [0, 1500].
+    let mut zmax = f32::NEG_INFINITY;
+    for chunk in mesh.vertices.chunks_exact(3) {
+        zmax = zmax.max(chunk[2]);
+    }
+    assert!(zmax <= 1510.0, "upper half should be gone, got zmax={zmax}");
+}
+
+/// Deep-BCR case mirroring the Sannergata wall topology (GH #39):
+/// a wall extrusion clipped by THREE stacked `IfcBooleanClippingResult`
+/// levels of `IfcHalfSpaceSolid`. Each clip is along an axis-aligned
+/// plane perpendicular to a different world axis.
+///
+/// Geometry: 2000 × 200 × 3000 mm extrusion, profile centred on
+/// origin so the box occupies X ∈ [-1000, 1000], Y ∈ [-100, 100],
+/// Z ∈ [0, 3000]. Three clipping planes, all `AgreementFlag = .T.` —
+/// under the de-facto IFC convention `.T.` keeps the +normal side:
+///   1. Through (500, 0, 0), normal +X → keeps X ∈ [500, 1000]
+///      (width 500 mm).
+///   2. Through (0, 50, 0), normal +Y → keeps Y ∈ [50, 100]
+///      (thickness 50 mm).
+///   3. Through (0, 0, 1000), normal +Z → keeps Z ∈ [1000, 3000]
+///      (height 2000 mm).
+///
+/// Expected post-clip volume: 500 × 50 × 2000 = 5e7 mm³ = 0.05 m³.
+const WALL_WITH_DEEP_BCR: &str = r#"ISO-10303-21;
+HEADER;
+FILE_DESCRIPTION(('ViewDefinition [ReferenceView]'),'2;1');
+FILE_NAME('deep_bcr.ifc','2026-06-03T00:00:00',('test'),('skiplum'),'ifcfast','ifcfast','');
+FILE_SCHEMA(('IFC4'));
+ENDSEC;
+DATA;
+#1=IFCPROJECT('0Test000000000000000001',$,'p',$,$,$,$,(#5),#2);
+#2=IFCUNITASSIGNMENT((#3,#4));
+#3=IFCSIUNIT(*,.LENGTHUNIT.,.MILLI.,.METRE.);
+#4=IFCSIUNIT(*,.PLANEANGLEUNIT.,$,.RADIAN.);
+#5=IFCGEOMETRICREPRESENTATIONCONTEXT($,'Model',3,1.0E-5,#6,$);
+#6=IFCAXIS2PLACEMENT3D(#7,$,$);
+#7=IFCCARTESIANPOINT((0.,0.,0.));
+#10=IFCSITE('1Site000000000000000001',$,'s',$,$,#15,$,$,.ELEMENT.,$,$,$,$,$);
+#11=IFCBUILDING('2Bldg000000000000000001',$,'b',$,$,#15,$,$,.ELEMENT.,$,$,$);
+#12=IFCBUILDINGSTOREY('3Stor000000000000000001',$,'L1',$,$,#15,$,$,.ELEMENT.,0.0);
+#15=IFCLOCALPLACEMENT($,#6);
+#16=IFCLOCALPLACEMENT(#15,#6);
+#20=IFCRELAGGREGATES('4Agg000000000000000001',$,$,$,#1,(#10));
+#21=IFCRELAGGREGATES('5Agg000000000000000001',$,$,$,#10,(#11));
+#22=IFCRELAGGREGATES('6Agg000000000000000001',$,$,$,#11,(#12));
+#30=IFCRECTANGLEPROFILEDEF(.AREA.,'WallRect',#31,2000.,200.);
+#31=IFCAXIS2PLACEMENT2D(#7,$);
+#32=IFCDIRECTION((0.,0.,1.));
+#33=IFCEXTRUDEDAREASOLID(#30,#6,#32,3000.);
+#40=IFCCARTESIANPOINT((500.,0.,0.));
+#41=IFCDIRECTION((1.,0.,0.));
+#42=IFCDIRECTION((0.,1.,0.));
+#43=IFCAXIS2PLACEMENT3D(#40,#41,#42);
+#44=IFCPLANE(#43);
+#45=IFCHALFSPACESOLID(#44,.T.);
+#50=IFCBOOLEANCLIPPINGRESULT(.DIFFERENCE.,#33,#45);
+#60=IFCCARTESIANPOINT((0.,50.,0.));
+#61=IFCDIRECTION((0.,1.,0.));
+#62=IFCDIRECTION((1.,0.,0.));
+#63=IFCAXIS2PLACEMENT3D(#60,#61,#62);
+#64=IFCPLANE(#63);
+#65=IFCHALFSPACESOLID(#64,.T.);
+#70=IFCBOOLEANCLIPPINGRESULT(.DIFFERENCE.,#50,#65);
+#80=IFCCARTESIANPOINT((0.,0.,1000.));
+#81=IFCAXIS2PLACEMENT3D(#80,$,$);
+#82=IFCPLANE(#81);
+#83=IFCHALFSPACESOLID(#82,.T.);
+#90=IFCBOOLEANCLIPPINGRESULT(.DIFFERENCE.,#70,#83);
+#100=IFCSHAPEREPRESENTATION(#5,'Body','Clipping',(#90));
+#101=IFCPRODUCTDEFINITIONSHAPE($,$,(#100));
+#110=IFCWALL('7Wall00000000000000001',$,'DeepClipped',$,$,#16,#101,'tag',.STANDARD.);
+#120=IFCRELCONTAINEDINSPATIALSTRUCTURE('8Rel000000000000000001',$,$,$,(#110),#12);
+ENDSEC;
+END-ISO-10303-21;
+"#;
+
+#[test]
+fn deep_bcr_with_three_halfspaces_cuts_correctly() {
+    // Three sequential clips, all AgreementFlag = .T. — same topology
+    // as Sannergata wall #299591 in GH #39, at miniature scale. The
+    // failure mode the report describes (host fully consumed by
+    // stacked half-space cutters going through manifold-csg) must
+    // NOT reproduce here.
+    let mut sink = CaptureSink {
+        products: Vec::new(),
+    };
+    let _ = mesh_ifc_streaming(WALL_WITH_DEEP_BCR.as_bytes(), &mut sink);
+    let entities: Vec<String> = sink.products.iter().map(|m| m.entity.clone()).collect();
+    let mut mesh = sink
+        .products
+        .into_iter()
+        .find(|m| m.entity == "IfcWall")
+        .unwrap_or_else(|| panic!("deep-clipped wall must reach the sink; got entities: {:?}", entities));
+
+    let outcome = apply(&mut mesh);
+    assert_eq!(
+        outcome,
+        Outcome::Cut,
+        "three sequential half-space clips must succeed via halfspace_clip"
+    );
+    let m = csg::build_manifold(&mesh.vertices, &mesh.indices)
+        .expect("post-clip wall must remain a closed manifold");
+    let vol = m.volume() * 1.0e-9_f64;
+    let expected = 0.05_f64; // 500 × 50 × 2000 mm³
+    assert!(
+        (vol - expected).abs() < 0.005,
+        "expected ~{expected} m³ after 3-deep clipping, got {vol} m³"
+    );
+}
+
 #[test]
 fn cut_openings_is_a_no_op_on_solid_wall_without_boolean() {
     // Build a minimal fixture identical to WALL_WITH_OPENING but with

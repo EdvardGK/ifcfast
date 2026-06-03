@@ -24,6 +24,7 @@ pub mod curveset;
 pub mod extrusion;
 pub mod faceset;
 pub mod gltf;
+pub mod halfspace_clip;
 pub mod indexed_curve;
 pub mod mapped;
 pub mod obj;
@@ -145,8 +146,10 @@ impl MeshFragment {
             "boolean_first_operand",
             "boolean_second_operand",
             "csg_branch",
-            "halfspace_bounded",
-            "halfspace_plane",
+            "halfspace_bounded:agree",
+            "halfspace_bounded:disagree",
+            "halfspace_plane:agree",
+            "halfspace_plane:disagree",
             "curve_set",
             "csg_block",
             "csg_cylinder",
@@ -1036,9 +1039,21 @@ pub(crate) fn mesh_item(
         } else if type_name.eq_ignore_ascii_case(b"IFCCSGSOLID") {
             boolean::csg_solid(table, item_id, shape_cache, &mesh_item)
         } else if type_name.eq_ignore_ascii_case(b"IFCPOLYGONALBOUNDEDHALFSPACE") {
-            single(boolean::polygonal_bounded_halfspace(table, item_id), "halfspace_bounded")
+            match boolean::polygonal_bounded_halfspace(table, item_id) {
+                Some((m, agreement)) => single(
+                    Some(m),
+                    if agreement { "halfspace_bounded:agree" } else { "halfspace_bounded:disagree" },
+                ),
+                None => Vec::new(),
+            }
         } else if type_name.eq_ignore_ascii_case(b"IFCHALFSPACESOLID") {
-            single(boolean::halfspace_solid(table, item_id), "halfspace_plane")
+            match boolean::halfspace_solid(table, item_id) {
+                Some((m, agreement)) => single(
+                    Some(m),
+                    if agreement { "halfspace_plane:agree" } else { "halfspace_plane:disagree" },
+                ),
+                None => Vec::new(),
+            }
         } else if type_name.eq_ignore_ascii_case(b"IFCGEOMETRICCURVESET")
             || type_name.eq_ignore_ascii_case(b"IFCGEOMETRICSET")
         {

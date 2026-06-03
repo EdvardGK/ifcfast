@@ -105,26 +105,38 @@ pub fn csg_solid(
     out
 }
 
+/// Parse an IFC BOOLEAN field (`.T.` / `.F.`). IFC has no schema
+/// default for AgreementFlag; honest fallback for malformed input is
+/// `true` (the most common value across Revit / ArchiCAD / Tekla
+/// exports, and the orientation that has the half-space pointing
+/// along the surface's own normal).
+fn parse_agreement_flag(raw: Option<&[u8]>) -> bool {
+    match raw.map(parse_field) {
+        Some(Field::Enum(b"T")) => true,
+        Some(Field::Enum(b"F")) => false,
+        _ => true,
+    }
+}
+
 /// `IfcPolygonalBoundedHalfSpace(BaseSurface, AgreementFlag, Position, PolygonalBoundary)`
 ///
-/// This one IS a finite volume: the polygonal boundary (a 2D curve in
-/// the `Position` frame's XY plane) is extruded through its base plane
-/// to make a closed slab. We emit it as a real bounded mesh tagged
-/// `"halfspace_bounded"`.
-///
-/// Implementation: we approximate the slab as a vertical extrusion of
-/// the polygon (depth = HALFSPACE_SLAB_THICKNESS, centred about the
-/// position's z=0). The AgreementFlag direction is preserved by signing
-/// the extrusion depth. For the common Revit case (clipping a wall by a
-/// vertical plane through a polygon), this produces the cutting volume
-/// in the right place.
-pub fn polygonal_bounded_halfspace(table: &EntityTable, id: u64) -> Option<LocalMesh> {
+/// Emits a thin one-sided slab on the AgreementFlag side of the base
+/// plane (the polygon, extruded by `HALFSPACE_SLAB_THICKNESS` in the
+/// agreement direction). The slab is a visualisation stand-in — the
+/// consumer can see the cutting plane and which side the half-space
+/// occupies. `cut_openings` consumes the same slab via the
+/// `halfspace_bounded:{agreement}` tag and clips the host against the
+/// derived plane directly (no CSG kernel involvement) — see GH #39
+/// and `mesh::halfspace_clip`.
+pub fn polygonal_bounded_halfspace(table: &EntityTable, id: u64) -> Option<(LocalMesh, bool)> {
     let (type_name, args) = table.get(id)?;
     if !type_name.eq_ignore_ascii_case(b"IFCPOLYGONALBOUNDEDHALFSPACE") {
         return None;
     }
     let fields = split_top_level_args(args);
-    // arg[2] = Position (IfcAxis2Placement3D), arg[3] = PolygonalBoundary (IfcBoundedCurve)
+    // arg[1] = AgreementFlag, arg[2] = Position (IfcAxis2Placement3D),
+    // arg[3] = PolygonalBoundary (IfcBoundedCurve).
+    let agreement = parse_agreement_flag(fields.get(1).copied());
     let position = fields
         .get(2)
         .copied()
@@ -142,17 +154,57 @@ pub fn polygonal_bounded_halfspace(table: &EntityTable, id: u64) -> Option<Local
         return None;
     }
     let polygon = Polygon2D { outer, holes: Vec::new() };
-    let mesh = extrude_polygon(&polygon, Vec3::Z, HALFSPACE_SLAB_THICKNESS, position);
-    Some(mesh)
+    // Slab orientation follows the **de-facto** IFC convention — what
+    // ifcopenshell, Revit and web-ifc all do, which is the OPPOSITE of
+    // the literal reading of the IFC4 doc text for `AgreementFlag`. See
+    // ifcopenshell `src/ifcgeom/mapping/IfcHalfSpaceSolid.cpp:33`:
+    //
+    //     f->orientation.reset(!inst->AgreementFlag());
+    //
+    // and the OCCT kernel at `kernels/opencascade/solid.cpp:47`:
+    //
+    //     pnt = pln.Location().Translated(orientation ? +axis : -axis);
+    //     halfspace = BRepPrimAPI_MakeHalfSpace(face, pnt);
+    //
+    // where `BRepPrimAPI_MakeHalfSpace(face, refPnt)` builds the half-
+    // space CONTAINING `refPnt`. Net mapping:
+    //   * `.T.` (`agreement=true`)  → keep +position.Z side
+    //   * `.F.` (`agreement=false`) → keep -position.Z side
+    //
+    // We build a thin one-sided slab whose top-cap normal lives on the
+    // SUBTRACTED side (the side `halfspace_clip` is told to remove).
+    // `halfspace_clip::clip_by_plane` keeps the **negative** side of
+    // the normal it's given, so:
+    //   * `.T.` → slab built on -position.Z side (apply Y-180° rotation
+    //              so local +Z lands on world -position.Z) → clip
+    //              keeps +position.Z.
+    //   * `.F.` → slab built on +position.Z side (no rotation) → clip
+    //              keeps -position.Z.
+    //
+    // The Y-180° rotation has `det=+1`, so outward-facing windings are
+    // preserved through the matrix.
+    let frame = if agreement {
+        position * Mat4::from_rotation_y(std::f32::consts::PI)
+    } else {
+        position
+    };
+    let mesh = extrude_polygon(&polygon, Vec3::Z, HALFSPACE_SLAB_THICKNESS, frame);
+    Some((mesh, agreement))
 }
 
 /// `IfcHalfSpaceSolid(BaseSurface: IfcSurface, AgreementFlag: BOOL)` —
 /// the base surface is typically `IfcPlane(Position: IfcAxis2Placement3D)`.
-/// The half-space is unbounded; we emit a finite square cap on the base
-/// plane (sized HALFSPACE_PLANE_EXTENT × HALFSPACE_PLANE_EXTENT) so the
-/// consumer can SEE where the cutting plane is. The fragment is tagged
-/// `"halfspace_plane"` so they know it's a finite stand-in.
-pub fn halfspace_solid(table: &EntityTable, id: u64) -> Option<LocalMesh> {
+/// We emit a square thin slab on the AgreementFlag side of the base
+/// plane (`HALFSPACE_PLANE_EXTENT × HALFSPACE_PLANE_EXTENT` lateral,
+/// `HALFSPACE_SLAB_THICKNESS * 0.01` deep — near-paper-thin) so the
+/// consumer can see the cutting plane and which side is "inside" the
+/// half-space. The half-space's actual subtraction effect is computed
+/// in `cut_openings` via the `mesh::halfspace_clip` plane-clipping
+/// primitive, NOT via CSG on this slab — see GH #39 for the rationale
+/// (Manifold's batch boolean is fragile when a half-space cutter is
+/// materialised as a finite box and stacked across a deep
+/// IfcBooleanClippingResult tree).
+pub fn halfspace_solid(table: &EntityTable, id: u64) -> Option<(LocalMesh, bool)> {
     let (type_name, args) = table.get(id)?;
     if !type_name.eq_ignore_ascii_case(b"IFCHALFSPACESOLID") {
         return None;
@@ -162,6 +214,7 @@ pub fn halfspace_solid(table: &EntityTable, id: u64) -> Option<LocalMesh> {
         Some(Field::Ref(sid)) => sid,
         _ => return None,
     };
+    let agreement = parse_agreement_flag(fields.get(1).copied());
     // Expect IfcPlane.
     let (s_type, s_args) = table.get(surface_id)?;
     if !s_type.eq_ignore_ascii_case(b"IFCPLANE") {
@@ -176,7 +229,6 @@ pub fn halfspace_solid(table: &EntityTable, id: u64) -> Option<LocalMesh> {
             _ => None,
         })
         .unwrap_or(Mat4::IDENTITY);
-    // Emit a square quad in the plane's local XY (z = 0), centred on origin.
     let e = HALFSPACE_PLANE_EXTENT;
     let square = vec![
         Vec2::new(-e, -e),
@@ -185,9 +237,19 @@ pub fn halfspace_solid(table: &EntityTable, id: u64) -> Option<LocalMesh> {
         Vec2::new(-e, e),
     ];
     let polygon = Polygon2D { outer: square, holes: Vec::new() };
-    // Extrude a paper-thin slab so the cap is visible from both sides.
-    let mesh = extrude_polygon(&polygon, Vec3::Z, HALFSPACE_SLAB_THICKNESS * 0.01, position);
-    Some(mesh)
+    // De-facto IFC convention — see `polygonal_bounded_halfspace` above
+    // for the citation chain (ifcopenshell `!AgreementFlag` flip + OCCT
+    // `BRepPrimAPI_MakeHalfSpace`). Net mapping:
+    //   * `.T.` → keep +position.Z side (slab on -position.Z, rotated).
+    //   * `.F.` → keep -position.Z side (slab on +position.Z, no rotation).
+    // `halfspace_clip` keeps the negative side of the slab-top normal.
+    let frame = if agreement {
+        position * Mat4::from_rotation_y(std::f32::consts::PI)
+    } else {
+        position
+    };
+    let mesh = extrude_polygon(&polygon, Vec3::Z, HALFSPACE_SLAB_THICKNESS * 0.01, frame);
+    Some((mesh, agreement))
 }
 
 /// Mark the structural position of a fragment inside its parent

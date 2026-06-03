@@ -216,12 +216,18 @@ fn boolean_over_halfspace_preserves_both_facts() {
         tags.contains(&"boolean_first_operand|extrusion"),
         "wall bulk volume should surface as boolean_first_operand|extrusion, got {:?}", tags
     );
-    // The clip volume — second operand, leaf = halfspace_bounded.
-    // Losing either fact (just "boolean_second_operand" or just
-    // "halfspace_bounded") would mean the reveal-all stance leaked.
+    // The clip volume — second operand, leaf = halfspace_bounded:*.
+    // Since v0.4.32 the halfspace tag carries an `:agree` / `:disagree`
+    // suffix encoding `IfcPolygonalBoundedHalfSpace.AgreementFlag` so
+    // `cut_openings` can route the cutter through `mesh::halfspace_clip`
+    // on the correct side of the plane. Losing either fact (just
+    // `boolean_second_operand` or just `halfspace_bounded:*`) would
+    // mean the reveal-all stance leaked.
     assert!(
-        tags.contains(&"boolean_second_operand|halfspace_bounded"),
-        "clip volume should surface as boolean_second_operand|halfspace_bounded, got {:?}", tags
+        tags.iter().any(|t| *t == "boolean_second_operand|halfspace_bounded:agree"
+            || *t == "boolean_second_operand|halfspace_bounded:disagree"),
+        "clip volume should surface as boolean_second_operand|halfspace_bounded:{{agree|disagree}}, got {:?}",
+        tags
     );
 }
 
@@ -237,8 +243,10 @@ fn source_tags_set_is_documented() {
         "boolean_first_operand",
         "boolean_second_operand",
         "csg_branch",
-        "halfspace_bounded",
-        "halfspace_plane",
+        "halfspace_bounded:agree",
+        "halfspace_bounded:disagree",
+        "halfspace_plane:agree",
+        "halfspace_plane:disagree",
         "advanced_brep_approx",
         "curve_set",
         "csg_block",
