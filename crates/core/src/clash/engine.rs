@@ -37,6 +37,104 @@ impl ClashKind {
     }
 }
 
+/// Semantic category for a clash pair. Engine *categorises* (never
+/// drops) so consumers can triage a real-world MEP run where ~90% of
+/// raw hits are joints / insulation / non-physical class involvement.
+/// See GH #49 for the production data behind the rules.
+///
+/// Precedence (first match wins): `NonPhysical` > `Insulation` >
+/// `Connection` > `Clash`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClashCategory {
+    /// Actionable cross-system clash — the default bucket.
+    Clash,
+    /// At least one side is `IfcCovering` (typically insulation
+    /// overlapping its host pipe/duct, or neighbouring insulation
+    /// segments).
+    Insulation,
+    /// Same-medium MEP joint: one side is `<Family>Fitting`, the other
+    /// is `<Family>Segment`, with the same family prefix (Pipe, Duct,
+    /// CableCarrier, …). Captures fittings meeting their own run —
+    /// expected geometry, not a real clash.
+    Connection,
+    /// At least one side is a non-physical class
+    /// (`Grid`, `Annotation`, `Space`, `OpeningElement`,
+    /// `VirtualElement`) — never an actionable clash, regardless of
+    /// the other side.
+    NonPhysical,
+}
+
+impl ClashCategory {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Clash => "clash",
+            Self::Insulation => "insulation",
+            Self::Connection => "connection",
+            Self::NonPhysical => "non_physical",
+        }
+    }
+}
+
+/// Classes the engine treats as non-physical. Substrate stores
+/// classes with the `Ifc` prefix stripped (e.g. `"Grid"` for
+/// `IfcGrid`).
+const NON_PHYSICAL_CLASSES: &[&str] = &[
+    "Grid",
+    "Annotation",
+    "Space",
+    "OpeningElement",
+    "VirtualElement",
+];
+
+fn is_non_physical(class: &str) -> bool {
+    NON_PHYSICAL_CLASSES.iter().any(|c| *c == class)
+}
+
+/// Detect a same-family MEP joint: one side ends with `"Fitting"`,
+/// the other with `"Segment"`, and the prefix before that suffix
+/// matches on both sides. Generic so future MEP families (e.g.
+/// `CableCarrier`, `Cable`) are picked up without a hardcoded list.
+fn is_same_family_joint(class_a: &str, class_b: &str) -> bool {
+    let (a_prefix, a_is_fitting) = split_mep_class(class_a);
+    let (b_prefix, b_is_fitting) = split_mep_class(class_b);
+    match (a_prefix, b_prefix) {
+        (Some(pa), Some(pb)) if pa == pb && a_is_fitting != b_is_fitting => true,
+        _ => false,
+    }
+}
+
+/// Splits an MEP class into `(family_prefix, is_fitting)`. Returns
+/// `None` prefix if the class is neither `*Fitting` nor `*Segment`.
+fn split_mep_class(class: &str) -> (Option<&str>, bool) {
+    if let Some(prefix) = class.strip_suffix("Fitting") {
+        if !prefix.is_empty() {
+            return (Some(prefix), true);
+        }
+    }
+    if let Some(prefix) = class.strip_suffix("Segment") {
+        if !prefix.is_empty() {
+            return (Some(prefix), false);
+        }
+    }
+    (None, false)
+}
+
+/// Categorise a clash pair from the substrate classes alone. Pure
+/// function of the two class strings — no geometry, no IFC parse —
+/// so it's cheap and easy to test.
+pub fn categorise(class_a: &str, class_b: &str) -> ClashCategory {
+    if is_non_physical(class_a) || is_non_physical(class_b) {
+        return ClashCategory::NonPhysical;
+    }
+    if class_a == "Covering" || class_b == "Covering" {
+        return ClashCategory::Insulation;
+    }
+    if is_same_family_joint(class_a, class_b) {
+        return ClashCategory::Connection;
+    }
+    ClashCategory::Clash
+}
+
 /// One clash fact between two instances. Identity is by `ifc_id` and
 /// the substrate `guid` — agents join this back to `instances.parquet`
 /// for storey / type / pset enrichment.
@@ -49,6 +147,7 @@ pub struct ClashPair {
     pub class_a: String,
     pub class_b: String,
     pub kind: ClashKind,
+    pub category: ClashCategory,
     pub min_distance_m: f32,
 }
 
@@ -204,6 +303,7 @@ pub fn run(
 
         let a = &instances[id_a as usize];
         let b = &instances[id_b as usize];
+        let category = categorise(&a.class, &b.class);
         pairs.push(ClashPair {
             ifc_id_a: a.ifc_id,
             ifc_id_b: b.ifc_id,
@@ -212,6 +312,7 @@ pub fn run(
             class_a: a.class.clone(),
             class_b: b.class.clone(),
             kind,
+            category,
             min_distance_m: distance,
         });
     }
@@ -526,6 +627,92 @@ mod tests {
         )
         .unwrap();
         assert_eq!(report.pairs.len(), 1);
+    }
+
+    #[test]
+    fn categorise_default_is_clash() {
+        assert_eq!(categorise("Wall", "Slab"), ClashCategory::Clash);
+        assert_eq!(categorise("Pipe", "Beam"), ClashCategory::Clash);
+    }
+
+    #[test]
+    fn categorise_covering_either_side_is_insulation() {
+        assert_eq!(categorise("Covering", "PipeSegment"), ClashCategory::Insulation);
+        assert_eq!(categorise("Wall", "Covering"), ClashCategory::Insulation);
+        assert_eq!(categorise("Covering", "Covering"), ClashCategory::Insulation);
+    }
+
+    #[test]
+    fn categorise_same_family_fitting_segment_is_connection() {
+        assert_eq!(categorise("PipeFitting", "PipeSegment"), ClashCategory::Connection);
+        assert_eq!(categorise("PipeSegment", "PipeFitting"), ClashCategory::Connection);
+        assert_eq!(categorise("DuctFitting", "DuctSegment"), ClashCategory::Connection);
+        assert_eq!(
+            categorise("CableCarrierFitting", "CableCarrierSegment"),
+            ClashCategory::Connection,
+        );
+    }
+
+    #[test]
+    fn categorise_cross_family_fitting_segment_is_clash() {
+        // Different MEP families colliding is a real clash, not a joint.
+        assert_eq!(categorise("PipeFitting", "DuctSegment"), ClashCategory::Clash);
+        assert_eq!(categorise("DuctFitting", "PipeSegment"), ClashCategory::Clash);
+    }
+
+    #[test]
+    fn categorise_fitting_fitting_or_segment_segment_is_clash() {
+        // Two fittings (or two segments) of the same family meeting is
+        // NOT a complementary joint — leave as default clash.
+        assert_eq!(categorise("PipeFitting", "PipeFitting"), ClashCategory::Clash);
+        assert_eq!(categorise("PipeSegment", "PipeSegment"), ClashCategory::Clash);
+    }
+
+    #[test]
+    fn categorise_non_physical_takes_precedence_over_insulation() {
+        // Annotation + Covering should be non_physical, not insulation —
+        // the annotation involvement is the dominant non-actionable
+        // signal.
+        assert_eq!(categorise("Annotation", "Covering"), ClashCategory::NonPhysical);
+        assert_eq!(categorise("Grid", "Wall"), ClashCategory::NonPhysical);
+        assert_eq!(categorise("Space", "PipeSegment"), ClashCategory::NonPhysical);
+        assert_eq!(
+            categorise("OpeningElement", "Wall"),
+            ClashCategory::NonPhysical,
+        );
+        assert_eq!(
+            categorise("VirtualElement", "Door"),
+            ClashCategory::NonPhysical,
+        );
+    }
+
+    #[test]
+    fn categorise_bare_fitting_or_segment_without_family_is_clash() {
+        // Defensive: empty family prefix should not match the joint rule.
+        assert_eq!(categorise("Fitting", "Segment"), ClashCategory::Clash);
+    }
+
+    #[test]
+    fn run_emits_categorised_pairs() {
+        let (v, i) = unit_cube_local();
+        let rep = RepresentationRow {
+            rep_id: 100,
+            source_kind: "shared_or_direct".to_string(),
+            vertices: v,
+            indices: i,
+        };
+        let mut reps = HashMap::new();
+        reps.insert(100u64, rep);
+
+        let mut a = make_instance(1, 100, identity(), [0.0, 0.0, 0.0]);
+        a.class = "PipeFitting".to_string();
+        let mut b = make_instance(2, 100, translate(0.5, 0.0, 0.0), [0.5, 0.0, 0.0]);
+        b.class = "PipeSegment".to_string();
+        let instances = vec![a, b];
+
+        let report = run(&instances, &reps, &ClashOptions::default()).unwrap();
+        assert_eq!(report.pairs.len(), 1);
+        assert_eq!(report.pairs[0].category, ClashCategory::Connection);
     }
 
     #[test]

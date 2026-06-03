@@ -19,7 +19,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Instant;
 
-use _core::clash::{clash as run_clash, write_clashes_parquet, ClashOptions};
+use _core::clash::{clash as run_clash, write_clashes_parquet, ClashCategory, ClashOptions};
 
 fn parse_args(args: &[String]) -> Result<(PathBuf, f32, PathBuf), String> {
     if args.len() < 2 {
@@ -87,19 +87,33 @@ fn main() -> ExitCode {
 
     let mut hard = 0usize;
     let mut clearance = 0usize;
+    let mut cat_clash = 0usize;
+    let mut cat_insulation = 0usize;
+    let mut cat_connection = 0usize;
+    let mut cat_non_physical = 0usize;
     for p in &report.pairs {
         match p.kind {
             _core::clash::ClashKind::Hard => hard += 1,
             _core::clash::ClashKind::Clearance => clearance += 1,
         }
+        match p.category {
+            ClashCategory::Clash => cat_clash += 1,
+            ClashCategory::Insulation => cat_insulation += 1,
+            ClashCategory::Connection => cat_connection += 1,
+            ClashCategory::NonPhysical => cat_non_physical += 1,
+        }
     }
 
-    eprintln!("[ifcfast-clash] tolerance         : {tolerance_m} m");
-    eprintln!("[ifcfast-clash] pairs (hard)      : {hard}");
-    eprintln!("[ifcfast-clash] pairs (clearance) : {clearance}");
-    eprintln!("[ifcfast-clash] geometryless skip : {}", report.geometryless_skipped);
-    eprintln!("[ifcfast-clash] narrow residuals  : {}", report.narrow_phase_residuals);
-    eprintln!("[ifcfast-clash] elapsed           : {:.1} ms", elapsed_ms);
+    eprintln!("[ifcfast-clash] tolerance           : {tolerance_m} m");
+    eprintln!("[ifcfast-clash] pairs (hard)        : {hard}");
+    eprintln!("[ifcfast-clash] pairs (clearance)   : {clearance}");
+    eprintln!("[ifcfast-clash] cat clash           : {cat_clash}");
+    eprintln!("[ifcfast-clash] cat insulation      : {cat_insulation}");
+    eprintln!("[ifcfast-clash] cat connection      : {cat_connection}");
+    eprintln!("[ifcfast-clash] cat non_physical    : {cat_non_physical}");
+    eprintln!("[ifcfast-clash] geometryless skip   : {}", report.geometryless_skipped);
+    eprintln!("[ifcfast-clash] narrow residuals    : {}", report.narrow_phase_residuals);
+    eprintln!("[ifcfast-clash] elapsed             : {:.1} ms", elapsed_ms);
 
     if let Err(e) = write_clashes_parquet(&out_path, &report.pairs) {
         eprintln!("write {}: {e}", out_path.display());

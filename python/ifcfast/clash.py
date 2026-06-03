@@ -83,6 +83,16 @@ def clash(
         * ``kind`` (``object``) — ``"hard"`` for intersecting meshes
           (zero minimum distance), ``"clearance"`` for pairs within the
           tolerance band.
+        * ``category`` (``object``) — semantic bucket assigned from
+          the substrate classes alone. One of ``"clash"`` (actionable
+          cross-system overlap — the default), ``"insulation"``
+          (either side is ``Covering``), ``"connection"`` (same-family
+          ``XFitting``/``XSegment`` MEP joint — fittings meeting their
+          own run), or ``"non_physical"`` (either side is
+          ``Grid``/``Annotation``/``Space``/``OpeningElement``/
+          ``VirtualElement``). Engine *categorises*, never drops —
+          filter with e.g. ``df[df.category == "clash"]`` to triage
+          a noisy MEP run. See GH #49.
         * ``min_distance_m`` (``float32``) — minimum mesh-to-mesh
           distance in metres. ``0.0`` for hard clashes.
 
@@ -123,6 +133,7 @@ def clash(
             "class_a": d["class_a"],
             "class_b": d["class_b"],
             "kind": d["kind"],
+            "category": d["category"],
             "min_distance_m": d["min_distance_m"],
         }
     )

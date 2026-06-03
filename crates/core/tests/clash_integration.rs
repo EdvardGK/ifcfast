@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use _core::bundle::parquet_sink::ParquetSink;
 use _core::bundle::Bundle;
 use _core::clash::{
-    clash as run_clash, write_clashes_parquet, ClashKind, ClashOptions,
+    clash as run_clash, write_clashes_parquet, ClashCategory, ClashKind, ClashOptions,
 };
 use _core::mesh::mesh_ifc_streaming;
 
@@ -135,6 +135,9 @@ fn two_overlapping_walls_produce_one_hard_clash() {
     assert_eq!(p.min_distance_m, 0.0);
     assert_eq!(p.class_a, "Wall");
     assert_eq!(p.class_b, "Wall");
+    // Wall-vs-Wall is neither insulation nor a same-family MEP joint
+    // nor non-physical → default "clash" category.
+    assert_eq!(p.category, ClashCategory::Clash);
     let guids = [p.guid_a.as_str(), p.guid_b.as_str()];
     assert!(guids.contains(&"7WallA0000000000000001"));
     assert!(guids.contains(&"8WallB0000000000000001"));
@@ -195,6 +198,12 @@ fn write_clashes_parquet_roundtrips() {
         .as_any()
         .downcast_ref::<StringArray>()
         .unwrap();
+    let category = batch
+        .column_by_name("category")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
     let distance = batch
         .column_by_name("min_distance_m")
         .unwrap()
@@ -208,6 +217,7 @@ fn write_clashes_parquet_roundtrips() {
         .downcast_ref::<UInt64Array>()
         .unwrap();
     assert_eq!(kind.value(0), "hard");
+    assert_eq!(category.value(0), "clash");
     assert_eq!(distance.value(0), 0.0);
     assert!(ifc_id_a.value(0) > 0);
 }

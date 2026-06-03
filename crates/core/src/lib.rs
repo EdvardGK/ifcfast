@@ -2156,6 +2156,7 @@ mod python {
         let mut class_a: Vec<String> = Vec::with_capacity(n);
         let mut class_b: Vec<String> = Vec::with_capacity(n);
         let mut kind: Vec<&'static str> = Vec::with_capacity(n);
+        let mut category: Vec<&'static str> = Vec::with_capacity(n);
         let mut min_distance_m: Vec<f32> = Vec::with_capacity(n);
         for p in &report.pairs {
             ifc_id_a.push(p.ifc_id_a);
@@ -2168,6 +2169,7 @@ mod python {
                 ClashKind::Hard => "hard",
                 ClashKind::Clearance => "clearance",
             });
+            category.push(p.category.as_str());
             min_distance_m.push(p.min_distance_m);
         }
 
@@ -2179,6 +2181,7 @@ mod python {
         out.set_item("class_a", PyList::new_bound(py, &class_a))?;
         out.set_item("class_b", PyList::new_bound(py, &class_b))?;
         out.set_item("kind", PyList::new_bound(py, &kind))?;
+        out.set_item("category", PyList::new_bound(py, &category))?;
         out.set_item("min_distance_m", PyList::new_bound(py, &min_distance_m))?;
         out.set_item("geometryless_skipped", report.geometryless_skipped as u64)?;
         out.set_item("narrow_phase_residuals", report.narrow_phase_residuals as u64)?;

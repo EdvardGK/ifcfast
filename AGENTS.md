@@ -209,14 +209,43 @@ df = ifcfast.clash(
 | `guid_a/b`       | Utf8    | IFC GUIDs                                                |
 | `class_a/b`      | Utf8    | normalised classes (`"Pipe"`, not `"IfcPipe"`)           |
 | `kind`           | Utf8    | `"hard"` (meshes intersect) or `"clearance"` (within tol)|
+| `category`       | Utf8    | semantic bucket (`"clash"` / `"insulation"` / `"connection"` / `"non_physical"`) — see below |
 | `min_distance_m` | Float32 | minimum mesh-to-mesh distance, metres; `0.0` for hard    |
 
 The engine is just the *fact* layer — does this pair touch, by how
-much. **Policy** (wall-meets-slab is normally not a real clash;
-clashes inside the same opening assembly are noise; BCF emit;
-discipline routing) lives in the layer above and queries
-`clashes.parquet` joined to `instances.parquet`. Example:
-"every MEP-vs-structure hard clash on level 3":
+much, and which semantic bucket it falls in. **Policy** (BCF emit,
+discipline routing, what to hide) lives in the layer above and
+queries `clashes.parquet` joined to `instances.parquet`.
+
+#### `category` (since v0.4.32)
+
+On a real-world MEP export the raw clash list is dominated by
+*non-actionable* hits — insulation overlapping its host pipe, fittings
+meeting their own run, hits against `IfcGrid` / `IfcAnnotation`. On
+one production run (`G55_RIV`, 23 163 hits) only 8 % were
+cross-system clashes a coordinator would review. The `category`
+column buckets each row so consumers can triage without ifcfast
+deciding what to hide. Precedence (first match wins):
+
+| value          | rule                                                                                                                                  |
+|----------------|---------------------------------------------------------------------------------------------------------------------------------------|
+| `non_physical` | either side ∈ {`Grid`, `Annotation`, `Space`, `OpeningElement`, `VirtualElement`}                                                     |
+| `insulation`   | either side is `Covering`                                                                                                             |
+| `connection`   | same family prefix, one side ends in `Fitting`, the other in `Segment` — e.g. `PipeFitting`↔`PipeSegment`, `DuctFitting`↔`DuctSegment` |
+| `clash`        | default — everything else                                                                                                             |
+
+Two fittings (or two segments) of the same family colliding is NOT a
+joint and stays `clash`; cross-family `PipeFitting`↔`DuctSegment`
+also stays `clash`. Insulation is detected from `Covering`
+involvement alone (the substrate's `class` column doesn't carry
+`PredefinedType`); over-tagging an architectural `Covering` here is
+the trade-off. The categorisation is a pure function of the two
+class strings — see `clash::categorise` in the core crate. Filter
+with e.g. `df[df.category == "clash"]` for the actionable subset, or
+`df.value_counts("category")` for a triage histogram.
+
+Example: "every MEP-vs-structure hard clash on level 3, dropping the
+known-noise buckets":
 
 ```sql
 SELECT c.guid_a, c.guid_b, c.class_a, c.class_b
@@ -224,9 +253,10 @@ FROM 'model.bundle/clashes.parquet' c
 JOIN 'model.bundle/instances.parquet' ia ON c.ifc_id_a = ia.ifc_id
 JOIN 'model.bundle/instances.parquet' ib ON c.ifc_id_b = ib.ifc_id
 WHERE c.kind = 'hard'
+  AND c.category = 'clash'           -- drop insulation / connection / non_physical
   AND ia.storey_name = 'Level 3'
-  AND (ia.class IN ('Pipe','Duct','CableCarrier')) XOR
-      (ib.class IN ('Pipe','Duct','CableCarrier'));
+  AND (ia.class IN ('PipeSegment','DuctSegment','CableCarrierSegment')) XOR
+      (ib.class IN ('PipeSegment','DuctSegment','CableCarrierSegment'));
 ```
 
 **Units.** `tolerance_m` and `min_distance_m` are always in metres,

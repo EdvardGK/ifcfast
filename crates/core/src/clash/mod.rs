@@ -47,5 +47,7 @@ pub mod engine;
 pub mod sink;
 pub mod source;
 
-pub use engine::{clash, ClashError, ClashKind, ClashOptions, ClashPair, ClashReport};
+pub use engine::{
+    categorise, clash, ClashCategory, ClashError, ClashKind, ClashOptions, ClashPair, ClashReport,
+};
 pub use sink::write_clashes_parquet;
