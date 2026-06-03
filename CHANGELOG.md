@@ -17,10 +17,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`pyproject.toml`, `Cargo.toml`, `crates/core/Cargo.toml`,
   `python/ifcfast/__init__.py`) and silently drifted out of sync
   across releases — every release required four manual edits, one
-  of which got forgotten or stale. The version now lives in
-  `pyproject.toml` (consumed by maturin to populate the dist-info
-  the wheel installs) and the two `Cargo.toml` files (required by
-  the Rust build before any wheel exists). Pinned by
+  of which got forgotten or stale. Two of those four now collapse:
+  `crates/core/Cargo.toml` inherits `version` / `edition` /
+  `license` / `repository` from `[workspace.package]`, and
+  `__init__.py` reads from `importlib.metadata`. A release now
+  needs two coordinated bumps: `pyproject.toml` (wheel side) and
+  `[workspace.package].version` (Rust side). Pinned by
   `tests/test_smoke.py::test_version_matches_installed_metadata`.
 
 ### Fixed — `world_coordinate_baked` detector rewrite (GH #33)

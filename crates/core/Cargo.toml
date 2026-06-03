@@ -1,10 +1,15 @@
 [package]
 name = "ifcfast-core"
-version = "0.4.31"
-edition = "2021"
-license = "MIT"
+# Inherit from `[workspace.package]` in the repo-root Cargo.toml so
+# the version, edition, license, and repository live in one place.
+# Bumping `workspace.package.version` is enough to rev the Rust side;
+# pyproject.toml carries the wheel's own version string separately
+# (maturin reads from there to populate dist-info — see GH #46).
+version.workspace = true
+edition.workspace = true
+license.workspace = true
 description = "Fast native IFC parser and data extractors"
-repository = "https://github.com/EdvardGK/ifcfast"
+repository.workspace = true
 
 [lib]
 # Python sees this module at `ifcfast._core` thanks to maturin's
