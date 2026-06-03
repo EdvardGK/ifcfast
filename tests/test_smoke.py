@@ -553,3 +553,108 @@ def test_iter_point_cloud_early_drop_does_not_hang(tmp_path):
     # would block. Run a second iter immediately as a liveness check.
     second_chunks = list(m.iter_point_cloud(per_m2=50, seed=2, chunk_points=999_999))
     assert len(second_chunks) >= 1
+
+
+# ---------------------------------------------------------------------------
+# GH #38 — IfcPropertyTableValue, IfcComplexProperty, unhandled markers
+# ---------------------------------------------------------------------------
+
+
+_GH38_PSET_X = """ISO-10303-21;
+HEADER;
+FILE_DESCRIPTION(('ViewDefinition [ReferenceView]'),'2;1');
+FILE_NAME('gh38_pset_x.ifc','2026-06-03T00:00:00',('t'),('t'),'ifcfast','ifcfast','');
+FILE_SCHEMA(('IFC4'));
+ENDSEC;
+DATA;
+#1=IFCPROJECT('0Test000000000000000001',$,'p',$,$,$,$,(#5),#2);
+#2=IFCUNITASSIGNMENT((#3));
+#3=IFCSIUNIT(*,.LENGTHUNIT.,.MILLI.,.METRE.);
+#5=IFCGEOMETRICREPRESENTATIONCONTEXT($,'Model',3,1.0E-5,#6,$);
+#6=IFCAXIS2PLACEMENT3D(#7,$,$);
+#7=IFCCARTESIANPOINT((0.,0.,0.));
+#15=IFCLOCALPLACEMENT($,#6);
+#50=IFCWALL('7Wall00000000000000001',$,'host',$,$,#15,$,'tag',.STANDARD.);
+#100=IFCPROPERTYSINGLEVALUE('S',$,IFCLABEL('hello'),$);
+#101=IFCPROPERTYTABLEVALUE('TableProp',$,(IFCREAL(0.),IFCREAL(1.),IFCREAL(2.)),(IFCREAL(10.),IFCREAL(20.),IFCREAL(30.)),$,$,$,.LINEAR.);
+#102=IFCPROPERTYSINGLEVALUE('Inner1',$,IFCLABEL('inner_value'),$);
+#103=IFCCOMPLEXPROPERTY('ComplexProp',$,'GROUP',(#102));
+#104=IFCPROPERTYREFERENCEVALUE('RefProp',$,$,$);
+#110=IFCPROPERTYSET('1PSet000000000000000X1',$,'Pset_X',$,(#100,#101,#103,#104));
+#120=IFCRELDEFINESBYPROPERTIES('1RDP000000000000000X1',$,$,$,(#50),#110);
+ENDSEC;
+END-ISO-10303-21;
+"""
+
+
+def test_psets_gh38_table_complex_and_unhandled_marker(tmp_path):
+    """GH #38 acceptance: a Pset_X carrying all four shapes — single,
+    table, complex (with one nested single), and one IfcSimpleProperty
+    leaf ifcfast has no parser for (IfcPropertyReferenceValue) — must
+    emit one row each:
+
+    - `S` → captured (single value baseline)
+    - `TableProp` → captured with `value = "d=>v, ..."` and the
+      DefinedValues axis type
+    - `ComplexProp.Inner1` → captured via dot-joined flattening
+      (the wrapper name does NOT appear on its own; nested leaves carry
+      the prefix so consumers can query `prop_name.startswith(...)`)
+    - `RefProp` → captured as a marker row with
+      `value_type = "unhandled:IFCPROPERTYREFERENCEVALUE"` and
+      `value = None`
+
+    Pre-#38: every shape but `S` was silently dropped, with no marker.
+    Ed re-tested v0.4.29 and reported ComplexProp / Inner1 still
+    missing — the flattening convention (Ed himself asked for "handle
+    IfcComplexProperty (flatten nested)") writes them under the
+    `ComplexProp.Inner1` joined name, not as separate `ComplexProp`
+    + `Inner1` rows. This test pins the convention so the captured /
+    not-captured boundary is unambiguous on future reads.
+    """
+    p = tmp_path / "gh38_pset_x.ifc"
+    p.write_text(_GH38_PSET_X, encoding="utf-8")
+    m = ifcfast.open(p, use_cache=False, write_cache=False)
+    df = m.psets
+    rows = {r.prop_name: (r.value, r.value_type) for r in df.itertuples()}
+
+    assert "S" in rows
+    assert rows["S"] == ("hello", "IfcLabel")
+
+    assert "TableProp" in rows
+    table_val, table_type = rows["TableProp"]
+    # Pairing convention is "defining=>defined, ..." in input order.
+    assert table_val == "0=>10, 1=>20, 2=>30"
+    # value_type follows the DefinedValues axis (the payload).
+    assert table_type == "IfcReal"
+
+    # Dot-joined flatten: wrapper name does NOT appear as a row, but
+    # the inner leaf carries the wrapper as a prefix.
+    assert "ComplexProp" not in rows, (
+        "complex wrapper should not appear as a standalone row — the "
+        "convention is to flatten leaves with dot-joined names"
+    )
+    assert "Inner1" not in rows, (
+        "nested leaf should carry the wrapper prefix, not appear "
+        "ungrouped at top level"
+    )
+    assert "ComplexProp.Inner1" in rows, (
+        "nested leaves must surface under `Wrapper.Leaf` so consumers "
+        "can recover the grouping by filtering "
+        "prop_name.startswith('ComplexProp.')"
+    )
+    assert rows["ComplexProp.Inner1"] == ("inner_value", "IfcLabel")
+
+    # Unhandled-marker row for the IfcPropertyReferenceValue we don't
+    # parse. Markers make the blind spot enumerable from Python
+    # without re-parsing the file.
+    import math
+    assert "RefProp" in rows
+    ref_val, ref_type = rows["RefProp"]
+    # value is null in arrow → NaN after pandas round-trip.
+    assert ref_val is None or (isinstance(ref_val, float) and math.isnan(ref_val))
+    assert ref_type == "unhandled:IFCPROPERTYREFERENCEVALUE"
+
+    # Enumerate blind spots — documented filter in CHANGELOG / docs.
+    blind = df[df["value_type"].fillna("").str.startswith("unhandled:")]
+    assert len(blind) == 1
+    assert blind.iloc[0]["prop_name"] == "RefProp"
