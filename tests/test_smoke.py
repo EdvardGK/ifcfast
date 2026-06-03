@@ -24,6 +24,23 @@ def model():
     return ifcfast.open(FIXTURE, use_cache=False, write_cache=False)
 
 
+def test_version_matches_installed_metadata():
+    """`ifcfast.__version__` must match the installed package metadata,
+    not a hand-bumped string in __init__.py (GH #46).
+
+    Pre-fix, __version__ was hardcoded and silently drifted out of
+    sync with pyproject.toml across releases (every release required
+    four manual bumps). Single source of truth: importlib.metadata
+    reads from the .dist-info maturin generates from pyproject.toml.
+    """
+    from importlib.metadata import version as _pkg_version
+
+    assert ifcfast.__version__ == _pkg_version("ifcfast")
+    # And it's an actual string, not the fallback sentinel — a source-
+    # only import without any install would hit "0.0.0+unknown".
+    assert ifcfast.__version__ != "0.0.0+unknown"
+
+
 def test_header():
     h = ifcfast.header(FIXTURE)
     assert h.schema == "IFC4"

@@ -102,7 +102,28 @@ __all__ = [
     "system_prompt",
 ]
 
-__version__ = "0.4.31"
+# Single source of truth: read the version from the installed package
+# metadata (populated by maturin from pyproject.toml at wheel-build
+# time). Editable installs via `maturin develop` work the same way —
+# the `.dist-info/` dir is written next to the wheel and
+# `importlib.metadata` reads it. Falls back to "0.0.0+unknown" only on
+# a source-only import without any install (tooling / type-check
+# runs); in practice the live path always resolves.
+#
+# GH #46. Pre-fix `__version__` was hardcoded here and silently
+# drifted out of sync with pyproject.toml / Cargo.toml — every release
+# required four manual edits and a step you'd forget. Now the only
+# spots that carry the version string are `pyproject.toml`,
+# `Cargo.toml`, and `crates/core/Cargo.toml` (the Cargo files exist
+# because the maturin build needs them at compile time, before the
+# wheel exists; we accept that as a Rust-side fact).
+from importlib.metadata import PackageNotFoundError, version as _pkg_version
+
+try:
+    __version__ = _pkg_version("ifcfast")
+except PackageNotFoundError:  # pragma: no cover
+    __version__ = "0.0.0+unknown"
+del _pkg_version, PackageNotFoundError
 
 
 def example_path() -> Path:

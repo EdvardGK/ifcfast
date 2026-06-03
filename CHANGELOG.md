@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.4.31] - 2026-06-03
 
+### Fixed — `__version__` single source of truth (GH #46)
+
+- **`ifcfast.__version__` now reads from the installed package
+  metadata** via `importlib.metadata`, not a hand-bumped string in
+  `__init__.py`. The version string lived in four files
+  (`pyproject.toml`, `Cargo.toml`, `crates/core/Cargo.toml`,
+  `python/ifcfast/__init__.py`) and silently drifted out of sync
+  across releases — every release required four manual edits, one
+  of which got forgotten or stale. The version now lives in
+  `pyproject.toml` (consumed by maturin to populate the dist-info
+  the wheel installs) and the two `Cargo.toml` files (required by
+  the Rust build before any wheel exists). Pinned by
+  `tests/test_smoke.py::test_version_matches_installed_metadata`.
+
 ### Fixed — `world_coordinate_baked` detector rewrite (GH #33)
 
 - **`m.world_coordinate_baked` is now symptom-based, not
