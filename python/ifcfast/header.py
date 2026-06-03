@@ -218,7 +218,19 @@ _HASH_TAIL_BYTES = 4 * 1024 * 1024
 #       outputs shift accordingly on any product authored via
 #       IfcArbitraryProfileDef(WithVoids) + IfcIndexedPolyCurve. Old
 #       caches must be re-extracted on any RIV / HVAC model.
-_CACHE_SCHEMA_VERSION = 11
+#  12 — v0.4.31: drift `world_coordinate_baked` detector rewritten
+#       (GH #33). Old heuristic (≥80% of products with placement
+#       within 1 mm of world origin) only caught Tekla / Revit
+#       "everything-at-origin" style and missed every other
+#       baked-coords variant. New heuristic: model-level flag
+#       triggers when ≥25% of meshed products would carry per-row
+#       `drift_severity == "error"` (file must have ≥20 meshed
+#       products). When flagged, every `error` / `warn` row demotes
+#       to `info` — model-level pattern, not per-element bug.
+#       Old caches: severity counts shift on mixed/baked structural
+#       models (G55_RIB: 382 `error` → `info`); raw
+#       `drift_distance_m` / `drift_ratio` unchanged.
+_CACHE_SCHEMA_VERSION = 12
 
 _FIELD_RE = re.compile(r"\(\s*(.*?)\s*\)\s*;", re.DOTALL)
 

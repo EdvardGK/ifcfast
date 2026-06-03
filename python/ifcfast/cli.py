@@ -192,35 +192,47 @@ def _cmd_drift(args: argparse.Namespace) -> int:
             print(msg)
         return 1
     counts = {k: int(v) for k, v in df["drift_severity"].value_counts().to_dict().items()}
+    baked = bool(m.world_coordinate_baked)
     payload = {
         "path": str(args.file),
         "products_with_geometry": int(len(df)),
         "severity_counts": {sev: counts.get(sev, 0) for sev in ("ok", "info", "warn", "error")},
-        "world_coordinate_baked": bool(m.world_coordinate_baked),
+        "world_coordinate_baked": baked,
     }
-    if args.top and counts.get("error", 0):
-        top_errs = (
-            df[df["drift_severity"] == "error"]
-            .nlargest(args.top, "drift_distance_m")
-            [["guid", "entity", "drift_distance_m", "max_extent_m", "drift_ratio"]]
-        )
-        payload["top_errors"] = top_errs.to_dict(orient="records")
+    # Top-N "drift offenders" — in a baked-pattern model all the
+    # interesting rows have been demoted to `info`, so widen the pool
+    # past `error` and rank by the raw drift signal (which is
+    # untouched by the model-level demotion). Still useful for
+    # eyeballing the worst cases even in pattern mode.
+    if args.top:
+        non_ok = df[df["drift_severity"] != "ok"]
+        if not non_ok.empty:
+            top_drift = (
+                non_ok.nlargest(args.top, "drift_distance_m")
+                [["guid", "entity", "drift_distance_m", "max_extent_m", "drift_ratio", "drift_severity"]]
+            )
+            payload["top_drift"] = top_drift.to_dict(orient="records")
     pretty = [f"products with geometry: {payload['products_with_geometry']}"]
     for sev in ("ok", "info", "warn", "error"):
         pretty.append(f"  {sev:<6} {payload['severity_counts'][sev]}")
-    if payload["world_coordinate_baked"]:
+    if baked:
         pretty.append("")
         pretty.append(
-            "note: world-coordinate-baked authoring detected — per-element "
-            "drift on origin-placed products demoted to 'info' (model-level "
-            "convention, not per-element bug)."
+            "note: model-level drift pattern detected (>=25% of meshed "
+            "products would be 'error' under the per-row rule). All "
+            "would-be 'error'/'warn' rows demoted to 'info' — this is "
+            "an authoring-style fingerprint (e.g. Tekla / IFC2X3 baked-"
+            "in-world-coords, building-origin-anchored placements), "
+            "not per-element bugs. Raw drift columns are unchanged; "
+            "filter on `drift_distance_m` / `drift_ratio` for the raw "
+            "signal."
         )
-    if "top_errors" in payload:
+    if "top_drift" in payload:
         pretty.append("")
         pretty.append(
-            df[df["drift_severity"] == "error"]
+            df[df["drift_severity"] != "ok"]
             .nlargest(args.top, "drift_distance_m")
-            [["guid", "entity", "drift_distance_m", "max_extent_m", "drift_ratio"]]
+            [["guid", "entity", "drift_distance_m", "max_extent_m", "drift_ratio", "drift_severity"]]
             .to_string(index=False)
         )
     _emit(payload, args, pretty_lines=pretty)

@@ -7,6 +7,67 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.31] - 2026-06-03
+
+### Fixed — `world_coordinate_baked` detector rewrite (GH #33)
+
+- **`m.world_coordinate_baked` is now symptom-based, not
+  cause-based.** The v0.4.27 detector required ≥80% of meshed
+  products to have placement within 1 mm of world origin — a
+  Tekla-specific guess at the underlying authoring style. It
+  missed every other baked-coords variant: building-origin-anchored
+  placements with geometry authored further out, prefab-heavy
+  structural files, and mixed-baked exports like G55_RIB
+  (Ed's tester-in-chief re-verify on 2026-06-02 showed 382/896
+  `error` rows still flagged after v0.4.27 shipped). The new
+  detector trips when ≥25% of meshed products would carry
+  `drift_severity == "error"` under the per-row rule (file must
+  have ≥20 meshed products to qualify). When tripped, every
+  `error` and `warn` row demotes to `info`. Raw `drift_distance_m`
+  and `drift_ratio` columns are unchanged — the demotion is
+  cosmetic on the severity column, the underlying signal is
+  intact for analysts who want it.
+- **`ifcfast drift` banner rewritten to match the new semantic.**
+  No longer claims "origin-placed products demoted"; explains the
+  model-level pattern, names the common authoring styles that
+  produce it, and points at the raw drift columns as the un-
+  demoted signal.
+- **`ifcfast drift --top` widens past `error`.** In a baked-
+  pattern model all interesting rows are `info`; the top-N now
+  ranks any non-`ok` row by `drift_distance_m` so the worst
+  cases stay visible.
+
+### Schema
+
+- `_CACHE_SCHEMA_VERSION` 11 → 12. Old caches re-extract on next
+  open; severity counts shift on baked-pattern models, raw drift
+  columns are byte-identical.
+
+## [0.4.30] - 2026-06-02
+
+### Fixed — IfcArcIndex tessellation in IfcIndexedPolyCurve (GH #48)
+
+- **`IfcArcIndex` segments inside `IfcIndexedPolyCurve` are now
+  curve-sampled, not chorded.** Old behavior treated every
+  3-index arc tuple as a straight chord between the first and
+  third indexed points, collapsing Revit MEP pipes / ducts
+  authored via `IfcArbitraryProfileDef(WithVoids)` to square
+  prisms. Cross-validation on G55_RIV vs ifcopenshell:
+  `IfcPipeSegment` volume-ratio 0.21 → 1.003 (-79% error → <1%),
+  `IfcDuctSegment` 0.997. New shared module
+  `mesh::indexed_curve` exposes 2D and 3D arc evaluators
+  (32-segment-per-full-circle budget, matching
+  `IfcCircleProfileDef`), wired into `profile.rs`,
+  `curveset.rs`, and `boolean.rs`. CCW orientation forced on
+  output — Revit MEP authors CW and the earcut + extrusion
+  pipeline silently inverts cap triangulation otherwise (volume
+  drops to 1/3 with correct arc geometry).
+
+### Schema
+
+- `_CACHE_SCHEMA_VERSION` 10 → 11. Old caches re-extract on next
+  open on any RIV / HVAC / MEP model.
+
 ## [0.4.29] - 2026-06-02
 
 ### Fixed — pset / quantity extractor batch (GH #36, #38, #43, #45)

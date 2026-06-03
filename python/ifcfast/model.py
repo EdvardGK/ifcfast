@@ -373,16 +373,23 @@ class Model:
 
     @property
     def world_coordinate_baked(self) -> bool:
-        """``True`` when the drift extract decided this file follows the
-        world-coordinate-baked authoring style.
+        """``True`` when placement-vs-geometry drift is a model-wide
+        authoring convention rather than per-element defect.
 
-        Common on Tekla / IFC2X3 structural exports: most products have
-        identity ``IfcLocalPlacement`` and their geometry is authored
-        in world coordinates. Under a naive per-row drift check this
-        looks like a model-wide bug (every element flagged "error")
-        — see GH #33. When this flag is ``True``, the per-row
-        ``drift_severity`` of affected rows is demoted to ``"info"``
-        and the file-level fact is the actionable signal instead.
+        Triggered when ≥25% of meshed products would carry
+        ``drift_severity == "error"`` under the per-row rule (and the
+        file has ≥20 meshed products). Common on Tekla / IFC2X3
+        structural exports that bake mesh vertices in world
+        coordinates, building-origin-anchored placements with element
+        geometry authored further out, and prefab-heavy structural
+        files — see GH #33.
+
+        When this flag is ``True``, every ``error`` and ``warn`` row in
+        :attr:`drift` is demoted to ``"info"`` so the per-row severity
+        column reflects "model-level pattern, not per-element bug." The
+        underlying ``drift_distance_m`` / ``drift_ratio`` columns are
+        unchanged — analysts who want the raw signal can filter on
+        those directly.
 
         Forces a drift extract if drift isn't already loaded.
         """
@@ -414,7 +421,10 @@ class Model:
         * ``max_extent_m`` — largest AABB span (metres)
         * ``drift_ratio`` — ``drift_distance_m / max_extent_m``
           (unitless)
-        * ``drift_severity`` — ``"ok"`` / ``"warn"`` / ``"error"``
+        * ``drift_severity`` — ``"ok"`` / ``"info"`` / ``"warn"`` /
+          ``"error"`` (when :attr:`world_coordinate_baked` is ``True``,
+          all rows that would be ``warn`` / ``error`` under the
+          per-row rule are demoted to ``"info"``; see GH #33)
         * ``mesh_quality`` — ``"closed"`` / ``"open_shell"`` /
           ``"degenerate"``
         """

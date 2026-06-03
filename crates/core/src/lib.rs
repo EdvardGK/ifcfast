@@ -793,13 +793,8 @@ mod python {
         let mut drift_severity: Vec<&'static str> = Vec::with_capacity(n);
         let mut aabb_volume = Vec::with_capacity(n);
         let mut mesh_quality = Vec::with_capacity(n);
-        // Placement-at-origin epsilon for the world-coordinate-baked
-        // pattern detector below — 1 mm in SI, which is well inside
-        // typical float round-trip noise even on far-from-origin
-        // models.
-        const PLACEMENT_ORIGIN_EPS_M: f32 = 1e-3;
-        let mut placement_at_origin = 0u32;
         let mut meshed_total = 0u32;
+        let mut raw_error_count = 0u32;
         for s in &prod_stats {
             let px_m = s.placement_x * us_len;
             let py_m = s.placement_y * us_len;
@@ -840,36 +835,20 @@ mod python {
             aabb_volume.push(s.aabb_volume * us_vol);
             mesh_quality.push(s.mesh_quality);
 
-            // World-coord-baked detector — see post-loop block.
             meshed_total += 1;
-            if px_m.abs() < PLACEMENT_ORIGIN_EPS_M
-                && py_m.abs() < PLACEMENT_ORIGIN_EPS_M
-                && pz_m.abs() < PLACEMENT_ORIGIN_EPS_M
-            {
-                placement_at_origin += 1;
+            if severity == "error" {
+                raw_error_count += 1;
             }
         }
 
-        // World-coordinate-baked authoring style is common on Tekla /
-        // IFC2X3 structural exports: every element has identity
-        // `IfcLocalPlacement` and its mesh is authored in world
-        // coordinates. Under the raw per-row rule that would surface
-        // ~half the model as `drift_severity == "error"`, drowning
-        // any genuine per-element drift in the noise (GH #33). When
-        // the model exhibits the pattern across most of its meshed
-        // products, demote the elements that share it to severity
-        // "info" and surface the file-level fact instead.
-        let world_coord_baked = meshed_total > 4
-            && (placement_at_origin as f32 / meshed_total as f32) >= 0.80;
+        // Model-level drift-pattern detector — see
+        // `crate::mesh::stats::is_world_coordinate_baked` for the
+        // heuristic and the GH #33 rationale.
+        let world_coord_baked =
+            crate::mesh::stats::is_world_coordinate_baked(meshed_total, raw_error_count);
         if world_coord_baked {
-            for (i, sev) in drift_severity.iter_mut().enumerate() {
-                if *sev == "ok" {
-                    continue;
-                }
-                if px[i].abs() < PLACEMENT_ORIGIN_EPS_M
-                    && py_v[i].abs() < PLACEMENT_ORIGIN_EPS_M
-                    && pz[i].abs() < PLACEMENT_ORIGIN_EPS_M
-                {
+            for sev in drift_severity.iter_mut() {
+                if *sev == "error" || *sev == "warn" {
                     *sev = "info";
                 }
             }

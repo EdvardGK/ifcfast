@@ -232,6 +232,90 @@ pub fn write_csv<W: std::io::Write>(stats: &[ProductStats], out: &mut W) -> std:
     Ok(())
 }
 
+/// Decide whether the per-row drift signal should be demoted to a
+/// model-level note (GH #33).
+///
+/// Some authoring styles produce placement-vs-geometry drift on a
+/// large fraction of elements as a matter of convention, not
+/// per-element defect — Tekla / IFC2X3 structural exports that bake
+/// mesh vertices in world coordinates and leave `IfcLocalPlacement`
+/// at identity, building-origin-anchored placements with element
+/// geometry authored further out, and prefab-heavy structural files
+/// where the same anchor pattern repeats per assembly. In those
+/// models the per-row severity is uninformative noise (G55_RIB:
+/// 382/896 = 42.6% "error" rows), drowning any genuine authoring
+/// bug.
+///
+/// The heuristic is intentionally symptom-based, not cause-based:
+/// when raw would-be-`error` rows exceed a quarter of the meshed
+/// population (and there are enough rows for that fraction to mean
+/// something), flag the file. The previous origin-placement test
+/// caught only the Tekla "everything-at-origin" sub-style and missed
+/// G55_RIB outright (`v0.4.27` shipped that detector, Ed reverified
+/// it didn't fire). The caller then demotes every `error` / `warn`
+/// row to `info`. Raw `drift_distance` / `drift_ratio` columns stay
+/// intact for analysts who want the un-demoted signal.
+///
+/// Threshold rationale:
+/// - **floor at 20 meshed products** — on tiny files, 25% means a
+///   handful of elements the user can eyeball directly; per-row
+///   `error` remains more useful than a model-level banner.
+/// - **0.25 (25%) of meshed_total as raw error rows** — keeps a
+///   clean model with up-to-handful authoring bugs surfacing them as
+///   `error`, while a baked-style model flips to model-level
+///   reporting.
+#[inline]
+pub fn is_world_coordinate_baked(meshed_total: u32, raw_error_count: u32) -> bool {
+    meshed_total >= 20 && (raw_error_count as f32 / meshed_total as f32) >= 0.25
+}
+
+#[cfg(test)]
+mod world_coord_baked_tests {
+    use super::is_world_coordinate_baked;
+
+    #[test]
+    fn empty_or_tiny_models_do_not_trigger() {
+        assert!(!is_world_coordinate_baked(0, 0));
+        assert!(!is_world_coordinate_baked(1, 1));
+        // 5 products, 5 errors → 100%, still below the floor.
+        assert!(!is_world_coordinate_baked(5, 5));
+        // 19 products, 19 errors → 100%, one short of the floor.
+        assert!(!is_world_coordinate_baked(19, 19));
+    }
+
+    #[test]
+    fn at_floor_with_one_quarter_errors_triggers() {
+        // 20 products, 5 errors → exactly 25% at the floor.
+        assert!(is_world_coordinate_baked(20, 5));
+    }
+
+    #[test]
+    fn under_one_quarter_does_not_trigger_even_above_floor() {
+        // Clean model with a handful of authoring bugs — the case the
+        // heuristic must NOT silence.
+        assert!(!is_world_coordinate_baked(100, 5));
+        assert!(!is_world_coordinate_baked(1000, 100));
+        // Right at the threshold minus one row.
+        assert!(!is_world_coordinate_baked(100, 24));
+    }
+
+    #[test]
+    fn g55_rib_regression_triggers() {
+        // The model that motivated GH #33: 896 meshed products,
+        // 382 "error" rows under the per-row rule. v0.4.27 detector
+        // (origin-placement / 1mm / 80%) did not trigger; the new
+        // detector must.
+        assert!(is_world_coordinate_baked(896, 382));
+    }
+
+    #[test]
+    fn tekla_style_all_at_origin_still_triggers() {
+        // The narrower style the old detector targeted — every element
+        // would-be-error, file is uniformly baked.
+        assert!(is_world_coordinate_baked(500, 500));
+    }
+}
+
 /// File-level aggregate analytics.
 #[derive(Debug, Default, Clone)]
 pub struct FileStats {
