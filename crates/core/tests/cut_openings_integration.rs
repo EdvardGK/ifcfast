@@ -554,3 +554,120 @@ END-ISO-10303-21;
     let cross = CrossProductCut::from_indexer(&idx.voids_opening, &idx.voids_host);
     assert!(cross.is_empty(), "no voids → buffer must be empty");
 }
+
+/// GH #52: IfcPolygonalBoundedHalfSpace where BaseSurface.Position
+/// (the plane) and IfcPolygonalBoundedHalfSpace.Position (the polygon
+/// frame) diverge. Sannergata wall #50724 in miniature.
+///
+/// Geometry: wall extrusion is the standard 1000 × 200 × 3000 mm box
+/// (X ∈ [-500, 500], Y ∈ [-100, 100], Z ∈ [0, 3000]). Cutter:
+///   - BaseSurface plane normal = (0, 0, -1), origin = (0, 0, 2500) —
+///     normal points DOWN. Under the de-facto `.T.` convention we
+///     keep +normal side, i.e. Pz < 2500 → upper 500 mm of the wall
+///     is removed.
+///   - PolygonalBoundary polygon (large enough to cover the whole
+///     wall footprint in the polygon's local XY).
+///   - IfcPolygonalBoundedHalfSpace.Position = identity (axis +Z).
+///
+/// BaseSurface.Position.Axis = (0, 0, -1), polygon-Position.Axis =
+/// (0, 0, 1). Pre-#52, the slab used the polygon's Position, so its
+/// world normal was +Z and `clip_by_plane` would have kept Pz < 2500
+/// (the LOWER half — exactly opposite of what BaseSurface said).
+/// Wait — that happens to match in this axis-symmetric case. The
+/// REAL pre-#52 failure showed up on the Sannergata-style cutter
+/// with normal (-0.02, 0, -0.9998); axis-aligned cases were
+/// degenerate. Let me build the actual failure case.
+///
+/// Replicating Sannergata #50724 at miniature scale: BaseSurface
+/// plane normal = (0, 0, -1), origin = (0, 0, 2500) — keeps lower
+/// half (z < 2500). With the polygon-Position being +Z (default),
+/// pre-#52 the slab's normal landed on the polygon's +Z → clip kept
+/// the side based on polygon-Z, which IS (0, 0, +1) — opposite of
+/// the BaseSurface normal. Post-#52 the slab takes BaseSurface's
+/// normal direct so the clip uses the right direction.
+const WALL_DIVERGING_POSITION_HALFSPACE: &str = r#"ISO-10303-21;
+HEADER;
+FILE_DESCRIPTION(('ViewDefinition [ReferenceView]'),'2;1');
+FILE_NAME('gh52.ifc','2026-06-04T00:00:00',('test'),('skiplum'),'ifcfast','ifcfast','');
+FILE_SCHEMA(('IFC4'));
+ENDSEC;
+DATA;
+#1=IFCPROJECT('0Test000000000000000001',$,'p',$,$,$,$,(#5),#2);
+#2=IFCUNITASSIGNMENT((#3,#4));
+#3=IFCSIUNIT(*,.LENGTHUNIT.,.MILLI.,.METRE.);
+#4=IFCSIUNIT(*,.PLANEANGLEUNIT.,$,.RADIAN.);
+#5=IFCGEOMETRICREPRESENTATIONCONTEXT($,'Model',3,1.0E-5,#6,$);
+#6=IFCAXIS2PLACEMENT3D(#7,$,$);
+#7=IFCCARTESIANPOINT((0.,0.,0.));
+#10=IFCSITE('1Site000000000000000001',$,'s',$,$,#15,$,$,.ELEMENT.,$,$,$,$,$);
+#11=IFCBUILDING('2Bldg000000000000000001',$,'b',$,$,#15,$,$,.ELEMENT.,$,$,$);
+#12=IFCBUILDINGSTOREY('3Stor000000000000000001',$,'L1',$,$,#15,$,$,.ELEMENT.,0.0);
+#15=IFCLOCALPLACEMENT($,#6);
+#16=IFCLOCALPLACEMENT(#15,#6);
+#20=IFCRELAGGREGATES('4Agg000000000000000001',$,$,$,#1,(#10));
+#21=IFCRELAGGREGATES('5Agg000000000000000001',$,$,$,#10,(#11));
+#22=IFCRELAGGREGATES('6Agg000000000000000001',$,$,$,#11,(#12));
+#30=IFCRECTANGLEPROFILEDEF(.AREA.,'WallRect',#31,1000.,200.);
+#31=IFCAXIS2PLACEMENT2D(#7,$);
+#32=IFCDIRECTION((0.,0.,1.));
+#33=IFCEXTRUDEDAREASOLID(#30,#6,#32,3000.);
+#40=IFCCARTESIANPOINT((0.,0.,2500.));
+#41=IFCDIRECTION((0.,0.,-1.));
+#42=IFCDIRECTION((1.,0.,0.));
+#43=IFCAXIS2PLACEMENT3D(#40,#41,#42);
+#44=IFCPLANE(#43);
+#50=IFCAXIS2PLACEMENT3D(#7,$,$);
+#51=IFCCARTESIANPOINT((-1000.,-500.));
+#52=IFCCARTESIANPOINT(( 1000.,-500.));
+#53=IFCCARTESIANPOINT(( 1000., 500.));
+#54=IFCCARTESIANPOINT((-1000., 500.));
+#55=IFCCARTESIANPOINT((-1000.,-500.));
+#56=IFCPOLYLINE((#51,#52,#53,#54,#55));
+#57=IFCPOLYGONALBOUNDEDHALFSPACE(#44,.T.,#50,#56);
+#60=IFCBOOLEANCLIPPINGRESULT(.DIFFERENCE.,#33,#57);
+#70=IFCSHAPEREPRESENTATION(#5,'Body','Clipping',(#60));
+#71=IFCPRODUCTDEFINITIONSHAPE($,$,(#70));
+#80=IFCWALL('7Wall00000000000000001',$,'GH52',$,$,#16,#71,'tag',.STANDARD.);
+#90=IFCRELCONTAINEDINSPATIALSTRUCTURE('8Rel000000000000000001',$,$,$,(#80),#12);
+ENDSEC;
+END-ISO-10303-21;
+"#;
+
+#[test]
+fn polygonal_bounded_uses_base_surface_position_normal() {
+    // Wall is X∈[-500,500], Y∈[-100,100], Z∈[0,3000]. Volume = 0.6 m³.
+    // Cutter's BaseSurface plane normal points -Z (down) at z=2500.
+    // Under .T. (de-facto convention) we keep +normal side, i.e.
+    // -(-Z) = +Z below the plane meaning Pz < 2500. Wait — keep
+    // +normal side means (P-origin)·normal > 0:
+    //   normal = (0, 0, -1), origin = (0, 0, 2500).
+    //   keep where -1*(Pz - 2500) > 0 → Pz < 2500.
+    // So we keep the lower 2500 mm of the wall. Volume = 1000 × 200
+    // × 2500 = 5e8 mm³ = 0.5 m³.
+    let mut sink = CaptureSink { products: Vec::new() };
+    let _ = mesh_ifc_streaming(WALL_DIVERGING_POSITION_HALFSPACE.as_bytes(), &mut sink);
+    let mut mesh = sink
+        .products
+        .into_iter()
+        .find(|m| m.entity == "IfcWall")
+        .expect("wall must reach the sink");
+    let outcome = apply(&mut mesh);
+    assert_eq!(outcome, Outcome::Cut);
+    let m = csg::build_manifold(&mesh.vertices, &mesh.indices)
+        .expect("post-clip wall is a closed manifold");
+    let vol_m3 = m.volume() * 1.0e-9_f64;
+    let expected = 0.5_f64;
+    assert!(
+        (vol_m3 - expected).abs() < 0.02,
+        "expected ~{expected} m³ (lower 2500 mm kept), got {vol_m3} m³ — \
+         pre-#52 this used the polygon-Position's +Z normal instead of \
+         BaseSurface.Position's -Z and clipped the wrong half (or \
+         emptied entirely when BaseSurface was tilted)",
+    );
+    // Bbox: top of the kept body is z ≈ 2500.
+    let mut zmax = f32::NEG_INFINITY;
+    for chunk in mesh.vertices.chunks_exact(3) {
+        zmax = zmax.max(chunk[2]);
+    }
+    assert!(zmax <= 2510.0, "upper half should be gone, zmax = {zmax}");
+}

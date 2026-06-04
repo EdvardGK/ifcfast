@@ -134,14 +134,39 @@ pub fn polygonal_bounded_halfspace(table: &EntityTable, id: u64) -> Option<(Loca
         return None;
     }
     let fields = split_top_level_args(args);
-    // arg[1] = AgreementFlag, arg[2] = Position (IfcAxis2Placement3D),
-    // arg[3] = PolygonalBoundary (IfcBoundedCurve).
+    // IfcPolygonalBoundedHalfSpace inherits from IfcHalfSpaceSolid:
+    //   arg[0] = BaseSurface (IfcPlane, inherited) — defines the
+    //           cutting plane's normal via its Position.Axis.
+    //   arg[1] = AgreementFlag (BOOL, inherited).
+    //   arg[2] = Position (IfcAxis2Placement3D) — defines the LOCAL XY
+    //           frame in which PolygonalBoundary's 2D points live;
+    //           independent from BaseSurface.Position.
+    //   arg[3] = PolygonalBoundary (IfcBoundedCurve).
+    //
+    // Pre-GH #52, we used arg[2]'s Position for the slab's orientation.
+    // That's wrong: when BaseSurface.Position.Axis differs from
+    // arg[2].Position.Axis, the slab's world normal lands on the
+    // polygon's Z direction, not the cutting plane's normal — and
+    // `cut_openings::derive_plane_from_slab` reads exactly that normal
+    // to clip the host. Sannergata wall #50724 reproduced cleanly:
+    // BaseSurface.Axis = (-0.02, 0, -0.9998) (tilted), arg[2].Axis =
+    // (0, 0, 1) — pre-fix the wall emptied; post-fix it's preserved.
     let agreement = parse_agreement_flag(fields.get(1).copied());
-    let position = fields
-        .get(2)
+    let base_surface_position = fields
+        .first()
         .copied()
         .and_then(|f| match parse_field(f) {
-            Field::Ref(pid) => Some(axis_placement_3d_from_id(table, pid)),
+            Field::Ref(sid) => {
+                let (s_type, s_args) = table.get(sid)?;
+                if !s_type.eq_ignore_ascii_case(b"IFCPLANE") {
+                    return None;
+                }
+                let s_fields = split_top_level_args(s_args);
+                match s_fields.first().copied().map(parse_field) {
+                    Some(Field::Ref(pid)) => Some(axis_placement_3d_from_id(table, pid)),
+                    _ => None,
+                }
+            }
             _ => None,
         })
         .unwrap_or(Mat4::IDENTITY);
@@ -183,10 +208,20 @@ pub fn polygonal_bounded_halfspace(table: &EntityTable, id: u64) -> Option<(Loca
     //
     // The Y-180° rotation has `det=+1`, so outward-facing windings are
     // preserved through the matrix.
+    // The slab is built in **BaseSurface.Position**'s frame — its
+    // local +Z is the cutting plane's normal direction (which is what
+    // `cut_openings` needs). The polygon vertices were authored in the
+    // arg[2].Position frame, so when that frame diverges from
+    // BaseSurface.Position the slab's polygonal footprint will look
+    // sheared/rotated in world — a visualisation cost, but cut_openings
+    // only reads the first triangle's normal direction, so the cut is
+    // still correct. Faithful polygon-shape preservation under
+    // diverging frames would require projecting the polygon prism
+    // onto the BaseSurface plane (out of scope here).
     let frame = if agreement {
-        position * Mat4::from_rotation_y(std::f32::consts::PI)
+        base_surface_position * Mat4::from_rotation_y(std::f32::consts::PI)
     } else {
-        position
+        base_surface_position
     };
     let mesh = extrude_polygon(&polygon, Vec3::Z, HALFSPACE_SLAB_THICKNESS, frame);
     Some((mesh, agreement))
