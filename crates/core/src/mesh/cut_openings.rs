@@ -631,6 +631,7 @@ mod tests {
             ],
             world_origin: [0.0, 0.0, 0.0],
             mesh_anchor: [0.0, 0.0, 0.0],
+            surface_color: None,
         }
     }
 
@@ -669,6 +670,7 @@ mod tests {
             ],
             world_origin: [0.0, 0.0, 0.0],
             mesh_anchor: [0.0, 0.0, 0.0],
+            surface_color: None,
         };
         let before_verts = mesh.vertices.clone();
         assert_eq!(apply(&mut mesh), Outcome::Passthrough);
@@ -720,6 +722,7 @@ mod tests {
             index_start: 0,
             index_count: 0,
             source: "boolean_first_operand|extrusion".into(),
+            surface_color: None,
         });
         let _ = apply(&mut mesh);
         assert!(mesh.parts.is_empty(), "parts must clear post-cut");

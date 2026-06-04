@@ -515,6 +515,21 @@ The wheel ships with `csg` in the default Cargo features (since
 v0.4.25), so `pip install ifcfast` is enough — no extras or
 build-from-source needed.
 
+Materials carry **authored `IfcSurfaceStyle` colours** since v0.4.33
+(GH #3). Each PBR `baseColorFactor` is resolved by walking, in
+priority order, `IfcStyledItem.Item == rep_step_id` → first
+reachable `IfcSurfaceStyle` (through `IfcPresentationStyleAssignment`
+if present), then the product's material chain
+(`IfcRelAssociatesMaterial` → `IfcMaterial` →
+`IfcMaterialDefinitionRepresentation` → `IfcStyledRepresentation`).
+`IfcSurfaceStyleRendering.Transparency` flows to `1 - Transparency`
+on the alpha channel and flips `alphaMode` to `BLEND`. Products with
+no styled representation fall back to a per-entity-type palette
+(neutral grey for slabs, brick tan for walls, etc.) so the output
+is never a flat-grey lump. Layered/usage materials
+(`IfcMaterialLayerSetUsage` etc.) are not walked yet — those still
+hit the palette fallback.
+
 ## CLI quick reference
 
 ```bash

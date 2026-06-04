@@ -30,9 +30,10 @@
 //! `instances: [{guid, entity, segments}, ...]` (instanced path) so the
 //! viewer can pick by GUID either way.
 //!
-//! No materials beyond the per-entity-type palette (richer
-//! `IfcSurfaceStyle` colour extraction tracked separately in ifcfast#3),
-//! no textures, no animations. The viewer computes face normals on load
+//! Materials follow [`resolve_product_color`] — authored
+//! `IfcSurfaceStyle` colour when present (resolved via `mesh::styles`),
+//! else the per-entity palette fallback in [`default_color_for_entity`].
+//! No textures, no animations. The viewer computes face normals on load
 //! (Three.js / Babylon / xeokit all do this for normal-less meshes).
 
 use std::collections::HashMap;
@@ -700,38 +701,35 @@ fn build_json(
     let mesh_baked_base = 0;
     let mesh_inst_base = n_baked;
 
-    // materials: per-entity-type palette, reused across instances of
-    // the same entity to avoid an N-entry material array per glb.
-    // Baked products carry a per-product GUID material (kept for
-    // pick-to-BIM-by-material backwards-compat); instanced groups
-    // share one material keyed by the first member's entity.
+    // materials: per-product authored colour (`IfcSurfaceStyle`) when
+    // present, else the per-entity palette fallback. GH #3. Each baked
+    // product gets its own material entry (keyed by GUID, kept for
+    // pick-to-BIM-by-material back-compat); instanced groups share one
+    // material per group keyed by (entity, RGBA) so identical-coloured
+    // instances of the same entity dedup, but a Revit export that
+    // authors two different blues on the same `IfcWallType` still
+    // surfaces both.
     let mut entity_palette: Vec<(String, [f32; 4])> = Vec::new();
-    let mut entity_index: HashMap<String, usize> = HashMap::new();
+    let mut group_index: HashMap<(String, [u32; 4]), usize> = HashMap::new();
     let mut baked_material_idx: Vec<usize> = Vec::with_capacity(n_baked);
     for &i in &plan.baked {
         let mesh = &meshes[i];
-        // Per-product material name = GUID (legacy pick-to-BIM hook),
-        // colour = entity palette lookup.
-        let color = default_color_for_entity(&mesh.entity);
+        let color = resolve_product_color(mesh);
         let idx = baked_material_idx.len();
         baked_material_idx.push(idx);
         entity_palette.push((mesh.guid.clone(), color));
     }
-    // Groups: one material per group, named by the rep_step_id-derived
-    // tag `instanced:<entity>` so a viewer sees these aren't
-    // individually addressable by GUID (the per-instance GUIDs live
-    // in node.extras).
     let mut group_material_idx: Vec<usize> = Vec::with_capacity(n_groups);
     for group in &plan.instanced {
         let first = &meshes[group.member_indices[0]];
-        let key = first.entity.clone();
-        let idx = if let Some(&existing) = entity_index.get(&key) {
+        let color = resolve_product_color(first);
+        let key = (first.entity.clone(), color_key(color));
+        let idx = if let Some(&existing) = group_index.get(&key) {
             existing
         } else {
-            let color = default_color_for_entity(&first.entity);
             let new_idx = entity_palette.len();
             entity_palette.push((format!("instanced:{}", first.entity), color));
-            entity_index.insert(key, new_idx);
+            group_index.insert(key, new_idx);
             new_idx
         };
         group_material_idx.push(idx);
@@ -1133,11 +1131,45 @@ fn push_accessor_vec(
     s.push_str(r#""}"#);
 }
 
+/// Resolve a product's display colour. Priority:
+///   1. The first `InstancePart.surface_color` (per-item `IfcStyledItem`
+///      chain on `IfcRepresentationItem`).
+///   2. `ProductMesh.surface_color` (product material chain via
+///      `IfcRelAssociatesMaterial` → `IfcMaterial` →
+///      `IfcMaterialDefinitionRepresentation`).
+///   3. The per-entity-type palette fallback (no styling authored at
+///      all).
+/// Closing GH #3 — see `mesh::styles` for the indexer that populates
+/// the per-item and per-product fields.
+fn resolve_product_color(mesh: &ProductMesh) -> [f32; 4] {
+    if let Some(c) = mesh
+        .parts
+        .iter()
+        .find_map(|p| p.surface_color)
+        .or(mesh.surface_color)
+    {
+        return c;
+    }
+    default_color_for_entity(&mesh.entity)
+}
+
+/// Hashable colour key for instance-group material dedup. Quantises each
+/// channel to u32 over `[0, 1] × 65535` so near-identical authored
+/// colours dedup to one material entry without requiring `Hash` on f32.
+fn color_key(c: [f32; 4]) -> [u32; 4] {
+    let q = |x: f32| -> u32 {
+        let v = x.clamp(0.0, 1.0);
+        (v * 65535.0).round() as u32
+    };
+    [q(c[0]), q(c[1]), q(c[2]), q(c[3])]
+}
+
 /// Per-entity-type default colour palette. Returns linear-space sRGB +
 /// alpha. Translucent entries (alpha < 1) flag the material as BLEND in
 /// the JSON emitter so the viewer can see *through* spaces and openings
-/// to the solid geometry behind. Real IfcSurfaceStyle colour extraction
-/// is tracked in ifcfast#3 — this is the neutral fallback.
+/// to the solid geometry behind. The neutral fallback for products
+/// without an authored `IfcSurfaceStyle` (see [`resolve_product_color`]
+/// and `mesh::styles`).
 fn default_color_for_entity(entity: &str) -> [f32; 4] {
     // Lowercase, strip "Ifc" prefix for matching.
     let e = entity.to_ascii_lowercase();

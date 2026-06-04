@@ -34,6 +34,7 @@ pub mod qto;
 pub mod revolved;
 pub mod sample;
 pub mod stats;
+pub mod styles;
 
 use std::collections::HashMap;
 use std::time::Instant;
@@ -202,6 +203,12 @@ pub struct InstancePart {
     /// Compound source tag, mirroring `MeshSegment.source` (e.g.
     /// `"boolean_first_operand|extrusion"` or `"mapped"`).
     pub source: String,
+    /// RGBA in linear-space `[0, 1]` derived from the
+    /// `IfcStyledItem.Item == rep_step_id` chain (`IfcSurfaceStyle` →
+    /// `IfcSurfaceStyleRendering`/`Shading` → `IfcColourRgb` + Transparency).
+    /// `None` when no per-item style was authored — consumers fall back
+    /// to [`ProductMesh::surface_color`] or a per-entity palette.
+    pub surface_color: Option<[f32; 4]>,
 }
 
 /// A finished mesh in world coordinates, keyed back to its IfcProduct.
@@ -263,6 +270,14 @@ pub struct ProductMesh {
     /// geometry in world space — using `world_origin` instead would
     /// re-collapse rebased fragments.
     pub mesh_anchor: [f64; 3],
+    /// Product-level fallback colour resolved through the material
+    /// chain (`IfcRelAssociatesMaterial` → `IfcMaterial` →
+    /// `IfcMaterialDefinitionRepresentation` →
+    /// `IfcStyledRepresentation` → `IfcStyledItem`). Used only when no
+    /// `InstancePart` carries a `surface_color`. `None` when the
+    /// product has no styled material — caller falls back to a
+    /// per-entity palette.
+    pub surface_color: Option<[f32; 4]>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -392,6 +407,13 @@ pub fn mesh_ifc_streaming_framed<S: ProductSink>(
     let table = EntityTable::build(buf);
     stats.entity_table_build_ms = t0.elapsed().as_secs_f64() * 1000.0;
     let _ = table.len();
+
+    // Resolve IfcStyledItem + IfcRelAssociatesMaterial chains once up
+    // front so each `tessellate_one` call can look up per-fragment +
+    // per-product colour by integer step_id. Cost: one extra linear
+    // pass; cheap relative to placement-resolve / tessellation.
+    // GH #3.
+    let style_index = styles::StyleIndex::build(&table);
 
     let t_mesh = Instant::now();
 
@@ -545,7 +567,7 @@ pub fn mesh_ifc_streaming_framed<S: ProductSink>(
     // baseline timing exactly: walk work, tessellate, drain to sink.
     if num_threads == 1 {
         for w in work {
-            let outcome = tessellate_one(&table, &shape_cache, frame, w);
+            let outcome = tessellate_one(&table, &shape_cache, &style_index, frame, w);
             apply_outcome(outcome, sink, &mut stats);
         }
         stats.elapsed_ms = t_mesh.elapsed().as_secs_f64() * 1000.0;
@@ -569,6 +591,7 @@ pub fn mesh_ifc_streaming_framed<S: ProductSink>(
     std::thread::scope(|s| {
         let table_ref = &table;
         let shape_cache_ref = &shape_cache;
+        let style_index_ref = &style_index;
         s.spawn(move || {
             // Rayon drives the parallel tessellation. Per-worker `tx`
             // clones via `for_each_with`; the seed `tx` is consumed
@@ -580,6 +603,7 @@ pub fn mesh_ifc_streaming_framed<S: ProductSink>(
                     let outcome = tessellate_one(
                         table_ref,
                         shape_cache_ref,
+                        style_index_ref,
                         frame,
                         w,
                     );
@@ -676,6 +700,7 @@ enum ProductOutcome {
 fn tessellate_one(
     table: &EntityTable,
     shape_cache: &ShapeCache,
+    style_index: &styles::StyleIndex,
     frame: BakeFrame,
     w: Work,
 ) -> ProductOutcome {
@@ -797,6 +822,7 @@ fn tessellate_one(
                             index_count: seg_index_count,
                             source: tag.clone(),
                         });
+                        let surface_color = style_index.item.get(&rep_step_id).copied();
                         parts.push(InstancePart {
                             rep_step_id,
                             instance_transform: instance_transform.to_cols_array(),
@@ -805,6 +831,7 @@ fn tessellate_one(
                             index_start: seg_index_start,
                             index_count: seg_index_count,
                             source: tag,
+                            surface_color,
                         });
                     }
                 }
@@ -843,6 +870,7 @@ fn tessellate_one(
         None => world_origin,
     };
 
+    let product_surface_color = style_index.product.get(&step_id).copied();
     ProductOutcome::Mesh {
         product: ProductMesh {
             guid,
@@ -857,6 +885,7 @@ fn tessellate_one(
             world_transform: world.to_cols_array(),
             world_origin,
             mesh_anchor,
+            surface_color: product_surface_color,
         },
         triangle_count,
         segment_tags,
@@ -956,6 +985,7 @@ fn emit_geometryless<S: ProductSink>(
             // mesh_anchor to the placement origin so Stage 2 sinks see a
             // consistent f64 anchor.
             mesh_anchor: world_origin,
+            surface_color: None,
         });
     }
 }

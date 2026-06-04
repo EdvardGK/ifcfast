@@ -1067,3 +1067,75 @@ fn far_faceset_with_baked_world_coords_meshes_intact() {
         );
     }
 }
+
+/// End-to-end style extraction (GH #3): a synthetic IFC4 wall with an
+/// `IfcStyledItem` chain on its extrusion produces a `ProductMesh`
+/// whose `parts[0].surface_color` carries the authored RGBA.
+const STYLED_WALL_IFC: &str = r#"ISO-10303-21;
+HEADER;
+FILE_DESCRIPTION(('ViewDefinition [ReferenceView]'),'2;1');
+FILE_NAME('styled_wall.ifc','2026-06-04T00:00:00',('test'),('skiplum'),'ifcfast','ifcfast','');
+FILE_SCHEMA(('IFC4'));
+ENDSEC;
+DATA;
+#1=IFCPROJECT('0Test000000000000000001',$,'p',$,$,$,$,(#5),#2);
+#2=IFCUNITASSIGNMENT((#3,#4));
+#3=IFCSIUNIT(*,.LENGTHUNIT.,.MILLI.,.METRE.);
+#4=IFCSIUNIT(*,.PLANEANGLEUNIT.,$,.RADIAN.);
+#5=IFCGEOMETRICREPRESENTATIONCONTEXT($,'Model',3,1.0E-5,#6,$);
+#6=IFCAXIS2PLACEMENT3D(#7,$,$);
+#7=IFCCARTESIANPOINT((0.,0.,0.));
+#10=IFCSITE('1Site000000000000000001',$,'s',$,$,#15,$,$,.ELEMENT.,$,$,$,$,$);
+#11=IFCBUILDING('2Bldg000000000000000001',$,'b',$,$,#15,$,$,.ELEMENT.,$,$,$);
+#12=IFCBUILDINGSTOREY('3Stor000000000000000001',$,'L1',$,$,#15,$,$,.ELEMENT.,0.0);
+#15=IFCLOCALPLACEMENT($,#6);
+#16=IFCLOCALPLACEMENT(#15,#6);
+#20=IFCRELAGGREGATES('4Agg000000000000000001',$,$,$,#1,(#10));
+#21=IFCRELAGGREGATES('5Agg000000000000000001',$,$,$,#10,(#11));
+#22=IFCRELAGGREGATES('6Agg000000000000000001',$,$,$,#11,(#12));
+#30=IFCRECTANGLEPROFILEDEF(.AREA.,'WallRect',#31,1000.,200.);
+#31=IFCAXIS2PLACEMENT2D(#7,$);
+#32=IFCDIRECTION((0.,0.,1.));
+#33=IFCEXTRUDEDAREASOLID(#30,#6,#32,3000.);
+#40=IFCSHAPEREPRESENTATION(#5,'Body','SweptSolid',(#33));
+#41=IFCPRODUCTDEFINITIONSHAPE($,$,(#40));
+#50=IFCWALL('7Wall00000000000000001',$,'StyledWall',$,$,#16,#41,'tag',.STANDARD.);
+#60=IFCRELCONTAINEDINSPATIALSTRUCTURE('8Rel00000000000000001',$,$,$,(#50),#12);
+#100=IFCCOLOURRGB('Olive',0.55,0.45,0.20);
+#101=IFCSURFACESTYLERENDERING(#100,0.25,$,$,$,$,$,$,.NOTDEFINED.);
+#102=IFCSURFACESTYLE('OliveWall',.BOTH.,(#101));
+#103=IFCPRESENTATIONSTYLEASSIGNMENT((#102));
+#104=IFCSTYLEDITEM(#33,(#103),$);
+ENDSEC;
+END-ISO-10303-21;
+"#;
+
+#[test]
+fn styled_item_chain_populates_part_surface_color() {
+    struct Cap(Vec<ProductMesh>);
+    impl ProductSink for Cap {
+        fn on_product(&mut self, m: ProductMesh) { self.0.push(m); }
+    }
+
+    let mut cap = Cap(Vec::new());
+    mesh_ifc_streaming(STYLED_WALL_IFC.as_bytes(), &mut cap);
+    let wall = cap
+        .0
+        .into_iter()
+        .find(|m| m.entity == "IfcWall")
+        .expect("wall product must reach the sink");
+    assert_eq!(wall.parts.len(), 1, "wall has one extrusion part");
+    let color = wall.parts[0]
+        .surface_color
+        .expect("IfcStyledItem chain must populate per-item surface_color");
+    let want = [0.55_f32, 0.45, 0.20, 0.75]; // alpha = 1 - Transparency(0.25)
+    for i in 0..4 {
+        assert!(
+            (color[i] - want[i]).abs() < 1e-4,
+            "channel {} mismatch: got {:?}, want {:?}",
+            i,
+            color,
+            want
+        );
+    }
+}
