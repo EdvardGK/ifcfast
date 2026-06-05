@@ -25,12 +25,21 @@ jobs:
     # Catches CVEs in transitive deps before they ship — see GH #51.
     # Lockfile changes auto-rerun this; advisory-only failures (no
     # lockfile change but a new CVE published) surface on the next push.
+    #
+    # Invoked directly (not via `rustsec/audit-check`) because that
+    # action posts a GitHub check-run, which needs `checks: write` AND
+    # treats every warning as a failure regardless of audit.toml. Our
+    # gate is just "does `cargo audit` return non-zero?" — `audit.toml`
+    # handles allowlisted advisories and gives us a clean exit 0 on
+    # currently-acceptable warnings.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - uses: rustsec/audit-check@v2.0.0
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - name: Install cargo-audit
+        run: cargo install --locked cargo-audit
+      - name: cargo audit
+        run: cargo audit
 
   pytest:
     runs-on: ${{ matrix.os }}
