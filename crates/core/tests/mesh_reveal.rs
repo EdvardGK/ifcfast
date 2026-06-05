@@ -1139,3 +1139,131 @@ fn styled_item_chain_populates_part_surface_color() {
         );
     }
 }
+
+/// GH #54: a product whose representation has TWO operands with
+/// distinct surface styles produces TWO glTF primitives with TWO
+/// distinct materials. Pre-#54, the whole product collapsed to the
+/// first part's colour (`find_map`).
+const TWO_STYLED_OPERANDS_IFC: &str = r#"ISO-10303-21;
+HEADER;
+FILE_DESCRIPTION(('ViewDefinition [ReferenceView]'),'2;1');
+FILE_NAME('two_styles.ifc','2026-06-04T00:00:00',('test'),('skiplum'),'ifcfast','ifcfast','');
+FILE_SCHEMA(('IFC4'));
+ENDSEC;
+DATA;
+#1=IFCPROJECT('0Test000000000000000001',$,'p',$,$,$,$,(#5),#2);
+#2=IFCUNITASSIGNMENT((#3,#4));
+#3=IFCSIUNIT(*,.LENGTHUNIT.,.MILLI.,.METRE.);
+#4=IFCSIUNIT(*,.PLANEANGLEUNIT.,$,.RADIAN.);
+#5=IFCGEOMETRICREPRESENTATIONCONTEXT($,'Model',3,1.0E-5,#6,$);
+#6=IFCAXIS2PLACEMENT3D(#7,$,$);
+#7=IFCCARTESIANPOINT((0.,0.,0.));
+#10=IFCSITE('1Site000000000000000001',$,'s',$,$,#15,$,$,.ELEMENT.,$,$,$,$,$);
+#11=IFCBUILDING('2Bldg000000000000000001',$,'b',$,$,#15,$,$,.ELEMENT.,$,$,$);
+#12=IFCBUILDINGSTOREY('3Stor000000000000000001',$,'L1',$,$,#15,$,$,.ELEMENT.,0.0);
+#15=IFCLOCALPLACEMENT($,#6);
+#16=IFCLOCALPLACEMENT(#15,#6);
+#20=IFCRELAGGREGATES('4Agg000000000000000001',$,$,$,#1,(#10));
+#21=IFCRELAGGREGATES('5Agg000000000000000001',$,$,$,#10,(#11));
+#22=IFCRELAGGREGATES('6Agg000000000000000001',$,$,$,#11,(#12));
+#30=IFCRECTANGLEPROFILEDEF(.AREA.,'WallRect',#31,1000.,200.);
+#31=IFCAXIS2PLACEMENT2D(#7,$);
+#32=IFCDIRECTION((0.,0.,1.));
+#33=IFCEXTRUDEDAREASOLID(#30,#6,#32,3000.);
+#40=IFCRECTANGLEPROFILEDEF(.AREA.,'DoorRect',#41,300.,200.);
+#41=IFCAXIS2PLACEMENT2D(#7,$);
+#42=IFCEXTRUDEDAREASOLID(#40,#6,#32,2100.);
+#50=IFCBOOLEANCLIPPINGRESULT(.DIFFERENCE.,#33,#42);
+#60=IFCSHAPEREPRESENTATION(#5,'Body','Clipping',(#50));
+#61=IFCPRODUCTDEFINITIONSHAPE($,$,(#60));
+#70=IFCWALL('7Wall00000000000000001',$,'TwoStyles',$,$,#16,#61,'tag',.STANDARD.);
+#80=IFCRELCONTAINEDINSPATIALSTRUCTURE('8Rel000000000000000001',$,$,$,(#70),#12);
+#200=IFCCOLOURRGB('BrickRed',0.7,0.2,0.15);
+#201=IFCSURFACESTYLERENDERING(#200,0.0,$,$,$,$,$,$,.NOTDEFINED.);
+#202=IFCSURFACESTYLE('Brick',.BOTH.,(#201));
+#203=IFCPRESENTATIONSTYLEASSIGNMENT((#202));
+#204=IFCSTYLEDITEM(#33,(#203),$);
+#210=IFCCOLOURRGB('GlassBlue',0.6,0.8,0.9);
+#211=IFCSURFACESTYLERENDERING(#210,0.6,$,$,$,$,$,$,.NOTDEFINED.);
+#212=IFCSURFACESTYLE('Glass',.BOTH.,(#211));
+#213=IFCPRESENTATIONSTYLEASSIGNMENT((#212));
+#214=IFCSTYLEDITEM(#42,(#213),$);
+ENDSEC;
+END-ISO-10303-21;
+"#;
+
+#[test]
+fn per_primitive_materials_split_two_styled_operands() {
+    use _core::mesh::gltf;
+
+    struct Cap(Vec<ProductMesh>);
+    impl ProductSink for Cap {
+        fn on_product(&mut self, m: ProductMesh) { self.0.push(m); }
+    }
+
+    let mut cap = Cap(Vec::new());
+    mesh_ifc_streaming(TWO_STYLED_OPERANDS_IFC.as_bytes(), &mut cap);
+    let wall_idx = cap.0.iter().position(|m| m.entity == "IfcWall")
+        .expect("wall must reach the sink");
+    assert!(
+        cap.0[wall_idx].parts.len() >= 2,
+        "wall should have ≥2 parts (host + cutter)"
+    );
+    // Both parts must carry an authored surface_color (one brick, one glass).
+    let colours: Vec<_> = cap.0[wall_idx].parts.iter()
+        .filter_map(|p| p.surface_color)
+        .collect();
+    assert!(
+        colours.len() >= 2,
+        "expected ≥2 distinct authored colours on parts, got {colours:?}"
+    );
+
+    // Write to glb and verify the JSON has ≥2 primitives in the wall mesh.
+    let mut buf: Vec<u8> = Vec::new();
+    gltf::write(&cap.0, &mut buf).expect("glb writes");
+
+    // Parse JSON chunk.
+    assert_eq!(&buf[0..4], b"glTF");
+    let json_len = u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]) as usize;
+    let json_start = 20;
+    let json_end = json_start + json_len;
+    let json_bytes = &buf[json_start..json_end];
+    // Trim any trailing space padding.
+    let json_str = std::str::from_utf8(
+        &json_bytes[..json_bytes.iter().rposition(|&b| b != b' ').map(|i| i+1).unwrap_or(0)]
+    ).expect("json utf-8");
+
+    // Look for the wall mesh entry: walk the meshes array and find one
+    // whose first primitive's material name is the brick hex `#b23326`
+    // OR the glass `#99cce6`. The wall mesh should have ≥2 primitives.
+    let primitives_marker = r#""primitives":["#;
+    let mut split_count = 0;
+    let mut pos = 0;
+    while let Some(off) = json_str[pos..].find(primitives_marker) {
+        let chunk_start = pos + off;
+        // Count `{"attributes"` openings up to the matching `]`.
+        let after_marker = chunk_start + primitives_marker.len();
+        // Find the matching `]` accounting for nested brackets.
+        let mut depth = 1; let mut idx = after_marker;
+        let bytes = json_str.as_bytes();
+        while idx < bytes.len() && depth > 0 {
+            match bytes[idx] {
+                b'[' => depth += 1,
+                b']' => depth -= 1,
+                _ => {}
+            }
+            if depth == 0 { break; }
+            idx += 1;
+        }
+        let primitives_chunk = &json_str[after_marker..idx];
+        let n_primitives = primitives_chunk.matches(r#""attributes""#).count();
+        if n_primitives >= 2 {
+            split_count += 1;
+        }
+        pos = idx + 1;
+    }
+    assert!(
+        split_count >= 1,
+        "expected at least one mesh with ≥2 primitives, found none in glTF JSON"
+    );
+}

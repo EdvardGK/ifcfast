@@ -701,38 +701,87 @@ fn build_json(
     let mesh_baked_base = 0;
     let mesh_inst_base = n_baked;
 
-    // materials: per-product authored colour (`IfcSurfaceStyle`) when
-    // present, else the per-entity palette fallback. GH #3. Each baked
-    // product gets its own material entry (keyed by GUID, kept for
-    // pick-to-BIM-by-material back-compat); instanced groups share one
-    // material per group keyed by (entity, RGBA) so identical-coloured
-    // instances of the same entity dedup, but a Revit export that
-    // authors two different blues on the same `IfcWallType` still
-    // surfaces both.
-    let mut entity_palette: Vec<(String, [f32; 4])> = Vec::new();
-    let mut group_index: HashMap<(String, [u32; 4]), usize> = HashMap::new();
-    let mut baked_material_idx: Vec<usize> = Vec::with_capacity(n_baked);
-    for &i in &plan.baked {
+    // Materials: per-PRIMITIVE authored colour (`IfcSurfaceStyle`), GH
+    // #54. Each baked product can produce N primitives — one per
+    // `MeshSegment` (i.e. per `IfcRepresentationItem` that
+    // contributed) — so a wall whose representation is
+    // `IfcBooleanClippingResult(wall_extrusion, door)` surfaces with
+    // distinct materials per operand, and a glazing proxy whose
+    // representation is one mapped frame + four glass extrusions
+    // surfaces the transparent glass material on the glass primitives
+    // instead of collapsing the whole product to the first part's
+    // colour.
+    //
+    // Materials are globally deduped by RGBA (quantised to u16 per
+    // channel via `color_key`) so identically-coloured primitives
+    // across the file share one entry. Material name is the hex code;
+    // viewers should pick by `node.extras.guid` not by material name.
+    //
+    // Per-segment colour priority (see `resolve_segment_color`):
+    //   `parts[k].surface_color` → `mesh.surface_color` → entity palette.
+    let mut materials_list: Vec<[f32; 4]> = Vec::new();
+    let mut color_dedup: HashMap<[u32; 4], usize> = HashMap::new();
+    let mut intern_color = |c: [f32; 4],
+                            list: &mut Vec<[f32; 4]>,
+                            dedup: &mut HashMap<[u32; 4], usize>|
+     -> usize {
+        let key = color_key(c);
+        *dedup.entry(key).or_insert_with(|| {
+            let idx = list.len();
+            list.push(c);
+            idx
+        })
+    };
+
+    // Per-baked-product segment list: (byte_offset_in_idx_bv, n_indices, material_idx)
+    // — emitted as N primitives + N indices accessors per product.
+    let mut baked_segments: Vec<Vec<(u32, u32, usize)>> = Vec::with_capacity(n_baked);
+    for (bi, &i) in plan.baked.iter().enumerate() {
         let mesh = &meshes[i];
-        let color = resolve_product_color(mesh);
-        let idx = baked_material_idx.len();
-        baked_material_idx.push(idx);
-        entity_palette.push((mesh.guid.clone(), color));
+        let idx_size = match layout.baked[bi].idx_component {
+            U16_T => 2u32,
+            U32_T => 4u32,
+            _ => 4u32,
+        };
+        let mut segs: Vec<(u32, u32, usize)> = Vec::new();
+        let use_segments = mesh.segments.len() > 0
+            && !mesh.parts.is_empty()
+            && mesh.parts.len() == mesh.segments.len();
+        if use_segments {
+            for (k, seg) in mesh.segments.iter().enumerate() {
+                if seg.index_count == 0 {
+                    continue;
+                }
+                let color = resolve_segment_color(mesh, k);
+                let mat_idx = intern_color(color, &mut materials_list, &mut color_dedup);
+                let byte_offset = seg.index_start * idx_size;
+                segs.push((byte_offset, seg.index_count, mat_idx));
+            }
+        }
+        if segs.is_empty() {
+            // Post-cut single-segment products, products without
+            // per-fragment parts, or pathological empty-segment lists
+            // — emit one primitive covering the whole indices buffer
+            // with the product-level / palette colour.
+            let color = resolve_product_color(mesh);
+            let mat_idx = intern_color(color, &mut materials_list, &mut color_dedup);
+            let n_indices = mesh.indices.len() as u32;
+            segs.push((0, n_indices, mat_idx));
+        }
+        baked_segments.push(segs);
     }
+    // Instance groups still emit one primitive per group keyed by the
+    // first member's colour. Per-segment splitting of an instanced
+    // group would break the sharing contract that the EXT_mesh_gpu_instancing
+    // path is built on (every member has the SAME local mesh + segment
+    // layout); a future change can revisit that if MEP exports start
+    // using per-item styling on shared types.
     let mut group_material_idx: Vec<usize> = Vec::with_capacity(n_groups);
     for group in &plan.instanced {
         let first = &meshes[group.member_indices[0]];
         let color = resolve_product_color(first);
-        let key = (first.entity.clone(), color_key(color));
-        let idx = if let Some(&existing) = group_index.get(&key) {
-            existing
-        } else {
-            let new_idx = entity_palette.len();
-            entity_palette.push((format!("instanced:{}", first.entity), color));
-            group_index.insert(key, new_idx);
-            new_idx
-        };
-        group_material_idx.push(idx);
+        let mat_idx = intern_color(color, &mut materials_list, &mut color_dedup);
+        group_material_idx.push(mat_idx);
     }
 
     // ----- begin JSON -----
@@ -800,17 +849,39 @@ fn build_json(
     }
     s.push_str("],");
 
-    // 3. Accessors. bufferView indices are issued in the same order
-    //    the bufferViews block uses (baked × 2 then instanced × 5).
+    // 3. Accessors. Per baked product: 1 positions accessor + N
+    //    indices accessors (one per segment, GH #54). Per instanced
+    //    group: positions + indices + T + R + S. bufferView indices
+    //    are issued in the same order the bufferViews block uses
+    //    (baked × 2 then instanced × 5).
     s.push_str(r#""accessors":["#);
     first = true;
     let mut bv_idx: u32 = 0;
-    for v in &layout.baked {
+    // Track where each baked product's accessors START in the
+    // accessor list, so the meshes step can reference them.
+    let mut baked_pos_acc: Vec<u32> = Vec::with_capacity(n_baked);
+    let mut baked_idx_acc_start: Vec<u32> = Vec::with_capacity(n_baked);
+    let mut next_acc: u32 = 0;
+    for (bi, v) in layout.baked.iter().enumerate() {
         // Quantized positions: UNSIGNED_SHORT, accessor min/max in
         // *encoded* (u16) units per the KHR_mesh_quantization spec.
         push_accessor_positions_quantized(&mut s, &mut first, bv_idx, v.n_verts, v.quant_u16_max);
+        baked_pos_acc.push(next_acc);
+        next_acc += 1;
         bv_idx += 1;
-        push_accessor_indices(&mut s, &mut first, bv_idx, v.n_indices, v.idx_component);
+        // One indices accessor per segment.
+        baked_idx_acc_start.push(next_acc);
+        for (byte_offset, n_indices, _mat) in &baked_segments[bi] {
+            push_accessor_indices_at(
+                &mut s,
+                &mut first,
+                bv_idx,
+                *byte_offset,
+                *n_indices,
+                v.idx_component,
+            );
+            next_acc += 1;
+        }
         bv_idx += 1;
     }
     for v in &layout.instanced {
@@ -835,11 +906,14 @@ fn build_json(
     }
     s.push_str("],");
 
-    // 4. Materials — palette deduped by entity (instanced) plus per-
-    //    product (baked).
+    // 4. Materials — globally deduped by RGBA (GH #54). Material name
+    //    is the hex code so a viewer that doesn't read node.extras can
+    //    still display something meaningful; pick-to-BIM should
+    //    use `node.extras.guid` (baked) or `node.extras.instances[i].guid`
+    //    (instanced), not material name.
     s.push_str(r#""materials":["#);
     first = true;
-    for (name, color) in &entity_palette {
+    for color in &materials_list {
         if !first {
             s.push(',');
         }
@@ -847,7 +921,7 @@ fn build_json(
         let (r, g, b, a) = (color[0], color[1], color[2], color[3]);
         let translucent = a < 1.0;
         s.push_str(r#"{"name":""#);
-        push_json_string(&mut s, name);
+        s.push_str(&hex_color_name(*color));
         s.push_str(r#"","pbrMetallicRoughness":{"baseColorFactor":["#);
         s.push_str(&format_f32(r));
         s.push(',');
@@ -864,33 +938,47 @@ fn build_json(
     }
     s.push_str("],");
 
-    // 5. Meshes — one per baked product, one per instance group.
+    // 5. Meshes — one per baked product (N primitives per product,
+    //    GH #54), one per instance group (1 primitive each).
     s.push_str(r#""meshes":["#);
     first = true;
-    let mut acc_base: u32 = 0;
-    for (i, _) in plan.baked.iter().enumerate() {
+    for (bi, _) in plan.baked.iter().enumerate() {
         if !first {
             s.push(',');
         }
         first = false;
-        let pos_acc = acc_base;
-        let idx_acc = acc_base + 1;
-        s.push_str(r#"{"primitives":[{"attributes":{"POSITION":"#);
-        s.push_str(&pos_acc.to_string());
-        s.push_str(r#"},"indices":"#);
-        s.push_str(&idx_acc.to_string());
-        s.push_str(r#","material":"#);
-        s.push_str(&baked_material_idx[i].to_string());
-        s.push_str(r#","mode":4}]}"#);
-        acc_base += 2;
+        let pos_acc = baked_pos_acc[bi];
+        let idx_acc_start = baked_idx_acc_start[bi];
+        s.push_str(r#"{"primitives":["#);
+        let mut prim_first = true;
+        for (k, (_byte_offset, _n_indices, mat_idx)) in baked_segments[bi].iter().enumerate() {
+            if !prim_first {
+                s.push(',');
+            }
+            prim_first = false;
+            let idx_acc = idx_acc_start + (k as u32);
+            s.push_str(r#"{"attributes":{"POSITION":"#);
+            s.push_str(&pos_acc.to_string());
+            s.push_str(r#"},"indices":"#);
+            s.push_str(&idx_acc.to_string());
+            s.push_str(r#","material":"#);
+            s.push_str(&mat_idx.to_string());
+            s.push_str(r#","mode":4}"#);
+        }
+        s.push_str("]}");
     }
+    // Instanced groups follow the baked accessors; each group adds 5
+    // accessors (positions + indices + T + R + S) and uses the first
+    // two as its primitive's POSITION + indices. Group accessor base
+    // = next_acc carried out of the accessors loop.
+    let mut group_acc_base = next_acc;
     for (g, _group) in plan.instanced.iter().enumerate() {
         if !first {
             s.push(',');
         }
         first = false;
-        let pos_acc = acc_base;
-        let idx_acc = acc_base + 1;
+        let pos_acc = group_acc_base;
+        let idx_acc = group_acc_base + 1;
         s.push_str(r#"{"primitives":[{"attributes":{"POSITION":"#);
         s.push_str(&pos_acc.to_string());
         s.push_str(r#"},"indices":"#);
@@ -898,7 +986,7 @@ fn build_json(
         s.push_str(r#","material":"#);
         s.push_str(&group_material_idx[g].to_string());
         s.push_str(r#","mode":4}]}"#);
-        acc_base += 5; // positions + indices + T + R + S
+        group_acc_base += 5; // positions + indices + T + R + S
     }
     s.push_str("],");
 
@@ -961,7 +1049,10 @@ fn build_json(
     //     attributes pointing at the T/R/S accessors. Per-instance
     //     identity (guid + entity + segments) goes into extras.instances
     //     as a parallel array indexed by instance order.
-    let mut acc_inst_walker: u32 = (2 * n_baked) as u32; // accessor index of the first instance group's positions
+    // Baked accessor count = `next_acc` captured at the end of the
+    // accessors loop (one positions + `segments.len()` indices per
+    // baked product, GH #54). Instance group accessors come after.
+    let mut acc_inst_walker: u32 = next_acc;
     for (gi, group) in plan.instanced.iter().enumerate() {
         if !first {
             s.push(',');
@@ -1087,6 +1178,37 @@ fn push_accessor_positions_quantized(
     s.push_str("]}");
 }
 
+/// Per-segment indices accessor — `byte_offset` is from the start of
+/// the indices bufferView (GH #54). Used by the baked path to slice
+/// the product's index buffer into one accessor per primitive.
+fn push_accessor_indices_at(
+    s: &mut String,
+    first: &mut bool,
+    bv_idx: u32,
+    byte_offset: u32,
+    n_indices: u32,
+    component: u32,
+) {
+    if !*first {
+        s.push(',');
+    }
+    *first = false;
+    s.push_str(r#"{"bufferView":"#);
+    s.push_str(&bv_idx.to_string());
+    if byte_offset > 0 {
+        s.push_str(r#","byteOffset":"#);
+        s.push_str(&byte_offset.to_string());
+    }
+    s.push_str(r#","componentType":"#);
+    s.push_str(&component.to_string());
+    s.push_str(r#","count":"#);
+    s.push_str(&n_indices.to_string());
+    s.push_str(r#","type":""#);
+    s.push_str(SCALAR);
+    s.push_str(r#""}"#);
+}
+
+#[allow(dead_code)]
 fn push_accessor_indices(
     s: &mut String,
     first: &mut bool,
@@ -1151,6 +1273,46 @@ fn resolve_product_color(mesh: &ProductMesh) -> [f32; 4] {
         return c;
     }
     default_color_for_entity(&mesh.entity)
+}
+
+/// Resolve a SPECIFIC SEGMENT's display colour for the per-primitive
+/// materials path (GH #54). Priority: `parts[segment_idx].surface_color`
+/// → product-level / palette fallback. The fragment-level cascade lets
+/// a wall whose two operands have different `IfcSurfaceStyle`s emit two
+/// glTF primitives with different materials, instead of collapsing to
+/// the first part's colour.
+fn resolve_segment_color(mesh: &ProductMesh, segment_idx: usize) -> [f32; 4] {
+    if let Some(part) = mesh.parts.get(segment_idx) {
+        if let Some(c) = part.surface_color {
+            return c;
+        }
+    }
+    if let Some(c) = mesh.surface_color {
+        return c;
+    }
+    default_color_for_entity(&mesh.entity)
+}
+
+/// Material name = `#rrggbbaa` hex code. Globally-deduped materials
+/// can't carry a per-product GUID in their name (one material is shared
+/// across many products); viewers should pick by `node.extras.guid`
+/// instead.
+fn hex_color_name(c: [f32; 4]) -> String {
+    let q = |x: f32| -> u8 {
+        let v = x.clamp(0.0, 1.0);
+        (v * 255.0 + 0.5) as u8
+    };
+    if c[3] >= 0.9995 {
+        format!("#{:02x}{:02x}{:02x}", q(c[0]), q(c[1]), q(c[2]))
+    } else {
+        format!(
+            "#{:02x}{:02x}{:02x}{:02x}",
+            q(c[0]),
+            q(c[1]),
+            q(c[2]),
+            q(c[3])
+        )
+    }
 }
 
 /// Hashable colour key for instance-group material dedup. Quantises each

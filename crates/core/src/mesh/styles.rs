@@ -84,7 +84,17 @@ impl StyleIndex {
             };
             let colour = first_surface_style_colour(table, styles_body, &style_color);
             if let Some(c) = colour {
-                idx.item.insert(item_id, c);
+                // Bind the colour to every leaf step_id reachable from
+                // `item_id`. IFC2x3 MagiCAD-style exports (and any
+                // tool that styles at the instance level) write
+                // `IfcStyledItem(IfcMappedItem(...), Styles, Name)`,
+                // but the mesh pipeline carries the INNER leaf item's
+                // step_id on `InstancePart.rep_step_id`. Binding only
+                // to `item_id` would miss everything in those files —
+                // GH #55. So we follow IfcMappedItem indirection
+                // (recursively) to all reachable leaf items and bind
+                // the same colour to each.
+                expand_styled_target(table, item_id, c, &mut idx.item);
             }
         }
 
@@ -153,6 +163,83 @@ impl StyleIndex {
             .copied()
             .or_else(|| self.product.get(&product_id).copied())
     }
+}
+
+/// Bind `colour` to every **leaf representation item** step_id
+/// reachable from `target_id`, recursing through `IfcMappedItem` and
+/// `IfcShapeRepresentation` so a style attached at the instance level
+/// still lands on the inner geometry that `mesh::tessellate_one`
+/// surfaces as `InstancePart.rep_step_id`. GH #55.
+///
+/// Cycle-guarded with a HashSet — pathological self-referencing
+/// `IfcRepresentationMap` chains can't be expressed in the schema but
+/// the guard keeps us from looping if a malformed file ever ships one.
+fn expand_styled_target(
+    table: &EntityTable,
+    target_id: u64,
+    colour: [f32; 4],
+    out: &mut HashMap<u64, [f32; 4]>,
+) {
+    fn recurse(
+        table: &EntityTable,
+        id: u64,
+        colour: [f32; 4],
+        out: &mut HashMap<u64, [f32; 4]>,
+        visited: &mut std::collections::HashSet<u64>,
+    ) {
+        if !visited.insert(id) {
+            return;
+        }
+        let Some((t, args)) = table.get(id) else {
+            return;
+        };
+        if t.eq_ignore_ascii_case(b"IFCMAPPEDITEM") {
+            // IfcMappedItem(MappingSource, MappingTarget)
+            let fields = split_top_level_args(args);
+            let map_id = match fields.first().copied().map(parse_field) {
+                Some(Field::Ref(rid)) => rid,
+                _ => return,
+            };
+            // IfcRepresentationMap(MappingOrigin, MappedRepresentation)
+            let Some((mt, margs)) = table.get(map_id) else {
+                return;
+            };
+            if !mt.eq_ignore_ascii_case(b"IFCREPRESENTATIONMAP") {
+                return;
+            }
+            let mfields = split_top_level_args(margs);
+            let rep_id = match mfields.get(1).copied().map(parse_field) {
+                Some(Field::Ref(rid)) => rid,
+                _ => return,
+            };
+            recurse(table, rep_id, colour, out, visited);
+            return;
+        }
+        if t.eq_ignore_ascii_case(b"IFCSHAPEREPRESENTATION")
+            || t.eq_ignore_ascii_case(b"IFCREPRESENTATION")
+        {
+            // (ContextOfItems, RepresentationIdentifier, RepresentationType, Items[])
+            let fields = split_top_level_args(args);
+            let items_body = match fields.get(3).copied().map(parse_field) {
+                Some(Field::List(b)) => b,
+                _ => return,
+            };
+            for f in split_top_level_args(items_body) {
+                if let Field::Ref(inner) = parse_field(f) {
+                    recurse(table, inner, colour, out, visited);
+                }
+            }
+            return;
+        }
+        // Leaf — bind the colour here. Don't overwrite if a more
+        // specific styled-item already wrote one for this same id
+        // (the earlier write was a closer-to-the-geometry style; this
+        // expansion was at one or more wrapping levels above).
+        out.entry(id).or_insert(colour);
+    }
+
+    let mut visited = std::collections::HashSet::new();
+    recurse(table, target_id, colour, out, &mut visited);
 }
 
 /// Walk the styles list on an `IfcStyledItem` (or the styles list on an
@@ -433,6 +520,63 @@ END-ISO-10303-21;
         let idx = StyleIndex::build(&table);
         assert!(idx.item.is_empty());
         assert!(idx.product.is_empty());
+    }
+
+    /// GH #55: `IfcStyledItem.Item` points at an `IfcMappedItem` (the
+    /// MagiCAD pattern). The colour must propagate to the INNER
+    /// representation item that the mesh pipeline keys
+    /// `InstancePart.rep_step_id` on, not just the outer mapped-item
+    /// step_id.
+    const STYLED_MAPPED_IFC: &str = r#"ISO-10303-21;
+HEADER;
+FILE_DESCRIPTION(('ViewDefinition [ReferenceView]'),'2;1');
+FILE_NAME('styled_mapped.ifc','2026-06-04T00:00:00',('test'),('skiplum'),'ifcfast','ifcfast','');
+FILE_SCHEMA(('IFC4'));
+ENDSEC;
+DATA;
+#1=IFCPROJECT('0Test000000000000000001',$,'p',$,$,$,$,(#5),#2);
+#2=IFCUNITASSIGNMENT((#3,#4));
+#3=IFCSIUNIT(*,.LENGTHUNIT.,.MILLI.,.METRE.);
+#4=IFCSIUNIT(*,.PLANEANGLEUNIT.,$,.RADIAN.);
+#5=IFCGEOMETRICREPRESENTATIONCONTEXT($,'Model',3,1.0E-5,#6,$);
+#6=IFCAXIS2PLACEMENT3D(#7,$,$);
+#7=IFCCARTESIANPOINT((0.,0.,0.));
+#30=IFCRECTANGLEPROFILEDEF(.AREA.,'WallRect',#31,1000.,200.);
+#31=IFCAXIS2PLACEMENT2D(#7,$);
+#32=IFCDIRECTION((0.,0.,1.));
+#33=IFCEXTRUDEDAREASOLID(#30,#6,#32,3000.);
+#40=IFCSHAPEREPRESENTATION(#5,'Body','SweptSolid',(#33));
+#41=IFCREPRESENTATIONMAP(#6,#40);
+#42=IFCCARTESIANTRANSFORMATIONOPERATOR3D($,$,#7,1.,$);
+#43=IFCMAPPEDITEM(#41,#42);
+#100=IFCCOLOURRGB('Green',0.1,0.7,0.2);
+#101=IFCSURFACESTYLERENDERING(#100,0.0,$,$,$,$,$,$,.NOTDEFINED.);
+#102=IFCSURFACESTYLE('GreenStyle',.BOTH.,(#101));
+#103=IFCPRESENTATIONSTYLEASSIGNMENT((#102));
+#104=IFCSTYLEDITEM(#43,(#103),$);
+ENDSEC;
+END-ISO-10303-21;
+"#;
+
+    #[test]
+    fn styled_mapped_item_propagates_to_inner_extrusion() {
+        // IfcStyledItem #104 styles IfcMappedItem #43, NOT the inner
+        // #33 extrusion. Pre-#55, idx.item[33] would be None and the
+        // glTF emitter would fall back to the per-entity palette.
+        // Post-#55, idx.item[33] = the green RGBA.
+        let table = EntityTable::build(STYLED_MAPPED_IFC.as_bytes());
+        let idx = StyleIndex::build(&table);
+        let got = idx.item.get(&33).copied().expect(
+            "GH #55: colour authored on IfcMappedItem must reach inner extrusion #33",
+        );
+        let want = [0.1_f32, 0.7, 0.2, 1.0];
+        for i in 0..4 {
+            assert!(
+                (got[i] - want[i]).abs() < 1e-5,
+                "channel {} mismatch: got {got:?}, want {want:?}",
+                i
+            );
+        }
     }
 
     #[test]
