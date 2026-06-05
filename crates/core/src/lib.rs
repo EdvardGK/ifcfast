@@ -38,6 +38,7 @@ pub mod geom;
 pub mod clash;
 
 #[cfg(feature = "python")]
+#[allow(unexpected_cfgs)] // pyo3 0.22 `create_exception!` expands a `feature = "gil-refs"` cfg into our crate; remove when bumping to pyo3 ≥ 0.23.
 mod python {
     use std::path::Path;
     use std::panic::{catch_unwind, AssertUnwindSafe};

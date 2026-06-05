@@ -38,7 +38,7 @@
 
 use std::collections::HashMap;
 
-use glam::{Vec2, Vec3};
+use glam::Vec3;
 
 use crate::mesh::profile::Polygon2D;
 

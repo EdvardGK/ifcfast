@@ -255,7 +255,6 @@ struct BakedViews {
     positions: View,
     indices: View,
     n_verts: u32,
-    n_indices: u32,
     /// `U16_T` (when verts < 65536) or `U32_T`.
     idx_component: u32,
     /// Quantization metadata for KHR_mesh_quantization. The position
@@ -433,7 +432,6 @@ fn pack_one_baked(mesh: &ProductMesh, bin: &mut Vec<u8>) -> BakedViews {
             target: ELEMENT_ARRAY_BUFFER,
         },
         n_verts,
-        n_indices: mesh.indices.len() as u32,
         idx_component,
         quant_translation: min,
         quant_scale: q_scale,
@@ -721,9 +719,9 @@ fn build_json(
     //   `parts[k].surface_color` → `mesh.surface_color` → entity palette.
     let mut materials_list: Vec<[f32; 4]> = Vec::new();
     let mut color_dedup: HashMap<[u32; 4], usize> = HashMap::new();
-    let mut intern_color = |c: [f32; 4],
-                            list: &mut Vec<[f32; 4]>,
-                            dedup: &mut HashMap<[u32; 4], usize>|
+    let intern_color = |c: [f32; 4],
+                        list: &mut Vec<[f32; 4]>,
+                        dedup: &mut HashMap<[u32; 4], usize>|
      -> usize {
         let key = color_key(c);
         *dedup.entry(key).or_insert_with(|| {
