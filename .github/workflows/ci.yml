@@ -20,6 +20,18 @@ jobs:
       - name: cargo test
         run: cargo test --release
 
+  cargo-audit:
+    # Scan the committed Cargo.lock against the RustSec advisory DB.
+    # Catches CVEs in transitive deps before they ship — see GH #51.
+    # Lockfile changes auto-rerun this; advisory-only failures (no
+    # lockfile change but a new CVE published) surface on the next push.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: rustsec/audit-check@v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
   pytest:
     runs-on: ${{ matrix.os }}
     strategy:

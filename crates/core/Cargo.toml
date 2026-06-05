@@ -65,7 +65,7 @@ clash = ["bundle", "geom"]
 csg = ["geom", "dep:manifold-csg"]
 
 [dependencies]
-pyo3 = { version = "0.22", features = ["extension-module", "abi3-py310"], optional = true }
+pyo3 = { version = "0.24", features = ["extension-module", "abi3-py310"], optional = true }
 memchr = "2.7"
 memmap2 = "0.9"
 zip = { version = "2.2", default-features = false, features = ["deflate"] }

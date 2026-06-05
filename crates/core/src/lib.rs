@@ -38,7 +38,6 @@ pub mod geom;
 pub mod clash;
 
 #[cfg(feature = "python")]
-#[allow(unexpected_cfgs)] // pyo3 0.22 `create_exception!` expands a `feature = "gil-refs"` cfg into our crate; remove when bumping to pyo3 ≥ 0.23.
 mod python {
     use std::path::Path;
     use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -102,7 +101,7 @@ mod python {
 
         let t_marshal = Instant::now();
 
-        let dict = PyDict::new_bound(py);
+        let dict = PyDict::new(py);
         dict.set_item("schema", &idx.schema)?;
         dict.set_item("project_name", &idx.project_name)?;
         dict.set_item("authoring_app", &idx.authoring_app)?;
@@ -111,69 +110,69 @@ mod python {
         dict.set_item("open_ms", open_ms)?;
         dict.set_item("index_ms", index_ms)?;
 
-        let tc = PyDict::new_bound(py);
+        let tc = PyDict::new(py);
         for (k, v) in &idx.type_counts {
             tc.set_item(k, v)?;
         }
         dict.set_item("type_counts", tc)?;
 
-        let products = PyDict::new_bound(py);
-        products.set_item("step_id", PyList::new_bound(py, &idx.product_step_id))?;
-        products.set_item("guid", PyList::new_bound(py, &idx.product_guid))?;
-        products.set_item("entity", PyList::new_bound(py, &idx.product_entity))?;
-        products.set_item("name", PyList::new_bound(py, &idx.product_name))?;
+        let products = PyDict::new(py);
+        products.set_item("step_id", PyList::new(py, &idx.product_step_id)?)?;
+        products.set_item("guid", PyList::new(py, &idx.product_guid)?)?;
+        products.set_item("entity", PyList::new(py, &idx.product_entity)?)?;
+        products.set_item("name", PyList::new(py, &idx.product_name)?)?;
         products.set_item(
             "predefined_type",
-            PyList::new_bound(py, &idx.product_predefined_type),
+            PyList::new(py, &idx.product_predefined_type)?,
         )?;
-        products.set_item("object_type", PyList::new_bound(py, &idx.product_object_type))?;
-        products.set_item("tag", PyList::new_bound(py, &idx.product_tag))?;
+        products.set_item("object_type", PyList::new(py, &idx.product_object_type)?)?;
+        products.set_item("tag", PyList::new(py, &idx.product_tag)?)?;
         dict.set_item("products", products)?;
 
-        let storeys = PyDict::new_bound(py);
-        storeys.set_item("step_id", PyList::new_bound(py, &idx.storey_step_id))?;
-        storeys.set_item("guid", PyList::new_bound(py, &idx.storey_guid))?;
-        storeys.set_item("name", PyList::new_bound(py, &idx.storey_name))?;
-        storeys.set_item("elevation", PyList::new_bound(py, &idx.storey_elevation))?;
+        let storeys = PyDict::new(py);
+        storeys.set_item("step_id", PyList::new(py, &idx.storey_step_id)?)?;
+        storeys.set_item("guid", PyList::new(py, &idx.storey_guid)?)?;
+        storeys.set_item("name", PyList::new(py, &idx.storey_name)?)?;
+        storeys.set_item("elevation", PyList::new(py, &idx.storey_elevation)?)?;
         storeys.set_item(
             "building_step_id",
-            PyList::new_bound(py, &idx.storey_building_step_id),
+            PyList::new(py, &idx.storey_building_step_id)?,
         )?;
         dict.set_item("storeys", storeys)?;
 
-        let contained = PyDict::new_bound(py);
-        contained.set_item("child", PyList::new_bound(py, &idx.contained_in_child))?;
-        contained.set_item("structure", PyList::new_bound(py, &idx.contained_in_structure))?;
+        let contained = PyDict::new(py);
+        contained.set_item("child", PyList::new(py, &idx.contained_in_child)?)?;
+        contained.set_item("structure", PyList::new(py, &idx.contained_in_structure)?)?;
         dict.set_item("contained_in", contained)?;
 
-        let agg = PyDict::new_bound(py);
-        agg.set_item("child", PyList::new_bound(py, &idx.aggregates_child))?;
-        agg.set_item("parent", PyList::new_bound(py, &idx.aggregates_parent))?;
+        let agg = PyDict::new(py);
+        agg.set_item("child", PyList::new(py, &idx.aggregates_child)?)?;
+        agg.set_item("parent", PyList::new(py, &idx.aggregates_parent)?)?;
         dict.set_item("aggregates", agg)?;
 
-        let sb = PyDict::new_bound(py);
-        sb.set_item("storey", PyList::new_bound(py, &idx.storey_building_storey))?;
-        sb.set_item("building", PyList::new_bound(py, &idx.storey_building_building))?;
+        let sb = PyDict::new(py);
+        sb.set_item("storey", PyList::new(py, &idx.storey_building_storey)?)?;
+        sb.set_item("building", PyList::new(py, &idx.storey_building_building)?)?;
         dict.set_item("storey_building", sb)?;
 
-        let voids = PyDict::new_bound(py);
-        voids.set_item("opening", PyList::new_bound(py, &idx.voids_opening))?;
-        voids.set_item("host", PyList::new_bound(py, &idx.voids_host))?;
+        let voids = PyDict::new(py);
+        voids.set_item("opening", PyList::new(py, &idx.voids_opening)?)?;
+        voids.set_item("host", PyList::new(py, &idx.voids_host)?)?;
         dict.set_item("voids", voids)?;
 
         // IfcRelDefinesByType: (product_step_id, type_step_id) pairs, plus
         // the IfcTypeObject table that lets Python resolve type_step_id to
         // (type_guid, type_name, type_entity).
-        let dbt = PyDict::new_bound(py);
-        dbt.set_item("product", PyList::new_bound(py, &idx.defines_by_type_product))?;
-        dbt.set_item("type", PyList::new_bound(py, &idx.defines_by_type_type))?;
+        let dbt = PyDict::new(py);
+        dbt.set_item("product", PyList::new(py, &idx.defines_by_type_product)?)?;
+        dbt.set_item("type", PyList::new(py, &idx.defines_by_type_type)?)?;
         dict.set_item("defines_by_type", dbt)?;
 
-        let types = PyDict::new_bound(py);
-        types.set_item("step_id", PyList::new_bound(py, &idx.type_object_step_id))?;
-        types.set_item("entity", PyList::new_bound(py, &idx.type_object_entity))?;
-        types.set_item("guid", PyList::new_bound(py, &idx.type_object_guid))?;
-        types.set_item("name", PyList::new_bound(py, &idx.type_object_name))?;
+        let types = PyDict::new(py);
+        types.set_item("step_id", PyList::new(py, &idx.type_object_step_id)?)?;
+        types.set_item("entity", PyList::new(py, &idx.type_object_entity)?)?;
+        types.set_item("guid", PyList::new(py, &idx.type_object_guid)?)?;
+        types.set_item("name", PyList::new(py, &idx.type_object_name)?)?;
         dict.set_item("type_objects", types)?;
 
         let site_ids: Vec<u64> = idx.site_step_id_to_guid.keys().copied().collect();
@@ -181,9 +180,9 @@ mod python {
             .iter()
             .map(|i| idx.site_step_id_to_guid.get(i).unwrap().as_str())
             .collect();
-        let sites = PyDict::new_bound(py);
-        sites.set_item("step_id", PyList::new_bound(py, site_ids))?;
-        sites.set_item("guid", PyList::new_bound(py, site_guids))?;
+        let sites = PyDict::new(py);
+        sites.set_item("step_id", PyList::new(py, site_ids)?)?;
+        sites.set_item("guid", PyList::new(py, site_guids)?)?;
         dict.set_item("sites", sites)?;
 
         let bldg_ids: Vec<u64> = idx.building_step_id_to_guid.keys().copied().collect();
@@ -191,9 +190,9 @@ mod python {
             .iter()
             .map(|i| idx.building_step_id_to_guid.get(i).unwrap().as_str())
             .collect();
-        let buildings = PyDict::new_bound(py);
-        buildings.set_item("step_id", PyList::new_bound(py, bldg_ids))?;
-        buildings.set_item("guid", PyList::new_bound(py, bldg_guids))?;
+        let buildings = PyDict::new(py);
+        buildings.set_item("step_id", PyList::new(py, bldg_ids)?)?;
+        buildings.set_item("guid", PyList::new(py, bldg_guids)?)?;
         dict.set_item("buildings", buildings)?;
 
         let proj_ids: Vec<u64> = idx.project_step_id_to_guid.keys().copied().collect();
@@ -201,9 +200,9 @@ mod python {
             .iter()
             .map(|i| idx.project_step_id_to_guid.get(i).unwrap().as_str())
             .collect();
-        let projects = PyDict::new_bound(py);
-        projects.set_item("step_id", PyList::new_bound(py, proj_ids))?;
-        projects.set_item("guid", PyList::new_bound(py, proj_guids))?;
+        let projects = PyDict::new(py);
+        projects.set_item("step_id", PyList::new(py, proj_ids)?)?;
+        projects.set_item("guid", PyList::new(py, proj_guids)?)?;
         dict.set_item("projects", projects)?;
 
         let space_ids: Vec<u64> = idx.space_step_id_to_guid.keys().copied().collect();
@@ -211,9 +210,9 @@ mod python {
             .iter()
             .map(|i| idx.space_step_id_to_guid.get(i).unwrap().as_str())
             .collect();
-        let spaces = PyDict::new_bound(py);
-        spaces.set_item("step_id", PyList::new_bound(py, space_ids))?;
-        spaces.set_item("guid", PyList::new_bound(py, space_guids))?;
+        let spaces = PyDict::new(py);
+        spaces.set_item("step_id", PyList::new(py, space_ids)?)?;
+        spaces.set_item("guid", PyList::new(py, space_guids)?)?;
         dict.set_item("spaces", spaces)?;
 
         let marshal_ms = t_marshal.elapsed().as_secs_f64() * 1000.0;
@@ -269,13 +268,13 @@ mod python {
         let pset_ms = t_psets.elapsed().as_secs_f64() * 1000.0;
 
         let t_marshal = Instant::now();
-        let out = PyDict::new_bound(py);
-        out.set_item("guid", PyList::new_bound(py, &psets.guid))?;
-        out.set_item("pset_name", PyList::new_bound(py, &psets.pset_name))?;
-        out.set_item("prop_name", PyList::new_bound(py, &psets.prop_name))?;
-        out.set_item("value", PyList::new_bound(py, &psets.value))?;
-        out.set_item("value_type", PyList::new_bound(py, &psets.value_type))?;
-        out.set_item("source", PyList::new_bound(py, &psets.source))?;
+        let out = PyDict::new(py);
+        out.set_item("guid", PyList::new(py, &psets.guid)?)?;
+        out.set_item("pset_name", PyList::new(py, &psets.pset_name)?)?;
+        out.set_item("prop_name", PyList::new(py, &psets.prop_name)?)?;
+        out.set_item("value", PyList::new(py, &psets.value)?)?;
+        out.set_item("value_type", PyList::new(py, &psets.value_type)?)?;
+        out.set_item("source", PyList::new(py, &psets.source)?)?;
         out.set_item("open_ms", open_ms)?;
         out.set_item("entity_table_ms", table_ms)?;
         out.set_item("guid_index_ms", guid_ms)?;
@@ -301,14 +300,14 @@ mod python {
         let qto_ms = t_qto.elapsed().as_secs_f64() * 1000.0;
 
         let t_marshal = Instant::now();
-        let out = PyDict::new_bound(py);
-        out.set_item("guid", PyList::new_bound(py, &qto.guid))?;
-        out.set_item("qto_name", PyList::new_bound(py, &qto.qto_name))?;
-        out.set_item("quantity_name", PyList::new_bound(py, &qto.quantity_name))?;
-        out.set_item("value", PyList::new_bound(py, &qto.value))?;
-        out.set_item("quantity_type", PyList::new_bound(py, &qto.quantity_type))?;
-        out.set_item("unit_step_id", PyList::new_bound(py, &qto.unit_step_id))?;
-        out.set_item("source", PyList::new_bound(py, &qto.source))?;
+        let out = PyDict::new(py);
+        out.set_item("guid", PyList::new(py, &qto.guid)?)?;
+        out.set_item("qto_name", PyList::new(py, &qto.qto_name)?)?;
+        out.set_item("quantity_name", PyList::new(py, &qto.quantity_name)?)?;
+        out.set_item("value", PyList::new(py, &qto.value)?)?;
+        out.set_item("quantity_type", PyList::new(py, &qto.quantity_type)?)?;
+        out.set_item("unit_step_id", PyList::new(py, &qto.unit_step_id)?)?;
+        out.set_item("source", PyList::new(py, &qto.source)?)?;
         out.set_item("open_ms", open_ms)?;
         out.set_item("entity_table_ms", table_ms)?;
         out.set_item("guid_index_ms", guid_ms)?;
@@ -337,17 +336,17 @@ mod python {
         let mat_ms = t_mat.elapsed().as_secs_f64() * 1000.0;
 
         let t_marshal = Instant::now();
-        let out = PyDict::new_bound(py);
-        out.set_item("guid", PyList::new_bound(py, &mats.guid))?;
-        out.set_item("role", PyList::new_bound(py, &mats.role))?;
-        out.set_item("layer_index", PyList::new_bound(py, &mats.layer_index))?;
-        out.set_item("material_name", PyList::new_bound(py, &mats.material_name))?;
-        out.set_item("fraction", PyList::new_bound(py, &mats.fraction))?;
+        let out = PyDict::new(py);
+        out.set_item("guid", PyList::new(py, &mats.guid)?)?;
+        out.set_item("role", PyList::new(py, &mats.role)?)?;
+        out.set_item("layer_index", PyList::new(py, &mats.layer_index)?)?;
+        out.set_item("material_name", PyList::new(py, &mats.material_name)?)?;
+        out.set_item("fraction", PyList::new(py, &mats.fraction)?)?;
         out.set_item(
             "layer_thickness_mm",
-            PyList::new_bound(py, &mats.layer_thickness_mm),
+            PyList::new(py, &mats.layer_thickness_mm)?,
         )?;
-        out.set_item("category", PyList::new_bound(py, &mats.category))?;
+        out.set_item("category", PyList::new(py, &mats.category)?)?;
         out.set_item("open_ms", open_ms)?;
         out.set_item("entity_table_ms", table_ms)?;
         out.set_item("guid_index_ms", guid_ms)?;
@@ -376,14 +375,14 @@ mod python {
         let cls_ms = t_cls.elapsed().as_secs_f64() * 1000.0;
 
         let t_marshal = Instant::now();
-        let out = PyDict::new_bound(py);
-        out.set_item("guid", PyList::new_bound(py, &cls.guid))?;
-        out.set_item("system_name", PyList::new_bound(py, &cls.system_name))?;
-        out.set_item("edition", PyList::new_bound(py, &cls.edition))?;
-        out.set_item("identification", PyList::new_bound(py, &cls.identification))?;
-        out.set_item("name", PyList::new_bound(py, &cls.name))?;
-        out.set_item("location", PyList::new_bound(py, &cls.location))?;
-        out.set_item("source", PyList::new_bound(py, &cls.source))?;
+        let out = PyDict::new(py);
+        out.set_item("guid", PyList::new(py, &cls.guid)?)?;
+        out.set_item("system_name", PyList::new(py, &cls.system_name)?)?;
+        out.set_item("edition", PyList::new(py, &cls.edition)?)?;
+        out.set_item("identification", PyList::new(py, &cls.identification)?)?;
+        out.set_item("name", PyList::new(py, &cls.name)?)?;
+        out.set_item("location", PyList::new(py, &cls.location)?)?;
+        out.set_item("source", PyList::new(py, &cls.source)?)?;
         out.set_item("open_ms", open_ms)?;
         out.set_item("entity_table_ms", table_ms)?;
         out.set_item("guid_index_ms", guid_ms)?;
@@ -433,51 +432,51 @@ mod python {
             });
 
         let t_marshal = Instant::now();
-        let out = PyDict::new_bound(py);
+        let out = PyDict::new(py);
         {
-            let d = PyDict::new_bound(py);
-            d.set_item("guid", PyList::new_bound(py, &psets.guid))?;
-            d.set_item("pset_name", PyList::new_bound(py, &psets.pset_name))?;
-            d.set_item("prop_name", PyList::new_bound(py, &psets.prop_name))?;
-            d.set_item("value", PyList::new_bound(py, &psets.value))?;
-            d.set_item("value_type", PyList::new_bound(py, &psets.value_type))?;
-            d.set_item("source", PyList::new_bound(py, &psets.source))?;
+            let d = PyDict::new(py);
+            d.set_item("guid", PyList::new(py, &psets.guid)?)?;
+            d.set_item("pset_name", PyList::new(py, &psets.pset_name)?)?;
+            d.set_item("prop_name", PyList::new(py, &psets.prop_name)?)?;
+            d.set_item("value", PyList::new(py, &psets.value)?)?;
+            d.set_item("value_type", PyList::new(py, &psets.value_type)?)?;
+            d.set_item("source", PyList::new(py, &psets.source)?)?;
             out.set_item("psets", d)?;
         }
         {
-            let d = PyDict::new_bound(py);
-            d.set_item("guid", PyList::new_bound(py, &quantities.guid))?;
-            d.set_item("qto_name", PyList::new_bound(py, &quantities.qto_name))?;
-            d.set_item("quantity_name", PyList::new_bound(py, &quantities.quantity_name))?;
-            d.set_item("value", PyList::new_bound(py, &quantities.value))?;
-            d.set_item("quantity_type", PyList::new_bound(py, &quantities.quantity_type))?;
-            d.set_item("unit_step_id", PyList::new_bound(py, &quantities.unit_step_id))?;
-            d.set_item("source", PyList::new_bound(py, &quantities.source))?;
+            let d = PyDict::new(py);
+            d.set_item("guid", PyList::new(py, &quantities.guid)?)?;
+            d.set_item("qto_name", PyList::new(py, &quantities.qto_name)?)?;
+            d.set_item("quantity_name", PyList::new(py, &quantities.quantity_name)?)?;
+            d.set_item("value", PyList::new(py, &quantities.value)?)?;
+            d.set_item("quantity_type", PyList::new(py, &quantities.quantity_type)?)?;
+            d.set_item("unit_step_id", PyList::new(py, &quantities.unit_step_id)?)?;
+            d.set_item("source", PyList::new(py, &quantities.source)?)?;
             out.set_item("quantities", d)?;
         }
         {
-            let d = PyDict::new_bound(py);
-            d.set_item("guid", PyList::new_bound(py, &materials.guid))?;
-            d.set_item("role", PyList::new_bound(py, &materials.role))?;
-            d.set_item("layer_index", PyList::new_bound(py, &materials.layer_index))?;
-            d.set_item("material_name", PyList::new_bound(py, &materials.material_name))?;
+            let d = PyDict::new(py);
+            d.set_item("guid", PyList::new(py, &materials.guid)?)?;
+            d.set_item("role", PyList::new(py, &materials.role)?)?;
+            d.set_item("layer_index", PyList::new(py, &materials.layer_index)?)?;
+            d.set_item("material_name", PyList::new(py, &materials.material_name)?)?;
             d.set_item(
                 "layer_thickness_mm",
-                PyList::new_bound(py, &materials.layer_thickness_mm),
+                PyList::new(py, &materials.layer_thickness_mm)?,
             )?;
-            d.set_item("category", PyList::new_bound(py, &materials.category))?;
-            d.set_item("fraction", PyList::new_bound(py, &materials.fraction))?;
+            d.set_item("category", PyList::new(py, &materials.category)?)?;
+            d.set_item("fraction", PyList::new(py, &materials.fraction)?)?;
             out.set_item("materials", d)?;
         }
         {
-            let d = PyDict::new_bound(py);
-            d.set_item("guid", PyList::new_bound(py, &classifications.guid))?;
-            d.set_item("system_name", PyList::new_bound(py, &classifications.system_name))?;
-            d.set_item("edition", PyList::new_bound(py, &classifications.edition))?;
-            d.set_item("identification", PyList::new_bound(py, &classifications.identification))?;
-            d.set_item("name", PyList::new_bound(py, &classifications.name))?;
-            d.set_item("location", PyList::new_bound(py, &classifications.location))?;
-            d.set_item("source", PyList::new_bound(py, &classifications.source))?;
+            let d = PyDict::new(py);
+            d.set_item("guid", PyList::new(py, &classifications.guid)?)?;
+            d.set_item("system_name", PyList::new(py, &classifications.system_name)?)?;
+            d.set_item("edition", PyList::new(py, &classifications.edition)?)?;
+            d.set_item("identification", PyList::new(py, &classifications.identification)?)?;
+            d.set_item("name", PyList::new(py, &classifications.name)?)?;
+            d.set_item("location", PyList::new(py, &classifications.location)?)?;
+            d.set_item("source", PyList::new(py, &classifications.source)?)?;
             out.set_item("classifications", d)?;
         }
         let marshal_ms = t_marshal.elapsed().as_secs_f64() * 1000.0;
@@ -720,25 +719,25 @@ mod python {
         }
         let mesh_ms = t_mesh.elapsed().as_secs_f64() * 1000.0;
 
-        let out = PyDict::new_bound(py);
-        out.set_item("guid", PyList::new_bound(py, sink.guid))?;
-        out.set_item("entity", PyList::new_bound(py, sink.entity))?;
-        out.set_item("volume_m3", PyList::new_bound(py, sink.volume_m3))?;
-        out.set_item("aabb_volume_m3", PyList::new_bound(py, sink.aabb_volume_m3))?;
-        out.set_item("surface_area_m2", PyList::new_bound(py, sink.surface_area_m2))?;
-        out.set_item("area_top_m2", PyList::new_bound(py, sink.area_top_m2))?;
-        out.set_item("area_bottom_m2", PyList::new_bound(py, sink.area_bottom_m2))?;
-        out.set_item("area_side_m2", PyList::new_bound(py, sink.area_side_m2))?;
-        out.set_item("area_inclined_m2", PyList::new_bound(py, sink.area_inclined_m2))?;
-        out.set_item("largest_surface_m2", PyList::new_bound(py, sink.largest_surface_m2))?;
-        out.set_item("smallest_surface_m2", PyList::new_bound(py, sink.smallest_surface_m2))?;
-        out.set_item("surface_count", PyList::new_bound(py, sink.surface_count))?;
-        out.set_item("surface_guid", PyList::new_bound(py, sink.s_guid))?;
-        out.set_item("surface_index", PyList::new_bound(py, sink.s_index))?;
-        out.set_item("surface_area_m2_long", PyList::new_bound(py, sink.s_area_m2))?;
-        out.set_item("surface_nx", PyList::new_bound(py, sink.s_nx))?;
-        out.set_item("surface_ny", PyList::new_bound(py, sink.s_ny))?;
-        out.set_item("surface_nz", PyList::new_bound(py, sink.s_nz))?;
+        let out = PyDict::new(py);
+        out.set_item("guid", PyList::new(py, sink.guid)?)?;
+        out.set_item("entity", PyList::new(py, sink.entity)?)?;
+        out.set_item("volume_m3", PyList::new(py, sink.volume_m3)?)?;
+        out.set_item("aabb_volume_m3", PyList::new(py, sink.aabb_volume_m3)?)?;
+        out.set_item("surface_area_m2", PyList::new(py, sink.surface_area_m2)?)?;
+        out.set_item("area_top_m2", PyList::new(py, sink.area_top_m2)?)?;
+        out.set_item("area_bottom_m2", PyList::new(py, sink.area_bottom_m2)?)?;
+        out.set_item("area_side_m2", PyList::new(py, sink.area_side_m2)?)?;
+        out.set_item("area_inclined_m2", PyList::new(py, sink.area_inclined_m2)?)?;
+        out.set_item("largest_surface_m2", PyList::new(py, sink.largest_surface_m2)?)?;
+        out.set_item("smallest_surface_m2", PyList::new(py, sink.smallest_surface_m2)?)?;
+        out.set_item("surface_count", PyList::new(py, sink.surface_count)?)?;
+        out.set_item("surface_guid", PyList::new(py, sink.s_guid)?)?;
+        out.set_item("surface_index", PyList::new(py, sink.s_index)?)?;
+        out.set_item("surface_area_m2_long", PyList::new(py, sink.s_area_m2)?)?;
+        out.set_item("surface_nx", PyList::new(py, sink.s_nx)?)?;
+        out.set_item("surface_ny", PyList::new(py, sink.s_ny)?)?;
+        out.set_item("surface_nz", PyList::new(py, sink.s_nz)?)?;
         out.set_item("unit_scale", unit_scale as f64)?;
         out.set_item("indexer_ms", idx_ms)?;
         out.set_item("mesh_ms", mesh_ms)?;
@@ -777,7 +776,7 @@ mod python {
             .collect();
         let file_stats = crate::mesh::stats::FileStats::from_products(&prod_stats);
 
-        let out = PyDict::new_bound(py);
+        let out = PyDict::new(py);
         let n = prod_stats.len();
         let (mut guid, mut entity, mut source) =
             (Vec::with_capacity(n), Vec::with_capacity(n), Vec::with_capacity(n));
@@ -870,24 +869,24 @@ mod python {
                 _ => {}
             }
         }
-        out.set_item("guid", PyList::new_bound(py, guid))?;
-        out.set_item("entity", PyList::new_bound(py, entity))?;
-        out.set_item("source", PyList::new_bound(py, source))?;
-        out.set_item("triangle_count", PyList::new_bound(py, tri_count))?;
-        out.set_item("surface_area_m2", PyList::new_bound(py, surface_area))?;
-        out.set_item("volume_abs_m3", PyList::new_bound(py, volume_abs))?;
-        out.set_item("placement_x_m", PyList::new_bound(py, px))?;
-        out.set_item("placement_y_m", PyList::new_bound(py, py_v))?;
-        out.set_item("placement_z_m", PyList::new_bound(py, pz))?;
-        out.set_item("centroid_x_m", PyList::new_bound(py, cx))?;
-        out.set_item("centroid_y_m", PyList::new_bound(py, cy))?;
-        out.set_item("centroid_z_m", PyList::new_bound(py, cz))?;
-        out.set_item("drift_distance_m", PyList::new_bound(py, drift_distance))?;
-        out.set_item("max_extent_m", PyList::new_bound(py, max_extent))?;
-        out.set_item("drift_ratio", PyList::new_bound(py, drift_ratio))?;
-        out.set_item("drift_severity", PyList::new_bound(py, drift_severity))?;
-        out.set_item("aabb_volume_m3", PyList::new_bound(py, aabb_volume))?;
-        out.set_item("mesh_quality", PyList::new_bound(py, mesh_quality))?;
+        out.set_item("guid", PyList::new(py, guid)?)?;
+        out.set_item("entity", PyList::new(py, entity)?)?;
+        out.set_item("source", PyList::new(py, source)?)?;
+        out.set_item("triangle_count", PyList::new(py, tri_count)?)?;
+        out.set_item("surface_area_m2", PyList::new(py, surface_area)?)?;
+        out.set_item("volume_abs_m3", PyList::new(py, volume_abs)?)?;
+        out.set_item("placement_x_m", PyList::new(py, px)?)?;
+        out.set_item("placement_y_m", PyList::new(py, py_v)?)?;
+        out.set_item("placement_z_m", PyList::new(py, pz)?)?;
+        out.set_item("centroid_x_m", PyList::new(py, cx)?)?;
+        out.set_item("centroid_y_m", PyList::new(py, cy)?)?;
+        out.set_item("centroid_z_m", PyList::new(py, cz)?)?;
+        out.set_item("drift_distance_m", PyList::new(py, drift_distance)?)?;
+        out.set_item("max_extent_m", PyList::new(py, max_extent)?)?;
+        out.set_item("drift_ratio", PyList::new(py, drift_ratio)?)?;
+        out.set_item("drift_severity", PyList::new(py, drift_severity)?)?;
+        out.set_item("aabb_volume_m3", PyList::new(py, aabb_volume)?)?;
+        out.set_item("mesh_quality", PyList::new(py, mesh_quality)?)?;
         out.set_item("unit_scale", unit_scale as f64)?;
         // Use the SI-recomputed counts so file-level totals agree
         // with the per-row severity actually emitted (after the
@@ -927,12 +926,12 @@ mod python {
                 seg_index_start.push(seg.index_start);
             }
         }
-        out.set_item("seg_guid", PyList::new_bound(py, seg_guid))?;
-        out.set_item("seg_product_index", PyList::new_bound(py, seg_product_index))?;
-        out.set_item("seg_index", PyList::new_bound(py, seg_index))?;
-        out.set_item("seg_source", PyList::new_bound(py, seg_source))?;
-        out.set_item("seg_triangle_count", PyList::new_bound(py, seg_triangle_count))?;
-        out.set_item("seg_index_start", PyList::new_bound(py, seg_index_start))?;
+        out.set_item("seg_guid", PyList::new(py, seg_guid)?)?;
+        out.set_item("seg_product_index", PyList::new(py, seg_product_index)?)?;
+        out.set_item("seg_index", PyList::new(py, seg_index)?)?;
+        out.set_item("seg_source", PyList::new(py, seg_source)?)?;
+        out.set_item("seg_triangle_count", PyList::new(py, seg_triangle_count)?)?;
+        out.set_item("seg_index_start", PyList::new(py, seg_index_start)?)?;
 
         out.set_item("mesh_emission_ms", mesh_stats.elapsed_ms)?;
         out.set_item("entity_table_ms", mesh_stats.entity_table_build_ms)?;
@@ -1123,15 +1122,15 @@ mod python {
         let mesh_ms = t_mesh.elapsed().as_secs_f64() * 1000.0;
 
         let t_marshal = Instant::now();
-        let out = PyDict::new_bound(py);
-        out.set_item("guid", PyList::new_bound(py, &sink.guid))?;
-        out.set_item("entity", PyList::new_bound(py, &sink.entity))?;
-        out.set_item("x", PyList::new_bound(py, &sink.x))?;
-        out.set_item("y", PyList::new_bound(py, &sink.y))?;
-        out.set_item("z", PyList::new_bound(py, &sink.z))?;
-        out.set_item("nx", PyList::new_bound(py, &sink.nx))?;
-        out.set_item("ny", PyList::new_bound(py, &sink.ny))?;
-        out.set_item("nz", PyList::new_bound(py, &sink.nz))?;
+        let out = PyDict::new(py);
+        out.set_item("guid", PyList::new(py, &sink.guid)?)?;
+        out.set_item("entity", PyList::new(py, &sink.entity)?)?;
+        out.set_item("x", PyList::new(py, &sink.x)?)?;
+        out.set_item("y", PyList::new(py, &sink.y)?)?;
+        out.set_item("z", PyList::new(py, &sink.z)?)?;
+        out.set_item("nx", PyList::new(py, &sink.nx)?)?;
+        out.set_item("ny", PyList::new(py, &sink.ny)?)?;
+        out.set_item("nz", PyList::new(py, &sink.nz)?)?;
         out.set_item("unit_scale", unit_scale as f64)?;
         // Global shift in METRES: add this back to (x, y, z) to recover
         // absolute world coordinates. `[0, 0, 0]` when the model has no
@@ -1140,7 +1139,7 @@ mod python {
         let us = unit_scale as f64;
         out.set_item(
             "global_shift",
-            PyList::new_bound(py, [gs[0] * us, gs[1] * us, gs[2] * us]),
+            PyList::new(py, [gs[0] * us, gs[1] * us, gs[2] * us])?,
         )?;
         out.set_item("per_m2", per_m2 as f64)?;
         out.set_item("seed", seed)?;
@@ -1332,7 +1331,7 @@ mod python {
     /// matching the per-chunk columns of [`sample_point_cloud`], or
     /// `None` (StopIteration) when the worker is drained.
     #[cfg(feature = "mesh")]
-    #[pyclass]
+    #[pyclass(unsendable)]
     pub struct PointCloudIter {
         rx: Option<std::sync::mpsc::Receiver<CloudChunkResult>>,
         worker: Option<std::thread::JoinHandle<()>>,
@@ -1401,18 +1400,18 @@ mod python {
             self.rx = Some(rx);
             match received {
                 Ok(Ok(chunk)) => {
-                    let out = PyDict::new_bound(py);
-                    out.set_item("guid", PyList::new_bound(py, &chunk.guid))?;
-                    out.set_item("entity", PyList::new_bound(py, &chunk.entity))?;
-                    out.set_item("x", PyList::new_bound(py, &chunk.x))?;
-                    out.set_item("y", PyList::new_bound(py, &chunk.y))?;
-                    out.set_item("z", PyList::new_bound(py, &chunk.z))?;
-                    out.set_item("nx", PyList::new_bound(py, &chunk.nx))?;
-                    out.set_item("ny", PyList::new_bound(py, &chunk.ny))?;
-                    out.set_item("nz", PyList::new_bound(py, &chunk.nz))?;
+                    let out = PyDict::new(py);
+                    out.set_item("guid", PyList::new(py, &chunk.guid)?)?;
+                    out.set_item("entity", PyList::new(py, &chunk.entity)?)?;
+                    out.set_item("x", PyList::new(py, &chunk.x)?)?;
+                    out.set_item("y", PyList::new(py, &chunk.y)?)?;
+                    out.set_item("z", PyList::new(py, &chunk.z)?)?;
+                    out.set_item("nx", PyList::new(py, &chunk.nx)?)?;
+                    out.set_item("ny", PyList::new(py, &chunk.ny)?)?;
+                    out.set_item("nz", PyList::new(py, &chunk.nz)?)?;
                     out.set_item(
                         "global_shift",
-                        PyList::new_bound(py, chunk.global_shift_m),
+                        PyList::new(py, chunk.global_shift_m)?,
                     )?;
                     out.set_item("per_m2", self.per_m2 as f64)?;
                     out.set_item("seed", self.seed)?;
@@ -1749,30 +1748,30 @@ mod python {
         let mesh_ms = t_mesh.elapsed().as_secs_f64() * 1000.0;
 
         let t_marshal = Instant::now();
-        let out = PyDict::new_bound(py);
-        out.set_item("guid", PyList::new_bound(py, &sink.guid))?;
-        out.set_item("entity", PyList::new_bound(py, &sink.entity))?;
-        out.set_item("vertex_count", PyList::new_bound(py, &sink.vertex_count))?;
-        out.set_item("triangle_count", PyList::new_bound(py, &sink.triangle_count))?;
+        let out = PyDict::new(py);
+        out.set_item("guid", PyList::new(py, &sink.guid)?)?;
+        out.set_item("entity", PyList::new(py, &sink.entity)?)?;
+        out.set_item("vertex_count", PyList::new(py, &sink.vertex_count)?)?;
+        out.set_item("triangle_count", PyList::new(py, &sink.triangle_count)?)?;
         let verts: Vec<Bound<'py, PyBytes>> = sink
             .vertices_le
             .iter()
-            .map(|b| PyBytes::new_bound(py, b))
+            .map(|b| PyBytes::new(py, b))
             .collect();
         let inds: Vec<Bound<'py, PyBytes>> = sink
             .indices_le
             .iter()
-            .map(|b| PyBytes::new_bound(py, b))
+            .map(|b| PyBytes::new(py, b))
             .collect();
-        out.set_item("vertices", PyList::new_bound(py, verts))?;
-        out.set_item("indices", PyList::new_bound(py, inds))?;
+        out.set_item("vertices", PyList::new(py, verts)?)?;
+        out.set_item("indices", PyList::new(py, inds)?)?;
         // Global shift in METRES — add back to vertices for absolute
         // world coords. `[0, 0, 0]` for near-origin or empty models.
         let gs = sink.shift.unwrap_or([0.0, 0.0, 0.0]);
         let us = unit_scale as f64;
         out.set_item(
             "global_shift",
-            PyList::new_bound(py, [gs[0] * us, gs[1] * us, gs[2] * us]),
+            PyList::new(py, [gs[0] * us, gs[1] * us, gs[2] * us])?,
         )?;
         out.set_item("products_meshed", mesh_stats.products_meshed as u64)?;
         out.set_item("mesh_ms", mesh_ms)?;
@@ -1975,7 +1974,7 @@ mod python {
 
             let out_size = std::fs::metadata(out_path).map(|m| m.len()).unwrap_or(0);
 
-            let out = PyDict::new_bound(py);
+            let out = PyDict::new(py);
             out.set_item("products_emitted", sink.products.len() as u64)?;
             out.set_item("products_meshed", mesh_stats.products_meshed as u64)?;
             out.set_item("triangles", mesh_stats.triangles as u64)?;
@@ -2076,7 +2075,7 @@ mod python {
         let rep_bytes = std::fs::metadata(&rep_path).map(|m| m.len()).unwrap_or(0);
         let inst_bytes = std::fs::metadata(&inst_path).map(|m| m.len()).unwrap_or(0);
 
-        let out = PyDict::new_bound(py);
+        let out = PyDict::new(py);
         out.set_item("bundle_dir", out_dir_path.to_string_lossy().to_string())?;
         out.set_item("instances_parquet", inst_path.to_string_lossy().to_string())?;
         out.set_item("representations_parquet", rep_path.to_string_lossy().to_string())?;
@@ -2174,16 +2173,16 @@ mod python {
             min_distance_m.push(p.min_distance_m);
         }
 
-        let out = PyDict::new_bound(py);
-        out.set_item("ifc_id_a", PyList::new_bound(py, &ifc_id_a))?;
-        out.set_item("ifc_id_b", PyList::new_bound(py, &ifc_id_b))?;
-        out.set_item("guid_a", PyList::new_bound(py, &guid_a))?;
-        out.set_item("guid_b", PyList::new_bound(py, &guid_b))?;
-        out.set_item("class_a", PyList::new_bound(py, &class_a))?;
-        out.set_item("class_b", PyList::new_bound(py, &class_b))?;
-        out.set_item("kind", PyList::new_bound(py, &kind))?;
-        out.set_item("category", PyList::new_bound(py, &category))?;
-        out.set_item("min_distance_m", PyList::new_bound(py, &min_distance_m))?;
+        let out = PyDict::new(py);
+        out.set_item("ifc_id_a", PyList::new(py, &ifc_id_a)?)?;
+        out.set_item("ifc_id_b", PyList::new(py, &ifc_id_b)?)?;
+        out.set_item("guid_a", PyList::new(py, &guid_a)?)?;
+        out.set_item("guid_b", PyList::new(py, &guid_b)?)?;
+        out.set_item("class_a", PyList::new(py, &class_a)?)?;
+        out.set_item("class_b", PyList::new(py, &class_b)?)?;
+        out.set_item("kind", PyList::new(py, &kind)?)?;
+        out.set_item("category", PyList::new(py, &category)?)?;
+        out.set_item("min_distance_m", PyList::new(py, &min_distance_m)?)?;
         out.set_item("geometryless_skipped", report.geometryless_skipped as u64)?;
         out.set_item("narrow_phase_residuals", report.narrow_phase_residuals as u64)?;
         out.set_item("pair_count", n as u64)?;
@@ -2197,7 +2196,7 @@ mod python {
 
     #[pymodule]
     fn _core(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
-        m.add("IfcfastError", _py.get_type_bound::<IfcfastError>())?;
+        m.add("IfcfastError", _py.get_type::<IfcfastError>())?;
         m.add_function(wrap_pyfunction!(index_ifc, m)?)?;
         m.add_function(wrap_pyfunction!(extract_psets, m)?)?;
         m.add_function(wrap_pyfunction!(extract_quantities, m)?)?;

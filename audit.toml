@@ -1,0 +1,18 @@
+# cargo-audit / rustsec configuration.
+#
+# Ignored advisories must each carry a rationale comment + link to a
+# tracking issue. The point of `cargo audit` in CI (GH #51) is to surface
+# real risk; muting an entry without justification turns the gate into
+# theatre.
+
+[advisories]
+ignore = [
+    # `paste` 1.0.15 unmaintained (RUSTSEC-2024-0436). No exploit path —
+    # it's a proc-macro helper for compile-time identifier pasting.
+    # Reaches us transitively via `parquet` (substrate I/O) and
+    # `simba` (under `nalgebra` + `parry3d`, used by the clash engine).
+    # Both upstreams are tracking the migration to alternatives
+    # (`pastey` / inlined). Re-evaluate when bumping parquet → 58 or
+    # parry3d → 0.28.
+    "RUSTSEC-2024-0436",
+]
