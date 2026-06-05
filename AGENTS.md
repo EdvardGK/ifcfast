@@ -375,6 +375,22 @@ curated summary. The glTF emitter writes each segment's `(start, count,
 source)` into per-node `extras.segments` so viewers can colour /
 split / filter by role.
 
+**Source-tag chain encoding (v0.4.35+, GH #58 / W1).** The `source`
+field on `MeshSegment` / `InstancePart` / `instances.parquet.source`
+is a pipe-separated chain: every wrapping composite role accumulates
+from outermost to innermost, ending with the leaf entity tag. For a
+3-deep nested boolean where the outer cutter is itself a boolean
+(e.g. `IfcBooleanResult(host=wall, cutter=IfcBooleanResult(host=door,
+cutter=handle))`), the door fragment chain is
+`boolean_second_operand|boolean_first_operand|extrusion` — the outer
+cutter annotation AND the inner host annotation both survive. Pre-W1
+the chain was at most two tokens (innermost-wins) and the outer
+annotation was silently dropped; downstream tools that scanned the
+chain at depth got wrong answers on multi-level booleans. To read
+the chain, use the helpers `chain_contains(source, link)` and
+`chain_count(source, link)` (`crates/core/src/mesh/cut_openings.rs`)
+or split on `|` directly.
+
 **Opt-in cut: `m.meshes(cut_openings=True)`.** For viewer / rendering
 work where you want the net solid (doors and windows as actual
 holes), pass `cut_openings=True`. The mesher then folds every
@@ -403,6 +419,37 @@ Unhandled representation types (e.g. `IfcRevolvedAreaSolid`,
 `IfcSurfaceCurveSweptAreaSolid`) appear as `unhandled:IFCXXX`
 entries in `mesh_stats.by_source` so you can see exactly what the
 file contained that wasn't tessellated, instead of a silent drop.
+
+**Cut diagnostics: `Outcome::Unsupported(reason)` (v0.4.35+, GH #58
+/ W2).** When a cut can't proceed, the per-pass counters surface a
+typed reason instead of an opaque `Fallback`. Every entry point that
+runs `cut_openings` (`mesh_qto`, `extract_meshes`, `write_gltf`)
+returns a dict carrying:
+
+- `cut_openings_cut` — products where the cut succeeded and the
+  output is the net solid.
+- `cut_openings_passthrough` — products with no cutter segments;
+  mesh unchanged.
+- `cut_openings_fallback` — catch-all "we couldn't cut and have no
+  diagnostic"; reveal-all on the input mesh.
+- `cut_openings_unsupported_*` — 14 per-reason counters carrying
+  recognised failure types. Vocabulary (each maps to an
+  `UnsupportedReason` variant): `non_manifold_input`,
+  `self_intersecting_cutter`, `coplanar_face_degeneracy`,
+  `kernel_internal_error`, `curved_surface_approximated`,
+  `intersection_not_implemented`, `union_with_overlap`,
+  `non_planar_base_surface`, `unhandled_cutter_entity`,
+  `malformed_host`, `bsp_depth_exceeded`,
+  `tight_polygonal_boundary_ignored`, `degenerate_cutter`,
+  `host_consumed`.
+
+Detection paths land progressively over W3 (unit-aware tolerance
+gate), W4 (operator-aware `IfcBooleanResult`), W6 (tight
+polygonal-bounded halfspace), W11 (brep cutter pre-flight), and W17
+(curved-host detection). Counters are zero today for variants whose
+detection has not landed yet — the vocabulary is exposed first so
+downstream parquet columns and Python wrappers can pivot on a
+stable shape. See `docs/plans/2026-06-05_cut-openings-manifold-replacement.md`.
 
 ## What `ifcfast` does NOT do (yet)
 

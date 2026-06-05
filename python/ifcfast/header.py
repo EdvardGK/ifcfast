@@ -230,7 +230,28 @@ _HASH_TAIL_BYTES = 4 * 1024 * 1024
 #       Old caches: severity counts shift on mixed/baked structural
 #       models (G55_RIB: 382 `error` → `info`); raw
 #       `drift_distance_m` / `drift_ratio` unchanged.
-_CACHE_SCHEMA_VERSION = 12
+#  13 — v0.4.35: cut_openings W1 + W2 (GH #58).
+#       W1 — `mesh::boolean::retag` accumulates the full chain of
+#       wrapping composite roles instead of innermost-wins. Cutter
+#       fragments at any nesting depth now carry
+#       `boolean_second_operand` in their chain, so segment
+#       provenance (`MeshSegment.source`, `InstancePart.source`,
+#       `instances.parquet.source`) gains additional tokens on
+#       nested-boolean trees. Pre-fix files with multi-level
+#       `IfcBooleanResult` chains had cutter-side fragments
+#       silently mis-classified as host segments — observable in
+#       parquet column `source` shape changes for those products.
+#       W2 — `Outcome::Unsupported(UnsupportedReason)` typed
+#       diagnostics + 14 new flat counter fields on
+#       `CutOpeningsStats`. PyO3 dict surfaces new keys
+#       `cut_openings_unsupported_*` on every entry point that
+#       emits cut stats (`mesh_qto`, `extract_meshes`, `write_gltf`).
+#       Legacy keys (`cut_openings_cut`/`_passthrough`/`_fallback`)
+#       preserved for back-compat. No mesh / volume / topology
+#       output changes today — the detection paths land over
+#       W3 (validation gate) / W4 (operator-aware IfcBooleanResult)
+#       / W11 (brep cutter pre-flight).
+_CACHE_SCHEMA_VERSION = 13
 
 _FIELD_RE = re.compile(r"\(\s*(.*?)\s*\)\s*;", re.DOTALL)
 

@@ -671,3 +671,159 @@ fn polygonal_bounded_uses_base_surface_position_normal() {
     }
     assert!(zmax <= 2510.0, "upper half should be gone, zmax = {zmax}");
 }
+
+// ---------- W1: source-chain encoding (GH #58) ----------
+
+/// Nested-boolean fixture where the outer cutter is ITSELF a composite
+/// boolean. The cutter operand of the outer `IfcBooleanResult` is a
+/// second `IfcBooleanResult` whose own first operand (the door) is
+/// structurally a CUTTER at the outer level but a HOST at the inner.
+/// Pre-W1 the chain encoding was innermost-wins (`role.unwrap_or(...)`),
+/// so the door fragment serialised as `boolean_first_operand|extrusion`
+/// — losing the outer cutter annotation and causing `is_cutter` to
+/// mis-classify it as a host segment.
+const NESTED_BOOLEAN_CUTTER: &str = r#"ISO-10303-21;
+HEADER;
+FILE_DESCRIPTION(('ViewDefinition [ReferenceView]'),'2;1');
+FILE_NAME('nested.ifc','2026-06-05T00:00:00',('test'),('skiplum'),'ifcfast','ifcfast','');
+FILE_SCHEMA(('IFC4'));
+ENDSEC;
+DATA;
+#1=IFCPROJECT('0Test000000000000000001',$,'p',$,$,$,$,(#5),#2);
+#2=IFCUNITASSIGNMENT((#3,#4));
+#3=IFCSIUNIT(*,.LENGTHUNIT.,.MILLI.,.METRE.);
+#4=IFCSIUNIT(*,.PLANEANGLEUNIT.,$,.RADIAN.);
+#5=IFCGEOMETRICREPRESENTATIONCONTEXT($,'Model',3,1.0E-5,#6,$);
+#6=IFCAXIS2PLACEMENT3D(#7,$,$);
+#7=IFCCARTESIANPOINT((0.,0.,0.));
+#10=IFCSITE('1Site000000000000000001',$,'s',$,$,#15,$,$,.ELEMENT.,$,$,$,$,$);
+#11=IFCBUILDING('2Bldg000000000000000001',$,'b',$,$,#15,$,$,.ELEMENT.,$,$,$);
+#12=IFCBUILDINGSTOREY('3Stor000000000000000001',$,'L1',$,$,#15,$,$,.ELEMENT.,0.0);
+#15=IFCLOCALPLACEMENT($,#6);
+#16=IFCLOCALPLACEMENT(#15,#6);
+#20=IFCRELAGGREGATES('4Agg000000000000000001',$,$,$,#1,(#10));
+#21=IFCRELAGGREGATES('5Agg000000000000000001',$,$,$,#10,(#11));
+#22=IFCRELAGGREGATES('6Agg000000000000000001',$,$,$,#11,(#12));
+#30=IFCRECTANGLEPROFILEDEF(.AREA.,'WallRect',#31,1000.,200.);
+#31=IFCAXIS2PLACEMENT2D(#7,$);
+#32=IFCDIRECTION((0.,0.,1.));
+#33=IFCEXTRUDEDAREASOLID(#30,#6,#32,3000.);
+#40=IFCRECTANGLEPROFILEDEF(.AREA.,'DoorRect',#41,500.,200.);
+#41=IFCAXIS2PLACEMENT2D(#7,$);
+#42=IFCCARTESIANPOINT((0.,0.,400.));
+#43=IFCAXIS2PLACEMENT3D(#42,$,$);
+#44=IFCEXTRUDEDAREASOLID(#40,#43,#32,2100.);
+#50=IFCRECTANGLEPROFILEDEF(.AREA.,'HandleRect',#51,100.,50.);
+#51=IFCAXIS2PLACEMENT2D(#7,$);
+#52=IFCCARTESIANPOINT((180.,0.,1200.));
+#53=IFCAXIS2PLACEMENT3D(#52,$,$);
+#54=IFCEXTRUDEDAREASOLID(#50,#53,#32,50.);
+#60=IFCBOOLEANRESULT(.DIFFERENCE.,#44,#54);
+#70=IFCBOOLEANRESULT(.DIFFERENCE.,#33,#60);
+#80=IFCSHAPEREPRESENTATION(#5,'Body','Boolean',(#70));
+#81=IFCPRODUCTDEFINITIONSHAPE($,$,(#80));
+#90=IFCWALL('7Wall00000000000000001',$,'NestedCutter',$,$,#16,#81,'tag',.STANDARD.);
+#100=IFCRELCONTAINEDINSPATIALSTRUCTURE('8Rel000000000000000001',$,$,$,(#90),#12);
+ENDSEC;
+END-ISO-10303-21;
+"#;
+
+#[test]
+fn chain_encoding_carries_outer_role_through_nested_boolean() {
+    // Outer is BooleanResult(host=wall, cutter=BooleanResult(host=door, cutter=handle)).
+    // After this PR:
+    //   wall  →  `boolean_first_operand|extrusion`
+    //   door  →  `boolean_second_operand|boolean_first_operand|extrusion`
+    //   handle → `boolean_second_operand|boolean_second_operand|extrusion`
+    // The door's chain MUST contain `boolean_second_operand` because the
+    // door fragment is structurally a cutter at the OUTER level — even
+    // though it is the host of the inner boolean. Pre-fix this annotation
+    // was dropped by `retag`'s `role.unwrap_or(new_role)` innermost-wins
+    // semantics, and `is_cutter` would mis-classify the door as a host
+    // segment.
+    let mut sink = CaptureSink { products: Vec::new() };
+    let _ = mesh_ifc_streaming(NESTED_BOOLEAN_CUTTER.as_bytes(), &mut sink);
+    let mesh = sink
+        .products
+        .into_iter()
+        .find(|m| m.entity == "IfcWall")
+        .expect("wall must reach the sink");
+
+    // Three segments expected — wall (host), door (composite cutter
+    // first operand), handle (composite cutter second operand). The
+    // outer split with manifold isn't relevant here; we just look at
+    // the segment chains.
+    let chains: Vec<String> = mesh.segments.iter().map(|s| s.source.clone()).collect();
+    assert_eq!(
+        chains.len(),
+        3,
+        "expected 3 segments (wall, door, handle), got chains: {:?}",
+        chains,
+    );
+
+    let has_wall = chains.iter().any(|c| {
+        let links: Vec<&str> = c.split('|').collect();
+        links.contains(&"boolean_first_operand")
+            && !links.contains(&"boolean_second_operand")
+            && links.last().copied() == Some("extrusion")
+    });
+    assert!(has_wall, "wall fragment chain must be host-only, got: {:?}", chains);
+
+    let has_door_with_outer_cutter = chains.iter().any(|c| {
+        let links: Vec<&str> = c.split('|').collect();
+        // Door is the inner host (boolean_first_operand) AND the outer
+        // cutter (boolean_second_operand). Both must appear in the chain.
+        links.contains(&"boolean_first_operand")
+            && links.contains(&"boolean_second_operand")
+            && links.last().copied() == Some("extrusion")
+    });
+    assert!(
+        has_door_with_outer_cutter,
+        "door fragment chain must carry BOTH `boolean_first_operand` (inner host) AND \
+         `boolean_second_operand` (outer cutter). Pre-W1 the outer annotation was \
+         dropped by `retag`'s innermost-wins semantics. Got chains: {:?}",
+        chains,
+    );
+
+    let has_handle = chains.iter().any(|c| {
+        let n = c.split('|').filter(|l| *l == "boolean_second_operand").count();
+        n >= 2 && c.split('|').last() == Some("extrusion")
+    });
+    assert!(
+        has_handle,
+        "handle fragment chain must carry `boolean_second_operand` twice (cutter at both \
+         inner and outer levels). Got chains: {:?}",
+        chains,
+    );
+
+    // is_cutter via the existing `cut_openings::apply` partition: door
+    // and handle must BOTH be classified as cutters. Pre-W1 the door
+    // mis-classifies as host.
+    let (hosts, cutters) = _core::mesh::cut_openings::_expose_partition(&mesh.segments);
+    assert_eq!(
+        cutters.len(),
+        2,
+        "expected 2 cutter segments (door + handle), got {} cutter and {} host: cutters={:?} hosts={:?}",
+        cutters.len(),
+        hosts.len(),
+        cutters.iter().map(|s| s.source.clone()).collect::<Vec<_>>(),
+        hosts.iter().map(|s| s.source.clone()).collect::<Vec<_>>(),
+    );
+}
+
+#[test]
+fn chain_count_helper_recognises_depth() {
+    // Sanity test for the chain_count helper introduced in W1. A
+    // synthetic chain string carries multiple links; the helper must
+    // count each token's occurrences without depending on order.
+    use _core::mesh::cut_openings::{chain_contains, chain_count};
+
+    let chain = "boolean_second_operand|boolean_first_operand|boolean_second_operand|extrusion";
+    assert!(chain_contains(chain, "boolean_second_operand"));
+    assert!(chain_contains(chain, "extrusion"));
+    assert!(!chain_contains(chain, "halfspace_plane:agree"));
+    assert_eq!(chain_count(chain, "boolean_second_operand"), 2);
+    assert_eq!(chain_count(chain, "boolean_first_operand"), 1);
+    assert_eq!(chain_count(chain, "extrusion"), 1);
+    assert_eq!(chain_count(chain, "missing"), 0);
+}

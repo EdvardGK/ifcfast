@@ -287,22 +287,37 @@ pub fn halfspace_solid(table: &EntityTable, id: u64) -> Option<(LocalMesh, bool)
     Some((mesh, agreement))
 }
 
-/// Mark the structural position of a fragment inside its parent
-/// composite (e.g. boolean operand role) WITHOUT touching the leaf
-/// `source` — so the consumer sees both facts in the eventual segment
-/// tag. If a deeper composite already set a role (nested boolean trees),
-/// we don't overwrite it; the outermost role survives unchanged, the
-/// innermost wins. (Choice: the innermost role is the most specific
-/// answer to "what is this fragment?".)
+/// Annotate a fragment with its structural position inside the current
+/// composite — the boolean operand role for `IfcBooleanResult` /
+/// `IfcBooleanClippingResult`, or the `csg_branch` marker for an
+/// `IfcCsgSolid` subtree. Roles accumulate: each retag call pushes
+/// `new_role` onto the existing chain (innermost-first), so a
+/// fragment that wraps through N levels of composite carries N roles
+/// plus its leaf `source`. Serialisation reverses the vec so the chain
+/// reads outermost-first.
+///
+/// Pre-W1 ([GH #58]) this function returned `role.unwrap_or(new_role)`
+/// against a single `Option<&'static str>`, which silently dropped the
+/// outer role whenever an inner one was already set. A nested
+/// `IfcBooleanResult(host=wall, cutter=IfcBooleanResult(host=door,
+/// cutter=handle))` would lose the outer-cutter annotation on the
+/// door fragment, causing `cut_openings::is_cutter` to mis-classify
+/// it as a host segment and assemble it with the wall. Accumulating
+/// the full chain fixes that: every wrapping role is preserved, and
+/// readers see the structural truth at every level via
+/// `cut_openings::chain_contains` / `chain_count`.
 fn retag(frag: MeshFragment, new_role: &'static str) -> MeshFragment {
     match frag {
-        MeshFragment::Mesh { mesh, source, role, rep_step_id, instance_transform } => MeshFragment::Mesh {
-            mesh,
-            source,
-            role: Some(role.unwrap_or(new_role)),
-            rep_step_id,
-            instance_transform,
-        },
+        MeshFragment::Mesh { mesh, source, mut roles, rep_step_id, instance_transform } => {
+            roles.push(new_role);
+            MeshFragment::Mesh {
+                mesh,
+                source,
+                roles,
+                rep_step_id,
+                instance_transform,
+            }
+        }
         u @ MeshFragment::Unhandled { .. } => u,
     }
 }

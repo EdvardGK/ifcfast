@@ -89,6 +89,91 @@ mod python {
         }
     }
 
+    // ----- cut_openings stats marshalling (W2) -------------------------
+    //
+    // Single owner of the FFI key set for the per-pass cut_openings
+    // counters. mesh_qto, extract_meshes and write_gltf all surface
+    // these via the same Outcome::accumulate path on
+    // crate::mesh::cut_openings::CutOpeningsStats — keeping the dict
+    // shape consistent across entry points means downstream parquet
+    // columns and Python wrappers can pivot once on a stable schema.
+    //
+    // The legacy `cut_openings_cut` / `_passthrough` / `_fallback`
+    // keys stay for back-compat; the new `cut_openings_unsupported_*`
+    // keys are added under [W2] (see
+    // `docs/plans/2026-06-05_cut-openings-manifold-replacement.md` for
+    // the per-reason vocabulary). Bumping `_CACHE_SCHEMA_VERSION`
+    // covers consumers that pin against a schema fingerprint.
+    //
+    // Always emit every counter — csg-off builds carry zeros. The
+    // shape stays stable so the parquet substrate and Python wrappers
+    // never need to discriminate on feature flags.
+    fn set_cut_openings_stats(
+        out: &Bound<'_, PyDict>,
+        stats: &crate::mesh::cut_openings::CutOpeningsStats,
+    ) -> PyResult<()> {
+        out.set_item("cut_openings_cut", stats.cut as u64)?;
+        out.set_item("cut_openings_passthrough", stats.passthrough as u64)?;
+        out.set_item("cut_openings_fallback", stats.fallback as u64)?;
+        out.set_item(
+            "cut_openings_unsupported_non_manifold_input",
+            stats.unsupported_non_manifold_input as u64,
+        )?;
+        out.set_item(
+            "cut_openings_unsupported_self_intersecting_cutter",
+            stats.unsupported_self_intersecting_cutter as u64,
+        )?;
+        out.set_item(
+            "cut_openings_unsupported_coplanar_face_degeneracy",
+            stats.unsupported_coplanar_face_degeneracy as u64,
+        )?;
+        out.set_item(
+            "cut_openings_unsupported_kernel_internal_error",
+            stats.unsupported_kernel_internal_error as u64,
+        )?;
+        out.set_item(
+            "cut_openings_unsupported_curved_surface_approximated",
+            stats.unsupported_curved_surface_approximated as u64,
+        )?;
+        out.set_item(
+            "cut_openings_unsupported_intersection_not_implemented",
+            stats.unsupported_intersection_not_implemented as u64,
+        )?;
+        out.set_item(
+            "cut_openings_unsupported_union_with_overlap",
+            stats.unsupported_union_with_overlap as u64,
+        )?;
+        out.set_item(
+            "cut_openings_unsupported_non_planar_base_surface",
+            stats.unsupported_non_planar_base_surface as u64,
+        )?;
+        out.set_item(
+            "cut_openings_unsupported_unhandled_cutter_entity",
+            stats.unsupported_unhandled_cutter_entity as u64,
+        )?;
+        out.set_item(
+            "cut_openings_unsupported_malformed_host",
+            stats.unsupported_malformed_host as u64,
+        )?;
+        out.set_item(
+            "cut_openings_unsupported_bsp_depth_exceeded",
+            stats.unsupported_bsp_depth_exceeded as u64,
+        )?;
+        out.set_item(
+            "cut_openings_unsupported_tight_polygonal_boundary_ignored",
+            stats.unsupported_tight_polygonal_boundary_ignored as u64,
+        )?;
+        out.set_item(
+            "cut_openings_unsupported_degenerate_cutter",
+            stats.unsupported_degenerate_cutter as u64,
+        )?;
+        out.set_item(
+            "cut_openings_unsupported_host_consumed",
+            stats.unsupported_host_consumed as u64,
+        )?;
+        Ok(())
+    }
+
     // ----- index_ifc ----------------------------------------------------
 
     #[pyfunction]
@@ -578,9 +663,7 @@ mod python {
             s_nx: Vec<f32>,
             s_ny: Vec<f32>,
             s_nz: Vec<f32>,
-            cut_stats_cut: usize,
-            cut_stats_passthrough: usize,
-            cut_stats_fallback: usize,
+            cut_stats: crate::mesh::cut_openings::CutOpeningsStats,
             // Cross-product IfcRelVoidsElement buffer — same pattern as
             // extract_meshes. Only `Some` when cut_openings && at least
             // one void relation exists; else the hot path is identical
@@ -619,12 +702,7 @@ mod python {
 
             #[cfg(feature = "csg")]
             fn bump_outcome(&mut self, outcome: crate::mesh::cut_openings::Outcome) {
-                use crate::mesh::cut_openings::Outcome;
-                match outcome {
-                    Outcome::Cut => self.cut_stats_cut += 1,
-                    Outcome::Passthrough => self.cut_stats_passthrough += 1,
-                    Outcome::Fallback => self.cut_stats_fallback += 1,
-                }
+                outcome.accumulate(&mut self.cut_stats);
             }
         }
         impl ProductSink for QtoSink {
@@ -688,9 +766,7 @@ mod python {
             s_nx: Vec::new(),
             s_ny: Vec::new(),
             s_nz: Vec::new(),
-            cut_stats_cut: 0,
-            cut_stats_passthrough: 0,
-            cut_stats_fallback: 0,
+            cut_stats: crate::mesh::cut_openings::CutOpeningsStats::default(),
             #[cfg(feature = "csg")]
             cross,
         };
@@ -746,9 +822,7 @@ mod python {
         out.set_item("products_meshed", mesh_stats.products_meshed)?;
         out.set_item("size_bytes", mmap.len() as u64)?;
         out.set_item("cut_openings", cut_openings)?;
-        out.set_item("cut_openings_cut", sink.cut_stats_cut as u64)?;
-        out.set_item("cut_openings_passthrough", sink.cut_stats_passthrough as u64)?;
-        out.set_item("cut_openings_fallback", sink.cut_stats_fallback as u64)?;
+        set_cut_openings_stats(&out, &sink.cut_stats)?;
         Ok(out)
         })
     }
@@ -1597,9 +1671,7 @@ mod python {
             triangle_count: Vec<u32>,
             vertices_le: Vec<Vec<u8>>,
             indices_le: Vec<Vec<u8>>,
-            cut_stats_cut: usize,
-            cut_stats_passthrough: usize,
-            cut_stats_fallback: usize,
+            cut_stats: crate::mesh::cut_openings::CutOpeningsStats,
             // Cross-product IfcRelVoidsElement buffer. Some(_) only
             // when cut_openings && the file has at least one void
             // relation; otherwise None keeps the hot path identical
@@ -1651,12 +1723,7 @@ mod python {
 
             #[cfg(feature = "csg")]
             fn bump_outcome(&mut self, outcome: crate::mesh::cut_openings::Outcome) {
-                use crate::mesh::cut_openings::Outcome;
-                match outcome {
-                    Outcome::Cut => self.cut_stats_cut += 1,
-                    Outcome::Passthrough => self.cut_stats_passthrough += 1,
-                    Outcome::Fallback => self.cut_stats_fallback += 1,
-                }
+                outcome.accumulate(&mut self.cut_stats);
             }
         }
 
@@ -1720,9 +1787,7 @@ mod python {
             triangle_count: Vec::new(),
             vertices_le: Vec::new(),
             indices_le: Vec::new(),
-            cut_stats_cut: 0,
-            cut_stats_passthrough: 0,
-            cut_stats_fallback: 0,
+            cut_stats: crate::mesh::cut_openings::CutOpeningsStats::default(),
             #[cfg(feature = "csg")]
             cross,
         };
@@ -1779,9 +1844,7 @@ mod python {
         out.set_item("total_ms", t_total.elapsed().as_secs_f64() * 1000.0)?;
         out.set_item("size_bytes", mmap.len() as u64)?;
         out.set_item("cut_openings", cut_openings)?;
-        out.set_item("cut_openings_cut", sink.cut_stats_cut as u64)?;
-        out.set_item("cut_openings_passthrough", sink.cut_stats_passthrough as u64)?;
-        out.set_item("cut_openings_fallback", sink.cut_stats_fallback as u64)?;
+        set_cut_openings_stats(&out, &sink.cut_stats)?;
         Ok(out)
         })
     }
@@ -1838,9 +1901,7 @@ mod python {
                 products: Vec<ProductMesh>,
                 cut_openings: bool,
                 unit_scale: f32,
-                cut_stats_cut: usize,
-                cut_stats_passthrough: usize,
-                cut_stats_fallback: usize,
+                cut_stats: crate::mesh::cut_openings::CutOpeningsStats,
                 #[cfg(feature = "csg")]
                 cross: Option<crate::mesh::cut_openings::CrossProductCut>,
             }
@@ -1868,12 +1929,7 @@ mod python {
 
                 #[cfg(feature = "csg")]
                 fn bump_outcome(&mut self, outcome: crate::mesh::cut_openings::Outcome) {
-                    use crate::mesh::cut_openings::Outcome;
-                    match outcome {
-                        Outcome::Cut => self.cut_stats_cut += 1,
-                        Outcome::Passthrough => self.cut_stats_passthrough += 1,
-                        Outcome::Fallback => self.cut_stats_fallback += 1,
-                    }
+                    outcome.accumulate(&mut self.cut_stats);
                 }
             }
 
@@ -1913,9 +1969,7 @@ mod python {
                 products: Vec::new(),
                 cut_openings,
                 unit_scale,
-                cut_stats_cut: 0,
-                cut_stats_passthrough: 0,
-                cut_stats_fallback: 0,
+                cut_stats: crate::mesh::cut_openings::CutOpeningsStats::default(),
                 #[cfg(feature = "csg")]
                 cross,
             };
@@ -1984,9 +2038,7 @@ mod python {
             out.set_item("size_bytes", mmap.len() as u64)?;
             out.set_item("out_size_bytes", out_size)?;
             out.set_item("cut_openings", cut_openings)?;
-            out.set_item("cut_openings_cut", sink.cut_stats_cut as u64)?;
-            out.set_item("cut_openings_passthrough", sink.cut_stats_passthrough as u64)?;
-            out.set_item("cut_openings_fallback", sink.cut_stats_fallback as u64)?;
+            set_cut_openings_stats(&out, &sink.cut_stats)?;
             out.set_item("instancing", options.instancing)?;
             Ok(out)
         })

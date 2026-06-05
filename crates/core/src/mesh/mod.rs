@@ -121,8 +121,24 @@ pub(crate) type ShapeCache = dashmap::DashMap<u64, Vec<(LocalMesh, &'static str)
 pub enum MeshFragment {
     Mesh {
         mesh: LocalMesh,
+        /// The leaf entity tag (e.g. `"extrusion"`, `"brep"`,
+        /// `"csg_cylinder"`). Always exactly one token. See
+        /// [`MeshFragment::source_tags`] for the closed set.
         source: &'static str,
-        role: Option<&'static str>,
+        /// Wrapping composite roles, accumulated as we walk back up
+        /// the dispatch tree. Innermost-first (the first push is the
+        /// role at the deepest containing boolean / csg node); each
+        /// outer wrapping retag call appends. At serialization the
+        /// chain is rendered outermost-first by reversing this vec.
+        ///
+        /// Pre-W1 this was a single `Option<&'static str>` with
+        /// innermost-wins semantics (`role.unwrap_or(new_role)`),
+        /// which silently dropped outer wrapping roles. A fragment
+        /// that is a cutter at level N but a host at level N+1 would
+        /// lose the cutter annotation on the chain — see
+        /// [GH #58 / W1] in `docs/plans/2026-06-05_cut-openings-manifold-replacement.md`
+        /// for the design call.
+        roles: Vec<&'static str>,
         rep_step_id: u64,
         instance_transform: Mat4,
     },
@@ -759,7 +775,7 @@ fn tessellate_one(
                 MeshFragment::Mesh {
                     mesh: local,
                     source,
-                    role,
+                    roles,
                     rep_step_id,
                     instance_transform,
                 } => {
@@ -813,9 +829,28 @@ fn tessellate_one(
                     }
                     let seg_index_count = combined_i.len() as u32 - seg_index_start;
                     if seg_index_count > 0 {
-                        let tag = match role {
-                            Some(r) => format!("{}|{}", r, source),
-                            None => source.to_string(),
+                        // Serialise the chain outermost-first: `roles`
+                        // is stored innermost-first (the deepest retag
+                        // pushed first as we walked back up the tree),
+                        // so iterate in reverse, then append the leaf
+                        // `source`. A 3-deep boolean cutter-of-cutter
+                        // produces `boolean_second_operand|boolean_second_operand|extrusion`;
+                        // a cutter-side fragment that is a host at the
+                        // innermost level produces
+                        // `boolean_second_operand|boolean_first_operand|extrusion`.
+                        // Readers split on `|` and scan tokens — see
+                        // `cut_openings::chain_contains` / `chain_count`.
+                        let tag = if roles.is_empty() {
+                            source.to_string()
+                        } else {
+                            let mut buf =
+                                String::with_capacity(roles.iter().map(|r| r.len() + 1).sum::<usize>() + source.len());
+                            for r in roles.iter().rev() {
+                                buf.push_str(r);
+                                buf.push('|');
+                            }
+                            buf.push_str(source);
+                            buf
                         };
                         segments.push(MeshSegment {
                             index_start: seg_index_start,
@@ -1006,7 +1041,7 @@ pub(crate) fn mesh_item(
             .map(|(m, s)| MeshFragment::Mesh {
                 mesh: clone_local(m),
                 source: s,
-                role: None,
+                roles: Vec::new(),
                 // Cache contents are non-composite direct geometry —
                 // their natural rep_step_id IS the lookup key. No per-
                 // instance transform: any IfcMappedItem composition is
@@ -1027,7 +1062,7 @@ pub(crate) fn mesh_item(
             Some(m) => vec![MeshFragment::Mesh {
                 mesh: m,
                 source: tag,
-                role: None,
+                roles: Vec::new(),
                 rep_step_id: item_id,
                 instance_transform: Mat4::IDENTITY,
             }],
