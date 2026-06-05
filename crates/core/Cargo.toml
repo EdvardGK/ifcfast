@@ -88,3 +88,11 @@ parquet = { version = "53", features = ["arrow"], optional = true }
 parry3d = { version = "0.17", optional = true }
 nalgebra = { version = "0.33", optional = true }
 manifold-csg = { version = "0.2", optional = true, default-features = false, features = ["parallel"] }
+
+[dev-dependencies]
+# Property-based testing for the cut_openings dispatcher. Generates
+# random valid (host, cutter) configurations from a constrained
+# parameter space and shrinks counterexamples to a minimal repro
+# automatically — see `tests/cut_openings_proptest.rs` for the
+# specific invariants. Pinned to 1.x.
+proptest = "1"

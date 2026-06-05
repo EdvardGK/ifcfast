@@ -81,7 +81,8 @@ The plan is ordered such that any prefix is a coherent, shippable codebase. Each
 | W2 | Unified Outcome / UnsupportedReason taxonomy + stats | W1 | low | days | default-on |
 | W3 | Unit-aware tolerance policy + cross-cutting validation gate | W2 | medium | days | default-on |
 | W4 | Operator-aware IfcBooleanResult (UNION/INTERSECTION semantics) | W1, W2 | low | hours | default-on |
-| W5 | Fixture corpus for cut_openings regression | W2 | low | days | CI gate |
+| W5a | Property-based generator harness (`tests/cut_openings_proptest.rs`) — **shipped 2026-06-05** | W2 | low | hours | default-on |
+| W5 | Fixed-corpus regression suite | W2 | low | days | CI gate |
 | W6 | Polygon-bounded halfspace correctness fix | W3, W5 | medium | days | default-on |
 | W7 | Anchor synchronization for cross-product cuts | W3 | medium | days | default-on |
 | W8 | Tapered extrusion + boxed halfspace + typed-Unsupported handlers | W2, W3 | low | days | default-on |
@@ -155,6 +156,25 @@ Anti-goal: **no dual-engine path at runtime**. Either manifold OR csgrs serves t
 5. **Unit-aware tolerance (W3) changes behaviour for US-imperial users.** Mitigation: frame as bug fix; debug log per cut; emergency opt-out env var `IFCFAST_LEGACY_HALFSPACE_TOLERANCE=1` for one minor release if a regression surfaces.
 6. **W14 cache-invariant fix reveals downstream consumers were relying on the wrong-but-consistent behaviour.** Mitigation: pair with W16's `_CACHE_SCHEMA_VERSION` bump and AGENTS.md note. Add an integration test asserting two instances of one mapped rep with different opening sets get different fingerprints but share the representation row.
 7. **Bus-factor compounding** — i_overlay, csgrs, manifold each fragile. Mitigation: vendor-or-fork policy, each pre-1.0 dep behind a one-file facade, quarterly health audit.
+
+## Baseline against manifold (W5a, shipped 2026-06-05)
+
+`tests/cut_openings_proptest.rs` is a proptest-driven property harness that generates random `(host_box, cutter_box)` configurations and asserts closed-form analytic invariants on `cut_openings::apply`'s output. Four properties, 256 cases each, 1024 total configurations:
+
+- **Volume invariant** — `volume(host − cutter) == volume(host) − volume(host ∩ cutter)` within `max(0.5%, 1e-5)` m³ tolerance.
+- **Closed-manifold output** — every undirected edge in exactly two triangles post-cut.
+- **Disjoint cutter** — `cutter ∩ host = ∅` → output volume unchanged.
+- **Contained cutter** — `cutter ⊆ host` → output volume reduced by exactly `cutter.volume()`.
+
+**Result on current main (manifold-csg as the cut engine):** all 4 properties pass on 256 cases each. The audit's "manifold is fragile on axis-aligned input" warning does **not** generalise to random axis-aligned prism × prism inputs at building scale — at least not at this sampling density. Pathological cases (exact-coplanar faces, sub-mm slivers, far-origin coords) are not exercised by this harness yet; those are W7 + a planned coplanar-stress harness.
+
+Implications for the plan:
+
+- The case for replacing manifold on prism-minus-prism rests primarily on **performance + dep-stack hygiene + cross-compile** (#28), not correctness. W9's benchmark gate should weight those signals accordingly.
+- GH #56's "wall sliver" symptom is **not reproducible by random axis-aligned prism × prism cuts on current main**. Either the failing G55_RIB walls aren't in this shape class (so the fix is in extraction, not in CSG — possibly Phase 1 of GH #52 fixed it in v0.4.34), or the pathology is narrower than axis-aligned prism-prism.
+- W6 (polygon-bounded halfspace) and W11 (brep cutter pre-flight) become the highest-leverage items: the failure modes there are NOT covered by this harness's prism-only generator, and prior-art tools (ifcopenshell) had specialised paths for them.
+
+The harness extends naturally to halfspace cutters, brep cutters, far-origin coords, and rotated prisms; each extension adds a generator + a property and reuses the same assertion shape.
 
 ## What would change this decision
 
