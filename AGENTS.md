@@ -391,6 +391,26 @@ the chain, use the helpers `chain_contains(source, link)` and
 `chain_count(source, link)` (`crates/core/src/mesh/cut_openings.rs`)
 or split on `|` directly.
 
+**Operator-aware operand tags (v0.4.35+, GH #58 / W4).** The second
+operand of an `IfcBooleanResult` is tagged by its `Operator`, so the
+chain encodes whether the operand is a cutter or additive /
+intersecting geometry:
+
+- `boolean_second_operand` — `.DIFFERENCE.` (and the default for a
+  missing / unreadable operator, and every `IfcBooleanClippingResult`,
+  which is DIFFERENCE by schema rule). This is the only tag treated as
+  a **cutter** — in cut mode it is subtracted from the first operand.
+- `boolean_union_operand` — `.UNION.`. Additive geometry, **not** a
+  cutter; never subtracted. Reveal-all already emits both operands.
+- `boolean_intersection_operand` — `.INTERSECTION.`. Not a cutter.
+
+Pre-W4 the operator was ignored: every second operand was tagged
+`boolean_second_operand` and subtracted in cut mode, so a `.UNION.`
+or `.INTERSECTION.` result silently produced `first − second`. Now
+those operands are left reveal-all and the cut pass surfaces a typed
+`union_with_overlap` / `intersection_not_implemented` counter (below)
+because the true union / intersection volume is not computed.
+
 **Opt-in cut: `m.meshes(cut_openings=True)`.** For viewer / rendering
 work where you want the net solid (doors and windows as actual
 holes), pass `cut_openings=True`. The mesher then folds every
@@ -443,13 +463,28 @@ returns a dict carrying:
   `tight_polygonal_boundary_ignored`, `degenerate_cutter`,
   `host_consumed`.
 
-Detection paths land progressively over W3 (unit-aware tolerance
-gate), W4 (operator-aware `IfcBooleanResult`), W6 (tight
-polygonal-bounded halfspace), W11 (brep cutter pre-flight), and W17
-(curved-host detection). Counters are zero today for variants whose
-detection has not landed yet — the vocabulary is exposed first so
-downstream parquet columns and Python wrappers can pivot on a
-stable shape. See `docs/plans/2026-06-05_cut-openings-manifold-replacement.md`.
+Detection paths land progressively. **Wired as of v0.4.35 (W3 + W4):**
+`union_with_overlap` and `intersection_not_implemented` (a `.UNION.` /
+`.INTERSECTION.` `IfcBooleanResult` operand — see operator-aware tags
+above), and `non_manifold_input` (a manifold subtract failed and the
+host or a cutter is not a closed manifold — the typed replacement for
+an opaque `fallback` on the common Revit "bad opening solid" case).
+The remaining variants land over W6 (tight polygonal-bounded
+halfspace), W11 (brep cutter pre-flight), and W17 (curved-host
+detection); their counters stay zero until then — the vocabulary is
+exposed in full first so downstream parquet columns and Python
+wrappers can pivot on a stable shape. See
+`docs/plans/2026-06-05_cut-openings-manifold-replacement.md`.
+
+**Unit-aware cut tolerance (v0.4.35+, GH #58 / W3).** The half-space
+clipper's "on-plane" snap tolerance is a physical 1 mm, resolved into
+the model's source units from `ifcfast.unit_scale`. A model authored
+in metres is unchanged (the historical baseline); millimetre and
+imperial models now clip at the corrected physical scale instead of a
+constant that meant 0.001 mm or 0.0003 m respectively. Net cut meshes
+and `mesh_qto` volumes can shift for non-metre files — this is the bug
+fix, not a regression. Emergency parity is not provided; re-bundle to
+pick up the corrected geometry (cache schema bumped to 14).
 
 ## What `ifcfast` does NOT do (yet)
 

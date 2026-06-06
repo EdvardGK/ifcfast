@@ -26,7 +26,7 @@ use std::collections::{HashMap, HashSet};
 use glam::Vec3;
 
 use crate::geom::csg::{self, CsgKernelError};
-use crate::mesh::{halfspace_clip, MeshSegment, ProductMesh};
+use crate::mesh::{cut_validate, halfspace_clip, MeshSegment, ProductMesh};
 
 /// Outcome counters from a cut pass. Aggregate across products in
 /// the caller's loop for a top-line "n products had their openings
@@ -82,11 +82,19 @@ pub struct CutOpeningsStats {
 ///
 /// On `Outcome::Passthrough` or `Outcome::Fallback`, the mesh is
 /// untouched.
-pub fn apply(mesh: &mut ProductMesh) -> Outcome {
+pub fn apply(mesh: &mut ProductMesh, unit_scale: f32) -> Outcome {
     let (host_segs, cutter_segs) = partition_segments(&mesh.segments);
 
     if cutter_segs.is_empty() {
-        return Outcome::Passthrough;
+        // No DIFFERENCE cutters. If the product carries a UNION /
+        // INTERSECTION boolean operand (W4), the mesh stays reveal-all
+        // (unchanged) but we surface the typed reason instead of a
+        // plain passthrough — the net solid we'd ideally produce
+        // (union / intersection) is not computed.
+        return match detect_unsupported_boolean_op(&mesh.segments) {
+            Some(reason) => Outcome::Unsupported(reason),
+            None => Outcome::Passthrough,
+        };
     }
 
     // Build the host mesh as the concatenation of all non-cutter
@@ -133,6 +141,11 @@ pub fn apply(mesh: &mut ProductMesh) -> Outcome {
         return Outcome::Passthrough;
     }
 
+    // Unit-aware "on-plane" tolerance (W3 / F2): a physical 1 mm in the
+    // model's source units, so mm / imperial files clip at the same
+    // physical scale as the metre files the clipper was tuned on.
+    let on_plane_eps = cut_validate::on_plane_eps(unit_scale);
+
     // Apply half-space clips sequentially. Each clip reduces the
     // host; if the host empties part-way we're done — the remaining
     // half-spaces and solid cutters would just confirm the empty.
@@ -145,6 +158,7 @@ pub fn apply(mesh: &mut ProductMesh) -> Outcome {
             &host.1,
             *plane_point,
             *plane_normal,
+            on_plane_eps,
         );
         host = (new_v, new_i);
     }
@@ -163,7 +177,7 @@ pub fn apply(mesh: &mut ProductMesh) -> Outcome {
             .collect();
         match csg::subtract_many(&host.0, &host.1, &cutter_refs) {
             Ok(out) => out,
-            Err(_e) => return Outcome::Fallback,
+            Err(_e) => return classify_subtract_failure(&host.1, &solid_cutters),
         }
     };
 
@@ -494,14 +508,14 @@ impl CrossProductCut {
     /// * `Fallback` — cutters existed but every subtraction failed.
     /// * `Passthrough` — no openings ever arrived (e.g. all expected
     ///   openings were geometryless or otherwise unmeshed).
-    pub fn flush(&mut self) -> Vec<(ProductMesh, Outcome)> {
+    pub fn flush(&mut self, unit_scale: f32) -> Vec<(ProductMesh, Outcome)> {
         let mut out = Vec::with_capacity(self.held_hosts.len());
         let held_hosts = std::mem::take(&mut self.held_hosts);
         for (host_id, mut host_mesh) in held_hosts {
             // Run in-rep cut first. Combined outcome accounting is
             // simplified to "did any subtraction happen on this
             // product?" — see the doc above.
-            let in_rep = apply(&mut host_mesh);
+            let in_rep = apply(&mut host_mesh, unit_scale);
 
             // Gather arrived openings for this host.
             let expected = self
@@ -557,13 +571,17 @@ impl CrossProductCut {
                     }
                     Err(_) => {
                         // If the in-rep cut already succeeded, keep
-                        // that as the win and surface the
-                        // cross-product failure only via a Fallback
-                        // bump when in-rep also passed/failed.
+                        // that as the win. Otherwise classify the
+                        // cross-product failure the same way the in-rep
+                        // path does (W3): attribute it to non-manifold
+                        // input when the host or a translated opening
+                        // is not a closed manifold, else opaque
+                        // Fallback. Post-failure only — never gates the
+                        // cut.
                         if matches!(in_rep, Outcome::Cut) {
                             Outcome::Cut
                         } else {
-                            Outcome::Fallback
+                            classify_subtract_failure(&host_mesh.indices, &cutter_buffers)
                         }
                     }
                 }
@@ -611,6 +629,57 @@ fn is_cutter(source: &str) -> bool {
     // fragment a cutter at the outer level despite being a host at the
     // inner one).
     chain_contains(source, "boolean_second_operand")
+}
+
+/// Scan a product's segments for a non-DIFFERENCE boolean operand
+/// (W4 — tagged by `boolean::second_operand_role`). Returns the typed
+/// reason for the first such operand: `UnionWithOverlap` for a
+/// `boolean_union_operand` token, `IntersectionNotImplemented` for
+/// `boolean_intersection_operand`. These operands are NOT cutters (so
+/// they are never subtracted — the F4 correctness fix), but their
+/// presence means the net solid we'd ideally produce is a union /
+/// intersection we don't compute, so we surface the signal rather than
+/// reporting a plain passthrough. `None` when every operand is a plain
+/// DIFFERENCE host / cutter. Union is checked first only for
+/// determinism; a product carrying both is pathological.
+fn detect_unsupported_boolean_op(segments: &[MeshSegment]) -> Option<UnsupportedReason> {
+    if segments
+        .iter()
+        .any(|s| chain_contains(&s.source, "boolean_union_operand"))
+    {
+        return Some(UnsupportedReason::UnionWithOverlap);
+    }
+    if segments
+        .iter()
+        .any(|s| chain_contains(&s.source, "boolean_intersection_operand"))
+    {
+        return Some(UnsupportedReason::IntersectionNotImplemented);
+    }
+    None
+}
+
+/// Classify a failed manifold subtract (W3). When the host or any
+/// solid cutter is not a closed manifold, the kernel's rejection is
+/// attributable to bad input — the Revit "open / odd-paired opening
+/// solid" reality — so surface `Unsupported(NonManifoldInput)` instead
+/// of an opaque `Fallback`. Otherwise the failure has no diagnostic and
+/// stays `Fallback`. Either outcome leaves the mesh untouched
+/// (reveal-all). This runs ONLY after the kernel already rejected the
+/// input, so the conservative (false-negative-prone) manifold check can
+/// never suppress a cut the kernel would have accepted.
+fn classify_subtract_failure(
+    host_indices: &[u32],
+    solid_cutters: &[(Vec<f32>, Vec<u32>)],
+) -> Outcome {
+    let bad_input = !cut_validate::is_manifold_mesh(host_indices)
+        || solid_cutters
+            .iter()
+            .any(|(_, i)| !cut_validate::is_manifold_mesh(i));
+    if bad_input {
+        Outcome::Unsupported(UnsupportedReason::NonManifoldInput)
+    } else {
+        Outcome::Fallback
+    }
 }
 
 /// True if `link` appears at least once as a token in the compound
@@ -813,7 +882,7 @@ mod tests {
             surface_color: None,
         };
         let before_verts = mesh.vertices.clone();
-        assert_eq!(apply(&mut mesh), Outcome::Passthrough);
+        assert_eq!(apply(&mut mesh, 1.0), Outcome::Passthrough);
         assert_eq!(mesh.vertices, before_verts);
         assert_eq!(mesh.segments.len(), 1);
         assert_eq!(mesh.segments[0].source, "extrusion");
@@ -825,7 +894,7 @@ mod tests {
         // Sanity: input has two segments.
         assert_eq!(mesh.segments.len(), 2);
 
-        let outcome = apply(&mut mesh);
+        let outcome = apply(&mut mesh, 1.0);
         assert_eq!(outcome, Outcome::Cut);
 
         // Output has exactly one segment, tagged "cut_openings".
@@ -864,7 +933,7 @@ mod tests {
             source: "boolean_first_operand|extrusion".into(),
             surface_color: None,
         });
-        let _ = apply(&mut mesh);
+        let _ = apply(&mut mesh, 1.0);
         assert!(mesh.parts.is_empty(), "parts must clear post-cut");
     }
 
@@ -878,6 +947,69 @@ mod tests {
         assert_eq!(stats.cut, 2);
         assert_eq!(stats.passthrough, 1);
         assert_eq!(stats.fallback, 1);
+    }
+
+    /// Build a two-operand product whose second operand carries the
+    /// given chain source — used to exercise the W4 operator-aware
+    /// paths (union / intersection operands are NOT cutters).
+    fn wall_with_second_operand(second_source: &str) -> ProductMesh {
+        let mut mesh = synthetic_wall_with_opening();
+        mesh.segments[1].source = second_source.to_string();
+        mesh
+    }
+
+    #[test]
+    fn union_operand_is_not_a_cutter() {
+        // The F4 correctness fix: a UNION / INTERSECTION operand must
+        // NOT be subtracted. `is_cutter` only matches DIFFERENCE.
+        assert!(!is_cutter("boolean_union_operand|extrusion"));
+        assert!(!is_cutter("boolean_intersection_operand|extrusion"));
+        assert!(is_cutter("boolean_second_operand|extrusion"));
+    }
+
+    #[test]
+    fn union_operand_surfaces_unsupported_and_preserves_mesh() {
+        let mut mesh = wall_with_second_operand("boolean_union_operand|extrusion");
+        let before_verts = mesh.vertices.clone();
+        let before_indices = mesh.indices.clone();
+        let outcome = apply(&mut mesh, 1.0);
+        assert_eq!(
+            outcome,
+            Outcome::Unsupported(UnsupportedReason::UnionWithOverlap)
+        );
+        // Reveal-all: the mesh is untouched (both operands still visible).
+        assert_eq!(mesh.vertices, before_verts);
+        assert_eq!(mesh.indices, before_indices);
+        assert_eq!(mesh.segments.len(), 2);
+    }
+
+    #[test]
+    fn intersection_operand_surfaces_unsupported() {
+        let mut mesh = wall_with_second_operand("boolean_intersection_operand|extrusion");
+        let outcome = apply(&mut mesh, 1.0);
+        assert_eq!(
+            outcome,
+            Outcome::Unsupported(UnsupportedReason::IntersectionNotImplemented)
+        );
+    }
+
+    #[test]
+    fn non_manifold_cutter_classified_on_failure() {
+        // A single triangle is not a closed manifold; an empty host is
+        // trivially "bad input" too. The classifier attributes the
+        // (hypothetical) kernel rejection to NonManifoldInput.
+        let open_cutter = (vec![0.0; 9], vec![0u32, 1, 2]);
+        let closed_host = box_at([0.0, 0.0, 0.0], [1.0, 1.0, 1.0]);
+        assert_eq!(
+            classify_subtract_failure(&closed_host.1, &[open_cutter]),
+            Outcome::Unsupported(UnsupportedReason::NonManifoldInput)
+        );
+        // Both manifold → no diagnostic, stays Fallback.
+        let closed_cutter = box_at([0.25, 0.25, 0.25], [0.75, 0.75, 0.75]);
+        assert_eq!(
+            classify_subtract_failure(&closed_host.1, &[closed_cutter]),
+            Outcome::Fallback
+        );
     }
 }
 

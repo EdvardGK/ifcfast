@@ -251,7 +251,21 @@ _HASH_TAIL_BYTES = 4 * 1024 * 1024
 #       output changes today — the detection paths land over
 #       W3 (validation gate) / W4 (operator-aware IfcBooleanResult)
 #       / W11 (brep cutter pre-flight).
-_CACHE_SCHEMA_VERSION = 13
+# v14: cut-openings W3 + W4 (GH #58). W4 — `IfcBooleanResult` is now
+#       operator-aware: a `.UNION.` / `.INTERSECTION.` second operand
+#       is tagged `boolean_union_operand` / `boolean_intersection_operand`
+#       (new tokens in the `source` column of `MeshSegment` /
+#       `InstancePart` / `instances.parquet`) instead of
+#       `boolean_second_operand`, so it is no longer subtracted in cut
+#       mode (it was: `first − second` where the file said
+#       `first ∪/∩ second`). Net solid for those products changes;
+#       reveal-all substrate gains the two new tokens. W3 — half-space
+#       clip tolerance is unit-scaled (physical 1 mm in any unit
+#       system); metre files unchanged, mm / imperial files clip at the
+#       corrected physical scale (net mesh / QTO can shift for those).
+#       Newly-emitted counters: `cut_openings_unsupported_union_with_overlap`,
+#       `_intersection_not_implemented`, `_non_manifold_input`.
+_CACHE_SCHEMA_VERSION = 14
 
 _FIELD_RE = re.compile(r"\(\s*(.*?)\s*\)\s*;", re.DOTALL)
 

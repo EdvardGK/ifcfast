@@ -39,12 +39,46 @@ const HALFSPACE_PLANE_EXTENT: f32 = 20_000.0;
 /// Picked to be small relative to building scale but visible.
 const HALFSPACE_SLAB_THICKNESS: f32 = 1.0;
 
+/// Map an `IfcBooleanOperator` enum token to the role tag the second
+/// operand carries in the source chain. The operator distinguishes
+/// how `cut_openings` treats the second operand:
+///
+/// * `.DIFFERENCE.` → `"boolean_second_operand"` — the operand is a
+///   cutter; in cut mode it is subtracted from the first operand.
+///   `IfcBooleanClippingResult` is always DIFFERENCE by schema rule.
+/// * `.UNION.` → `"boolean_union_operand"` — additive geometry, NOT a
+///   cutter. Reveal-all already emits both operands; cut mode must not
+///   subtract it (doing so produces `first − second` where the file
+///   says `first ∪ second`). Surfaced as
+///   `Outcome::Unsupported(UnionWithOverlap)` because the overlap
+///   volume is double-counted (we don't compute the true union).
+/// * `.INTERSECTION.` → `"boolean_intersection_operand"` — the net
+///   solid is `first ∩ second`, which we don't compute; reveal-all
+///   over-reports. Surfaced as
+///   `Outcome::Unsupported(IntersectionNotImplemented)`.
+///
+/// A missing / malformed operator defaults to DIFFERENCE: it is the
+/// overwhelmingly common case (every clipping result, almost every
+/// authored boolean) and preserves the pre-W4 behaviour exactly. See
+/// [GH #58] / W4.
+fn second_operand_role(operator: Option<&[u8]>) -> &'static str {
+    match operator.map(parse_field) {
+        Some(Field::Enum(b"UNION")) => "boolean_union_operand",
+        Some(Field::Enum(b"INTERSECTION")) => "boolean_intersection_operand",
+        // `.DIFFERENCE.` and anything we can't read fall here.
+        _ => "boolean_second_operand",
+    }
+}
+
 /// `IfcBooleanResult` / `IfcBooleanClippingResult`:
 ///   `(Operator: ENUM, FirstOperand: IfcBooleanOperand, SecondOperand: IfcBooleanOperand)`
 ///
 /// We recurse into both operands and tag the resulting mesh fragments
 /// with their structural role. No subtraction, no intersection — both
-/// volumes are emitted as their own visible meshes.
+/// volumes are emitted as their own visible meshes (reveal-all). The
+/// second operand's role tag encodes the operator (W4) so downstream
+/// `cut_openings` knows whether it is a cutter (DIFFERENCE) or additive
+/// / intersecting geometry it must not subtract.
 pub fn boolean_result(
     table: &EntityTable,
     id: u64,
@@ -57,6 +91,7 @@ pub fn boolean_result(
     };
     let fields = split_top_level_args(args);
     // Operator at fields[0], FirstOperand at fields[1], SecondOperand at fields[2].
+    let second_role = second_operand_role(fields.first().copied());
     let first_id = fields.get(1).copied().and_then(|f| match parse_field(f) {
         Field::Ref(rid) => Some(rid),
         _ => None,
@@ -74,7 +109,7 @@ pub fn boolean_result(
     }
     if let Some(sid) = second_id {
         for frag in recurse(table, sid, shape_cache) {
-            out.push(retag(frag, "boolean_second_operand"));
+            out.push(retag(frag, second_role));
         }
     }
     out
@@ -434,5 +469,27 @@ fn cartesian_point_list_2d(table: &EntityTable, id: u64) -> Option<Vec<Vec2>> {
         None
     } else {
         Some(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn second_operand_role_maps_operator() {
+        // DIFFERENCE (and the clipping-result default) → cutter tag.
+        assert_eq!(second_operand_role(Some(b".DIFFERENCE.")), "boolean_second_operand");
+        // UNION / INTERSECTION get their own non-cutter tags.
+        assert_eq!(second_operand_role(Some(b".UNION.")), "boolean_union_operand");
+        assert_eq!(
+            second_operand_role(Some(b".INTERSECTION.")),
+            "boolean_intersection_operand"
+        );
+        // Missing / malformed operator falls back to DIFFERENCE — the
+        // overwhelmingly common case, and the pre-W4 behaviour.
+        assert_eq!(second_operand_role(None), "boolean_second_operand");
+        assert_eq!(second_operand_role(Some(b"$")), "boolean_second_operand");
+        assert_eq!(second_operand_role(Some(b".WAT.")), "boolean_second_operand");
     }
 }

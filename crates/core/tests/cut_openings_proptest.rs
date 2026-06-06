@@ -386,7 +386,7 @@ proptest! {
         let inter_vol = host.intersection_volume(&cutter);
         let expected = host_vol - inter_vol;
 
-        let outcome = apply(&mut mesh);
+        let outcome = apply(&mut mesh, 1.0);
 
         match outcome {
             Outcome::Cut => {
@@ -419,9 +419,12 @@ proptest! {
                 );
             }
             Outcome::Unsupported(reason) => {
-                // W2 vocabulary; no detection wired yet for prism-prism
-                // so this branch shouldn't fire today. If it does we
-                // want to know — surface as a failure to investigate.
+                // W3 wired NonManifoldInput and W4 wired the
+                // union/intersection reasons, but none can fire on this
+                // fixture: the boxes are index-welded closed manifolds
+                // and the second operand is always tagged DIFFERENCE. An
+                // Unsupported reason here is a real regression — surface
+                // it as a failure to investigate.
                 prop_assert!(
                     false,
                     "unexpected Outcome::Unsupported({:?}) on prism-prism fixture; \
@@ -448,7 +451,7 @@ proptest! {
         (host, cutter) in prism_pair_strategy(),
     ) {
         let mut mesh = build_pair_product_mesh(&host, &cutter);
-        let outcome = apply(&mut mesh);
+        let outcome = apply(&mut mesh, 1.0);
         if matches!(outcome, Outcome::Cut) {
             prop_assert!(
                 is_closed_manifold(&mesh.indices),
@@ -473,7 +476,7 @@ proptest! {
             }),
     ) {
         let mut mesh = build_pair_product_mesh(&host, &cutter);
-        let outcome = apply(&mut mesh);
+        let outcome = apply(&mut mesh, 1.0);
         if let Outcome::Cut = outcome {
             let actual = signed_volume(&mesh.vertices, &mesh.indices);
             let expected = host.volume();
@@ -502,7 +505,7 @@ proptest! {
         (host, cutter) in contained_pair_strategy(),
     ) {
         let mut mesh = build_pair_product_mesh(&host, &cutter);
-        let outcome = apply(&mut mesh);
+        let outcome = apply(&mut mesh, 1.0);
         if let Outcome::Cut = outcome {
             let actual = signed_volume(&mesh.vertices, &mesh.indices);
             let expected = host.volume() - cutter.volume();

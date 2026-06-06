@@ -20,6 +20,8 @@ pub mod brep;
 pub mod csg_primitive;
 #[cfg(feature = "csg")]
 pub mod cut_openings;
+#[cfg(feature = "csg")]
+pub mod cut_validate;
 pub mod curveset;
 pub mod extrusion;
 pub mod faceset;
@@ -162,6 +164,8 @@ impl MeshFragment {
             "faceset_sbsm",
             "boolean_first_operand",
             "boolean_second_operand",
+            "boolean_union_operand",
+            "boolean_intersection_operand",
             "csg_branch",
             "halfspace_bounded:agree",
             "halfspace_bounded:disagree",

@@ -723,7 +723,7 @@ mod python {
                             Routed::PassThrough(m) => mesh = m,
                         }
                     }
-                    let outcome = crate::mesh::cut_openings::apply(&mut mesh);
+                    let outcome = crate::mesh::cut_openings::apply(&mut mesh, self.unit_scale);
                     self.bump_outcome(outcome);
                     if mesh.indices.is_empty() || mesh.vertices.is_empty() {
                         return;
@@ -785,7 +785,7 @@ mod python {
         // mesh through the same QTO recorder.
         #[cfg(feature = "csg")]
         if let Some(mut cross) = sink.cross.take() {
-            for (folded, outcome) in cross.flush() {
+            for (folded, outcome) in cross.flush(sink.unit_scale) {
                 sink.bump_outcome(outcome);
                 if folded.indices.is_empty() || folded.vertices.is_empty() {
                     continue;
@@ -1746,7 +1746,7 @@ mod python {
                             Routed::PassThrough(m) => mesh = m,
                         }
                     }
-                    let outcome = crate::mesh::cut_openings::apply(&mut mesh);
+                    let outcome = crate::mesh::cut_openings::apply(&mut mesh, self.unit_scale);
                     self.bump_outcome(outcome);
                     // The cut may have emptied the mesh (cutter fully
                     // consumed the host); skip in that case.
@@ -1802,7 +1802,7 @@ mod python {
         // through the same encode path. Stats accumulate per host.
         #[cfg(feature = "csg")]
         if let Some(mut cross) = sink.cross.take() {
-            for (folded, outcome) in cross.flush() {
+            for (folded, outcome) in cross.flush(sink.unit_scale) {
                 sink.bump_outcome(outcome);
                 if folded.indices.is_empty() || folded.vertices.is_empty() {
                     continue;
@@ -1945,7 +1945,7 @@ mod python {
                                 Routed::PassThrough(m) => mesh = m,
                             }
                         }
-                        let outcome = crate::mesh::cut_openings::apply(&mut mesh);
+                        let outcome = crate::mesh::cut_openings::apply(&mut mesh, self.unit_scale);
                         self.bump_outcome(outcome);
                     }
                     #[cfg(not(feature = "csg"))]
@@ -1991,7 +1991,7 @@ mod python {
             // arrived openings, run the result through `push_scaled`.
             #[cfg(feature = "csg")]
             if let Some(mut cross) = sink.cross.take() {
-                for (folded, outcome) in cross.flush() {
+                for (folded, outcome) in cross.flush(sink.unit_scale) {
                     sink.bump_outcome(outcome);
                     sink.push_scaled(folded);
                 }

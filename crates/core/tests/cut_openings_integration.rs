@@ -118,7 +118,7 @@ fn cut_openings_produces_single_segment_and_reduced_volume() {
     // Opening volume within host = 500 × 200 × 2000 = 2e8 mm³ = 0.2 m³.
     // Expected post-cut volume = 0.6 − 0.2 = 0.4 m³.
 
-    let outcome = apply(&mut mesh);
+    let outcome = apply(&mut mesh, 1.0);
     assert_eq!(outcome, Outcome::Cut, "cut must succeed on this fixture");
     assert_eq!(
         mesh.segments.len(),
@@ -197,7 +197,7 @@ fn halfspace_clip_with_agreement_false_keeps_lower_half() {
         .find(|m| m.entity == "IfcWall")
         .expect("clipped wall must reach the sink");
 
-    let outcome = apply(&mut mesh);
+    let outcome = apply(&mut mesh, 1.0);
     assert_eq!(outcome, Outcome::Cut);
     let m = csg::build_manifold(&mesh.vertices, &mesh.indices)
         .expect("post-clip wall must be a closed manifold");
@@ -302,7 +302,7 @@ fn deep_bcr_with_three_halfspaces_cuts_correctly() {
         .find(|m| m.entity == "IfcWall")
         .unwrap_or_else(|| panic!("deep-clipped wall must reach the sink; got entities: {:?}", entities));
 
-    let outcome = apply(&mut mesh);
+    let outcome = apply(&mut mesh, 1.0);
     assert_eq!(
         outcome,
         Outcome::Cut,
@@ -368,7 +368,7 @@ END-ISO-10303-21;
 
     let before_verts = mesh.vertices.clone();
     let before_idx = mesh.indices.clone();
-    let outcome = apply(&mut mesh);
+    let outcome = apply(&mut mesh, 1.0);
     assert_eq!(outcome, Outcome::Passthrough);
     assert_eq!(mesh.vertices, before_verts, "passthrough must not mutate verts");
     assert_eq!(mesh.indices, before_idx, "passthrough must not mutate indices");
@@ -510,7 +510,7 @@ fn cross_product_voids_fold_subtracts_opening_volume() {
     );
 
     // Flush — fold the wall with its arrived openings.
-    let folded = cross.flush();
+    let folded = cross.flush(1.0);
     assert_eq!(folded.len(), 1, "exactly one host emerges from the flush");
     let (wall_mesh, outcome) = &folded[0];
     assert_eq!(*outcome, Outcome::Cut, "the cross-product cut must succeed");
@@ -651,7 +651,7 @@ fn polygonal_bounded_uses_base_surface_position_normal() {
         .into_iter()
         .find(|m| m.entity == "IfcWall")
         .expect("wall must reach the sink");
-    let outcome = apply(&mut mesh);
+    let outcome = apply(&mut mesh, 1.0);
     assert_eq!(outcome, Outcome::Cut);
     let m = csg::build_manifold(&mesh.vertices, &mesh.indices)
         .expect("post-clip wall is a closed manifold");

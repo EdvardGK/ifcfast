@@ -42,12 +42,20 @@ use glam::Vec3;
 
 use crate::mesh::profile::Polygon2D;
 
-/// Tolerance for treating a vertex as "on the plane". Picked to be
-/// well below building-element tolerance (1 mm) while still firmly
-/// above f32 round-off at the world coordinates ifcfast operates on
-/// (vertices arrive in the wall's local-rebased frame, so values
-/// rarely exceed 1e5 mm).
-const ON_PLANE_EPS: f32 = 1.0e-3;
+/// Base physical "on-plane" tolerance, in **metres**: a vertex within
+/// this distance of the cutting plane is treated as lying on it. The
+/// value (1 mm) is the building-element snap tolerance — small enough
+/// not to drop real geometry, large enough to absorb f32 round-off at
+/// the local-rebased coordinates ifcfast clips in.
+///
+/// This is the value for a model authored in metres. Callers pass
+/// `clip_by_plane` a *unit-scaled* epsilon resolved from the model's
+/// `unit_scale` via [`crate::mesh::cut_validate::on_plane_eps`], so the
+/// snap stays a physical 1 mm in millimetre / imperial files too
+/// ([GH #58] / W3 / F2). Pre-W3 the constant was used directly, which
+/// meant 1 mm in metre files but 0.001 mm in mm files and 0.0003 m in
+/// foot files — three different physical tolerances for one constant.
+pub const ON_PLANE_EPS_BASE_M: f32 = 1.0e-3;
 
 /// Clip a closed triangle mesh by a plane, returning the closed
 /// portion on the **negative** side (i.e. the half-space *opposite*
@@ -63,11 +71,18 @@ const ON_PLANE_EPS: f32 = 1.0e-3;
 /// Returns the input unchanged when no triangle is removed (the
 /// host lies entirely outside the half-space — caller can short-
 /// circuit if performance matters).
+///
+/// `on_plane_eps` is the "on the plane → treat as outside" tolerance in
+/// the **same units as `vertices`** (source units). Callers resolve it
+/// from the model's `unit_scale` via
+/// [`crate::mesh::cut_validate::on_plane_eps`]; pass
+/// [`ON_PLANE_EPS_BASE_M`] directly for a metre-scale mesh.
 pub fn clip_by_plane(
     vertices: &[f32],
     indices: &[u32],
     plane_point: Vec3,
     plane_normal: Vec3,
+    on_plane_eps: f32,
 ) -> (Vec<f32>, Vec<u32>) {
     if indices.is_empty() || vertices.len() < 9 {
         return (vertices.to_vec(), indices.to_vec());
@@ -78,9 +93,10 @@ pub fn clip_by_plane(
     }
 
     // ----- Phase 1: per-vertex signed distance & sign --------------
-    // Treat |d| < ON_PLANE_EPS as "on plane → outside" (conservative
+    // Treat |d| < on_plane_eps as "on plane → outside" (conservative
     // toward removing tiny slivers, which keeps the cap topology
-    // crisp at the cost of dropping sub-mm geometry near the plane).
+    // crisp at the cost of dropping near-tolerance geometry by the
+    // plane). `on_plane_eps` is unit-scaled by the caller (W3 / F2).
     let nv = vertices.len() / 3;
     let mut dist: Vec<f32> = Vec::with_capacity(nv);
     let mut inside: Vec<bool> = Vec::with_capacity(nv);
@@ -88,7 +104,7 @@ pub fn clip_by_plane(
         let v = Vec3::new(chunk[0], chunk[1], chunk[2]);
         let d = (v - plane_point).dot(n);
         dist.push(d);
-        inside.push(d < -ON_PLANE_EPS);
+        inside.push(d < -on_plane_eps);
     }
 
     // Fast paths.
@@ -453,7 +469,8 @@ mod tests {
         // 1×1×1 cube at origin clipped by z=0.5 plane with normal +Z
         // (removes the upper half) → lower half remains, volume 0.5.
         let (v, i) = cube(Vec3::ZERO, Vec3::ONE);
-        let (cv, ci) = clip_by_plane(&v, &i, Vec3::new(0.0, 0.0, 0.5), Vec3::Z);
+        let (cv, ci) =
+            clip_by_plane(&v, &i, Vec3::new(0.0, 0.0, 0.5), Vec3::Z, ON_PLANE_EPS_BASE_M);
         let vol = signed_volume(&cv, &ci);
         assert!(
             (vol - 0.5).abs() < 1e-4,
@@ -468,7 +485,8 @@ mod tests {
         // Plane at z=2, normal +Z → cube (z in [0,1]) is entirely
         // on the keep (negative) side. Passthrough.
         let (v, i) = cube(Vec3::ZERO, Vec3::ONE);
-        let (cv, ci) = clip_by_plane(&v, &i, Vec3::new(0.0, 0.0, 2.0), Vec3::Z);
+        let (cv, ci) =
+            clip_by_plane(&v, &i, Vec3::new(0.0, 0.0, 2.0), Vec3::Z, ON_PLANE_EPS_BASE_M);
         assert_eq!(cv.len() / 3, v.len() / 3);
         assert_eq!(ci.len() / 3, i.len() / 3);
         let vol = signed_volume(&cv, &ci);
@@ -480,7 +498,8 @@ mod tests {
         // Plane at z=-1, normal +Z → cube (z in [0,1]) is entirely
         // on the remove (positive) side. Result empty.
         let (v, i) = cube(Vec3::ZERO, Vec3::ONE);
-        let (cv, ci) = clip_by_plane(&v, &i, Vec3::new(0.0, 0.0, -1.0), Vec3::Z);
+        let (cv, ci) =
+            clip_by_plane(&v, &i, Vec3::new(0.0, 0.0, -1.0), Vec3::Z, ON_PLANE_EPS_BASE_M);
         assert!(cv.is_empty() && ci.is_empty(), "expected empty result");
     }
 
@@ -494,7 +513,7 @@ mod tests {
         // mirror-symmetric → exactly 0.5 each.
         let (v, i) = cube(Vec3::ZERO, Vec3::ONE);
         let n = Vec3::new(1.0, 1.0, 1.0).normalize();
-        let (cv, ci) = clip_by_plane(&v, &i, Vec3::splat(0.5), n);
+        let (cv, ci) = clip_by_plane(&v, &i, Vec3::splat(0.5), n, ON_PLANE_EPS_BASE_M);
         let vol = signed_volume(&cv, &ci);
         assert!(
             (vol - 0.5).abs() < 1e-4,
@@ -512,7 +531,7 @@ mod tests {
         // Expected remaining: 1 − 0.070313 = 0.929688.
         let (v, i) = cube(Vec3::ZERO, Vec3::ONE);
         let n = Vec3::new(1.0, 1.0, 1.0).normalize();
-        let (cv, ci) = clip_by_plane(&v, &i, Vec3::splat(0.75), n);
+        let (cv, ci) = clip_by_plane(&v, &i, Vec3::splat(0.75), n, ON_PLANE_EPS_BASE_M);
         let vol = signed_volume(&cv, &ci);
         let expected = 1.0 - 0.75_f32.powi(3) / 6.0;
         assert!(
