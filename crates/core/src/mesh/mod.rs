@@ -33,6 +33,8 @@ pub mod obj;
 pub mod placement;
 #[cfg(feature = "prism-csg-fast")]
 pub mod polygon_bool;
+#[cfg(feature = "prism-csg-fast")]
+pub mod prism_csg;
 pub mod profile;
 pub mod qto;
 pub mod revolved;
