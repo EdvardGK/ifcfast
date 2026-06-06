@@ -6,6 +6,12 @@
 # plus the end-to-end `cut_openings_integration` test on the same five
 # targets `release.yml` produces wheels for — informational only,
 # not a required gate, until it's been green across a few merges.
+#
+# Also smoke-tests the off-by-default `prism-csg-fast` feature
+# (GH #58 W6/W9, pure-Rust i_overlay 2D Boolean). The default
+# `cargo test` lane never builds it, so without this it would bit-rot;
+# and since it's pure Rust, the cross-platform check doubles as proof
+# of the cross-compile-clean claim (incl. linux-aarch64, GH #28).
 name: csg-smoke
 
 on:
@@ -49,3 +55,11 @@ jobs:
       # feature; `--features csg` still activates the mesh+geom chain.
       - name: cargo test --no-default-features --features csg --test cut_openings_integration
         run: cargo test -p ifcfast-core --no-default-features --features csg --test cut_openings_integration --release
+      # prism-csg-fast (GH #58 W6/W9) — pure-Rust i_overlay path, off by
+      # default. Check it compiles everywhere (cross-compile proof) and
+      # the polygon_bool facade tests pass. `--no-default-features` keeps
+      # pyo3 out so the test binary links on macOS.
+      - name: cargo check --features prism-csg-fast
+        run: cargo check -p ifcfast-core --features prism-csg-fast
+      - name: cargo test --no-default-features --features prism-csg-fast (polygon_bool)
+        run: cargo test -p ifcfast-core --no-default-features --features prism-csg-fast --lib polygon_bool --release
