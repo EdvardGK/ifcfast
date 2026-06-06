@@ -63,6 +63,15 @@ clash = ["bundle", "geom"]
 # instead of solid bodies. Off by default in the wheel until the
 # native build dep is exercised across all wheel platforms.
 csg = ["geom", "dep:manifold-csg"]
+# Pure-Rust prism-minus-prism + tight polygonal-bounded halfspace via
+# the i_overlay 2D Boolean engine (GH #58 W6 + W9). Off by default
+# until the prism fast path clears the proptest baseline + a benchmark
+# gate; promotion to default-on retires manifold from the prism path
+# (see docs/plans/2026-06-05_cut-openings-manifold-replacement.md).
+# Pure Rust, no C++ toolchain — cross-compiles clean, unblocks
+# linux-aarch64 (GH #28). Composes with `csg` (manifold stays the
+# long-tail fallback while this earns trust).
+prism-csg-fast = ["mesh", "dep:i_overlay"]
 
 [dependencies]
 pyo3 = { version = "0.24", features = ["extension-module", "abi3-py310"], optional = true }
@@ -88,6 +97,11 @@ parquet = { version = "53", features = ["arrow"], optional = true }
 parry3d = { version = "0.17", optional = true }
 nalgebra = { version = "0.33", optional = true }
 manifold-csg = { version = "0.2", optional = true, default-features = false, features = ["parallel"] }
+# Pure-Rust 2D Boolean (union/intersect/difference/xor) for the prism
+# CSG fast path. v7 float API: `SingleFloatOverlay::overlay_as::<i64>`.
+# Pre-1.0-style churn across majors — quarantined behind
+# `mesh/polygon_bool.rs` so a bump or swap is a one-file change.
+i_overlay = { version = "7.0", optional = true }
 
 [dev-dependencies]
 # Property-based testing for the cut_openings dispatcher. Generates

@@ -31,6 +31,8 @@ pub mod indexed_curve;
 pub mod mapped;
 pub mod obj;
 pub mod placement;
+#[cfg(feature = "prism-csg-fast")]
+pub mod polygon_bool;
 pub mod profile;
 pub mod qto;
 pub mod revolved;
