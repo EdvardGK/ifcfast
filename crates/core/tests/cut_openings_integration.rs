@@ -1001,6 +1001,7 @@ fn z_pocket_opening_falls_back_to_manifold() {
 // cutter — the case most likely to expose a frame bug that the
 // identity-placed fixtures cannot. Net volume is rotation-invariant:
 // still 0.51 m³, and the prism path must agree with the manifold oracle.
+#[cfg(feature = "prism-csg-fast")]
 const WALL_WITH_THROUGH_CUT_ROTATED: &str = r#"ISO-10303-21;
 HEADER;
 FILE_DESCRIPTION(('ViewDefinition [ReferenceView]'),'2;1');
