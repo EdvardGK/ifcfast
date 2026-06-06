@@ -89,6 +89,29 @@ mod python {
         }
     }
 
+    // Build the entity table the cross-product prism fast-path consults
+    // for `extrude_params`, but ONLY when the experimental
+    // `prism-csg-fast` feature is on — default `csg` builds get `None`
+    // and the manifold fold runs unchanged. This is a second linear
+    // pass over the buffer (the streaming pass owns + drops its own
+    // table internally), confined to the post-stream flush and the
+    // feature build; threading the streaming table out is the
+    // promotion-time optimisation. `BakeFrame::World` callers must NOT
+    // use this — the prism result is near-origin (see
+    // `cut_openings::try_prism_cut` frame contract).
+    #[cfg(feature = "csg")]
+    fn prism_table_for_flush(buf: &[u8]) -> Option<crate::entity_table::EntityTable<'_>> {
+        #[cfg(feature = "prism-csg-fast")]
+        {
+            Some(crate::entity_table::EntityTable::build(buf))
+        }
+        #[cfg(not(feature = "prism-csg-fast"))]
+        {
+            let _ = buf;
+            None
+        }
+    }
+
     // ----- cut_openings stats marshalling (W2) -------------------------
     //
     // Single owner of the FFI key set for the per-pass cut_openings
@@ -785,7 +808,8 @@ mod python {
         // mesh through the same QTO recorder.
         #[cfg(feature = "csg")]
         if let Some(mut cross) = sink.cross.take() {
-            for (folded, outcome) in cross.flush(sink.unit_scale) {
+            let prism_table = prism_table_for_flush(&mmap);
+            for (folded, outcome) in cross.flush(sink.unit_scale, prism_table.as_ref()) {
                 sink.bump_outcome(outcome);
                 if folded.indices.is_empty() || folded.vertices.is_empty() {
                     continue;
@@ -1802,7 +1826,8 @@ mod python {
         // through the same encode path. Stats accumulate per host.
         #[cfg(feature = "csg")]
         if let Some(mut cross) = sink.cross.take() {
-            for (folded, outcome) in cross.flush(sink.unit_scale) {
+            let prism_table = prism_table_for_flush(&mmap);
+            for (folded, outcome) in cross.flush(sink.unit_scale, prism_table.as_ref()) {
                 sink.bump_outcome(outcome);
                 if folded.indices.is_empty() || folded.vertices.is_empty() {
                     continue;
@@ -1989,9 +2014,12 @@ mod python {
 
             // Cross-product flush — fold buffered hosts with their
             // arrived openings, run the result through `push_scaled`.
+            // `None`: this is a `BakeFrame::World` pass, so the host
+            // mesh is in world coordinates — the near-origin prism
+            // result would not align. Manifold fold only here.
             #[cfg(feature = "csg")]
             if let Some(mut cross) = sink.cross.take() {
-                for (folded, outcome) in cross.flush(sink.unit_scale) {
+                for (folded, outcome) in cross.flush(sink.unit_scale, None) {
                     sink.bump_outcome(outcome);
                     sink.push_scaled(folded);
                 }

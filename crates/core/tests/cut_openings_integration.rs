@@ -509,8 +509,10 @@ fn cross_product_voids_fold_subtracts_opening_volume() {
         passthrough.iter().map(|m| m.entity.as_str()).collect::<Vec<_>>(),
     );
 
-    // Flush — fold the wall with its arrived openings.
-    let folded = cross.flush(1.0);
+    // Flush — fold the wall with its arrived openings. `None` table →
+    // manifold fold (the default path; this fixture is a Z-pocket, not
+    // a through-cut, so the prism path would fall back here anyway).
+    let folded = cross.flush(1.0, None);
     assert_eq!(folded.len(), 1, "exactly one host emerges from the flush");
     let (wall_mesh, outcome) = &folded[0];
     assert_eq!(*outcome, Outcome::Cut, "the cross-product cut must succeed");
@@ -826,4 +828,246 @@ fn chain_count_helper_recognises_depth() {
     assert_eq!(chain_count(chain, "boolean_first_operand"), 1);
     assert_eq!(chain_count(chain, "extrusion"), 1);
     assert_eq!(chain_count(chain, "missing"), 0);
+}
+
+// ---------------------------------------------------------------------
+// Cross-product prism fast-path (GH #58 W9).
+//
+// The fixture below is a *same-axis through-cut*: a wall extruded along
+// Z, voided by a separately-modelled IfcOpeningElement that is ALSO
+// extruded along Z and spans the wall's full height with an interior
+// footprint. That is exactly the reducible case `mesh::prism_csg`
+// handles — the 3D boolean collapses to a 2D difference + re-extrude.
+// (The earlier WALL_WITH_CROSS_PRODUCT_OPENING fixture is a Z-pocket —
+// the opening ends inside the wall — so the prism path returns
+// NotParametric there and the manifold fold takes over; that graceful
+// fallback is asserted below too.)
+//
+// Wall   1000 × 200, Z 0..3000  → 0.60 m³
+// Cutter  300 × 100, Z 0..3000  → 0.09 m³  (interior, no coincident edges)
+// Net                            → 0.51 m³
+const WALL_WITH_THROUGH_CUT_OPENING: &str = r#"ISO-10303-21;
+HEADER;
+FILE_DESCRIPTION(('ViewDefinition [ReferenceView]'),'2;1');
+FILE_NAME('through.ifc','2026-06-06T00:00:00',('test'),('skiplum'),'ifcfast','ifcfast','');
+FILE_SCHEMA(('IFC4'));
+ENDSEC;
+DATA;
+#1=IFCPROJECT('0Test000000000000000001',$,'p',$,$,$,$,(#5),#2);
+#2=IFCUNITASSIGNMENT((#3,#4));
+#3=IFCSIUNIT(*,.LENGTHUNIT.,.MILLI.,.METRE.);
+#4=IFCSIUNIT(*,.PLANEANGLEUNIT.,$,.RADIAN.);
+#5=IFCGEOMETRICREPRESENTATIONCONTEXT($,'Model',3,1.0E-5,#6,$);
+#6=IFCAXIS2PLACEMENT3D(#7,$,$);
+#7=IFCCARTESIANPOINT((0.,0.,0.));
+#10=IFCSITE('1Site000000000000000001',$,'s',$,$,#15,$,$,.ELEMENT.,$,$,$,$,$);
+#11=IFCBUILDING('2Bldg000000000000000001',$,'b',$,$,#15,$,$,.ELEMENT.,$,$,$);
+#12=IFCBUILDINGSTOREY('3Stor000000000000000001',$,'Level 1',$,$,#15,$,$,.ELEMENT.,0.0);
+#15=IFCLOCALPLACEMENT($,#6);
+#16=IFCLOCALPLACEMENT(#15,#6);
+#20=IFCRELAGGREGATES('4Agg000000000000000001',$,$,$,#1,(#10));
+#21=IFCRELAGGREGATES('5Agg000000000000000001',$,$,$,#10,(#11));
+#22=IFCRELAGGREGATES('6Agg000000000000000001',$,$,$,#11,(#12));
+#30=IFCRECTANGLEPROFILEDEF(.AREA.,'WallRect',#31,1000.,200.);
+#31=IFCAXIS2PLACEMENT2D(#7,$);
+#32=IFCDIRECTION((0.,0.,1.));
+#33=IFCEXTRUDEDAREASOLID(#30,#6,#32,3000.);
+#34=IFCSHAPEREPRESENTATION(#5,'Body','SweptSolid',(#33));
+#35=IFCPRODUCTDEFINITIONSHAPE($,$,(#34));
+#40=IFCRECTANGLEPROFILEDEF(.AREA.,'OpeningRect',#41,300.,100.);
+#41=IFCAXIS2PLACEMENT2D(#7,$);
+#42=IFCAXIS2PLACEMENT3D(#7,$,$);
+#44=IFCEXTRUDEDAREASOLID(#40,#42,#32,3000.);
+#45=IFCSHAPEREPRESENTATION(#5,'Body','SweptSolid',(#44));
+#46=IFCPRODUCTDEFINITIONSHAPE($,$,(#45));
+#50=IFCWALL('7Wall00000000000000001',$,'TestWall',$,$,#16,#35,'tag',.STANDARD.);
+#51=IFCOPENINGELEMENT('8Open00000000000000001',$,'Opening',$,$,#16,#46,'tag',.OPENING.);
+#60=IFCRELVOIDSELEMENT('9Rel000000000000000001',$,$,$,#50,#51);
+#70=IFCRELCONTAINEDINSPATIALSTRUCTURE('ARelC0000000000000001',$,$,$,(#50),#12);
+ENDSEC;
+END-ISO-10303-21;
+"#;
+
+/// Weld/winding-agnostic enclosed volume via the divergence theorem
+/// (Σ signed tetrahedra, absolute). Works on the prism output's
+/// coincident-but-unwelded sub-shape seams as well as a closed
+/// manifold, so it compares the two cut paths on equal footing.
+fn signed_mesh_volume(vertices: &[f32], indices: &[u32]) -> f64 {
+    let mut v6 = 0.0_f64;
+    let p = |i: u32| {
+        let b = i as usize * 3;
+        (
+            vertices[b] as f64,
+            vertices[b + 1] as f64,
+            vertices[b + 2] as f64,
+        )
+    };
+    for t in indices.chunks_exact(3) {
+        let (ax, ay, az) = p(t[0]);
+        let (bx, by, bz) = p(t[1]);
+        let (cx, cy, cz) = p(t[2]);
+        v6 += ax * (by * cz - bz * cy) + ay * (bz * cx - bx * cz) + az * (bx * cy - by * cx);
+    }
+    (v6 / 6.0).abs()
+}
+
+/// Stream `buf` in `BakeFrame::Local` (the production frame for the
+/// prism path), route every product through a fresh `CrossProductCut`,
+/// and flush with the given table option. Returns the single folded
+/// host's `(net_volume_m3, outcome)`. Source units are mm → m³ via 1e-9.
+fn fold_one_host(
+    buf: &[u8],
+    table: Option<&_core::entity_table::EntityTable>,
+) -> (f64, Outcome) {
+    use _core::mesh::{mesh_ifc_streaming_framed, BakeFrame};
+
+    let idx = indexer::index(buf);
+    let mut cross = CrossProductCut::from_indexer(&idx.voids_opening, &idx.voids_host);
+    let mut sink = CaptureSink {
+        products: Vec::new(),
+    };
+    let _ = mesh_ifc_streaming_framed(buf, &mut sink, BakeFrame::Local);
+    for mesh in sink.products {
+        let _ = cross.route(mesh);
+    }
+    let folded = cross.flush(1.0, table);
+    assert_eq!(folded.len(), 1, "exactly one host emerges from the flush");
+    let (mesh, outcome) = &folded[0];
+    let vol_m3 = signed_mesh_volume(&mesh.vertices, &mesh.indices) * 1.0e-9;
+    (vol_m3, *outcome)
+}
+
+#[test]
+fn through_cut_manifold_fold_matches_analytic() {
+    // Default-build coverage of the through-cut fixture via the manifold
+    // fold (table = None). 0.60 − 0.09 = 0.51 m³.
+    let (vol, outcome) = fold_one_host(WALL_WITH_THROUGH_CUT_OPENING.as_bytes(), None);
+    assert_eq!(outcome, Outcome::Cut, "manifold fold must cut the through-opening");
+    assert!(
+        (vol - 0.51).abs() < 0.02,
+        "manifold through-cut volume {vol} m³, expected ~0.51",
+    );
+}
+
+#[cfg(feature = "prism-csg-fast")]
+#[test]
+fn through_cut_prism_path_matches_manifold() {
+    use _core::entity_table::EntityTable;
+
+    let buf = WALL_WITH_THROUGH_CUT_OPENING.as_bytes();
+    let table = EntityTable::build(buf);
+
+    // Same fixture, both paths. Manifold (None) is the oracle; prism
+    // (Some(table)) is the path under test. They must agree, and both
+    // must hit the analytic 0.51 m³.
+    let (manifold_vol, manifold_outcome) = fold_one_host(buf, None);
+    let (prism_vol, prism_outcome) = fold_one_host(buf, Some(&table));
+
+    assert_eq!(prism_outcome, Outcome::Cut, "prism path must cut the through-opening");
+    assert_eq!(manifold_outcome, Outcome::Cut);
+    assert!(
+        (prism_vol - 0.51).abs() < 0.02,
+        "prism through-cut volume {prism_vol} m³, expected ~0.51",
+    );
+    assert!(
+        (prism_vol - manifold_vol).abs() < 0.01,
+        "prism vs manifold divergence: prism {prism_vol} m³, manifold {manifold_vol} m³",
+    );
+}
+
+#[cfg(feature = "prism-csg-fast")]
+#[test]
+fn z_pocket_opening_falls_back_to_manifold() {
+    use _core::entity_table::EntityTable;
+
+    // The original pocket fixture (opening ends inside the wall along Z)
+    // is NOT a through-cut. With the prism path enabled (Some(table)) it
+    // must report NotParametric internally and fall back to the manifold
+    // fold, still producing the correct cut. 0.60 − 0.20 = 0.40 m³.
+    let buf = WALL_WITH_CROSS_PRODUCT_OPENING.as_bytes();
+    let table = EntityTable::build(buf);
+    let (vol, outcome) = fold_one_host(buf, Some(&table));
+    assert_eq!(outcome, Outcome::Cut, "pocket must still cut via manifold fallback");
+    assert!(
+        (vol - 0.40).abs() < 0.02,
+        "pocket fallback volume {vol} m³, expected ~0.40",
+    );
+}
+
+// Same through-cut, but the wall + opening share a world placement
+// rotated 30° about Z (#17). Both participants carry the SAME world
+// rotation, so the prism path's `rot_only(world_transform)` frame
+// composition must reproduce the rotated baked frame for BOTH host and
+// cutter — the case most likely to expose a frame bug that the
+// identity-placed fixtures cannot. Net volume is rotation-invariant:
+// still 0.51 m³, and the prism path must agree with the manifold oracle.
+const WALL_WITH_THROUGH_CUT_ROTATED: &str = r#"ISO-10303-21;
+HEADER;
+FILE_DESCRIPTION(('ViewDefinition [ReferenceView]'),'2;1');
+FILE_NAME('rot.ifc','2026-06-06T00:00:00',('test'),('skiplum'),'ifcfast','ifcfast','');
+FILE_SCHEMA(('IFC4'));
+ENDSEC;
+DATA;
+#1=IFCPROJECT('0Test000000000000000001',$,'p',$,$,$,$,(#5),#2);
+#2=IFCUNITASSIGNMENT((#3,#4));
+#3=IFCSIUNIT(*,.LENGTHUNIT.,.MILLI.,.METRE.);
+#4=IFCSIUNIT(*,.PLANEANGLEUNIT.,$,.RADIAN.);
+#5=IFCGEOMETRICREPRESENTATIONCONTEXT($,'Model',3,1.0E-5,#6,$);
+#6=IFCAXIS2PLACEMENT3D(#7,$,$);
+#7=IFCCARTESIANPOINT((0.,0.,0.));
+#10=IFCSITE('1Site000000000000000001',$,'s',$,$,#15,$,$,.ELEMENT.,$,$,$,$,$);
+#11=IFCBUILDING('2Bldg000000000000000001',$,'b',$,$,#15,$,$,.ELEMENT.,$,$,$);
+#12=IFCBUILDINGSTOREY('3Stor000000000000000001',$,'Level 1',$,$,#15,$,$,.ELEMENT.,0.0);
+#15=IFCLOCALPLACEMENT($,#6);
+#17=IFCAXIS2PLACEMENT3D(#7,#18,#19);
+#18=IFCDIRECTION((0.,0.,1.));
+#19=IFCDIRECTION((0.8660254,0.5,0.));
+#16=IFCLOCALPLACEMENT(#15,#17);
+#20=IFCRELAGGREGATES('4Agg000000000000000001',$,$,$,#1,(#10));
+#21=IFCRELAGGREGATES('5Agg000000000000000001',$,$,$,#10,(#11));
+#22=IFCRELAGGREGATES('6Agg000000000000000001',$,$,$,#11,(#12));
+#30=IFCRECTANGLEPROFILEDEF(.AREA.,'WallRect',#31,1000.,200.);
+#31=IFCAXIS2PLACEMENT2D(#7,$);
+#32=IFCDIRECTION((0.,0.,1.));
+#33=IFCEXTRUDEDAREASOLID(#30,#6,#32,3000.);
+#34=IFCSHAPEREPRESENTATION(#5,'Body','SweptSolid',(#33));
+#35=IFCPRODUCTDEFINITIONSHAPE($,$,(#34));
+#40=IFCRECTANGLEPROFILEDEF(.AREA.,'OpeningRect',#41,300.,100.);
+#41=IFCAXIS2PLACEMENT2D(#7,$);
+#42=IFCAXIS2PLACEMENT3D(#7,$,$);
+#44=IFCEXTRUDEDAREASOLID(#40,#42,#32,3000.);
+#45=IFCSHAPEREPRESENTATION(#5,'Body','SweptSolid',(#44));
+#46=IFCPRODUCTDEFINITIONSHAPE($,$,(#45));
+#50=IFCWALL('7Wall00000000000000001',$,'TestWall',$,$,#16,#35,'tag',.STANDARD.);
+#51=IFCOPENINGELEMENT('8Open00000000000000001',$,'Opening',$,$,#16,#46,'tag',.OPENING.);
+#60=IFCRELVOIDSELEMENT('9Rel000000000000000001',$,$,$,#50,#51);
+#70=IFCRELCONTAINEDINSPATIALSTRUCTURE('ARelC0000000000000001',$,$,$,(#50),#12);
+ENDSEC;
+END-ISO-10303-21;
+"#;
+
+#[cfg(feature = "prism-csg-fast")]
+#[test]
+fn rotated_through_cut_prism_matches_manifold() {
+    use _core::entity_table::EntityTable;
+
+    let buf = WALL_WITH_THROUGH_CUT_ROTATED.as_bytes();
+    let table = EntityTable::build(buf);
+
+    let (manifold_vol, _) = fold_one_host(buf, None);
+    let (prism_vol, prism_outcome) = fold_one_host(buf, Some(&table));
+
+    assert_eq!(
+        prism_outcome,
+        Outcome::Cut,
+        "rotated through-cut must still reduce to the prism path",
+    );
+    assert!(
+        (prism_vol - 0.51).abs() < 0.02,
+        "rotated prism volume {prism_vol} m³, expected ~0.51 (rotation-invariant)",
+    );
+    assert!(
+        (prism_vol - manifold_vol).abs() < 0.01,
+        "rotated prism vs manifold divergence: prism {prism_vol} m³, manifold {manifold_vol} m³",
+    );
 }

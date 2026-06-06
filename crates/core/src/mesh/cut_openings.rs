@@ -25,8 +25,9 @@ use std::collections::{HashMap, HashSet};
 
 use glam::Vec3;
 
+use crate::entity_table::EntityTable;
 use crate::geom::csg::{self, CsgKernelError};
-use crate::mesh::{cut_validate, halfspace_clip, MeshSegment, ProductMesh};
+use crate::mesh::{cut_validate, halfspace_clip, InstancePart, MeshSegment, ProductMesh};
 
 /// Outcome counters from a cut pass. Aggregate across products in
 /// the caller's loop for a top-line "n products had their openings
@@ -404,6 +405,28 @@ impl Outcome {
 /// `(opening.mesh_anchor - host.mesh_anchor)` before passing to the
 /// CSG kernel, which keeps everything in the host's local frame and
 /// stays f32-safe (host/opening anchors are typically <10 m apart).
+/// A buffered opening cutter, captured at [`CrossProductCut::route`]
+/// time. Carries enough to drive EITHER fold strategy:
+/// * the **manifold fold** uses the baked `vertices` / `indices`
+///   (translated by the host/opening anchor difference), and
+/// * the **prism fast-path** (`prism-csg-fast` feature) re-derives the
+///   opening's parametric prism from `rep_step_id` + `world_transform`
+///   + `mesh_anchor`, never touching the baked triangles.
+///
+/// `rep_step_id` is `Some` only when the opening meshed as exactly one
+/// *direct* (identity-instance) fragment — the precondition the prism
+/// path needs to map a single `IfcExtrudedAreaSolid` back to params.
+/// `world_transform` / `rep_step_id` are unread without the feature.
+struct HeldOpening {
+    vertices: Vec<f32>,
+    indices: Vec<u32>,
+    mesh_anchor: [f64; 3],
+    #[cfg_attr(not(feature = "prism-csg-fast"), allow(dead_code))]
+    rep_step_id: Option<u64>,
+    #[cfg_attr(not(feature = "prism-csg-fast"), allow(dead_code))]
+    world_transform: [f32; 16],
+}
+
 pub struct CrossProductCut {
     /// For each host step_id, the set of openings expected per
     /// `IfcRelVoidsElement`. A host may appear with multiple
@@ -415,10 +438,10 @@ pub struct CrossProductCut {
     /// Membership test for "is this product a host?".
     hosts: HashSet<u64>,
     /// Opening meshes that have arrived, keyed by opening step_id.
-    /// Stored as `(vertices, indices, mesh_anchor)` — the smallest
-    /// payload the fold needs, so the rest of `ProductMesh` can be
-    /// dropped immediately.
-    held_openings: HashMap<u64, (Vec<f32>, Vec<u32>, [f64; 3])>,
+    /// See [`HeldOpening`] — the smallest payload that drives BOTH the
+    /// manifold fold (baked buffers) and the prism fast-path (params
+    /// re-derivation), so the rest of `ProductMesh` is dropped here.
+    held_openings: HashMap<u64, HeldOpening>,
     /// Host meshes waiting for their openings, keyed by host
     /// step_id. The full `ProductMesh` is held so the existing
     /// MeshSink encoding logic (guid, entity, anchor, byte buffers)
@@ -484,8 +507,17 @@ impl CrossProductCut {
     pub fn route(&mut self, mesh: ProductMesh) -> Routed {
         let id = mesh.ifc_id;
         if self.openings.contains(&id) {
-            self.held_openings
-                .insert(id, (mesh.vertices, mesh.indices, mesh.mesh_anchor));
+            let rep_step_id = single_direct_rep_step_id(&mesh.parts);
+            self.held_openings.insert(
+                id,
+                HeldOpening {
+                    vertices: mesh.vertices,
+                    indices: mesh.indices,
+                    mesh_anchor: mesh.mesh_anchor,
+                    rep_step_id,
+                    world_transform: mesh.world_transform,
+                },
+            );
             return Routed::Suppressed;
         }
         if self.hosts.contains(&id) {
@@ -500,15 +532,35 @@ impl CrossProductCut {
     ///
     /// Per-host sequence: run the in-rep [`apply`] first (so a host
     /// authored as `IfcBooleanClippingResult` plus a cross-product
-    /// opening collapses the in-rep operands before the cross fold),
-    /// then translate each opening's vertices by
-    /// `(opening.mesh_anchor - host.mesh_anchor)` and call
-    /// `geom::csg::subtract_many`. Combined outcome:
-    /// * `Cut` — at least one subtraction succeeded on this host.
+    /// opening collapses the in-rep operands before the cross fold).
+    /// Then, when `table` is `Some` and the host was untouched by the
+    /// in-rep pass (`Passthrough`), try the **prism fast-path**
+    /// (`prism-csg-fast` feature): re-derive host + opening params and
+    /// subtract in 2D — see [`try_prism_cut`]. The prism path handles
+    /// only the reducible same-axis through-cut; anything else returns
+    /// `None` and we fall back to the manifold fold, which translates
+    /// each opening's vertices by `(opening.mesh_anchor -
+    /// host.mesh_anchor)` and calls `geom::csg::subtract_many`.
+    ///
+    /// `table` is the entity table the prism path consults for
+    /// `extrude_params`; pass `None` to force the manifold fold (the
+    /// default-build behaviour, and required for `BakeFrame::World`
+    /// callers — the prism result is emitted near-origin and only
+    /// matches a `BakeFrame::Local` host mesh). The param is accepted
+    /// in all builds; without the feature it is ignored.
+    ///
+    /// Combined outcome:
+    /// * `Cut` — the prism or manifold subtraction produced the net
+    ///   solid (or consumed the host, leaving empty geometry).
     /// * `Fallback` — cutters existed but every subtraction failed.
-    /// * `Passthrough` — no openings ever arrived (e.g. all expected
-    ///   openings were geometryless or otherwise unmeshed).
-    pub fn flush(&mut self, unit_scale: f32) -> Vec<(ProductMesh, Outcome)> {
+    /// * `Passthrough` — no openings affected the host (none arrived,
+    ///   or the prism path reported the cutters miss the host sweep).
+    pub fn flush(
+        &mut self,
+        unit_scale: f32,
+        table: Option<&EntityTable>,
+    ) -> Vec<(ProductMesh, Outcome)> {
+        let _ = table; // consulted only by the prism-csg-fast path
         let mut out = Vec::with_capacity(self.held_hosts.len());
         let held_hosts = std::mem::take(&mut self.held_hosts);
         for (host_id, mut host_mesh) in held_hosts {
@@ -517,28 +569,67 @@ impl CrossProductCut {
             // product?" — see the doc above.
             let in_rep = apply(&mut host_mesh, unit_scale);
 
-            // Gather arrived openings for this host.
+            // step_ids of the openings that actually arrived for this
+            // host (geometryless / unmeshed openings never landed in
+            // `held_openings` and are silently skipped).
             let expected = self
                 .expected_openings
                 .get(&host_id)
                 .cloned()
                 .unwrap_or_default();
-            let cutter_buffers: Vec<(Vec<f32>, Vec<u32>)> = expected
+            let arrived: Vec<u64> = expected
+                .iter()
+                .copied()
+                .filter(|oid| self.held_openings.contains_key(oid))
+                .collect();
+
+            // ---- Prism fast-path (feature-gated, table-gated). -------
+            // Only when the in-rep pass left the host body intact: the
+            // prism path re-derives params from the ORIGINAL extrusion,
+            // so it must not run on a host the in-rep cut already
+            // mutated. A `None` return drops through to the manifold
+            // fold below with the host mesh untouched.
+            #[cfg(feature = "prism-csg-fast")]
+            let prism_outcome: Option<Outcome> =
+                if matches!(in_rep, Outcome::Passthrough) {
+                    table.and_then(|t| {
+                        let openings: Vec<&HeldOpening> = arrived
+                            .iter()
+                            .filter_map(|oid| self.held_openings.get(oid))
+                            .collect();
+                        try_prism_cut(&mut host_mesh, &openings, t)
+                    })
+                } else {
+                    None
+                };
+            #[cfg(not(feature = "prism-csg-fast"))]
+            let prism_outcome: Option<Outcome> = None;
+
+            if let Some(outcome) = prism_outcome {
+                out.push((host_mesh, outcome));
+                continue;
+            }
+
+            // ---- Manifold fold (default path / prism fallback). ------
+            // Translate each arrived opening into the host frame by the
+            // anchor difference, then subtract via the mesh kernel.
+            let cutter_buffers: Vec<(Vec<f32>, Vec<u32>)> = arrived
                 .iter()
                 .filter_map(|oid| {
-                    let (v, i, anchor) = self.held_openings.get(oid)?;
+                    let op = self.held_openings.get(oid)?;
                     let off = [
-                        (anchor[0] - host_mesh.mesh_anchor[0]) as f32,
-                        (anchor[1] - host_mesh.mesh_anchor[1]) as f32,
-                        (anchor[2] - host_mesh.mesh_anchor[2]) as f32,
+                        (op.mesh_anchor[0] - host_mesh.mesh_anchor[0]) as f32,
+                        (op.mesh_anchor[1] - host_mesh.mesh_anchor[1]) as f32,
+                        (op.mesh_anchor[2] - host_mesh.mesh_anchor[2]) as f32,
                     ];
-                    let translated: Vec<f32> = v
+                    let translated: Vec<f32> = op
+                        .vertices
                         .chunks_exact(3)
                         .flat_map(|c| {
                             [c[0] + off[0], c[1] + off[1], c[2] + off[2]]
                         })
                         .collect();
-                    Some((translated, i.clone()))
+                    Some((translated, op.indices.clone()))
                 })
                 .collect();
 
@@ -596,6 +687,143 @@ impl CrossProductCut {
         self.held_openings.clear();
         out
     }
+}
+
+/// The single representation-item step_id of a product that meshed as
+/// exactly one *direct* (identity-instance) fragment, else `None`. The
+/// prism fast-path needs this to map the baked mesh back to one
+/// `IfcExtrudedAreaSolid`; multi-fragment or `IfcMappedItem`-instanced
+/// products carry a non-identity `instance_transform` the prism frame
+/// composition (which uses only the product world transform) would not
+/// account for, so they are excluded → manifold fallback.
+fn single_direct_rep_step_id(parts: &[InstancePart]) -> Option<u64> {
+    if parts.len() != 1 {
+        return None;
+    }
+    let p = &parts[0];
+    if !is_identity_mat4(&p.instance_transform) {
+        return None;
+    }
+    Some(p.rep_step_id)
+}
+
+/// Column-major 4×4 identity test with a tight absolute tolerance —
+/// `instance_transform` is exactly identity for direct geometry, so
+/// this only rejects genuinely-instanced fragments.
+fn is_identity_mat4(m: &[f32; 16]) -> bool {
+    const I: [f32; 16] = [
+        1.0, 0.0, 0.0, 0.0, //
+        0.0, 1.0, 0.0, 0.0, //
+        0.0, 0.0, 1.0, 0.0, //
+        0.0, 0.0, 0.0, 1.0,
+    ];
+    m.iter().zip(I.iter()).all(|(a, b)| (a - b).abs() < 1e-6)
+}
+
+/// Attempt the prism fast-path on one host + its arrived openings.
+///
+/// Returns `Some(outcome)` when the path applied (host mesh mutated in
+/// place as needed), or `None` when the configuration is outside the
+/// reducible case — missing/non-extrusion params on the host or ANY
+/// opening, or `prism_csg` reporting `NotParametric` (non-parallel
+/// sweep axes, oblique extrusion, partial/pocket cut). On `None` the
+/// host mesh is left untouched so the caller's manifold fold takes
+/// over for the WHOLE host (no mixed prism/manifold cutter handling —
+/// that is a deferred slab-decomposition follow-up).
+///
+/// # Frame contract (F3)
+///
+/// All prisms are composed into the host's mesh-anchor-local frame,
+/// which is exactly the frame a `BakeFrame::Local` host mesh lives in:
+/// vertices = `rot_only(world_transform) · local_xform · profile`, with
+/// the world translation carried separately on `mesh_anchor` (added
+/// back downstream). The host's anchor is the working origin; the
+/// cutter is rebased by the f64 anchor *difference* via
+/// [`prism_csg::rebase_params`], so only a small (<10 m, adjacent
+/// products) offset ever touches the f32 matrix — UTM magnitudes never
+/// collapse. This is why `flush` must pass `None` for `BakeFrame::World`
+/// callers: there the host mesh is in world coordinates and the
+/// near-origin prism result would not align.
+#[cfg(feature = "prism-csg-fast")]
+fn try_prism_cut(
+    host_mesh: &mut ProductMesh,
+    openings: &[&HeldOpening],
+    table: &EntityTable,
+) -> Option<Outcome> {
+    use crate::mesh::extrusion::extrude_params;
+    use crate::mesh::prism_csg::{self, PrismCsgOutcome, PrismParams};
+
+    // Host must be a single direct extrusion with resolvable params.
+    let host_rep = single_direct_rep_step_id(&host_mesh.parts)?;
+    let host_rot = rot_only(&host_mesh.world_transform);
+    let mut host_prism: PrismParams = extrude_params(table, host_rep)?.into();
+    host_prism.local_xform = host_rot * host_prism.local_xform;
+    let host_anchor = host_mesh.mesh_anchor;
+
+    // EVERY opening must reduce to a parametric prism in the host frame;
+    // a single non-extrusion / multi-fragment opening bails the whole
+    // host to the manifold fold (which handles the mixed set correctly).
+    let mut cutters: Vec<PrismParams> = Vec::with_capacity(openings.len());
+    for op in openings {
+        let rep = op.rep_step_id?;
+        let mut p: PrismParams = extrude_params(table, rep)?.into();
+        p.local_xform = rot_only(&op.world_transform) * p.local_xform;
+        cutters.push(prism_csg::rebase_params(&p, op.mesh_anchor, host_anchor));
+    }
+    if cutters.is_empty() {
+        return None;
+    }
+
+    match prism_csg::subtract_many(&host_prism, &cutters) {
+        PrismCsgOutcome::Cut(mesh) => {
+            rewrite_host_geometry(host_mesh, mesh.vertices, mesh.indices);
+            Some(Outcome::Cut)
+        }
+        PrismCsgOutcome::Empty => {
+            // Openings consumed the host entirely — legitimate net-empty
+            // solid. Emit empty geometry (the caller skips empty meshes);
+            // the cut still "happened", so count it as Cut.
+            rewrite_host_geometry(host_mesh, Vec::new(), Vec::new());
+            Some(Outcome::Cut)
+        }
+        // Cutters do not overlap the host along the sweep axis → host is
+        // unaffected; leave its mesh as-is and report passthrough.
+        PrismCsgOutcome::Unchanged => Some(Outcome::Passthrough),
+        // Outside the reducible case → manifold fallback.
+        PrismCsgOutcome::NotParametric => None,
+    }
+}
+
+/// Replace a host's world-baked geometry with a cut result and collapse
+/// it to the single `cut_openings` segment, clearing the per-fragment
+/// instance payload (a wall-minus-this-opening is unique — no dedup).
+/// Mirrors the rewrite the in-rep [`apply`] and manifold fold perform.
+#[cfg(feature = "prism-csg-fast")]
+fn rewrite_host_geometry(host_mesh: &mut ProductMesh, vertices: Vec<f32>, indices: Vec<u32>) {
+    let index_count = indices.len() as u32;
+    host_mesh.vertices = vertices;
+    host_mesh.indices = indices;
+    host_mesh.segments = vec![MeshSegment {
+        index_start: 0,
+        index_count,
+        source: "cut_openings".to_string(),
+    }];
+    host_mesh.parts.clear();
+}
+
+/// The rotation/linear part of a column-major world transform as a
+/// `Mat4` with its translation column zeroed. The `BakeFrame::Local`
+/// bake applies exactly this linear part to geometry (`transform_vector3`
+/// drops translation) and carries the world position on `mesh_anchor`,
+/// so composing it into the prism's `local_xform` reproduces the baked
+/// host frame without ever putting world translation into f32.
+#[cfg(feature = "prism-csg-fast")]
+fn rot_only(world_transform: &[f32; 16]) -> glam::Mat4 {
+    let mut m = glam::Mat4::from_cols_array(world_transform);
+    m.w_axis.x = 0.0;
+    m.w_axis.y = 0.0;
+    m.w_axis.z = 0.0;
+    m
 }
 
 /// Classify segments by whether their source tag marks them as a
