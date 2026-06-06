@@ -193,3 +193,140 @@ The harness extends naturally to halfspace cutters, brep cutters, far-origin coo
 - If W10 shows csgrs achieves ≥95% volume agreement vs manifold on the real corpus and ≤3× wall-clock, the calculus flips toward csgrs-as-default. Until the probe exists, this is speculation.
 - If linux-aarch64 wheel-build (GH #28) becomes a hard customer requirement, a narrow `pure-rust-csg` wheel becomes mandatory; W7/W8/W11 move up.
 - If ifcopenshell 0.9+ ships a stable Rust-bindings IFC geometry kernel, the entire question reframes as "wrap or write".
+
+---
+
+# W6 implementation blueprint (appended 2026-06-06)
+
+> Status: **designed, not yet implemented.** W9 cross-product flush-wiring
+> landed first (`8c15b94`). W6 is the last Phase-1 piece before the
+> bundled W3+W4+W6+W9 release. Blueprint from a code-architect pass;
+> the table-at-`apply` challenge (below) is the load-bearing decision a
+> implementer must settle before writing code.
+
+## The bug (F6) — precise location
+
+`IfcPolygonalBoundedHalfSpace` cutters are over-cut when the boundary is
+**tight** (smaller than the host cross-section). Flow today:
+
+```
+boolean.rs::polygonal_bounded_halfspace
+  → thin slab in BaseSurface.Position frame, tagged halfspace_bounded:{agree|disagree}
+cut_openings.rs::apply  (the IN-REP boolean path)
+  → is_halfspace_cutter → true
+  → derive_plane_from_slab → infinite (plane_point, normal)   ← boundary DISCARDED here
+  → halfspace_clip::clip_by_plane
+```
+
+The existing test `polygonal_bounded_uses_base_surface_position_normal`
+passes only because its boundary (X∈[-1000,1000], Y∈[-500,500]) **exceeds**
+the wall cross-section (X∈[-500,500], Y∈[-100,100]) — discarding a
+larger-than-host boundary is harmless. F6 needs a tight-boundary fixture.
+
+The unbounded `IfcHalfSpaceSolid` plane-clip path stays untouched (GH #39
+oversized-box fragility rationale intact). Only the **bounded** case with
+a **tight** boundary gets the new path.
+
+## Chosen approach: B (pure-Rust 2D reduction) fast-path, plane-clip fallback
+
+Rejected A (build the bounded solid, subtract via Manifold) — adds a NEW
+hot-path Manifold dependency against the retirement thesis, when the
+dominant real case (sloped wall top, corner notch) is 2D-reducible.
+Rejected C (boundary side-plane decomposition) — breaks on non-convex
+boundaries. Approach B reuses the just-landed `polygon_bool::difference`
++ `SweepFrame` + re-extrude machinery, exactly like `try_prism_cut`.
+
+Fast-path (behind `prism-csg-fast`), engaged only when: host is a single
+direct Z-perpendicular extrusion AND arg[2].Z ∥ host sweep axis AND the
+boundary is tight. Reduce to: project boundary polygon into the host
+sweep-frame 2D basis, `difference(host_footprint, boundary)`, re-extrude
+over the **plane-clipped sweep band** `[s_lo, s_hi]` (s_cut from
+projecting the BaseSurface plane point onto the host axis; band side from
+`plane_normal·axis` sign + agreement). Non-reducible (diverging axes,
+non-prism host) → `NotParametric` → existing plane-clip fallback.
+
+Default build: byte-identical to today (plane-clip over-cut). Feature on:
+correct bounded cut, plane-clip only as fallback.
+
+## The load-bearing implementation challenge (the architect glossed this)
+
+Unlike `flush` — a clean POST-stream hook where a second `EntityTable`
+was cheaply built and passed in — `apply` runs **inside the streaming
+sink's `on_product`**, where there is no table in scope. The bounded
+fast-path needs the boundary polygon + arg[2]/BaseSurface frames, which
+must be re-derived from the IFC entity (the slab mesh alone doesn't carry
+them). Two ways to get that data to `apply`, pick ONE up front:
+
+1. **Table-into-sink (borrow threading).** Build the table once behind
+   the feature (`prism_table_for_flush`), store `Option<&EntityTable>` on
+   the sink, pass to `apply`. Cost: the sink now holds a borrow that must
+   outlive the `py.allow_threads(|| mesh_ifc_streaming_framed(&mmap, &mut
+   sink, …))` call, which itself borrows `&mmap`. Lifetime-fiddly but the
+   table and mmap both outlive the streaming call, so it resolves; needs
+   the sink struct to carry a lifetime param OR an `Arc`-wrapped table.
+   Also `apply` gains a `table: Option<&EntityTable>` param → ripples to
+   the proptest + integration `apply(…)` call sites (pass `None`).
+
+2. **Payload-on-ProductMesh (carry from tessellation).** Resolve the
+   `BoundedHalfspacePayload` in `boolean.rs::polygonal_bounded_halfspace`
+   (table IS in scope there) and attach it to the `ProductMesh` (new
+   optional field, feature-gated or always-`Option`). `apply` reads it off
+   the mesh — no table param. Cost: pollutes the central `ProductMesh`
+   type with a feature-specific sidecar; every ProductMesh constructor
+   (tessellate_one, emit_geometryless, test fixtures) touches the field.
+
+Recommendation: **(2)** keeps `apply`'s signature stable for the hot
+in-rep path and avoids borrow-threading a table through the streaming
+sink; the ProductMesh field is the same "carry params, not the kernel"
+pattern `InstancePart.rep_step_id` already follows. Make it
+`Option<BoundedHalfspacePayload>` (not cfg-gated) so constructors don't
+need cfg blocks; it's `None` in default builds and on every non-bounded
+product. Decide before writing — it sets the whole change shape.
+
+## Tightness detector
+
+`is_tight_boundary`: project host bbox AND boundary polygon onto the
+BaseSurface plane's (e1,e2) in-plane basis (derivable from the slab
+normal). If the boundary AABB strictly contains the host AABB in both
+dims (≥10% margin) → not tight (cheap plane-clip). Else tight. The
+existing large-boundary test stays on the cheap path by construction.
+
+## Diagnostic counter (deferred within W6)
+
+`UnsupportedReason::TightPolygonalBoundaryIgnored` already exists but is
+unemitted. Wiring it cleanly needs a `stats`/warning channel orthogonal
+to the single per-product `Outcome` (a tight boundary that still
+plane-clips is `Outcome::Cut` AND a warning). To avoid an `apply`
+signature ripple for `stats`, DEFER emitting this counter — the primary
+W6 value is the correct bounded cut. Counter-wiring is a clean follow-up
+once the outcome/warning split is designed.
+
+## Differential test strategy (mirror the W9 prism tests)
+
+Fixture `WALL_WITH_TIGHT_BOUNDED_HALFSPACE`: wall 1000×200×3000 (0.6 m³);
+BaseSurface plane at Z=2000, +Z normal, `.T.` (subtracts Z<2000);
+boundary 300×200 at origin in arg[2]=identity (tight — inside the host
+footprint). Analytic: infinite-plane (current) leaves only Z∈[2000,3000]
+= **0.20 m³**; bounded (new) removes only 300×200×2000 = **0.48 m³**.
+The 0.28 m³ gap is unambiguous.
+
+- non-gated: `apply(table=None or no payload)` → ~0.20 m³ (documents the
+  over-cut as the default-build behaviour).
+- `prism-csg-fast`: bounded path → ~0.48 m³ (analytic).
+- oracle (`prism-csg-fast` + `csg`): build the exact bounded solid
+  (extrude boundary, clip by plane, cap) and subtract via
+  `csg::subtract_many`; assert the 2D fast-path matches within 1%.
+
+## Build sequence
+
+1. `boolean.rs`: resolve `BoundedHalfspacePayload {boundary: Polygon2D,
+   boundary_xform: Mat4, plane_normal: Vec3, plane_point: Vec3}` in
+   `polygonal_bounded_halfspace` and surface it (approach-2: attach to
+   ProductMesh).
+2. `prism_csg.rs`: expose `SweepFrame` as `pub(crate)` (or factor the
+   projection helper) so `cut_openings` can reuse it.
+3. `cut_openings.rs`: `is_tight_boundary`; bounded fast-path in `apply`
+   reading the payload; plane-clip fallback unchanged.
+4. Tests: the three above. Default + `prism-csg-fast` suites green under
+   `-D warnings`.
+5. Then bundle W3+W4+W6+W9 → single `v*` tag (cache already at 14).
