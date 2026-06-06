@@ -265,7 +265,17 @@ _HASH_TAIL_BYTES = 4 * 1024 * 1024
 #       corrected physical scale (net mesh / QTO can shift for those).
 #       Newly-emitted counters: `cut_openings_unsupported_union_with_overlap`,
 #       `_intersection_not_implemented`, `_non_manifold_input`.
-_CACHE_SCHEMA_VERSION = 14
+# v15: brep faces with inner `IfcFaceBound` holes are now honoured
+#       (GH #53). `mesh::brep::mesh_face` previously dropped inner bounds
+#       and fan-filled the outer loop, over-reporting solid volume by the
+#       hole area on `IfcFacetedBrep` / shell faces with punched openings
+#       (Revit-exported walls: +6 % … +122 %). Hole-bearing faces are now
+#       projected to 2D (Newell normal) and ear-clipped with holes; the
+#       cheap fan path is retained for the hole-free majority. Net mesh /
+#       volume / vertex buffers change for any baked-brep product with
+#       face holes — cached substrates from ≤v14 carry the over-filled
+#       geometry, so the bump forces re-extraction. No column-shape change.
+_CACHE_SCHEMA_VERSION = 15
 
 _FIELD_RE = re.compile(r"\(\s*(.*?)\s*\)\s*;", re.DOTALL)
 
