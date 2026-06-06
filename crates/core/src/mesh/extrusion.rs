@@ -64,8 +64,28 @@ impl LocalMesh {
     }
 }
 
-/// Build a mesh for an `IfcExtrudedAreaSolid` entity (by step_id).
-pub fn extrude(table: &EntityTable, id: u64) -> Option<LocalMesh> {
+/// The resolved parameters of an `IfcExtrudedAreaSolid`: a profile
+/// (outer + holes), a unit extrusion direction, a depth, and the
+/// solid-local `Position` placement. All in the solid's body-local
+/// frame — `local_xform` is the `IfcAxis2Placement3D` only, NOT the
+/// product's world `ObjectPlacement` (that is applied later by the bake
+/// loop). This is exactly what `extrude_polygon` consumes, and exactly
+/// the parametric description the prism-CSG fast path (GH #58 W9) needs
+/// alongside the baked mesh.
+#[derive(Debug, Clone)]
+pub struct ExtrudeParams {
+    pub profile: Polygon2D,
+    pub dir: Vec3,
+    pub depth: f32,
+    pub local_xform: Mat4,
+}
+
+/// Parse an `IfcExtrudedAreaSolid`'s parameters without tessellating.
+/// Returns `None` for any other entity (the caller can treat that as
+/// "not a prism" and fall back). Shared by [`extrude`] (which then
+/// meshes them) and the prism-CSG fast path (which subtracts them
+/// parametrically before any mesh exists).
+pub fn extrude_params(table: &EntityTable, id: u64) -> Option<ExtrudeParams> {
     let (type_name, args) = table.get(id)?;
     if !type_name.eq_ignore_ascii_case(b"IFCEXTRUDEDAREASOLID") {
         return None;
@@ -76,7 +96,7 @@ pub fn extrude(table: &EntityTable, id: u64) -> Option<LocalMesh> {
         Field::Ref(id) => id,
         _ => return None,
     };
-    let polygon = profile::extract(table, swept_id)?;
+    let profile = profile::extract(table, swept_id)?;
 
     // ExtrudedDirection (arg[2]), default (0, 0, 1).
     let dir = match fields
@@ -107,7 +127,13 @@ pub fn extrude(table: &EntityTable, id: u64) -> Option<LocalMesh> {
         })
         .unwrap_or(Mat4::IDENTITY);
 
-    Some(extrude_polygon(&polygon, dir, depth, local_xform))
+    Some(ExtrudeParams { profile, dir, depth, local_xform })
+}
+
+/// Build a mesh for an `IfcExtrudedAreaSolid` entity (by step_id).
+pub fn extrude(table: &EntityTable, id: u64) -> Option<LocalMesh> {
+    let p = extrude_params(table, id)?;
+    Some(extrude_polygon(&p.profile, p.dir, p.depth, p.local_xform))
 }
 
 /// Build mesh from an already-resolved 2D polygon + extrusion params.

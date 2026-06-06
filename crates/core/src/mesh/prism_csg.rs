@@ -38,7 +38,7 @@
 
 use glam::{Mat4, Vec2, Vec3, Vec4};
 
-use crate::mesh::extrusion::{extrude_polygon, LocalMesh};
+use crate::mesh::extrusion::{extrude_polygon, ExtrudeParams, LocalMesh};
 use crate::mesh::polygon_bool;
 use crate::mesh::profile::Polygon2D;
 
@@ -74,6 +74,49 @@ pub struct PrismParams {
     /// Solid-local placement: profile/local frame → the shared working
     /// frame. Must NOT carry the world ObjectPlacement (F3).
     pub local_xform: Mat4,
+}
+
+impl From<ExtrudeParams> for PrismParams {
+    /// An `IfcExtrudedAreaSolid`'s resolved parameters ARE prism params
+    /// (same four fields), in the solid's body-local frame. The frame
+    /// contract is the caller's responsibility: when combining prisms
+    /// from different products (cross-product `IfcRelVoidsElement`),
+    /// rebase into one shared near-origin frame via [`rebase_params`]
+    /// first.
+    fn from(p: ExtrudeParams) -> Self {
+        PrismParams {
+            profile: p.profile,
+            dir: p.dir,
+            depth: p.depth,
+            local_xform: p.local_xform,
+        }
+    }
+}
+
+/// Re-express a prism's params from one mesh-anchor frame into another
+/// by the anchor difference, for the cross-product cut where host and
+/// cutter are separate products with separate anchors (the same rigid
+/// offset `CrossProductCut` applies to opening vertices).
+///
+/// **F3-safe by construction.** `from_anchor` / `to_anchor` are f64
+/// world-scale anchors (possibly UTM, ~600 km), but only their
+/// *difference* — typically < 10 m for adjacent products — touches the
+/// f32 `local_xform`. The UTM magnitude never enters the matrix, so the
+/// prism algebra stays near-origin and f32-precise. Passing a raw world
+/// `ObjectPlacement` translation into `local_xform` would violate the
+/// frame contract and collapse under f32; this helper is the supported
+/// way to move a prism between anchor frames.
+pub fn rebase_params(p: &PrismParams, from_anchor: [f64; 3], to_anchor: [f64; 3]) -> PrismParams {
+    let offset = Vec3::new(
+        (from_anchor[0] - to_anchor[0]) as f32,
+        (from_anchor[1] - to_anchor[1]) as f32,
+        (from_anchor[2] - to_anchor[2]) as f32,
+    );
+    let mut out = p.clone();
+    out.local_xform.w_axis.x += offset.x;
+    out.local_xform.w_axis.y += offset.y;
+    out.local_xform.w_axis.z += offset.z;
+    out
 }
 
 /// Result of a prism-algebra subtraction.
@@ -435,5 +478,48 @@ mod tests {
         let mesh = expect_cut(subtract(&host, &cutter));
         let vol = signed_volume(&mesh);
         assert!((vol - 45.0).abs() < 1e-3, "volume {vol}, expected 45");
+    }
+
+    #[test]
+    fn rebase_params_offsets_translation() {
+        let p = z_prism(rect_profile(1.0, 1.0), 3.0, Vec3::ZERO);
+        let r = rebase_params(&p, [600_001.5, 10.0, 4.0], [600_000.0, 10.0, 0.0]);
+        // Only the small anchor DIFFERENCE (1.5, 0, 4) lands in the matrix.
+        assert!((r.local_xform.w_axis.x - 1.5).abs() < 1e-4);
+        assert!((r.local_xform.w_axis.y - 0.0).abs() < 1e-4);
+        assert!((r.local_xform.w_axis.z - 4.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn cross_product_rebase_is_far_origin_safe() {
+        // The F3 gate. Two products at UTM scale (~600 km east), 1.5 m
+        // apart. Each prism lives in its OWN anchor-local frame (near
+        // origin). Rebasing the cutter into the host's anchor frame must
+        // keep the math near origin so f32 doesn't collapse — the UTM
+        // magnitude only ever appears as a small anchor DIFFERENCE.
+        let host_anchor = [600_000.0_f64, 10.0, 0.0];
+        let cutter_anchor = [600_001.5_f64, 10.0, 0.0]; // 1.5 m east
+        let host = z_prism(rect_profile(4.0, 4.0), 3.0, Vec3::ZERO);
+        let cutter_local = z_prism(rect_profile(1.0, 1.0), 3.0, Vec3::ZERO);
+        let cutter = rebase_params(&cutter_local, cutter_anchor, host_anchor);
+        // Cutter now at +1.5 east in the host frame: footprint x∈[1,2],
+        // inside the host's x∈[-2,2] → 1×1 through-cut → (16−1)×3 = 45.
+        let mesh = expect_cut(subtract(&host, &cutter));
+        let vol = signed_volume(&mesh);
+        assert!(vol.is_finite(), "F3 collapse: non-finite volume");
+        assert!((vol - 45.0).abs() < 1e-3, "far-origin rebase volume {vol}, expected 45");
+    }
+
+    #[test]
+    fn extrude_params_converts_to_prism_params() {
+        let ep = ExtrudeParams {
+            profile: rect_profile(2.0, 2.0),
+            dir: Vec3::Z,
+            depth: 1.5,
+            local_xform: Mat4::IDENTITY,
+        };
+        let pp: PrismParams = ep.into();
+        assert_eq!(pp.profile.outer.len(), 4);
+        assert!((pp.depth - 1.5).abs() < 1e-6);
     }
 }
