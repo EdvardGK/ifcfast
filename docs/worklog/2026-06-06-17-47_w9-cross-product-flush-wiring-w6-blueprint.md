@@ -1,8 +1,8 @@
 ## Agent signature
 - **Agent**: `claude-opus-4-8[1m]`
 - **Working tree**: `/home/edkjo/workspace/inbox/ifcfast`
-- **Branch**: `main` @ `e784f9d` → `e5f0dba` (2 commits this session)
-- **Session scope**: GH #58 W9 cross-product prism flush-wiring (the mechanical slice that connects the W9 primitives to the extractor) + W6 design blueprint
+- **Branch**: `main` @ `e784f9d` → `d292b3a` (3 commits this session; the 3rd added post-worklog during real-file validation)
+- **Session scope**: GH #58 W9 cross-product prism flush-wiring + W6 design blueprint; then real-file cut validation (GH #53/#56/#57) which produced a brep-hole fix
 - **Touched paths**: crates/core/src/mesh/cut_openings.rs, crates/core/src/lib.rs, crates/core/tests/cut_openings_integration.rs, docs/plans/2026-06-05_cut-openings-manifold-replacement.md
 - **Parallel sessions observed**: none (origin/main carried only this session's commits during the window)
 - **Supersedes / superseded by**: none
@@ -103,6 +103,40 @@ feature sets green under `-D warnings`.
   prism, the `TightPolygonalBoundaryIgnored` counter wiring (needs a
   warning channel orthogonal to the single per-product `Outcome`).
 - GH #59 M1 oracle scaffold runs in parallel, no code conflict.
+
+## Real-file validation (post-worklog) — GH #53/#56/#57
+
+Tester lacks the Manifold/cmake toolchain, so ran the real-file cut
+validation locally (built the wheel with `csg`+`prism-csg-fast`;
+`ifcopenshell` 0.8.5 as oracle). Files: Sannergata ARK_E (local, 21 MB)
+and G55_RIB / G55_RIB_Prefab (found non-zero copies under
+`~/dev/oldpc1/...`; the acc-tree copies are 0-byte stubs). A test
+sub-agent did the #53 deep-dive.
+
+- **#53 — FIXED, shipped (`d292b3a`).** All 9 over-reporting walls were
+  MISDIAGNOSED (by the reporter and my first read) as a cross-product
+  cut-fold failure. Real cause: `mesh::brep::mesh_face` dropped inner
+  `IfcFaceBound` holes and fan-filled the outer loop → over-filled brep
+  faces by the hole area. 8 of 9 walls have no voids at all. Fix: honour
+  inner bounds via Newell-projection + earcut-with-holes; cheap fan path
+  kept for the hole-free majority. All 9 now match ifcopenshell to
+  sub-rounding (was +6 … +122 %). 3 new brep unit tests; full suite
+  green; cache 14→15. Benefits ANY baked-brep with punched faces.
+- **#56 — resolved on current main, not by today's work.** All 5 Revit
+  walls now match Solibri exactly; was ~0.0001 on 0.4.32. The brep fix
+  can't raise volume, so this is the W4 operator-aware boolean fix
+  (`f8b4cf2`): a `.UNION.` operand was being subtracted → sliver.
+- **#57 — 8× over-report gone; ifcfast == ifcopenshell exactly.** Slab is
+  an `IfcFacetedBrep` with 0 holes (today's fix is a no-op on it).
+  ifcfast 131.74 == ifcopenshell 131.74 (was 1504 on 0.4.32, fixed by an
+  earlier commit). Residual is ifcfast+ifcos vs **Solibri** 180.20 — a
+  kernel disagreement, not an ifcfast defect; needs the reporter's exact
+  file/Solibri solid to adjudicate (likely non-watertight brep where
+  OCC-class vs tessellation kernels differ).
+
+Takeaway: the brep-hole fix is the session's biggest correctness win and
+should ride the Phase-1 bundle release. The `csg`+`prism-csg-fast` wheel
+is built into `.venv` for further local validation.
 
 ## Notes
 
