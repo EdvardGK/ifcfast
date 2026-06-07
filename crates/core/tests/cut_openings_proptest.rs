@@ -188,6 +188,7 @@ fn build_pair_product_mesh(host: &Box3, cutter: &Box3) -> ProductMesh {
         world_origin: [0.0; 3],
         mesh_anchor: [0.0; 3],
         surface_color: None,
+        bounded_halfspaces: Vec::new(),
     }
 }
 

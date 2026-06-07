@@ -20,6 +20,11 @@ pub mod brep;
 pub mod csg_primitive;
 #[cfg(feature = "csg")]
 pub mod cut_openings;
+/// Pure-data outcome + counter types for the cut-openings pipeline.
+/// NOT csg-gated — mesh / prism builds carry the counters even when the
+/// csg-gated `cut_openings` module is absent (GH #61). `cut_openings`
+/// re-exports these when present.
+pub mod cut_stats;
 #[cfg(feature = "csg")]
 pub mod cut_validate;
 pub mod curveset;
@@ -147,6 +152,12 @@ pub enum MeshFragment {
         roles: Vec<&'static str>,
         rep_step_id: u64,
         instance_transform: Mat4,
+        /// Parametric `IfcPolygonalBoundedHalfSpace` cutter params, set
+        /// ONLY on a bounded-halfspace leaf fragment (W6 / GH #58 F6);
+        /// `None` for every other fragment. `retag` carries it up the
+        /// boolean tree unchanged so it reaches the [`ProductMesh`].
+        /// See [`BoundedHalfspacePayload`].
+        bounded_halfspace: Option<BoundedHalfspacePayload>,
     },
     Unhandled {
         ifc_type: String,
@@ -235,6 +246,49 @@ pub struct InstancePart {
     pub surface_color: Option<[f32; 4]>,
 }
 
+/// Parametric description of an `IfcPolygonalBoundedHalfSpace` cutter,
+/// resolved at tessellation time and carried on the [`ProductMesh`] so
+/// the cut-openings pass can perform the *bounded* cut (W6 / GH #58 F6)
+/// instead of the over-aggressive infinite-plane clip.
+///
+/// **Why this lives on `ProductMesh` (audit "approach 2").** The slab
+/// triangles `boolean::polygonal_bounded_halfspace` emits do not carry
+/// the boundary polygon or the cutter's frames — they are baked into a
+/// thin visualisation slab. `cut_openings::apply` runs inside the
+/// streaming sink's `on_product`, where no `EntityTable` is in scope, so
+/// it cannot re-derive the boundary from the IFC entity. Resolving the
+/// payload in `boolean.rs` (where the table IS in scope) and attaching it
+/// to the product is the same "carry params, not the kernel" pattern
+/// `InstancePart.rep_step_id` already follows.
+///
+/// `Option<...>` (not cfg-gated) keeps every `ProductMesh` constructor
+/// free of feature blocks: it is `None` in default builds and on every
+/// non-bounded product. The bounded fast-path only *reads* it under the
+/// `prism-csg-fast` feature; without the feature the field is inert.
+///
+/// **Frame contract (F3).** All vectors / matrices here are in the
+/// product's world frame (the same frame the baked `vertices` live in
+/// when `apply` runs). `boundary_xform` maps the 2D `boundary` points
+/// (in the `Position` arg[2] frame) into that world frame.
+#[derive(Debug, Clone)]
+pub struct BoundedHalfspacePayload {
+    /// step_id of the `IfcPolygonalBoundedHalfSpace` entity. Used by
+    /// `apply` to correlate this payload with the matching cutter
+    /// segment via the parallel [`InstancePart::rep_step_id`].
+    pub rep_step_id: u64,
+    /// The polygonal boundary in its own 2D (`Position` arg[2]) frame.
+    pub boundary: crate::mesh::profile::Polygon2D,
+    /// Maps `boundary` 2D points (`z = 0`) into the working frame.
+    pub boundary_xform: Mat4,
+    /// Unit cutting-plane normal, oriented into the **subtracted**
+    /// half-space (the side `cut_openings` removes), in the working
+    /// frame. Same convention as the slab's first-triangle normal.
+    pub plane_normal: Vec3,
+    /// A point on the cutting plane (the BaseSurface origin), working
+    /// frame.
+    pub plane_point: Vec3,
+}
+
 /// A finished mesh in world coordinates, keyed back to its IfcProduct.
 #[derive(Debug, Clone)]
 pub struct ProductMesh {
@@ -302,6 +356,13 @@ pub struct ProductMesh {
     /// product has no styled material — caller falls back to a
     /// per-entity palette.
     pub surface_color: Option<[f32; 4]>,
+    /// Parametric `IfcPolygonalBoundedHalfSpace` cutters carried for the
+    /// W6 bounded cut (GH #58 F6). `None` / empty for every product that
+    /// has no bounded-halfspace cutter — which is all of them in default
+    /// builds, where the field is never read. See
+    /// [`BoundedHalfspacePayload`]. Always-present (not cfg-gated) so
+    /// constructors stay free of feature blocks.
+    pub bounded_halfspaces: Vec<BoundedHalfspacePayload>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -775,6 +836,10 @@ fn tessellate_one(
     let mut parts: Vec<InstancePart> = Vec::new();
     let mut mesh_anchor_f64: Option<DVec3> = None;
     let mut unhandled_types: Vec<String> = Vec::new();
+    // Only mutated under `prism-csg-fast` (the rebake loop below); stays an
+    // empty, never-pushed Vec on default builds.
+    #[cfg_attr(not(feature = "prism-csg-fast"), allow(unused_mut))]
+    let mut bounded_halfspaces: Vec<BoundedHalfspacePayload> = Vec::new();
 
     for item_id in items {
         let fragments = mesh_item(table, item_id, shape_cache);
@@ -786,6 +851,7 @@ fn tessellate_one(
                     roles,
                     rep_step_id,
                     instance_transform,
+                    bounded_halfspace,
                 } => {
                     let seg_index_start = combined_i.len() as u32;
                     let base = (combined_v.len() / 3) as u32;
@@ -834,6 +900,52 @@ fn tessellate_one(
                     }
                     for &idx in &local.indices {
                         combined_i.push(base + idx);
+                    }
+
+                    // W6: bake the bounded-halfspace payload into the SAME
+                    // frame as this fragment's vertices so `cut_openings`
+                    // can use it against the baked mesh. The fragment's
+                    // bake map is affine: linear = `effective` (rotation +
+                    // any instance scale), translation = `anchor_f32`
+                    // (World) or the per-fragment offset (Local). Apply
+                    // that exact map to the payload's points + xform and
+                    // the linear part to its normal.
+                    // Only the `prism-csg-fast` bounded fast-path consumes
+                    // `bounded_halfspaces`; default builds skip the per-
+                    // product re-bake entirely (the payload is dropped).
+                    #[cfg(not(feature = "prism-csg-fast"))]
+                    let _ = bounded_halfspace;
+                    #[cfg(feature = "prism-csg-fast")]
+                    if let Some(p) = bounded_halfspace {
+                        let bake_translation = match frame {
+                            BakeFrame::World => anchor_f32,
+                            BakeFrame::Local => {
+                                let anchor = mesh_anchor_f64
+                                    .expect("pinned above for both bake frames");
+                                let off = precise_anchor_f64 - anchor;
+                                Vec3::new(off.x as f32, off.y as f32, off.z as f32)
+                            }
+                        };
+                        let bake = {
+                            let mut m = effective;
+                            m.w_axis = Vec4::new(
+                                bake_translation.x,
+                                bake_translation.y,
+                                bake_translation.z,
+                                1.0,
+                            );
+                            m
+                        };
+                        bounded_halfspaces.push(BoundedHalfspacePayload {
+                            rep_step_id: p.rep_step_id,
+                            boundary: p.boundary,
+                            boundary_xform: bake * p.boundary_xform,
+                            // Normal: linear part only (no translation).
+                            plane_normal: effective
+                                .transform_vector3(p.plane_normal)
+                                .normalize_or_zero(),
+                            plane_point: bake.transform_point3(p.plane_point),
+                        });
                     }
                     let seg_index_count = combined_i.len() as u32 - seg_index_start;
                     if seg_index_count > 0 {
@@ -929,6 +1041,7 @@ fn tessellate_one(
             world_origin,
             mesh_anchor,
             surface_color: product_surface_color,
+            bounded_halfspaces,
         },
         triangle_count,
         segment_tags,
@@ -1029,6 +1142,7 @@ fn emit_geometryless<S: ProductSink>(
             // consistent f64 anchor.
             mesh_anchor: world_origin,
             surface_color: None,
+            bounded_halfspaces: Vec::new(),
         });
     }
 }
@@ -1056,6 +1170,10 @@ pub(crate) fn mesh_item(
                 // captured by the caller (mapped::expand) on top.
                 rep_step_id: item_id,
                 instance_transform: Mat4::IDENTITY,
+                // Bounded-halfspace fragments are excluded from the cache
+                // (see the insert site below), so a cache hit never needs
+                // to reconstruct a payload — it is always `None` here.
+                bounded_halfspace: None,
             })
             .collect();
     }
@@ -1073,6 +1191,7 @@ pub(crate) fn mesh_item(
                 roles: Vec::new(),
                 rep_step_id: item_id,
                 instance_transform: Mat4::IDENTITY,
+                bounded_halfspace: None,
             }],
             None => Vec::new(),
         }
@@ -1113,10 +1232,22 @@ pub(crate) fn mesh_item(
             boolean::csg_solid(table, item_id, shape_cache, &mesh_item)
         } else if type_name.eq_ignore_ascii_case(b"IFCPOLYGONALBOUNDEDHALFSPACE") {
             match boolean::polygonal_bounded_halfspace(table, item_id) {
-                Some((m, agreement)) => single(
-                    Some(m),
-                    if agreement { "halfspace_bounded:agree" } else { "halfspace_bounded:disagree" },
-                ),
+                // Construct the fragment directly (not via `single`) so we
+                // can attach the W6 bounded-halfspace payload. The payload
+                // rides up the boolean tree via `retag` and lands on the
+                // product's `bounded_halfspaces` list in `tessellate_one`.
+                Some((m, agreement, payload)) => vec![MeshFragment::Mesh {
+                    mesh: m,
+                    source: if agreement {
+                        "halfspace_bounded:agree"
+                    } else {
+                        "halfspace_bounded:disagree"
+                    },
+                    roles: Vec::new(),
+                    rep_step_id: item_id,
+                    instance_transform: Mat4::IDENTITY,
+                    bounded_halfspace: Some(payload),
+                }],
                 None => Vec::new(),
             }
         } else if type_name.eq_ignore_ascii_case(b"IFCHALFSPACESOLID") {
@@ -1155,10 +1286,21 @@ pub(crate) fn mesh_item(
     // Cache only the real mesh fragments — unhandled markers are cheap
     // to re-derive. Composite handlers (boolean / csg) don't cache the
     // outer node either; their operand caches do the work.
+    //
+    // `IfcPolygonalBoundedHalfSpace` is excluded ONLY under
+    // `prism-csg-fast`: there its fragment carries a `bounded_halfspace`
+    // payload that the cache tuple `(LocalMesh, &str)` cannot hold, and a
+    // cache hit would reconstruct the fragment with
+    // `bounded_halfspace: None`, silently dropping the bounded-cut params.
+    // Default builds never read the payload, so they keep caching this
+    // leaf (re-extruding the slab per repeated instance would be pure
+    // waste on facade-heavy IfcRepresentationMap files).
     let is_composite = type_name.eq_ignore_ascii_case(b"IFCMAPPEDITEM")
         || type_name.eq_ignore_ascii_case(b"IFCBOOLEANRESULT")
         || type_name.eq_ignore_ascii_case(b"IFCBOOLEANCLIPPINGRESULT")
-        || type_name.eq_ignore_ascii_case(b"IFCCSGSOLID");
+        || type_name.eq_ignore_ascii_case(b"IFCCSGSOLID")
+        || (cfg!(feature = "prism-csg-fast")
+            && type_name.eq_ignore_ascii_case(b"IFCPOLYGONALBOUNDEDHALFSPACE"));
     if !is_composite {
         let cacheable: Vec<(LocalMesh, &'static str)> = result
             .iter()

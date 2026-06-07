@@ -29,7 +29,7 @@ use crate::lexer::{parse_field, split_top_level_args, Field};
 use crate::mesh::extrusion::{extrude_polygon, LocalMesh};
 use crate::mesh::placement::axis_placement_3d_from_id;
 use crate::mesh::profile::Polygon2D;
-use crate::mesh::MeshFragment;
+use crate::mesh::{BoundedHalfspacePayload, MeshFragment};
 
 /// Visible extent (in model units, typically mm) for the finite cap we
 /// emit to stand in for an infinite half-space's base plane. Sized to
@@ -163,7 +163,10 @@ fn parse_agreement_flag(raw: Option<&[u8]>) -> bool {
 /// `halfspace_bounded:{agreement}` tag and clips the host against the
 /// derived plane directly (no CSG kernel involvement) — see GH #39
 /// and `mesh::halfspace_clip`.
-pub fn polygonal_bounded_halfspace(table: &EntityTable, id: u64) -> Option<(LocalMesh, bool)> {
+pub fn polygonal_bounded_halfspace(
+    table: &EntityTable,
+    id: u64,
+) -> Option<(LocalMesh, bool, BoundedHalfspacePayload)> {
     let (type_name, args) = table.get(id)?;
     if !type_name.eq_ignore_ascii_case(b"IFCPOLYGONALBOUNDEDHALFSPACE") {
         return None;
@@ -205,6 +208,26 @@ pub fn polygonal_bounded_halfspace(table: &EntityTable, id: u64) -> Option<(Loca
             _ => None,
         })
         .unwrap_or(Mat4::IDENTITY);
+    // arg[2] = Position (IfcAxis2Placement3D) — the LOCAL frame the
+    // PolygonalBoundary's 2D points live in. Independent from
+    // BaseSurface.Position. W6 needs it to place the boundary polygon in
+    // world for the bounded cut. Defaults to identity when absent.
+    //
+    // Only the `prism-csg-fast` bounded fast-path ever reads this; default
+    // builds skip the placement-chain walk and carry an inert identity
+    // xform (the payload is constructed but never re-baked or consumed).
+    let boundary_position = if cfg!(feature = "prism-csg-fast") {
+        fields
+            .get(2)
+            .copied()
+            .and_then(|f| match parse_field(f) {
+                Field::Ref(pid) => Some(axis_placement_3d_from_id(table, pid)),
+                _ => None,
+            })
+            .unwrap_or(Mat4::IDENTITY)
+    } else {
+        Mat4::IDENTITY
+    };
     let boundary_id = match fields.get(3).copied().map(parse_field) {
         Some(Field::Ref(bid)) => bid,
         _ => return None,
@@ -259,7 +282,34 @@ pub fn polygonal_bounded_halfspace(table: &EntityTable, id: u64) -> Option<(Loca
         base_surface_position
     };
     let mesh = extrude_polygon(&polygon, Vec3::Z, HALFSPACE_SLAB_THICKNESS, frame);
-    Some((mesh, agreement))
+
+    // W6 / F6 payload. `plane_normal` matches the slab's top-cap normal
+    // (`frame`'s local +Z) — the direction `cut_openings` removes — so
+    // the bounded fast-path and the existing infinite-plane fallback read
+    // the same orientation. `plane_point` is the BaseSurface origin.
+    // `boundary` stays in its arg[2] frame; `boundary_xform` maps it to
+    // the (still solid-local) working frame the slab was built in. Both
+    // are re-baked into the product's world frame by `tessellate_one`.
+    let plane_normal = transform_vector(&frame, Vec3::Z).normalize_or_zero();
+    let plane_point = transform_point_local(&base_surface_position, Vec3::ZERO);
+    let payload = BoundedHalfspacePayload {
+        rep_step_id: id,
+        boundary: polygon,
+        boundary_xform: boundary_position,
+        plane_normal,
+        plane_point,
+    };
+    Some((mesh, agreement, payload))
+}
+
+fn transform_vector(m: &Mat4, v: Vec3) -> Vec3 {
+    let r = *m * glam::Vec4::new(v.x, v.y, v.z, 0.0);
+    Vec3::new(r.x, r.y, r.z)
+}
+
+fn transform_point_local(m: &Mat4, p: Vec3) -> Vec3 {
+    let r = *m * glam::Vec4::new(p.x, p.y, p.z, 1.0);
+    Vec3::new(r.x, r.y, r.z)
 }
 
 /// `IfcHalfSpaceSolid(BaseSurface: IfcSurface, AgreementFlag: BOOL)` —
@@ -343,7 +393,14 @@ pub fn halfspace_solid(table: &EntityTable, id: u64) -> Option<(LocalMesh, bool)
 /// `cut_openings::chain_contains` / `chain_count`.
 fn retag(frag: MeshFragment, new_role: &'static str) -> MeshFragment {
     match frag {
-        MeshFragment::Mesh { mesh, source, mut roles, rep_step_id, instance_transform } => {
+        MeshFragment::Mesh {
+            mesh,
+            source,
+            mut roles,
+            rep_step_id,
+            instance_transform,
+            bounded_halfspace,
+        } => {
             roles.push(new_role);
             MeshFragment::Mesh {
                 mesh,
@@ -351,6 +408,9 @@ fn retag(frag: MeshFragment, new_role: &'static str) -> MeshFragment {
                 roles,
                 rep_step_id,
                 instance_transform,
+                // Carry the W6 bounded-halfspace payload up the boolean
+                // tree unchanged so it reaches the product.
+                bounded_halfspace,
             }
         }
         u @ MeshFragment::Unhandled { .. } => u,

@@ -1072,3 +1072,179 @@ fn rotated_through_cut_prism_matches_manifold() {
         "rotated prism vs manifold divergence: prism {prism_vol} m³, manifold {manifold_vol} m³",
     );
 }
+
+// =====================================================================
+// W6 — polygon-bounded halfspace correctness (GH #58 F6)
+// =====================================================================
+//
+// Wall 1000 (X) × 200 (Y) × 3000 (Z) mm, profile centred on origin →
+// box X∈[-500,500], Y∈[-100,100], Z∈[0,3000] (volume 0.6 m³). Cut by an
+// `IfcPolygonalBoundedHalfSpace`: BaseSurface plane at Z=2000, +Z normal,
+// AgreementFlag `.T.` (de-facto convention keeps +Z side → subtracts
+// Z<2000). The boundary is a 300×200 rectangle centred at origin in the
+// arg[2]=identity frame (X∈[-150,150], Y∈[-100,100]) — TIGHT (smaller
+// than the host X cross-section).
+//
+//   * Infinite-plane (default build): the plane removes ALL of Z<2000 →
+//     only Z∈[2000,3000] survives → 1000×200×1000 = 0.20 m³.
+//   * Bounded (prism-csg-fast): only the boundary column below the plane
+//     is removed → 0.6 − (300×200×2000) = 0.6 − 0.12 = 0.48 m³.
+//
+// The 0.28 m³ gap is the W6 fix made visible.
+const WALL_WITH_TIGHT_BOUNDED_HALFSPACE: &str = r#"ISO-10303-21;
+HEADER;
+FILE_DESCRIPTION(('ViewDefinition [ReferenceView]'),'2;1');
+FILE_NAME('bounded.ifc','2026-06-07T00:00:00',('test'),('skiplum'),'ifcfast','ifcfast','');
+FILE_SCHEMA(('IFC4'));
+ENDSEC;
+DATA;
+#1=IFCPROJECT('0Test000000000000000001',$,'p',$,$,$,$,(#5),#2);
+#2=IFCUNITASSIGNMENT((#3,#4));
+#3=IFCSIUNIT(*,.LENGTHUNIT.,.MILLI.,.METRE.);
+#4=IFCSIUNIT(*,.PLANEANGLEUNIT.,$,.RADIAN.);
+#5=IFCGEOMETRICREPRESENTATIONCONTEXT($,'Model',3,1.0E-5,#6,$);
+#6=IFCAXIS2PLACEMENT3D(#7,$,$);
+#7=IFCCARTESIANPOINT((0.,0.,0.));
+#10=IFCSITE('1Site000000000000000001',$,'s',$,$,#15,$,$,.ELEMENT.,$,$,$,$,$);
+#11=IFCBUILDING('2Bldg000000000000000001',$,'b',$,$,#15,$,$,.ELEMENT.,$,$,$);
+#12=IFCBUILDINGSTOREY('3Stor000000000000000001',$,'L1',$,$,#15,$,$,.ELEMENT.,0.0);
+#15=IFCLOCALPLACEMENT($,#6);
+#16=IFCLOCALPLACEMENT(#15,#6);
+#20=IFCRELAGGREGATES('4Agg000000000000000001',$,$,$,#1,(#10));
+#21=IFCRELAGGREGATES('5Agg000000000000000001',$,$,$,#10,(#11));
+#22=IFCRELAGGREGATES('6Agg000000000000000001',$,$,$,#11,(#12));
+#30=IFCRECTANGLEPROFILEDEF(.AREA.,'WallRect',#31,1000.,200.);
+#31=IFCAXIS2PLACEMENT2D(#7,$);
+#32=IFCDIRECTION((0.,0.,1.));
+#33=IFCEXTRUDEDAREASOLID(#30,#6,#32,3000.);
+#50=IFCCARTESIANPOINT((0.,0.,2000.));
+#51=IFCAXIS2PLACEMENT3D(#50,$,$);
+#52=IFCPLANE(#51);
+#53=IFCAXIS2PLACEMENT3D(#7,$,$);
+#54=IFCCARTESIANPOINT((-150.,-100.));
+#55=IFCCARTESIANPOINT((150.,-100.));
+#56=IFCCARTESIANPOINT((150.,100.));
+#57=IFCCARTESIANPOINT((-150.,100.));
+#58=IFCPOLYLINE((#54,#55,#56,#57,#54));
+#59=IFCPOLYGONALBOUNDEDHALFSPACE(#52,.T.,#53,#58);
+#60=IFCBOOLEANCLIPPINGRESULT(.DIFFERENCE.,#33,#59);
+#70=IFCSHAPEREPRESENTATION(#5,'Body','Clipping',(#60));
+#71=IFCPRODUCTDEFINITIONSHAPE($,$,(#70));
+#80=IFCWALL('7Wall00000000000000001',$,'Bounded',$,$,#16,#71,'tag',.STANDARD.);
+#90=IFCRELCONTAINEDINSPATIALSTRUCTURE('8Rel000000000000000001',$,$,$,(#80),#12);
+ENDSEC;
+END-ISO-10303-21;
+"#;
+
+fn capture_wall_from(ifc: &str) -> ProductMesh {
+    let mut sink = CaptureSink {
+        products: Vec::new(),
+    };
+    let _ = mesh_ifc_streaming(ifc.as_bytes(), &mut sink);
+    sink.products
+        .into_iter()
+        .find(|m| m.entity == "IfcWall")
+        .expect("wall product must reach the sink")
+}
+
+fn manifold_volume_m3(mesh: &ProductMesh) -> f64 {
+    let m = csg::build_manifold(&mesh.vertices, &mesh.indices)
+        .expect("post-cut wall must be a closed manifold");
+    m.volume() * 1.0e-9_f64
+}
+
+/// W6 test 1 (DEFAULT build): the infinite-plane clip over-cuts — only
+/// the slab above the plane survives (0.20 m³). This documents the F6 bug
+/// as the default-build behaviour and is the proof the bounded path is
+/// genuinely a different result. Runs on EVERY build (the `apply` default
+/// path is identical with or without `prism-csg-fast`; under
+/// `prism-csg-fast` the carried payload IS tight + reducible, so this
+/// assertion is what the next test contradicts — hence it is itself
+/// gated OFF when the feature is on to avoid contradiction).
+#[cfg(not(feature = "prism-csg-fast"))]
+#[test]
+fn tight_bounded_halfspace_default_over_cuts() {
+    let mut mesh = capture_wall_from(WALL_WITH_TIGHT_BOUNDED_HALFSPACE);
+    let outcome = apply(&mut mesh, 1.0);
+    assert_eq!(outcome, Outcome::Cut, "bounded halfspace must cut the wall");
+    let vol = manifold_volume_m3(&mesh);
+    assert!(
+        (vol - 0.20).abs() < 0.02,
+        "default infinite-plane clip should over-cut to ~0.20 m³, got {vol} m³",
+    );
+}
+
+/// W6 test 2 (`prism-csg-fast`): the bounded fast-path removes only the
+/// boundary column below the plane → 0.48 m³ (the analytic correct cut).
+#[cfg(feature = "prism-csg-fast")]
+#[test]
+fn tight_bounded_halfspace_bounded_path_is_correct() {
+    let mut mesh = capture_wall_from(WALL_WITH_TIGHT_BOUNDED_HALFSPACE);
+    assert!(
+        !mesh.bounded_halfspaces.is_empty(),
+        "fixture must carry a bounded-halfspace payload",
+    );
+    let outcome = apply(&mut mesh, 1.0);
+    assert_eq!(outcome, Outcome::Cut, "bounded halfspace must cut the wall");
+    let vol = manifold_volume_m3(&mesh);
+    assert!(
+        (vol - 0.48).abs() < 0.02,
+        "bounded path should keep ~0.48 m³ (0.6 − 0.12 column), got {vol} m³",
+    );
+}
+
+/// W6 test 3 (oracle, `prism-csg-fast` + `csg`): build the EXACT bounded
+/// cutter solid (the 300×200 boundary extruded over the removed band
+/// Z∈[0,2000]) and subtract it from the host extrusion via manifold.
+/// The 2D fast-path result must match this independent 3D-CSG oracle
+/// within 1 %.
+#[cfg(feature = "prism-csg-fast")]
+#[test]
+fn tight_bounded_halfspace_matches_csg_oracle() {
+    // Fast-path result.
+    let mut fast = capture_wall_from(WALL_WITH_TIGHT_BOUNDED_HALFSPACE);
+    let _ = apply(&mut fast, 1.0);
+    let fast_vol = manifold_volume_m3(&fast);
+
+    // Oracle: host box X∈[-500,500] Y∈[-100,100] Z∈[0,3000] minus the
+    // bounded cutter box X∈[-150,150] Y∈[-100,100] Z∈[0,2000].
+    let host = axis_box([-500.0, -100.0, 0.0], [500.0, 100.0, 3000.0]);
+    let cutter = axis_box([-150.0, -100.0, 0.0], [150.0, 100.0, 2000.0]);
+    let (ov, oi) = csg::subtract_many(&host.0, &host.1, &[(&cutter.0, &cutter.1)])
+        .expect("oracle subtract must succeed");
+    let oracle = csg::build_manifold(&ov, &oi).expect("oracle is manifold");
+    let oracle_vol = oracle.volume() * 1.0e-9_f64;
+
+    assert!(
+        (oracle_vol - 0.48).abs() < 0.02,
+        "oracle sanity: expected ~0.48 m³, got {oracle_vol} m³",
+    );
+    assert!(
+        (fast_vol - oracle_vol).abs() / oracle_vol < 0.01,
+        "fast-path {fast_vol} m³ vs CSG oracle {oracle_vol} m³ — must agree within 1 %",
+    );
+}
+
+/// Axis-aligned closed box as (vertices, indices), CCW outward winding.
+#[cfg(feature = "prism-csg-fast")]
+fn axis_box(min: [f32; 3], max: [f32; 3]) -> (Vec<f32>, Vec<u32>) {
+    let v: Vec<f32> = vec![
+        min[0], min[1], min[2],
+        max[0], min[1], min[2],
+        max[0], max[1], min[2],
+        min[0], max[1], min[2],
+        min[0], min[1], max[2],
+        max[0], min[1], max[2],
+        max[0], max[1], max[2],
+        min[0], max[1], max[2],
+    ];
+    let i: Vec<u32> = vec![
+        0, 2, 1, 0, 3, 2,
+        4, 5, 6, 4, 6, 7,
+        0, 1, 5, 0, 5, 4,
+        2, 3, 7, 2, 7, 6,
+        1, 2, 6, 1, 6, 5,
+        0, 4, 7, 0, 7, 3,
+    ];
+    (v, i)
+}

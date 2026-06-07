@@ -85,7 +85,14 @@ pub fn expand(
     for inner in item_ids {
         for frag in super::mesh_item(table, inner, shape_cache) {
             match frag {
-                MeshFragment::Mesh { mesh, source: src, roles, rep_step_id, instance_transform: inner_xform } => {
+                MeshFragment::Mesh {
+                    mesh,
+                    source: src,
+                    roles,
+                    rep_step_id,
+                    instance_transform: inner_xform,
+                    bounded_halfspace,
+                } => {
                     // Inner direct geometry contributes Mat4::IDENTITY;
                     // if a nested IfcMappedItem ever propagates here it
                     // brings its own composition that we multiply in
@@ -97,6 +104,9 @@ pub fn expand(
                         roles,
                         rep_step_id,
                         instance_transform: composed * inner_xform,
+                        // Carry any bounded-halfspace payload through the
+                        // mapping (vanishingly rare, but keep it lossless).
+                        bounded_halfspace,
                     });
                 }
                 u @ MeshFragment::Unhandled { .. } => {

@@ -117,7 +117,7 @@ mod python {
     // Single owner of the FFI key set for the per-pass cut_openings
     // counters. mesh_qto, extract_meshes and write_gltf all surface
     // these via the same Outcome::accumulate path on
-    // crate::mesh::cut_openings::CutOpeningsStats — keeping the dict
+    // crate::mesh::cut_stats::CutOpeningsStats — keeping the dict
     // shape consistent across entry points means downstream parquet
     // columns and Python wrappers can pivot once on a stable schema.
     //
@@ -133,7 +133,7 @@ mod python {
     // never need to discriminate on feature flags.
     fn set_cut_openings_stats(
         out: &Bound<'_, PyDict>,
-        stats: &crate::mesh::cut_openings::CutOpeningsStats,
+        stats: &crate::mesh::cut_stats::CutOpeningsStats,
     ) -> PyResult<()> {
         out.set_item("cut_openings_cut", stats.cut as u64)?;
         out.set_item("cut_openings_passthrough", stats.passthrough as u64)?;
@@ -693,7 +693,7 @@ mod python {
             s_nx: Vec<f32>,
             s_ny: Vec<f32>,
             s_nz: Vec<f32>,
-            cut_stats: crate::mesh::cut_openings::CutOpeningsStats,
+            cut_stats: crate::mesh::cut_stats::CutOpeningsStats,
             // Cross-product IfcRelVoidsElement buffer — same pattern as
             // extract_meshes. Only `Some` when cut_openings && at least
             // one void relation exists; else the hot path is identical
@@ -736,7 +736,7 @@ mod python {
             }
 
             #[cfg(feature = "csg")]
-            fn bump_outcome(&mut self, outcome: crate::mesh::cut_openings::Outcome) {
+            fn bump_outcome(&mut self, outcome: crate::mesh::cut_stats::Outcome) {
                 outcome.accumulate(&mut self.cut_stats);
             }
         }
@@ -806,7 +806,7 @@ mod python {
             s_nx: Vec::new(),
             s_ny: Vec::new(),
             s_nz: Vec::new(),
-            cut_stats: crate::mesh::cut_openings::CutOpeningsStats::default(),
+            cut_stats: crate::mesh::cut_stats::CutOpeningsStats::default(),
             #[cfg(feature = "csg")]
             cross,
         };
@@ -1720,7 +1720,7 @@ mod python {
             triangle_count: Vec<u32>,
             vertices_le: Vec<Vec<u8>>,
             indices_le: Vec<Vec<u8>>,
-            cut_stats: crate::mesh::cut_openings::CutOpeningsStats,
+            cut_stats: crate::mesh::cut_stats::CutOpeningsStats,
             // Cross-product IfcRelVoidsElement buffer. Some(_) only
             // when cut_openings && the file has at least one void
             // relation; otherwise None keeps the hot path identical
@@ -1771,7 +1771,7 @@ mod python {
             }
 
             #[cfg(feature = "csg")]
-            fn bump_outcome(&mut self, outcome: crate::mesh::cut_openings::Outcome) {
+            fn bump_outcome(&mut self, outcome: crate::mesh::cut_stats::Outcome) {
                 outcome.accumulate(&mut self.cut_stats);
             }
         }
@@ -1836,7 +1836,7 @@ mod python {
             triangle_count: Vec::new(),
             vertices_le: Vec::new(),
             indices_le: Vec::new(),
-            cut_stats: crate::mesh::cut_openings::CutOpeningsStats::default(),
+            cut_stats: crate::mesh::cut_stats::CutOpeningsStats::default(),
             #[cfg(feature = "csg")]
             cross,
         };
@@ -1951,7 +1951,7 @@ mod python {
                 products: Vec<ProductMesh>,
                 cut_openings: bool,
                 unit_scale: f32,
-                cut_stats: crate::mesh::cut_openings::CutOpeningsStats,
+                cut_stats: crate::mesh::cut_stats::CutOpeningsStats,
                 #[cfg(feature = "csg")]
                 cross: Option<crate::mesh::cut_openings::CrossProductCut>,
             }
@@ -1978,7 +1978,7 @@ mod python {
                 }
 
                 #[cfg(feature = "csg")]
-                fn bump_outcome(&mut self, outcome: crate::mesh::cut_openings::Outcome) {
+                fn bump_outcome(&mut self, outcome: crate::mesh::cut_stats::Outcome) {
                     outcome.accumulate(&mut self.cut_stats);
                 }
             }
@@ -2019,7 +2019,7 @@ mod python {
                 products: Vec::new(),
                 cut_openings,
                 unit_scale,
-                cut_stats: crate::mesh::cut_openings::CutOpeningsStats::default(),
+                cut_stats: crate::mesh::cut_stats::CutOpeningsStats::default(),
                 #[cfg(feature = "csg")]
                 cross,
             };
