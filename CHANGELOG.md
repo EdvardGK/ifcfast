@@ -7,6 +7,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.35] - 2026-06-07
+
+> Bundled CSG-foundation + QTO-reliability release. Cache schema → 16
+> (re-extraction on first open). Note: the 0.4.32–0.4.34 releases shipped
+> without changelog entries; this entry covers the changes since 0.4.34.
+
+### Added — volume-reliability columns + prism fallback (GH #60)
+
+- **`mesh_qto()` / `instances.parquet` now self-label volume
+  confidence** so pipelines can route untrustworthy rows to an
+  authoritative kernel. New columns: `volume_reliable` (bool routing
+  flag), `volume_method` (`"mesh"` / `"prism_fallback"`),
+  `volume_mesh_m3` (raw signed-tetra value, always), and
+  `volume_prism_bound_m3` (`footprint × height` tight bound, `NaN` on
+  closed rows). `mesh_quality` is now also exposed in `mesh_qto()`.
+- **`volume_m3` is now the best estimate** — the mesh volume when
+  trustworthy, else a prism fallback — so `SUM(volume_m3)` no longer
+  mixes open-shell garbage into totals. A non-closed mesh keeps its mesh
+  value when it's within its tight prism bound (the edge-pairing check
+  over-flags dedup-imperfect-but-accurate shells); only volumes that
+  provably exceed the bound are replaced. Validated on the G55 ACC files
+  vs the Solibri ITO benchmark: flagged set 2.5 %, 0 regressions, and
+  the `IfcFaceBasedSurfaceModel` slab goes from 1504 m³ garbage to
+  180.1 m³ (= Solibri's QTO prism). See
+  `examples/hybrid_qto_routing.py`.
+
+### Added — cut-openings manifold-replacement programme, Phase 1 (GH #58)
+
+- **W1+W2** — real source-chain encoding + `Outcome::Unsupported`
+  taxonomy for the boolean/cut pipeline.
+- **W3** — unit-aware cut tolerance: the half-space clip epsilon is now
+  scaled by the file's `unit_scale` (physical 1 mm in any unit system),
+  fixing silent misbehaviour on mm / imperial files.
+- **W4** — operator-aware `IfcBooleanResult`: UNION / INTERSECTION
+  operators are honoured instead of being treated as subtraction
+  (previously ~2× volume errors on those products).
+- **W5a** — property-based correctness harness
+  (`tests/cut_openings_proptest.rs`), the validation gate for the
+  pure-Rust CSG paths.
+- **W9** (behind the opt-in `prism-csg-fast` Cargo feature) — pure-Rust
+  prism-CSG through-cut fast path via an `i_overlay` 2D-boolean facade,
+  including cross-product `IfcRelVoidsElement` primitives wired into the
+  void-flush. Default builds are byte-identical; manifold remains the
+  default kernel until the feature earns its benchmark/correctness gate.
+
+### Fixed
+
+- **Faceted-brep inner holes (GH #53)** — `mesh::brep::mesh_face` now
+  honours inner `IfcFaceBound` holes (Newell projection + ear-clipping)
+  instead of fan-filling the outer loop, fixing over-reported solid
+  volume (+6 %…+122 %) on Revit-exported walls with punched openings.
+- **pyo3 0.22 → 0.24 (GH #51)** — resolves RUSTSEC-2025-0020; CI green
+  under `-D warnings`.
+
 ## [0.4.31] - 2026-06-03
 
 ### Fixed — `__version__` single source of truth (GH #46)
