@@ -85,6 +85,19 @@ pub fn apply(mesh: &mut ProductMesh, unit_scale: f32) -> Outcome {
     let mut halfspace_planes: Vec<(Vec3, Vec3)> = Vec::new();
     let mut solid_cutters: Vec<(Vec<f32>, Vec<u32>)> = Vec::new();
     for seg in &cutter_segs {
+        // In `prism-csg-fast` builds a polygonal-bounded-halfspace cutter
+        // is represented by its carried `BoundedHalfspacePayload` (exact
+        // plane + boundary polygon), not a slab-derived plane. Skip its
+        // slab here; the bounded fast-path below handles the tight cases
+        // and feeds the *exact* payload plane to the infinite clip for the
+        // rest (GH #64 #3 — retires the slab-centroid plane + the
+        // float-tolerance `drop_matching_plane` correlation). Default
+        // builds carry no payloads, so they keep deriving the slab plane
+        // and stay byte-identical.
+        #[cfg(feature = "prism-csg-fast")]
+        if is_bounded_halfspace_cutter(&seg.source) {
+            continue;
+        }
         let Some(submesh) = assemble_submesh(&mesh.vertices, &mesh.indices, &[*seg]) else {
             continue;
         };
@@ -103,7 +116,14 @@ pub fn apply(mesh: &mut ProductMesh, unit_scale: f32) -> Outcome {
         }
     }
 
-    if halfspace_planes.is_empty() && solid_cutters.is_empty() {
+    // A product whose only cutters are bounded-halfspace slabs has empty
+    // `halfspace_planes` / `solid_cutters` here (the slabs were skipped),
+    // but it still has work to do via the carried payloads — don't bail.
+    #[cfg(feature = "prism-csg-fast")]
+    let has_bounded_payloads = !mesh.bounded_halfspaces.is_empty();
+    #[cfg(not(feature = "prism-csg-fast"))]
+    let has_bounded_payloads = false;
+    if halfspace_planes.is_empty() && solid_cutters.is_empty() && !has_bounded_payloads {
         return Outcome::Passthrough;
     }
 
@@ -116,21 +136,26 @@ pub fn apply(mesh: &mut ProductMesh, unit_scale: f32) -> Outcome {
     // clip). Tight, axis-parallel, host-crossing cutters are subtracted
     // by a region-decomposition of the footprint (one prism per disjoint
     // kept region — GH #64 #4: no coincident internal caps), instead of
-    // the F6 infinite-plane clip. Each handled cutter's slab-derived
-    // plane is dropped from `halfspace_planes` so the generic clip below
-    // does NOT double-cut it. Non-tight / non-axis / non-reducible
-    // payloads keep their plane for the infinite clip (correct there: an
-    // over-sized boundary does not constrain the cut). Default builds
-    // (feature off) skip this entirely and stay byte-identical.
+    // the F6 infinite-plane clip. Every payload the fast-path did NOT
+    // handle (over-sized / off-axis / non-reducible host) contributes its
+    // EXACT cutting plane to the infinite clip below — the F6 fallback,
+    // which is correct for an over-sized boundary that doesn't constrain
+    // the cut. Default builds (feature off) skip this entirely and stay
+    // byte-identical.
     #[cfg(feature = "prism-csg-fast")]
     {
         let bounded = std::mem::take(&mut mesh.bounded_halfspaces);
-        if let Some((new_v, new_i, handled)) =
-            bounded_halfspace::try_bounded_cut_multi(&host, &bounded)
-        {
-            host = (new_v, new_i);
-            for &i in &handled {
-                drop_matching_plane(&mut halfspace_planes, &bounded[i]);
+        let handled: Vec<usize> =
+            match bounded_halfspace::try_bounded_cut_multi(&host, &bounded) {
+                Some((new_v, new_i, handled)) => {
+                    host = (new_v, new_i);
+                    handled
+                }
+                None => Vec::new(),
+            };
+        for (i, p) in bounded.iter().enumerate() {
+            if !handled.contains(&i) {
+                halfspace_planes.push((p.plane_point, p.plane_normal));
             }
         }
     }
@@ -204,6 +229,18 @@ fn is_halfspace_cutter(source: &str) -> bool {
         || chain_contains(source, "halfspace_bounded:disagree")
 }
 
+/// Recognise specifically a *polygonal-bounded* half-space slab. In
+/// `prism-csg-fast` builds these are owned by their carried
+/// `BoundedHalfspacePayload`, so `apply` skips deriving a slab plane for
+/// them (see the cutter loop). Unbounded `halfspace_plane:*` slabs are
+/// NOT matched here — they have no payload and must keep their derived
+/// plane.
+#[cfg(feature = "prism-csg-fast")]
+fn is_bounded_halfspace_cutter(source: &str) -> bool {
+    chain_contains(source, "halfspace_bounded:agree")
+        || chain_contains(source, "halfspace_bounded:disagree")
+}
+
 /// Derive `(plane_point, plane_normal_into_halfspace)` from a thin
 /// half-space slab's geometry. The slab is built by
 /// `boolean::halfspace_solid` / `polygonal_bounded_halfspace` as a
@@ -256,27 +293,6 @@ fn derive_plane_from_slab(vertices: &[f32], indices: &[u32]) -> Option<(Vec3, Ve
     }
     let plane_point = sum / n;
     Some((plane_point, agree))
-}
-
-/// Remove from `planes` the slab-derived plane that matches `payload`'s
-/// cutting plane (same point + normal, within a generous tolerance), so
-/// the generic infinite-plane clip does not re-cut a cutter the W6
-/// bounded path already handled. Removes at most one entry.
-#[cfg(feature = "prism-csg-fast")]
-fn drop_matching_plane(planes: &mut Vec<(Vec3, Vec3)>, payload: &BoundedHalfspacePayload) {
-    // 1 mm point tolerance (working frame is near-origin) + 0.5° normal
-    // tolerance. The slab plane point is the slab centroid (offset by
-    // ≤½ slab thickness from the payload plane along the normal), so a
-    // mm-scale point tolerance is comfortably loose without risking a
-    // false match across two genuinely-distinct cutters.
-    const PT_EPS: f32 = 2.0;
-    const N_DOT_MIN: f32 = 0.9999;
-    if let Some(idx) = planes.iter().position(|(pp, pn)| {
-        pn.dot(payload.plane_normal) >= N_DOT_MIN
-            && (*pp - payload.plane_point).dot(payload.plane_normal).abs() <= PT_EPS
-    }) {
-        planes.remove(idx);
-    }
 }
 
 /// W6 bounded polygonal-halfspace cut (prism-csg-fast). Pure-Rust 2D

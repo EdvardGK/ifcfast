@@ -272,10 +272,6 @@ pub struct InstancePart {
 /// (in the `Position` arg[2] frame) into that world frame.
 #[derive(Debug, Clone)]
 pub struct BoundedHalfspacePayload {
-    /// step_id of the `IfcPolygonalBoundedHalfSpace` entity. Used by
-    /// `apply` to correlate this payload with the matching cutter
-    /// segment via the parallel [`InstancePart::rep_step_id`].
-    pub rep_step_id: u64,
     /// The polygonal boundary in its own 2D (`Position` arg[2]) frame.
     pub boundary: crate::mesh::profile::Polygon2D,
     /// Maps `boundary` 2D points (`z = 0`) into the working frame.
@@ -936,13 +932,19 @@ fn tessellate_one(
                             );
                             m
                         };
+                        // Normal: inverse-transpose of the linear part, so
+                        // mirrored / non-uniformly-scaled placements
+                        // (negative-determinant Revit families) transform
+                        // the plane normal correctly instead of skewing /
+                        // flipping it (GH #64 #6). For a pure rotation
+                        // (R⁻¹)ᵀ = R, identical to the linear part.
+                        let normal_xform =
+                            glam::Mat3::from_mat4(effective).inverse().transpose();
                         bounded_halfspaces.push(BoundedHalfspacePayload {
-                            rep_step_id: p.rep_step_id,
                             boundary: p.boundary,
                             boundary_xform: bake * p.boundary_xform,
-                            // Normal: linear part only (no translation).
-                            plane_normal: effective
-                                .transform_vector3(p.plane_normal)
+                            plane_normal: normal_xform
+                                .mul_vec3(p.plane_normal)
                                 .normalize_or_zero(),
                             plane_point: bake.transform_point3(p.plane_point),
                         });

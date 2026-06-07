@@ -293,7 +293,6 @@ pub fn polygonal_bounded_halfspace(
     let plane_normal = transform_vector(&frame, Vec3::Z).normalize_or_zero();
     let plane_point = transform_point_local(&base_surface_position, Vec3::ZERO);
     let payload = BoundedHalfspacePayload {
-        rep_step_id: id,
         boundary: polygon,
         boundary_xform: boundary_position,
         plane_normal,

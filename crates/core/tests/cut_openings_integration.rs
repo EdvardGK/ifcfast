@@ -1417,6 +1417,82 @@ fn bounded_halfspace_missing_host_is_uncut() {
     );
 }
 
+// =====================================================================
+// W6 hardening — an OVERSIZED bounded halfspace under prism-csg-fast.
+// Same wall + Z=2000 plane, but the boundary is 5000×5000 (Revit's
+// oversize convention) — it CONTAINS the host footprint, so it does not
+// constrain the cut. The bounded fast-path declines it (not tight) and
+// its EXACT payload plane feeds the infinite clip (GH #64 #3: this is
+// the path that replaced the slab-derived plane + `drop_matching_plane`).
+// Result: the whole Z<2000 side is removed → 0.20 m³, identical to the
+// default-build F6 behavior — confirming the payload-plane fallback is
+// equivalent to the old slab-plane fallback for the non-tight case.
+#[cfg(feature = "prism-csg-fast")]
+const WALL_WITH_OVERSIZED_BOUNDED_HALFSPACE: &str = r#"ISO-10303-21;
+HEADER;
+FILE_DESCRIPTION(('ViewDefinition [ReferenceView]'),'2;1');
+FILE_NAME('oversized.ifc','2026-06-07T00:00:00',('test'),('skiplum'),'ifcfast','ifcfast','');
+FILE_SCHEMA(('IFC4'));
+ENDSEC;
+DATA;
+#1=IFCPROJECT('0Test000000000000000001',$,'p',$,$,$,$,(#5),#2);
+#2=IFCUNITASSIGNMENT((#3,#4));
+#3=IFCSIUNIT(*,.LENGTHUNIT.,.MILLI.,.METRE.);
+#4=IFCSIUNIT(*,.PLANEANGLEUNIT.,$,.RADIAN.);
+#5=IFCGEOMETRICREPRESENTATIONCONTEXT($,'Model',3,1.0E-5,#6,$);
+#6=IFCAXIS2PLACEMENT3D(#7,$,$);
+#7=IFCCARTESIANPOINT((0.,0.,0.));
+#10=IFCSITE('1Site000000000000000001',$,'s',$,$,#15,$,$,.ELEMENT.,$,$,$,$,$);
+#11=IFCBUILDING('2Bldg000000000000000001',$,'b',$,$,#15,$,$,.ELEMENT.,$,$,$);
+#12=IFCBUILDINGSTOREY('3Stor000000000000000001',$,'L1',$,$,#15,$,$,.ELEMENT.,0.0);
+#15=IFCLOCALPLACEMENT($,#6);
+#16=IFCLOCALPLACEMENT(#15,#6);
+#20=IFCRELAGGREGATES('4Agg000000000000000001',$,$,$,#1,(#10));
+#21=IFCRELAGGREGATES('5Agg000000000000000001',$,$,$,#10,(#11));
+#22=IFCRELAGGREGATES('6Agg000000000000000001',$,$,$,#11,(#12));
+#30=IFCRECTANGLEPROFILEDEF(.AREA.,'WallRect',#31,1000.,200.);
+#31=IFCAXIS2PLACEMENT2D(#7,$);
+#32=IFCDIRECTION((0.,0.,1.));
+#33=IFCEXTRUDEDAREASOLID(#30,#6,#32,3000.);
+#50=IFCCARTESIANPOINT((0.,0.,2000.));
+#51=IFCAXIS2PLACEMENT3D(#50,$,$);
+#52=IFCPLANE(#51);
+#53=IFCAXIS2PLACEMENT3D(#7,$,$);
+#54=IFCCARTESIANPOINT((-2500.,-2500.));
+#55=IFCCARTESIANPOINT((2500.,-2500.));
+#56=IFCCARTESIANPOINT((2500.,2500.));
+#57=IFCCARTESIANPOINT((-2500.,2500.));
+#58=IFCPOLYLINE((#54,#55,#56,#57,#54));
+#59=IFCPOLYGONALBOUNDEDHALFSPACE(#52,.T.,#53,#58);
+#60=IFCBOOLEANCLIPPINGRESULT(.DIFFERENCE.,#33,#59);
+#70=IFCSHAPEREPRESENTATION(#5,'Body','Clipping',(#60));
+#71=IFCPRODUCTDEFINITIONSHAPE($,$,(#70));
+#80=IFCWALL('7Wall00000000000000001',$,'BoundedOversized',$,$,#16,#71,'tag',.STANDARD.);
+#90=IFCRELCONTAINEDINSPATIALSTRUCTURE('8Rel000000000000000001',$,$,$,(#80),#12);
+ENDSEC;
+END-ISO-10303-21;
+"#;
+
+/// GH #64 #3: an oversized (non-tight) bounded cutter under
+/// prism-csg-fast is declined by the fast-path and falls back to the
+/// infinite clip via its EXACT payload plane (not a slab-derived one,
+/// not a geometric `drop_matching_plane` match). Removes all of Z<2000
+/// → 0.20 m³, identical to the default-build F6 result.
+#[cfg(feature = "prism-csg-fast")]
+#[test]
+fn oversized_bounded_halfspace_falls_back_via_payload_plane() {
+    let mut mesh = capture_wall_from(WALL_WITH_OVERSIZED_BOUNDED_HALFSPACE);
+    assert_eq!(mesh.bounded_halfspaces.len(), 1, "fixture carries one payload");
+    let outcome = apply(&mut mesh, 1.0);
+    assert_eq!(outcome, Outcome::Cut, "oversized bounded halfspace still cuts");
+    let vol = manifold_volume_m3(&mesh);
+    assert!(
+        (vol - 0.20).abs() < 0.02,
+        "non-tight boundary must fall back to the infinite clip via its \
+         payload plane (~0.20 m³); got {vol} m³",
+    );
+}
+
 /// Axis-aligned closed box as (vertices, indices), CCW outward winding.
 #[cfg(feature = "prism-csg-fast")]
 fn axis_box(min: [f32; 3], max: [f32; 3]) -> (Vec<f32>, Vec<u32>) {
