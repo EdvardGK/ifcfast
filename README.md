@@ -5,10 +5,12 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![CI](https://github.com/EdvardGK/ifcfast/actions/workflows/ci.yml/badge.svg)](https://github.com/EdvardGK/ifcfast/actions/workflows/ci.yml)
 
-> **An agent-first IFC parser. Built for AI agents, RPA, and analytics
-> pipelines that need to ask questions of a model without loading a
-> geometry kernel. Complements `ifcopenshell` — different tradeoffs,
-> different jobs.**
+> **A speed-first, agent-first IFC parser. Built for AI agents, RPA, and
+> analytics pipelines that need to ask questions of a model without
+> loading a geometry kernel. A companion to `ifcopenshell`, not a
+> competitor — ifcfast goes fast and flags what it can't do reliably;
+> `ifcopenshell` owns the heavy geometry kernel. They work best
+> together (see the hybrid-routing example below).**
 
 ```python
 pip install ifcfast
@@ -59,8 +61,31 @@ pip install 'ifcfast[mcp]'
 > bug, blind spot, or edge case, please
 > [report it in detail](https://github.com/EdvardGK/ifcfast/issues) —
 > file, GUID, expected vs actual, and the tool you compared against — so
-> we can fix it. `ifcfast` complements `ifcopenshell` (which owns the
-> geometry kernels, authoring, and schema work) rather than replacing it.
+> we can fix it. `ifcfast` is a speed-first companion to `ifcopenshell`
+> (which owns the geometry kernels, authoring, and schema work) — built
+> to work hand-in-hand with it, not to replace it.
+
+### Speed *and* correctness: the hybrid pattern
+
+You don't have to choose. ifcfast's QTO rows self-label confidence — a
+real solid's `|volume|` can never exceed its bounding box, so
+`|volume_m3| > aabb_volume_m3` marks an untrustworthy mesh volume. Run
+ifcfast on everything, then escalate **only** the flagged rows (~0.3 %
+on a real structural model) to `ifcopenshell` — keeping ifcfast's
+14–46× speed and getting kernel-grade numbers exactly where they're
+needed. This is the partnership in practice: ifcfast for speed,
+`ifcopenshell` for the hard edge cases.
+
+```bash
+python examples/hybrid_qto_routing.py model.ifc
+# ifcfast: 747 products volumed in 618 ms; 2 flagged for review (0.3%)
+# ifcopenshell escalation: 2 products in 2882 ms
+#   0KQHSuyJH0wOic2WOZMsew  IfcSlab   ifcfast 1504.436   authoritative 131.695
+```
+
+See [`examples/hybrid_qto_routing.py`](examples/hybrid_qto_routing.py) —
+the same fast-pass-then-escalate flow drops into n8n, Power Automate, a
+cron/Python job, or an MCP agent loop.
 
 **What `ifcfast` is**
 

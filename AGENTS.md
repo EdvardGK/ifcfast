@@ -22,6 +22,19 @@ want.
 > these get fixed. `ifcfast` complements `ifcopenshell` (which owns the
 > geometry kernels, schema, and authoring) rather than replacing it.
 
+**Recommended pattern — fast pass + escalate the edge cases.** Don't
+choose between speed and correctness; route between them. ifcfast's QTO
+rows self-label confidence (a real solid's `|volume|` can never exceed
+its bounding box, so `|volume_m3| > aabb_volume_m3` marks an untrustworthy
+mesh volume). Run ifcfast on everything, then send **only** the flagged
+rows to an authoritative kernel (`ifcopenshell`, Solibri, or a
+human-review queue). The flagged set is tiny (~0.3 % on a real
+structural model), so you keep the 14–46× speedup and get kernel-grade
+numbers exactly where they're needed. Runnable reference:
+[`examples/hybrid_qto_routing.py`](examples/hybrid_qto_routing.py) — the
+same fast-pass-then-escalate flow drops into n8n (IF node), Power
+Automate (Condition), a cron/Python job, or an MCP agent loop.
+
 ## What `ifcfast` gives you
 
 - **Single import, no kernel.** A native (Rust) core reads the IFC

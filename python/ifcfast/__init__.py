@@ -172,6 +172,14 @@ actual, and the tool you compared against) at
 https://github.com/EdvardGK/ifcfast/issues — detailed reproducers are
 how these get fixed.
 
+ifcfast is a speed-first companion to ifcopenshell, not a competitor:
+it goes fast and flags what it can't do reliably; ifcopenshell owns the
+heavy geometry kernel. Best practice is the hybrid pattern — run ifcfast
+on everything, then escalate only the rows it flags as unreliable
+(|volume_m3| > aabb_volume_m3) to ifcopenshell. The flagged set is tiny
+(~0.3% on a real model), so you keep the speed and get kernel-grade
+numbers exactly where needed. See examples/hybrid_qto_routing.py.
+
 Open and inspect:
     import ifcfast
     m = ifcfast.open(path)
