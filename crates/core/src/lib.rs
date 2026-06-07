@@ -613,8 +613,10 @@ mod python {
     ///
     /// Returns a PyDict with two parallel views:
     ///   * **Per-product columns** (one row per meshed product):
-    ///     guid, entity, volume_m3, aabb_volume_m3, surface_area_m2,
-    ///     area_top_m2, area_bottom_m2, area_side_m2, area_inclined_m2,
+    ///     guid, entity, volume_m3 (best estimate), volume_mesh_m3 (raw
+    ///     mesh), volume_prism_bound_m3, volume_reliable, volume_method,
+    ///     mesh_quality, aabb_volume_m3, surface_area_m2, area_top_m2,
+    ///     area_bottom_m2, area_side_m2, area_inclined_m2,
     ///     largest_surface_m2, smallest_surface_m2, surface_count.
     ///   * **Per-surface long-format** (one row per (product, distinct
     ///     planar surface)): surface_guid, surface_index, area_m2,
@@ -670,6 +672,11 @@ mod python {
             guid: Vec<String>,
             entity: Vec<String>,
             volume_m3: Vec<f32>,
+            volume_mesh_m3: Vec<f32>,
+            volume_prism_bound_m3: Vec<f32>,
+            volume_reliable: Vec<bool>,
+            volume_method: Vec<&'static str>,
+            mesh_quality: Vec<&'static str>,
             aabb_volume_m3: Vec<f32>,
             surface_area_m2: Vec<f32>,
             area_top_m2: Vec<f32>,
@@ -703,7 +710,12 @@ mod python {
                 let q = qto::compute(&mesh.vertices, &mesh.indices, self.unit_scale);
                 self.guid.push(mesh.guid.clone());
                 self.entity.push(mesh.entity.clone());
-                self.volume_m3.push(q.volume_m3.abs());
+                self.volume_m3.push(q.volume_best_m3);
+                self.volume_mesh_m3.push(q.volume_m3.abs());
+                self.volume_prism_bound_m3.push(q.volume_prism_bound_m3);
+                self.volume_reliable.push(q.volume_reliable);
+                self.volume_method.push(q.volume_method);
+                self.mesh_quality.push(q.mesh_quality);
                 self.aabb_volume_m3.push(q.aabb_volume_m3);
                 self.surface_area_m2.push(q.surface_area_m2);
                 self.area_top_m2.push(q.area_top_m2);
@@ -774,6 +786,11 @@ mod python {
             guid: Vec::with_capacity(idx.product_step_id.len()),
             entity: Vec::with_capacity(idx.product_step_id.len()),
             volume_m3: Vec::with_capacity(idx.product_step_id.len()),
+            volume_mesh_m3: Vec::with_capacity(idx.product_step_id.len()),
+            volume_prism_bound_m3: Vec::with_capacity(idx.product_step_id.len()),
+            volume_reliable: Vec::with_capacity(idx.product_step_id.len()),
+            volume_method: Vec::with_capacity(idx.product_step_id.len()),
+            mesh_quality: Vec::with_capacity(idx.product_step_id.len()),
             aabb_volume_m3: Vec::with_capacity(idx.product_step_id.len()),
             surface_area_m2: Vec::with_capacity(idx.product_step_id.len()),
             area_top_m2: Vec::with_capacity(idx.product_step_id.len()),
@@ -823,6 +840,14 @@ mod python {
         out.set_item("guid", PyList::new(py, sink.guid)?)?;
         out.set_item("entity", PyList::new(py, sink.entity)?)?;
         out.set_item("volume_m3", PyList::new(py, sink.volume_m3)?)?;
+        out.set_item("volume_mesh_m3", PyList::new(py, sink.volume_mesh_m3)?)?;
+        out.set_item(
+            "volume_prism_bound_m3",
+            PyList::new(py, sink.volume_prism_bound_m3)?,
+        )?;
+        out.set_item("volume_reliable", PyList::new(py, sink.volume_reliable)?)?;
+        out.set_item("volume_method", PyList::new(py, sink.volume_method)?)?;
+        out.set_item("mesh_quality", PyList::new(py, sink.mesh_quality)?)?;
         out.set_item("aabb_volume_m3", PyList::new(py, sink.aabb_volume_m3)?)?;
         out.set_item("surface_area_m2", PyList::new(py, sink.surface_area_m2)?)?;
         out.set_item("area_top_m2", PyList::new(py, sink.area_top_m2)?)?;

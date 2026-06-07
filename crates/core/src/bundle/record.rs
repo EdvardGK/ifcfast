@@ -194,7 +194,27 @@ pub struct InstanceRecord {
     // IfcElementQuantity values, when present, live in `quantities`
     // and override these; these are the geometric truth that survives
     // when the author forgot to export Qto_* sets.
+    /// Best volume estimate in m³: the signed-tetra mesh volume when
+    /// `volume_reliable`, else the prism fallback (`volume_prism_bound_m3`).
+    /// `SUM(volume_m3)` no longer mixes open-shell garbage into totals;
+    /// see `volume_method` / `volume_reliable`. The raw mesh value stays
+    /// available on `volume_mesh_m3`.
     pub volume_m3: f32,
+    /// Raw signed-tetra mesh volume (absolute), always — for transparency
+    /// and so consumers can compare against the chosen `volume_m3`.
+    pub volume_mesh_m3: f32,
+    /// `footprint × z_extent` prism bound in m³, computed for every
+    /// non-closed row (both tripwire and fallback value); `NaN` on closed
+    /// rows where it is not needed. See `MeshQto::volume_prism_bound_m3`.
+    pub volume_prism_bound_m3: f32,
+    /// Routing flag: `true` when `volume_m3` is the trustworthy mesh
+    /// value (closed, or within its prism bound); `false` when the mesh
+    /// volume was provably too big and `volume_m3` is the prism fallback,
+    /// or the rep is degenerate. Pipelines escalate the `false` rows to
+    /// an authoritative kernel. See `MeshQto::volume_reliable`.
+    pub volume_reliable: bool,
+    /// `"mesh"` or `"prism_fallback"` — which definition `volume_m3` carries.
+    pub volume_method: &'static str,
     pub aabb_volume_m3: f32,
     pub surface_area_m2: f32,
     pub area_top_m2: f32,
@@ -401,7 +421,11 @@ pub fn pair_split(
         psets: semantics.psets,
         quantities: semantics.quantities,
         classifications: semantics.classifications,
-        volume_m3: qto.volume_m3.abs(),
+        volume_m3: qto.volume_best_m3,
+        volume_mesh_m3: qto.volume_m3.abs(),
+        volume_prism_bound_m3: qto.volume_prism_bound_m3,
+        volume_reliable: qto.volume_reliable,
+        volume_method: qto.volume_method,
         aabb_volume_m3: qto.aabb_volume_m3,
         surface_area_m2: qto.surface_area_m2,
         area_top_m2: qto.area_top_m2,

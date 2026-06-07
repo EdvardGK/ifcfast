@@ -103,6 +103,38 @@ pub struct MeshQto {
     /// `"open_shell"`; without this flag any downstream `SUM(volume_m3)`
     /// silently sums garbage with valid figures.
     pub mesh_quality: &'static str,
+    /// Routing flag: `true` when `volume_best_m3` is the mesh-measured
+    /// volume and is trustworthy — either a closed manifold, or a
+    /// non-manifold whose volume is still within its tight prism bound
+    /// (the edge-pairing classifier over-flags dedup-imperfect meshes
+    /// whose volumes are nonetheless accurate). `false` means the mesh
+    /// volume exceeded its prism bound (provably too big) or the rep is
+    /// degenerate, so `volume_best_m3` is the prism fallback / 0 instead.
+    /// Pipelines escalate the `false` rows to an authoritative kernel and
+    /// keep ifcfast's speed on the rest (~2-3 % flagged on a real model).
+    pub volume_reliable: bool,
+    /// Which definition `volume_best_m3` carries (always agrees with
+    /// `volume_reliable`):
+    /// - `"mesh"`: the signed-tetra mesh volume (reliable rows).
+    /// - `"prism_fallback"`: `footprint × z_extent` — substituted when
+    ///   the mesh volume is provably too big or the rep is degenerate.
+    ///   A tighter bound than the AABB; reproduces the QTO-convention
+    ///   prism value tools like Solibri report for open slabs.
+    pub volume_method: &'static str,
+    /// The best single volume estimate: the mesh volume when reliable,
+    /// else the prism fallback (`volume_prism_bound_m3`). This is what
+    /// the `volume_m3` substrate column / `mesh_qto()` output carries —
+    /// `SUM(volume_m3)` no longer mixes open-shell garbage into totals.
+    pub volume_best_m3: f32,
+    /// Tight prism upper-bound on volume, `footprint × z_extent` in m³,
+    /// where `footprint` is the raster-estimated union of the mesh's
+    /// triangles projected onto the XY plane. Computed for every
+    /// non-closed row (it is both the tripwire and the fallback value);
+    /// `f32::NAN` on closed rows, where it is neither needed nor computed
+    /// (keeps the watertight hot path raster-free). v1 uses the Z-axis
+    /// prism only (tight for slabs); a min over the three axis
+    /// projections (tight for beams/columns) is a documented follow-up.
+    pub volume_prism_bound_m3: f32,
 }
 
 // 20° threshold against ±Z: `cos(20°) ≈ 0.940`.
@@ -141,6 +173,10 @@ pub fn compute(vertices: &[f32], indices: &[u32], unit_scale: f32) -> MeshQto {
     if indices.len() < 3 || vertices.len() < 9 {
         return MeshQto {
             mesh_quality: "degenerate",
+            volume_reliable: false,
+            volume_method: "prism_fallback",
+            volume_best_m3: 0.0,
+            volume_prism_bound_m3: 0.0,
             ..MeshQto::default()
         };
     }
@@ -342,6 +378,59 @@ pub fn compute(vertices: &[f32], indices: &[u32], unit_scale: f32) -> MeshQto {
         "closed"
     };
 
+    // Volume-reliability + prism fallback (GH #60). A closed manifold's
+    // signed-tetra volume is trustworthy as-is. For anything else we
+    // compute the tight prism upper bound (union-XY footprint × z-extent)
+    // and use it two ways:
+    //   * as a *tripwire* — a mesh volume that exceeds its own prism
+    //     bound is provably too big (open shell / inverted winding), so
+    //     it gets replaced by the prism estimate (matches the QTO-prism
+    //     value tools like Solibri report for open slabs);
+    //   * but an open shell whose volume is still *within* the prism
+    //     bound keeps its mesh value. The edge-pairing classifier
+    //     over-flags watertight-enough meshes (coincident-vertex
+    //     dedup false negatives), and on real models those mesh volumes
+    //     are accurate to ~0.2 % — replacing them with the looser prism
+    //     would regress them (validated on G55: 0 regressions, 18 fixes).
+    // The raster runs only on the non-closed minority, so the closed hot
+    // path is untouched.
+    let volume_mesh_m3 = volume_m3.abs();
+    // Raster footprint error can slightly under-count, pulling the prism
+    // bound a hair below a correct mesh volume; this margin keeps such
+    // rows from being falsely tripped. Real violations exceed the bound
+    // by integer multiples — far outside the margin (G55: tripwire fires
+    // identically for any margin from 1.02 to 1.20).
+    const PRISM_TRIPWIRE_MARGIN: f32 = 1.05;
+    let (volume_best_m3, volume_method, volume_reliable, volume_prism_bound_m3) =
+        if mesh_quality == "closed" {
+            // Footprint deliberately NOT computed — NaN signals "not
+            // applicable / not computed" so consumers don't read it as 0.
+            (volume_mesh_m3, "mesh", true, f32::NAN)
+        } else {
+            let z_extent_raw = if zmin.is_finite() {
+                (zmax - zmin).max(0.0)
+            } else {
+                0.0
+            };
+            // Vertical / planar meshes have zero z-extent → the z-prism
+            // is zero regardless of footprint, so skip the raster.
+            let prism = if z_extent_raw > 0.0 && xmax > xmin && ymax > ymin {
+                let footprint_raw = footprint_xy_raw(vertices, indices, xmin, xmax, ymin, ymax);
+                footprint_raw * z_extent_raw * volume_scale
+            } else {
+                0.0
+            };
+            if prism > 0.0 && volume_mesh_m3 <= prism * PRISM_TRIPWIRE_MARGIN {
+                // Mesh volume sits within its tight upper bound — trust it
+                // even though the shell isn't a perfect manifold.
+                (volume_mesh_m3, "mesh", true, prism)
+            } else {
+                // Provably too big (or degenerate / no usable footprint)
+                // → fall back to the prism estimate.
+                (prism, "prism_fallback", false, prism)
+            }
+        };
+
     MeshQto {
         volume_m3,
         aabb_volume_m3,
@@ -354,8 +443,127 @@ pub fn compute(vertices: &[f32], indices: &[u32], unit_scale: f32) -> MeshQto {
         smallest_surface_m2: smallest,
         surface_count,
         mesh_quality,
+        volume_reliable,
+        volume_method,
+        volume_best_m3,
+        volume_prism_bound_m3,
         surfaces,
     }
+}
+
+/// Union of the mesh's triangles projected onto the XY plane, in raw
+/// (pre-`unit_scale`) units², estimated by rasterizing onto a fixed-cell
+/// grid that spans the XY bounding box. Overlapping triangles re-mark the
+/// same cells, so the result is the true *union* footprint, not the sum
+/// of per-triangle areas. Vertical faces project to a line (zero 2D area)
+/// and contribute nothing, which is exactly right — only the horizontal
+/// extent makes up a footprint.
+///
+/// Cost is `O(triangles + covered_cells)` and this is called ONLY on the
+/// flagged minority (`!volume_reliable`, ~0.3 % of products), so it never
+/// touches the reliable hot path. The grid is square-celled (no axis
+/// bias) and capped at `MAX_CELLS` per side, giving ~0.2 % relative area
+/// error on a slab — fine for a fallback/tripwire value.
+///
+/// This is an *estimate*: a coarse grid can slip thin triangles between
+/// cell centres (slight under-count). An exact 2D boolean union (via
+/// `i_overlay`) is the documented accuracy upgrade if telemetry needs it.
+fn footprint_xy_raw(
+    vertices: &[f32],
+    indices: &[u32],
+    xmin: f32,
+    xmax: f32,
+    ymin: f32,
+    ymax: f32,
+) -> f32 {
+    // 256 cells/side ≈ 0.4 % per-axis quantization (well under 1 % on
+    // footprint area) while keeping the per-triangle cell-bbox scan cheap
+    // enough to run on every non-closed row. On G55 this reproduced the
+    // Solibri QTO-prism value to within 0.01 m³.
+    const MAX_CELLS: usize = 256;
+    let w = (xmax - xmin).max(0.0);
+    let h = (ymax - ymin).max(0.0);
+    if w <= 0.0 || h <= 0.0 {
+        return 0.0;
+    }
+    let cell = w.max(h) / MAX_CELLS as f32;
+    if cell <= 0.0 {
+        return 0.0;
+    }
+    let nx = ((w / cell).ceil() as usize).clamp(1, MAX_CELLS);
+    let ny = ((h / cell).ceil() as usize).clamp(1, MAX_CELLS);
+    let cell_w = w / nx as f32;
+    let cell_h = h / ny as f32;
+    let mut covered = vec![false; nx * ny];
+
+    for tri in indices.chunks_exact(3) {
+        let ia = tri[0] as usize * 3;
+        let ib = tri[1] as usize * 3;
+        let ic = tri[2] as usize * 3;
+        if ia + 1 >= vertices.len() || ib + 1 >= vertices.len() || ic + 1 >= vertices.len() {
+            continue;
+        }
+        let ax = vertices[ia];
+        let ay = vertices[ia + 1];
+        let bx = vertices[ib];
+        let by = vertices[ib + 1];
+        let cx = vertices[ic];
+        let cy = vertices[ic + 1];
+
+        // Signed 2D area — skip near-zero (vertical faces project to a
+        // line and add no footprint).
+        let twice_area = (bx - ax) * (cy - ay) - (cx - ax) * (by - ay);
+        if twice_area.abs() < 1e-12 {
+            continue;
+        }
+
+        // Triangle's cell-index bbox, clamped into the grid.
+        let gx0 = (((ax.min(bx).min(cx) - xmin) / cell_w).floor() as isize)
+            .clamp(0, nx as isize - 1) as usize;
+        let gx1 = (((ax.max(bx).max(cx) - xmin) / cell_w).floor() as isize)
+            .clamp(0, nx as isize - 1) as usize;
+        let gy0 = (((ay.min(by).min(cy) - ymin) / cell_h).floor() as isize)
+            .clamp(0, ny as isize - 1) as usize;
+        let gy1 = (((ay.max(by).max(cy) - ymin) / cell_h).floor() as isize)
+            .clamp(0, ny as isize - 1) as usize;
+
+        for gy in gy0..=gy1 {
+            let py = ymin + (gy as f32 + 0.5) * cell_h;
+            let row = gy * nx;
+            for gx in gx0..=gx1 {
+                let px = xmin + (gx as f32 + 0.5) * cell_w;
+                if point_in_triangle(px, py, ax, ay, bx, by, cx, cy) {
+                    covered[row + gx] = true;
+                }
+            }
+        }
+    }
+
+    let count = covered.iter().filter(|&&c| c).count();
+    count as f32 * cell_w * cell_h
+}
+
+/// 2D point-in-triangle via the three edge half-plane signs. Winding-
+/// agnostic (a point inside has all three signs agree); edge-inclusive,
+/// which only matters at shared edges where the cell is marked once
+/// anyway.
+#[inline]
+fn point_in_triangle(
+    px: f32,
+    py: f32,
+    ax: f32,
+    ay: f32,
+    bx: f32,
+    by: f32,
+    cx: f32,
+    cy: f32,
+) -> bool {
+    let d1 = (px - bx) * (ay - by) - (ax - bx) * (py - by);
+    let d2 = (px - cx) * (by - cy) - (bx - cx) * (py - cy);
+    let d3 = (px - ax) * (cy - ay) - (cx - ax) * (py - ay);
+    let has_neg = d1 < 0.0 || d2 < 0.0 || d3 < 0.0;
+    let has_pos = d1 > 0.0 || d2 > 0.0 || d3 > 0.0;
+    !(has_neg && has_pos)
 }
 
 /// Closed-manifold check via directed-edge pairing.
@@ -736,5 +944,115 @@ mod tests {
         // edges twice. signed_count = ±2 on every edge → not closed.
         let i = vec![0, 1, 2,  0, 1, 2];
         assert!(!is_closed_manifold(&i));
+    }
+
+    #[test]
+    fn volume_reliable_uses_mesh_value_for_closed_cube() {
+        // Closed manifold → reliable; volume_best is the mesh volume,
+        // method "mesh", and the prism bound is NaN (not computed on the
+        // hot path).
+        let (v, i) = unit_cube_world();
+        let q = compute(&v, &i, 1.0);
+        assert!(q.volume_reliable);
+        assert_eq!(q.volume_method, "mesh");
+        assert!((q.volume_best_m3 - 1.0).abs() < 1e-5, "got {}", q.volume_best_m3);
+        assert!(
+            q.volume_prism_bound_m3.is_nan(),
+            "reliable rows leave the prism bound uncomputed (NaN), got {}",
+            q.volume_prism_bound_m3
+        );
+    }
+
+    #[test]
+    fn prism_fallback_replaces_garbage_volume_on_open_shell() {
+        // The far-offset cube missing its bottom face: the signed-tetra
+        // volume is enormous garbage (volume > aabb), but the footprint
+        // (1 m²) × z_extent (1 m) prism is a clean ~1 m³ estimate. The
+        // best estimate must switch to the prism, NOT the mesh garbage.
+        let offset = 10.0_f32;
+        let v: Vec<f32> = vec![
+            offset + -0.5, offset + -0.5, offset + -0.5,
+            offset +  0.5, offset + -0.5, offset + -0.5,
+            offset +  0.5, offset +  0.5, offset + -0.5,
+            offset + -0.5, offset +  0.5, offset + -0.5,
+            offset + -0.5, offset + -0.5, offset +  0.5,
+            offset +  0.5, offset + -0.5, offset +  0.5,
+            offset +  0.5, offset +  0.5, offset +  0.5,
+            offset + -0.5, offset +  0.5, offset +  0.5,
+        ];
+        // Same wind as unit_cube_world with the bottom face removed.
+        let i: Vec<u32> = vec![
+            4, 5, 6,  4, 6, 7,
+            0, 1, 5,  0, 5, 4,
+            3, 7, 6,  3, 6, 2,
+            0, 4, 7,  0, 7, 3,
+            1, 2, 6,  1, 6, 5,
+        ];
+        let q = compute(&v, &i, 1.0);
+        assert_eq!(q.mesh_quality, "open_shell");
+        assert!(!q.volume_reliable);
+        assert_eq!(q.volume_method, "prism_fallback");
+        // Raw mesh garbage is preserved on `volume_m3` (signed) but the
+        // best estimate is the prism, ~1 m³ (footprint 1 m² × 1 m).
+        assert!(q.volume_m3.abs() > q.aabb_volume_m3, "setup: mesh vol should be garbage");
+        assert!(
+            (q.volume_best_m3 - 1.0).abs() < 0.02,
+            "prism fallback should reconstruct ~1 m³, got {}",
+            q.volume_best_m3
+        );
+        assert!(
+            (q.volume_prism_bound_m3 - q.volume_best_m3).abs() < 1e-6,
+            "prism column should equal the chosen fallback value"
+        );
+    }
+
+    #[test]
+    fn open_shell_within_prism_bound_keeps_mesh_value() {
+        // Unit cube at origin missing its top face: edge-pairing flags it
+        // open_shell, but the divergence volume (~5/6 m³) sits well within
+        // the prism bound (~1 m³), so we KEEP the mesh value rather than
+        // regress it to the looser prism. Mirrors the real-file finding
+        // that dedup-imperfect open shells are ~0.2 % accurate.
+        let (v, mut i) = unit_cube_world();
+        i.drain(6..12); // remove the +Z face's two triangles
+        let q = compute(&v, &i, 1.0);
+        assert_eq!(q.mesh_quality, "open_shell");
+        assert!(q.volume_reliable, "mesh within its prism bound → trusted");
+        assert_eq!(q.volume_method, "mesh");
+        assert!(
+            (q.volume_best_m3 - q.volume_m3.abs()).abs() < 1e-6,
+            "reliable open shell keeps the mesh value"
+        );
+        // The prism bound is computed for non-closed rows and is a valid
+        // (within margin) upper bound on the kept mesh value.
+        assert!(q.volume_prism_bound_m3.is_finite());
+        assert!(q.volume_best_m3 <= q.volume_prism_bound_m3 * 1.05 + 1e-6);
+    }
+
+    #[test]
+    fn degenerate_row_is_unreliable_with_zero_fallback() {
+        // Empty mesh → degenerate, not reliable, zero fallback (nothing
+        // to escalate a volume for).
+        let q = compute(&[], &[], 1.0);
+        assert_eq!(q.mesh_quality, "degenerate");
+        assert!(!q.volume_reliable);
+        assert_eq!(q.volume_method, "prism_fallback");
+        assert_eq!(q.volume_best_m3, 0.0);
+        assert_eq!(q.volume_prism_bound_m3, 0.0);
+    }
+
+    #[test]
+    fn footprint_raster_recovers_unit_square() {
+        // Two triangles spanning the unit square at z=0..1; the XY
+        // footprint must be ~1 m² to within grid quantization.
+        let v: Vec<f32> = vec![
+            0.0, 0.0, 0.0,
+            1.0, 0.0, 0.0,
+            1.0, 1.0, 1.0,
+            0.0, 1.0, 1.0,
+        ];
+        let i: Vec<u32> = vec![0, 1, 2,  0, 2, 3];
+        let fp = footprint_xy_raw(&v, &i, 0.0, 1.0, 0.0, 1.0);
+        assert!((fp - 1.0).abs() < 1e-3, "footprint should be ~1 m², got {fp}");
     }
 }

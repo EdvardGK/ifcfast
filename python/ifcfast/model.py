@@ -452,12 +452,32 @@ class Model:
         Returns a tuple ``(products_df, surfaces_df)``:
 
         * ``products_df`` — one row per meshed product. Columns:
-          ``guid``, ``entity``, ``volume_m3``, ``aabb_volume_m3``,
+          ``guid``, ``entity``, ``volume_m3``, ``volume_mesh_m3``,
+          ``volume_prism_bound_m3``, ``volume_reliable``,
+          ``volume_method``, ``mesh_quality``, ``aabb_volume_m3``,
           ``surface_area_m2``, ``area_top_m2``, ``area_bottom_m2``
           (triangles within 20° of ±Z), ``area_side_m2`` (within 20°
           of the horizontal plane), ``area_inclined_m2`` (everything
           else — ramps, sloped roofs), ``largest_surface_m2``,
           ``smallest_surface_m2``, ``surface_count``.
+
+          **Volume reliability (GH #60).** ``volume_m3`` is the *best*
+          estimate: the signed-tetra mesh volume when trustworthy, else a
+          ``footprint × height`` prism fallback. ``volume_reliable``
+          (bool) is the routing flag — ``True`` when ``volume_m3`` is the
+          mesh value and it's trustworthy (a closed solid, or an open
+          shell whose volume is still within its tight prism bound — the
+          manifold check over-flags dedup-imperfect meshes that are in
+          fact accurate); ``False`` when the mesh volume was provably too
+          big so ``volume_m3`` is the prism fallback, or the rep is
+          degenerate. Escalate the ``False`` rows to an authoritative
+          kernel (see ``examples/hybrid_qto_routing.py``).
+          ``volume_method`` is ``"mesh"`` or ``"prism_fallback"``;
+          ``volume_mesh_m3`` is the raw mesh value regardless of
+          reliability; ``volume_prism_bound_m3`` is the prism bound,
+          computed for every non-closed row (``NaN`` on closed rows —
+          the watertight hot path stays raster-free); ``mesh_quality``
+          is ``"closed"`` / ``"open_shell"`` / ``"degenerate"``.
         * ``surfaces_df`` — long-format, one row per distinct planar
           surface per product (sorted by area within a product).
           Columns: ``guid``, ``surface_index``, ``area_m2``, ``nx``,
@@ -483,6 +503,11 @@ class Model:
             "guid": d["guid"],
             "entity": d["entity"],
             "volume_m3": d["volume_m3"],
+            "volume_mesh_m3": d["volume_mesh_m3"],
+            "volume_prism_bound_m3": d["volume_prism_bound_m3"],
+            "volume_reliable": d["volume_reliable"],
+            "volume_method": d["volume_method"],
+            "mesh_quality": d["mesh_quality"],
             "aabb_volume_m3": d["aabb_volume_m3"],
             "surface_area_m2": d["surface_area_m2"],
             "area_top_m2": d["area_top_m2"],

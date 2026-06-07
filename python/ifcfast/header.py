@@ -275,7 +275,19 @@ _HASH_TAIL_BYTES = 4 * 1024 * 1024
 #       volume / vertex buffers change for any baked-brep product with
 #       face holes — cached substrates from ≤v14 carry the over-filled
 #       geometry, so the bump forces re-extraction. No column-shape change.
-_CACHE_SCHEMA_VERSION = 15
+# v16: volume-reliability columns on `instances.parquet` (GH #60).
+#       Four new columns — `volume_mesh_m3` (raw signed-tetra mesh
+#       volume), `volume_prism_bound_m3` (footprint×height prism bound,
+#       both tripwire and fallback; NaN on closed rows), `volume_reliable`
+#       (bool routing flag), `volume_method` (`"mesh"` / `"prism_fallback"`).
+#       `volume_reliable` is true when `volume_m3` is the trustworthy mesh
+#       value — closed, OR a non-manifold whose volume is within its tight
+#       prism bound; false when the mesh volume exceeded the prism bound
+#       (provably too big) or the rep is degenerate. `volume_m3` SEMANTICS
+#       CHANGE: it is now the best estimate (mesh when reliable, else the
+#       prism fallback) instead of the raw mesh value — open-shell rows no
+#       longer poison `SUM(volume_m3)`. Column-shape change → re-extraction.
+_CACHE_SCHEMA_VERSION = 16
 
 _FIELD_RE = re.compile(r"\(\s*(.*?)\s*\)\s*;", re.DOTALL)
 

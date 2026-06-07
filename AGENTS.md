@@ -24,13 +24,15 @@ want.
 
 **Recommended pattern — fast pass + escalate the edge cases.** Don't
 choose between speed and correctness; route between them. ifcfast's QTO
-rows self-label confidence (a real solid's `|volume|` can never exceed
-its bounding box, so `|volume_m3| > aabb_volume_m3` marks an untrustworthy
-mesh volume). Run ifcfast on everything, then send **only** the flagged
-rows to an authoritative kernel (`ifcopenshell`, Solibri, or a
-human-review queue). The flagged set is tiny (~0.3 % on a real
-structural model), so you keep the 14–46× speedup and get kernel-grade
-numbers exactly where they're needed. Runnable reference:
+rows self-label confidence: every product carries a `volume_reliable`
+flag (`false` ⇒ the mesh volume isn't trustworthy — open shell,
+degenerate rep, inverted winding) and a `footprint × height` prism
+fallback already substituted into `volume_m3`. Run ifcfast on
+everything, then send **only** the `volume_reliable = false` rows to an
+authoritative kernel (`ifcopenshell`, Solibri, or a human-review queue).
+The flagged set is tiny (~0.3 % on a real structural model), so you keep
+the 14–46× speedup and get kernel-grade numbers exactly where they're
+needed. Runnable reference:
 [`examples/hybrid_qto_routing.py`](examples/hybrid_qto_routing.py) — the
 same fast-pass-then-escalate flow drops into n8n (IF node), Power
 Automate (Condition), a cron/Python job, or an MCP agent loop.
@@ -169,6 +171,20 @@ describing via `pq.read_schema(...)`):
   bucketed area columns, `largest_surface_m2`, `smallest_surface_m2`,
   `surface_count`, `mesh_quality` (`"closed"` / `"open_shell"` /
   `"degenerate"`).
+- Volume reliability (since cache schema v16, GH #60): `volume_m3` is
+  the **best** estimate (mesh volume when trustworthy, else a
+  `footprint × height` prism fallback — so `SUM(volume_m3)` no longer
+  mixes open-shell garbage into totals). `volume_reliable` (bool) is the
+  routing flag — `true` when `volume_m3` is the mesh value and it's
+  trustworthy (closed manifold, or a non-manifold whose volume is still
+  within its tight prism upper bound); `false` when the mesh volume was
+  provably too big (exceeded the prism bound) so `volume_m3` is the prism
+  fallback, or the rep is degenerate. Send `false` rows to an
+  authoritative kernel. `volume_method` is `"mesh"` / `"prism_fallback"`;
+  `volume_mesh_m3` is the raw mesh volume regardless of reliability;
+  `volume_prism_bound_m3` is the prism bound, computed for every
+  non-closed row (`NaN` on closed rows — the watertight hot path stays
+  raster-free).
 - Semantic payload: `materials`, `psets`, `quantities`,
   `classifications` (list-of-struct columns — `UNNEST` in DuckDB).
   Each `psets` and `quantities` struct carries `source`

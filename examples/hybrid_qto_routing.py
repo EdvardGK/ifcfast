@@ -36,30 +36,38 @@ import ifcfast
 
 
 def fast_pass(path: str) -> list[dict]:
-    """Run ifcfast's QTO and attach a per-row reliability flag.
+    """Run ifcfast's QTO and read the per-row reliability flag.
 
-    The flag is the **provable bounding-box tripwire**: a real solid's
-    ``|volume|`` can never exceed its axis-aligned bounding-box volume,
-    so ``|volume_m3| > aabb_volume_m3`` means the mesh volume is
-    geometrically impossible (open shell / inverted winding) and must not
-    be trusted. (A tighter ``footprint x height`` bound is even more
-    sensitive; ifcfast will also expose ``volume_reliable`` directly so
-    you won't need to derive it — this script derives it from the public
-    columns so it runs on any released wheel.)
+    ifcfast self-labels volume confidence as a first-class column
+    (``volume_reliable``, since cache schema v16 / GH #60): ``False``
+    means the signed-tetra mesh volume isn't trustworthy (open shell,
+    degenerate rep, inverted winding). For those rows ifcfast also
+    substitutes a ``footprint x height`` prism estimate into
+    ``volume_m3`` and records ``volume_method = "prism_fallback"`` — so
+    even with **no** escalation you get a sane number instead of garbage.
+    The raw mesh value stays on ``volume_mesh_m3`` for transparency.
+
+    This pass just reads the flag; ``main`` decides whether the prism
+    fallback is good enough or the row warrants a kernel-grade volume.
     """
     q, _ = ifcfast.open(path).mesh_qto()
     rows: list[dict] = []
-    for guid, entity, vol, aabb in zip(
-        q["guid"], q["entity"], q["volume_m3"], q["aabb_volume_m3"]
+    for guid, entity, vol, mesh_vol, method, reliable in zip(
+        q["guid"],
+        q["entity"],
+        q["volume_m3"],
+        q["volume_mesh_m3"],
+        q["volume_method"],
+        q["volume_reliable"],
     ):
-        reliable = aabb > 0.0 and abs(vol) <= aabb * 1.001
         rows.append(
             {
                 "guid": guid,
                 "entity": entity,
-                "volume_m3": float(vol),
-                "aabb_volume_m3": float(aabb),
-                "volume_reliable": reliable,
+                "volume_m3": float(vol),  # best estimate (mesh or prism)
+                "volume_mesh_m3": float(mesh_vol),  # raw mesh value
+                "volume_method": str(method),
+                "volume_reliable": bool(reliable),
             }
         )
     return rows
@@ -122,22 +130,27 @@ def main(path: str) -> int:
         f"{t_slow * 1000:.0f} ms\n"
     )
 
-    print(f"{'guid':24} {'entity':20} {'ifcfast m3':>12} {'authoritative':>14}")
+    print(
+        f"{'guid':24} {'entity':20} {'mesh (raw)':>12} "
+        f"{'prism fallbk':>12} {'authoritative':>14}"
+    )
     for r in flagged:
         a = authoritative.get(r["guid"])
         a_str = "kernel-failed" if a is None else f"{a:.3f}"
         print(
             f"{r['guid']:24} {r['entity']:20} "
-            f"{r['volume_m3']:12.3f} {a_str:>14}"
+            f"{r['volume_mesh_m3']:12.3f} {r['volume_m3']:12.3f} {a_str:>14}"
         )
 
-    # --- 3. Merge: ifcfast where reliable, authoritative where flagged. --
+    # --- 3. Merge: kernel-grade where escalation succeeded, else keep -----
+    # ifcfast's own number (mesh volume on reliable rows; prism fallback on
+    # flagged rows the kernel couldn't resolve — already in volume_m3).
     for r in rows:
         a = authoritative.get(r["guid"])
         if not r["volume_reliable"] and a is not None:
             r["final_volume_m3"] = a
         else:
-            r["final_volume_m3"] = abs(r["volume_m3"])
+            r["final_volume_m3"] = r["volume_m3"]
 
     total = sum(r["final_volume_m3"] for r in rows)
     print(f"\nMerged total volume: {total:.1f} m3 across {len(rows)} products.")

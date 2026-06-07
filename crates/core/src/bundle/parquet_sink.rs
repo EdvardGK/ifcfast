@@ -25,8 +25,9 @@ use std::path::Path;
 use std::sync::Arc;
 
 use arrow::array::{
-    ArrayRef, BinaryBuilder, FixedSizeListBuilder, Float32Builder, Float64Builder, Int32Builder,
-    ListBuilder, RecordBatch, StringBuilder, StructBuilder, UInt32Builder, UInt64Builder,
+    ArrayRef, BinaryBuilder, BooleanBuilder, FixedSizeListBuilder, Float32Builder, Float64Builder,
+    Int32Builder, ListBuilder, RecordBatch, StringBuilder, StructBuilder, UInt32Builder,
+    UInt64Builder,
 };
 use arrow::datatypes::{DataType, Field, Fields, Schema, SchemaRef};
 use parquet::arrow::ArrowWriter;
@@ -431,6 +432,14 @@ fn build_instance_schema() -> Schema {
         // 'closed'` — open-shell volumes are mathematically undefined
         // and currently affect ~9% of Duplex products.
         Field::new("mesh_quality", DataType::Utf8, false),
+        // Volume-reliability + prism fallback (GH #60). `volume_m3`
+        // above is the best estimate (mesh when reliable, else the prism
+        // fallback); these columns expose the decision so a pipeline can
+        // route the flagged rows to an authoritative kernel.
+        Field::new("volume_mesh_m3", DataType::Float32, false),
+        Field::new("volume_prism_bound_m3", DataType::Float32, false),
+        Field::new("volume_reliable", DataType::Boolean, false),
+        Field::new("volume_method", DataType::Utf8, false),
         // List<Struct> of every distinct planar surface, sorted by
         // area descending. DuckDB UNNEST(surfaces) turns it into a
         // row-per-face stream.
@@ -577,6 +586,10 @@ fn build_instance_batch(
     let mut smallest_surface_m2 = Float32Builder::with_capacity(n);
     let mut surface_count = UInt32Builder::with_capacity(n);
     let mut mesh_quality = StringBuilder::with_capacity(n, n * 8);
+    let mut volume_mesh_m3 = Float32Builder::with_capacity(n);
+    let mut volume_prism_bound_m3 = Float32Builder::with_capacity(n);
+    let mut volume_reliable = BooleanBuilder::with_capacity(n);
+    let mut volume_method = StringBuilder::with_capacity(n, n * 8);
 
     for r in records {
         ifc_id.append_value(r.ifc_id);
@@ -722,6 +735,10 @@ fn build_instance_batch(
         smallest_surface_m2.append_value(r.smallest_surface_m2);
         surface_count.append_value(r.surface_count);
         mesh_quality.append_value(r.mesh_quality);
+        volume_mesh_m3.append_value(r.volume_mesh_m3);
+        volume_prism_bound_m3.append_value(r.volume_prism_bound_m3);
+        volume_reliable.append_value(r.volume_reliable);
+        volume_method.append_value(r.volume_method);
 
         // Per-surface list — one row per distinct planar face.
         {
@@ -774,6 +791,10 @@ fn build_instance_batch(
         Arc::new(smallest_surface_m2.finish()),
         Arc::new(surface_count.finish()),
         Arc::new(mesh_quality.finish()),
+        Arc::new(volume_mesh_m3.finish()),
+        Arc::new(volume_prism_bound_m3.finish()),
+        Arc::new(volume_reliable.finish()),
+        Arc::new(volume_method.finish()),
         Arc::new(surfaces.finish()),
     ];
 
