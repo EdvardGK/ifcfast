@@ -47,12 +47,19 @@ pip install 'ifcfast[mcp]'
 { "mcpServers": { "ifcfast": { "command": "ifcfast-mcp" } } }
 ```
 
-> **Early & unverified.** `ifcfast` is under active development and has
-> not been validated against established tools. Treat its output as
-> provisional — cross-check against `ifcopenshell` or your existing
-> toolchain before relying on it, and
-> [open an issue](https://github.com/EdvardGK/ifcfast/issues) when
-> something looks wrong. It complements `ifcopenshell` (which owns
+> **⚠️ Experimental & WIP — verify before you trust.** `ifcfast` is
+> under active development and **not** validated against established
+> tools. **We take no responsibility for incorrect output**, and you
+> should not take its numbers for granted. **Benchmark and verify** —
+> especially **geometric quantities** (`mesh_qto` volumes / areas): they
+> are the highest-risk surface and can be silently wrong on edge cases
+> (open shells, non-watertight surface models, complex booleans). Always
+> cross-check against an authoritative tool — **`ifcopenshell`** or
+> **Solibri** — before relying on a value. When you hit a discrepancy,
+> bug, blind spot, or edge case, please
+> [report it in detail](https://github.com/EdvardGK/ifcfast/issues) —
+> file, GUID, expected vs actual, and the tool you compared against — so
+> we can fix it. `ifcfast` complements `ifcopenshell` (which owns the
 > geometry kernels, authoring, and schema work) rather than replacing it.
 
 **What `ifcfast` is**

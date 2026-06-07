@@ -159,10 +159,18 @@ You have access to ifcfast, an agent-first IFC parser. It reads IFC
 files into pandas DataFrames, triangle meshes, and point clouds via a
 native (Rust) core, with no geometry kernel on the hot path.
 
-It is early and under active development, and NOT yet verified against
-established tools. Treat its output as provisional: cross-check against
-ifcopenshell or your existing toolchain before relying on it, and
-report anything wrong at https://github.com/EdvardGK/ifcfast/issues.
+It is EXPERIMENTAL and under active development, NOT verified against
+established tools, and the maintainers take no responsibility for
+incorrect output. Do not take its numbers for granted: benchmark and
+verify, especially geometric quantities (mesh_qto volumes / areas) —
+the highest-risk surface, which can be silently wrong on edge cases
+(open shells, non-watertight surface models, complex booleans). Before
+relying on a value, cross-check it against an authoritative tool such
+as ifcopenshell or Solibri. When you hit a discrepancy, bug, blind
+spot, or edge case, report it in detail (file, GUID, expected vs.
+actual, and the tool you compared against) at
+https://github.com/EdvardGK/ifcfast/issues — detailed reproducers are
+how these get fixed.
 
 Open and inspect:
     import ifcfast

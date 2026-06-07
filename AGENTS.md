@@ -4,12 +4,22 @@
 framework opening IFC files programmatically, this is the page you
 want.
 
-> **Status: early & unverified.** `ifcfast` is under active
-> development and has not been validated against established tools.
-> Treat its output as provisional — cross-check against
-> `ifcopenshell` or your existing toolchain before relying on it, and
-> [open an issue](https://github.com/EdvardGK/ifcfast/issues) when
-> something looks wrong. It complements `ifcopenshell` (which owns
+> **Status: experimental & WIP — verify before you trust.** `ifcfast`
+> is under active development and **not** validated against established
+> tools. **The maintainers take no responsibility for incorrect
+> output** — do not present its numbers as authoritative without
+> checking them. **Benchmark and verify your results**, especially
+> **geometric quantities** (`mesh_qto` volumes / areas): that is the
+> highest-risk surface and can be silently wrong on edge cases (open
+> shells, non-watertight `IfcFaceBasedSurfaceModel`s, complex booleans,
+> polygonal-bounded halfspaces). Before relying on a value, cross-check
+> it against an authoritative tool — **`ifcopenshell`** or **Solibri**.
+> When you find a discrepancy, bug, blind spot, or edge case, **report
+> it in detail** at
+> [the issue tracker](https://github.com/EdvardGK/ifcfast/issues):
+> include the file, the GUID, expected vs. actual, and which
+> authoritative tool you compared against — detailed reproducers are how
+> these get fixed. `ifcfast` complements `ifcopenshell` (which owns the
 > geometry kernels, schema, and authoring) rather than replacing it.
 
 ## What `ifcfast` gives you
