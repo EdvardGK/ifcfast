@@ -1225,6 +1225,198 @@ fn tight_bounded_halfspace_matches_csg_oracle() {
     );
 }
 
+// =====================================================================
+// W6 hardening — multiple tight bounded halfspaces on ONE product
+// (GH #64 #1). The wall (1000×200×3000, 0.6 m³) is clipped by TWO nested
+// `IfcBooleanClippingResult` levels, each a tight
+// `IfcPolygonalBoundedHalfSpace` at Z=2000 (+Z, .T. → subtracts Z<2000):
+//
+//   * cutter 1 boundary: 300×200 column at X∈[-150,150] → removes
+//     300×200×2000 = 0.12 m³.
+//   * cutter 2 boundary: 200×200 column at X∈[250,450] → removes
+//     200×200×2000 = 0.08 m³ (disjoint from cutter 1 in X).
+//
+// Correct result: 0.6 − 0.12 − 0.08 = 0.40 m³.
+//
+// The pre-#64 path cut bounded cutters by CHAINING (host = cut(host));
+// after the 1st bounded cut the host was no longer a prism, so the 2nd
+// cutter failed its prism reduction, kept its plane, and the generic
+// infinite clip removed ALL of Z<2000 across the full footprint —
+// over-cutting far past 0.40. The redesign evaluates every cutter
+// against the ORIGINAL prism, so both reduce in 2D.
+#[cfg(feature = "prism-csg-fast")]
+const WALL_WITH_TWO_TIGHT_BOUNDED_HALFSPACES: &str = r#"ISO-10303-21;
+HEADER;
+FILE_DESCRIPTION(('ViewDefinition [ReferenceView]'),'2;1');
+FILE_NAME('bounded2.ifc','2026-06-07T00:00:00',('test'),('skiplum'),'ifcfast','ifcfast','');
+FILE_SCHEMA(('IFC4'));
+ENDSEC;
+DATA;
+#1=IFCPROJECT('0Test000000000000000001',$,'p',$,$,$,$,(#5),#2);
+#2=IFCUNITASSIGNMENT((#3,#4));
+#3=IFCSIUNIT(*,.LENGTHUNIT.,.MILLI.,.METRE.);
+#4=IFCSIUNIT(*,.PLANEANGLEUNIT.,$,.RADIAN.);
+#5=IFCGEOMETRICREPRESENTATIONCONTEXT($,'Model',3,1.0E-5,#6,$);
+#6=IFCAXIS2PLACEMENT3D(#7,$,$);
+#7=IFCCARTESIANPOINT((0.,0.,0.));
+#10=IFCSITE('1Site000000000000000001',$,'s',$,$,#15,$,$,.ELEMENT.,$,$,$,$,$);
+#11=IFCBUILDING('2Bldg000000000000000001',$,'b',$,$,#15,$,$,.ELEMENT.,$,$,$);
+#12=IFCBUILDINGSTOREY('3Stor000000000000000001',$,'L1',$,$,#15,$,$,.ELEMENT.,0.0);
+#15=IFCLOCALPLACEMENT($,#6);
+#16=IFCLOCALPLACEMENT(#15,#6);
+#20=IFCRELAGGREGATES('4Agg000000000000000001',$,$,$,#1,(#10));
+#21=IFCRELAGGREGATES('5Agg000000000000000001',$,$,$,#10,(#11));
+#22=IFCRELAGGREGATES('6Agg000000000000000001',$,$,$,#11,(#12));
+#30=IFCRECTANGLEPROFILEDEF(.AREA.,'WallRect',#31,1000.,200.);
+#31=IFCAXIS2PLACEMENT2D(#7,$);
+#32=IFCDIRECTION((0.,0.,1.));
+#33=IFCEXTRUDEDAREASOLID(#30,#6,#32,3000.);
+#50=IFCCARTESIANPOINT((0.,0.,2000.));
+#51=IFCAXIS2PLACEMENT3D(#50,$,$);
+#52=IFCPLANE(#51);
+#53=IFCAXIS2PLACEMENT3D(#7,$,$);
+#54=IFCCARTESIANPOINT((-150.,-100.));
+#55=IFCCARTESIANPOINT((150.,-100.));
+#56=IFCCARTESIANPOINT((150.,100.));
+#57=IFCCARTESIANPOINT((-150.,100.));
+#58=IFCPOLYLINE((#54,#55,#56,#57,#54));
+#59=IFCPOLYGONALBOUNDEDHALFSPACE(#52,.T.,#53,#58);
+#60=IFCBOOLEANCLIPPINGRESULT(.DIFFERENCE.,#33,#59);
+#61=IFCCARTESIANPOINT((0.,0.,2000.));
+#62=IFCAXIS2PLACEMENT3D(#61,$,$);
+#63=IFCPLANE(#62);
+#64=IFCAXIS2PLACEMENT3D(#7,$,$);
+#65=IFCCARTESIANPOINT((250.,-100.));
+#66=IFCCARTESIANPOINT((450.,-100.));
+#67=IFCCARTESIANPOINT((450.,100.));
+#68=IFCCARTESIANPOINT((250.,100.));
+#69=IFCPOLYLINE((#65,#66,#67,#68,#65));
+#70=IFCPOLYGONALBOUNDEDHALFSPACE(#63,.T.,#64,#69);
+#71=IFCBOOLEANCLIPPINGRESULT(.DIFFERENCE.,#60,#70);
+#72=IFCSHAPEREPRESENTATION(#5,'Body','Clipping',(#71));
+#73=IFCPRODUCTDEFINITIONSHAPE($,$,(#72));
+#80=IFCWALL('7Wall00000000000000001',$,'BoundedMulti',$,$,#16,#73,'tag',.STANDARD.);
+#90=IFCRELCONTAINEDINSPATIALSTRUCTURE('8Rel000000000000000001',$,$,$,(#80),#12);
+ENDSEC;
+END-ISO-10303-21;
+"#;
+
+/// GH #64 #1: two tight bounded halfspaces on one product. Both must
+/// reduce against the ORIGINAL prism — the result is the analytic
+/// 0.40 m³, not the over-cut the old chaining path produced for the 2nd
+/// cutter. Cross-checked against a 3D-CSG oracle (host minus the two
+/// boundary columns).
+#[cfg(feature = "prism-csg-fast")]
+#[test]
+fn two_tight_bounded_halfspaces_both_apply() {
+    let mut mesh = capture_wall_from(WALL_WITH_TWO_TIGHT_BOUNDED_HALFSPACES);
+    assert_eq!(
+        mesh.bounded_halfspaces.len(),
+        2,
+        "fixture must carry two bounded-halfspace payloads",
+    );
+    let outcome = apply(&mut mesh, 1.0);
+    assert_eq!(outcome, Outcome::Cut, "two bounded halfspaces must cut the wall");
+    let vol = manifold_volume_m3(&mesh);
+    assert!(
+        (vol - 0.40).abs() < 0.02,
+        "both bounded cuts must apply against the original prism → ~0.40 m³ \
+         (0.6 − 0.12 − 0.08); got {vol} m³ (an over-cut here is the #1 regression)",
+    );
+
+    // Independent 3D-CSG oracle: host box minus the two boundary columns.
+    let host = axis_box([-500.0, -100.0, 0.0], [500.0, 100.0, 3000.0]);
+    let cut1 = axis_box([-150.0, -100.0, 0.0], [150.0, 100.0, 2000.0]);
+    let cut2 = axis_box([250.0, -100.0, 0.0], [450.0, 100.0, 2000.0]);
+    let (ov, oi) = csg::subtract_many(
+        &host.0,
+        &host.1,
+        &[(&cut1.0, &cut1.1), (&cut2.0, &cut2.1)],
+    )
+    .expect("oracle subtract must succeed");
+    let oracle = csg::build_manifold(&ov, &oi).expect("oracle is manifold");
+    let oracle_vol = oracle.volume() * 1.0e-9_f64;
+    assert!(
+        (vol - oracle_vol).abs() / oracle_vol < 0.02,
+        "fast-path {vol} m³ vs CSG oracle {oracle_vol} m³ — must agree within 2 %",
+    );
+}
+
+// =====================================================================
+// W6 hardening — a bounded halfspace whose boundary MISSES the host.
+// Same wall as the tight fixture, but the 300×200 boundary is shifted to
+// X∈[2000,2300] — entirely outside the wall (X∈[-500,500]). The bounded
+// region (subtracted side ∩ boundary column) never intersects the wall,
+// so the faithful cut removes NOTHING → 0.6 m³ (uncut).
+//
+// This guards against "fixing" the disjoint case into a fallback to the
+// infinite-plane clip: that clip ignores the boundary and would shear
+// off all of Z<2000 → 0.20 m³, the F6 over-cut. Uncut (0.6) is correct.
+#[cfg(feature = "prism-csg-fast")]
+const WALL_WITH_BOUNDED_HALFSPACE_MISSING_HOST: &str = r#"ISO-10303-21;
+HEADER;
+FILE_DESCRIPTION(('ViewDefinition [ReferenceView]'),'2;1');
+FILE_NAME('miss.ifc','2026-06-07T00:00:00',('test'),('skiplum'),'ifcfast','ifcfast','');
+FILE_SCHEMA(('IFC4'));
+ENDSEC;
+DATA;
+#1=IFCPROJECT('0Test000000000000000001',$,'p',$,$,$,$,(#5),#2);
+#2=IFCUNITASSIGNMENT((#3,#4));
+#3=IFCSIUNIT(*,.LENGTHUNIT.,.MILLI.,.METRE.);
+#4=IFCSIUNIT(*,.PLANEANGLEUNIT.,$,.RADIAN.);
+#5=IFCGEOMETRICREPRESENTATIONCONTEXT($,'Model',3,1.0E-5,#6,$);
+#6=IFCAXIS2PLACEMENT3D(#7,$,$);
+#7=IFCCARTESIANPOINT((0.,0.,0.));
+#10=IFCSITE('1Site000000000000000001',$,'s',$,$,#15,$,$,.ELEMENT.,$,$,$,$,$);
+#11=IFCBUILDING('2Bldg000000000000000001',$,'b',$,$,#15,$,$,.ELEMENT.,$,$,$);
+#12=IFCBUILDINGSTOREY('3Stor000000000000000001',$,'L1',$,$,#15,$,$,.ELEMENT.,0.0);
+#15=IFCLOCALPLACEMENT($,#6);
+#16=IFCLOCALPLACEMENT(#15,#6);
+#20=IFCRELAGGREGATES('4Agg000000000000000001',$,$,$,#1,(#10));
+#21=IFCRELAGGREGATES('5Agg000000000000000001',$,$,$,#10,(#11));
+#22=IFCRELAGGREGATES('6Agg000000000000000001',$,$,$,#11,(#12));
+#30=IFCRECTANGLEPROFILEDEF(.AREA.,'WallRect',#31,1000.,200.);
+#31=IFCAXIS2PLACEMENT2D(#7,$);
+#32=IFCDIRECTION((0.,0.,1.));
+#33=IFCEXTRUDEDAREASOLID(#30,#6,#32,3000.);
+#50=IFCCARTESIANPOINT((0.,0.,2000.));
+#51=IFCAXIS2PLACEMENT3D(#50,$,$);
+#52=IFCPLANE(#51);
+#53=IFCAXIS2PLACEMENT3D(#7,$,$);
+#54=IFCCARTESIANPOINT((2000.,-100.));
+#55=IFCCARTESIANPOINT((2300.,-100.));
+#56=IFCCARTESIANPOINT((2300.,100.));
+#57=IFCCARTESIANPOINT((2000.,100.));
+#58=IFCPOLYLINE((#54,#55,#56,#57,#54));
+#59=IFCPOLYGONALBOUNDEDHALFSPACE(#52,.T.,#53,#58);
+#60=IFCBOOLEANCLIPPINGRESULT(.DIFFERENCE.,#33,#59);
+#70=IFCSHAPEREPRESENTATION(#5,'Body','Clipping',(#60));
+#71=IFCPRODUCTDEFINITIONSHAPE($,$,(#70));
+#80=IFCWALL('7Wall00000000000000001',$,'BoundedMiss',$,$,#16,#71,'tag',.STANDARD.);
+#90=IFCRELCONTAINEDINSPATIALSTRUCTURE('8Rel000000000000000001',$,$,$,(#80),#12);
+ENDSEC;
+END-ISO-10303-21;
+"#;
+
+/// GH #64 (review follow-up): a bounded halfspace whose boundary column
+/// is entirely outside the host removes nothing — the wall stays at its
+/// full 0.6 m³. NOT 0.20 m³ (the infinite-clip over-cut you'd get by
+/// routing the disjoint case to the fallback plane clip).
+#[cfg(feature = "prism-csg-fast")]
+#[test]
+fn bounded_halfspace_missing_host_is_uncut() {
+    let mut mesh = capture_wall_from(WALL_WITH_BOUNDED_HALFSPACE_MISSING_HOST);
+    assert_eq!(mesh.bounded_halfspaces.len(), 1, "fixture carries one payload");
+    let _ = apply(&mut mesh, 1.0);
+    let vol = manifold_volume_m3(&mesh);
+    assert!(
+        (vol - 0.60).abs() < 0.02,
+        "a bounded boundary that misses the host must leave it uncut (~0.60 m³); \
+         got {vol} m³ (0.20 here would mean the disjoint case wrongly fell back to \
+         the over-cutting infinite-plane clip)",
+    );
+}
+
 /// Axis-aligned closed box as (vertices, indices), CCW outward winding.
 #[cfg(feature = "prism-csg-fast")]
 fn axis_box(min: [f32; 3], max: [f32; 3]) -> (Vec<f32>, Vec<u32>) {

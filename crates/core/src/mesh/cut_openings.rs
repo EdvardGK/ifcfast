@@ -108,35 +108,29 @@ pub fn apply(mesh: &mut ProductMesh, unit_scale: f32) -> Outcome {
     }
 
     // ---- W6 bounded polygonal-halfspace fast-path (prism-csg-fast). ----
-    // For each carried `BoundedHalfspacePayload` whose boundary is *tight*
-    // (smaller than the host cross-section) and whose host reduces to a
-    // single prism along the plane normal, perform the *bounded* cut — a
-    // 2D `difference(host_footprint, boundary)` re-extruded over the
-    // subtracted sweep band — instead of the over-aggressive infinite
-    // plane clip (F6). Each handled payload's slab-derived plane is
-    // dropped from `halfspace_planes` so the generic clip below does NOT
-    // double-cut it. Non-tight / non-reducible payloads are left for the
-    // plane-clip path (correct there, since an over-sized boundary does
-    // not constrain the cut). Default builds (feature off) skip this
-    // entirely and stay byte-identical.
+    // Reduce the host to a prism along the bounded cutters' shared sweep
+    // axis ONCE, then evaluate EVERY carried `BoundedHalfspacePayload`
+    // against that ORIGINAL prism — never against an already-cut host
+    // (GH #64 #1: chaining bounded cuts let the 2nd+ cutter fail its
+    // prism check and silently fall back to the over-aggressive infinite
+    // clip). Tight, axis-parallel, host-crossing cutters are subtracted
+    // by a region-decomposition of the footprint (one prism per disjoint
+    // kept region — GH #64 #4: no coincident internal caps), instead of
+    // the F6 infinite-plane clip. Each handled cutter's slab-derived
+    // plane is dropped from `halfspace_planes` so the generic clip below
+    // does NOT double-cut it. Non-tight / non-axis / non-reducible
+    // payloads keep their plane for the infinite clip (correct there: an
+    // over-sized boundary does not constrain the cut). Default builds
+    // (feature off) skip this entirely and stay byte-identical.
     #[cfg(feature = "prism-csg-fast")]
     {
         let bounded = std::mem::take(&mut mesh.bounded_halfspaces);
-        for payload in &bounded {
-            if host.1.is_empty() {
-                break;
-            }
-            match bounded_halfspace::try_bounded_cut(&host, payload) {
-                Some(new_host) => {
-                    host = new_host;
-                    // Drop the matching slab-derived plane so the generic
-                    // loop doesn't re-clip this cutter.
-                    drop_matching_plane(&mut halfspace_planes, payload);
-                }
-                None => {
-                    // Not tight or not reducible — leave its plane in
-                    // `halfspace_planes` for the infinite-plane clip.
-                }
+        if let Some((new_v, new_i, handled)) =
+            bounded_halfspace::try_bounded_cut_multi(&host, &bounded)
+        {
+            host = (new_v, new_i);
+            for &i in &handled {
+                drop_matching_plane(&mut halfspace_planes, &bounded[i]);
             }
         }
     }
@@ -286,15 +280,28 @@ fn drop_matching_plane(planes: &mut Vec<(Vec3, Vec3)>, payload: &BoundedHalfspac
 }
 
 /// W6 bounded polygonal-halfspace cut (prism-csg-fast). Pure-Rust 2D
-/// reduction of an `IfcPolygonalBoundedHalfSpace` cutter: when the
-/// boundary is tight and the host is a prism along the plane normal, the
-/// cut is `host_footprint × kept_band  ∪  (host_footprint − boundary) ×
-/// removed_band`. No CSG kernel; reuses `polygon_bool` + `extrude_polygon`.
+/// reduction of `IfcPolygonalBoundedHalfSpace` cutters: when each
+/// boundary is tight and the host is a prism along the shared plane
+/// normal, the kept solid is a *region-decomposition* of the host
+/// footprint into disjoint columns, each swept over the sweep interval
+/// the bounded cutters leave intact. No CSG kernel; reuses `polygon_bool`
+/// + `extrude_polygon`.
+///
+/// Multi-cutter correctness (GH #64 #1): all cutters are evaluated
+/// against the ORIGINAL host prism, never against an already-cut mesh —
+/// chaining 3D cuts broke the prism reduction for the 2nd+ cutter and
+/// dropped it to the over-cutting infinite clip.
+///
+/// Interface correctness (GH #64 #4): the output is a set of
+/// footprint-DISJOINT prisms (the `difference`/`intersection` partition),
+/// so no two prisms share a coincident cap — the old two-glued-bands
+/// construction produced internal double faces over the host−boundary
+/// region.
 #[cfg(feature = "prism-csg-fast")]
 mod bounded_halfspace {
     use super::*;
-    use crate::mesh::extrusion::extrude_polygon;
-    use crate::mesh::polygon_bool;
+    use crate::mesh::extrusion::{extrude_polygon, LocalMesh};
+    use crate::mesh::polygon_bool::{self, Shape};
     use crate::mesh::profile::Polygon2D;
     use glam::{Mat4, Vec2, Vec4};
 
@@ -302,20 +309,176 @@ mod bounded_halfspace {
     /// planes (the two prism caps) within this fraction of the host's
     /// total sweep extent for the reduction to apply.
     const CAP_CLUSTER_FRAC: f32 = 0.02;
-    /// A boundary is "not tight" (and the cheap plane-clip stays correct)
-    /// when its AABB strictly contains the host AABB by at least this
-    /// margin in BOTH in-plane dimensions.
-    const TIGHT_MARGIN_FRAC: f32 = 0.10;
+    /// A boundary is *tight* only if `host − boundary` exceeds this
+    /// fraction of the host footprint area. Below it the boundary
+    /// effectively contains the host (Revit's oversized convention) and
+    /// the well-tested infinite-plane clip is the correct result. A
+    /// relative threshold also absorbs the sub-area slivers i_overlay can
+    /// leave at millimetre scale.
+    const TIGHT_AREA_FRAC: f64 = 0.005;
+    /// Two normals count as the same sweep axis when |dot| ≥ this.
+    const AXIS_DOT_MIN: f32 = 0.9999;
 
-    /// Attempt the bounded cut. Returns the new host `(vertices, indices)`
-    /// on success, or `None` to fall back to the infinite-plane clip
-    /// (non-tight boundary, or host not reducible to a prism along the
-    /// plane normal).
-    pub(super) fn try_bounded_cut(
+    /// The host reduced to a single straight prism swept along `n`,
+    /// computed ONCE and shared across every bounded cutter.
+    struct HostPrism {
+        e1: Vec3,
+        e2: Vec3,
+        n: Vec3,
+        origin: Vec3,
+        s_min: f32,
+        s_max: f32,
+        fp: Polygon2D,
+    }
+
+    /// One kept prism in the region-decomposition: a footprint region
+    /// (disjoint from every other band's footprint) swept over
+    /// `[s_lo, s_hi]` in the prism's sweep coordinate.
+    struct Band {
+        fp: Shape,
+        s_lo: f32,
+        s_hi: f32,
+    }
+
+    /// A bounded cutter that engages the 2D path: tight, axis-parallel to
+    /// the host prism, and crossing the host sweep span.
+    struct Engaged {
+        /// Index back into the caller's payload slice (so `apply` can drop
+        /// the matching slab plane from the infinite-clip list).
+        idx: usize,
+        /// Boundary footprint in the prism's `(e1, e2)` frame.
+        boundary: Shape,
+        /// Plane crossing in the prism's sweep coordinate.
+        s_p: f32,
+        /// `true` if the subtracted side is `s > s_p` (cutter normal
+        /// parallel to the prism axis), `false` if `s < s_p` (anti-parallel).
+        removes_above: bool,
+    }
+
+    /// Attempt the bounded cut over all carried `payloads`. Returns the
+    /// new host `(vertices, indices)` plus the indices of the payloads
+    /// actually handled in 2D (their slab planes must be dropped from the
+    /// infinite-clip list), or `None` when nothing engaged — host not
+    /// reducible to a prism along the reference axis, or every cutter
+    /// non-tight / off-axis / non-crossing — in which case `apply` leaves
+    /// the host untouched and every plane flows to the infinite clip.
+    pub(super) fn try_bounded_cut_multi(
         host: &(Vec<f32>, Vec<u32>),
-        payload: &BoundedHalfspacePayload,
-    ) -> Option<(Vec<f32>, Vec<u32>)> {
-        let n = payload.plane_normal.normalize_or_zero();
+        payloads: &[BoundedHalfspacePayload],
+    ) -> Option<(Vec<f32>, Vec<u32>, Vec<usize>)> {
+        if payloads.is_empty() || host.1.is_empty() {
+            return None;
+        }
+
+        // Reference frame from the first payload. Cutters whose normal is
+        // not parallel to this axis are left to the infinite-plane
+        // fallback (a wall clipped by two non-parallel bounded halfspaces
+        // is rare; the common case is one product, one shared axis).
+        let prism = reduce_host_to_prism(host, &payloads[0])?;
+
+        let mut engaged: Vec<Engaged> = Vec::new();
+        for (idx, p) in payloads.iter().enumerate() {
+            let ni = p.plane_normal.normalize_or_zero();
+            let d = ni.dot(prism.n);
+            if d.abs() < AXIS_DOT_MIN {
+                continue; // different sweep axis → fallback
+            }
+            let boundary_fp =
+                project_boundary(&p.boundary, &p.boundary_xform, prism.origin, prism.e1, prism.e2);
+            if boundary_fp.outer.len() < 3 {
+                continue;
+            }
+            if !is_tight_boundary(&prism.fp, &boundary_fp) {
+                continue; // oversized boundary → infinite clip is correct
+            }
+            let s_p = (p.plane_point - prism.origin).dot(prism.n);
+            if s_p <= prism.s_min + 1e-4 || s_p >= prism.s_max - 1e-4 {
+                continue; // plane does not cross the host → fallback
+            }
+            engaged.push(Engaged {
+                idx,
+                boundary: polygon_bool::shape_from_polygon2d(&boundary_fp),
+                s_p,
+                removes_above: d > 0.0,
+            });
+        }
+        if engaged.is_empty() {
+            return None;
+        }
+
+        // Region-decompose. Start from the whole footprint at full sweep
+        // height; for each engaged cutter split every band into the part
+        // OUTSIDE its boundary (interval unchanged) and the part INSIDE
+        // (interval clamped to the kept side of the plane). `difference`
+        // and `intersection` partition each band into disjoint pieces, so
+        // all bands stay footprint-disjoint — each extrudes to one prism
+        // with no coincident internal caps.
+        let host_area = polygon_area(&prism.fp.outer).abs() as f64;
+        let min_area = (host_area * 1e-6).max(1e-9);
+        let host_shape = polygon_bool::shape_from_polygon2d(&prism.fp);
+        let mut bands = vec![Band {
+            fp: host_shape,
+            s_lo: prism.s_min,
+            s_hi: prism.s_max,
+        }];
+        for e in &engaged {
+            let mut next: Vec<Band> = Vec::with_capacity(bands.len() + 1);
+            for band in &bands {
+                // Outside this boundary: cutter doesn't touch it.
+                for sh in polygon_bool::difference(&band.fp, std::slice::from_ref(&e.boundary)) {
+                    if shape_area(&sh) > min_area {
+                        next.push(Band {
+                            fp: sh,
+                            s_lo: band.s_lo,
+                            s_hi: band.s_hi,
+                        });
+                    }
+                }
+                // Inside this boundary: clamp the interval to the kept side.
+                let (lo, hi) = if e.removes_above {
+                    (band.s_lo, band.s_hi.min(e.s_p))
+                } else {
+                    (band.s_lo.max(e.s_p), band.s_hi)
+                };
+                if hi - lo > 1e-4 {
+                    for sh in polygon_bool::intersection(&band.fp, std::slice::from_ref(&e.boundary)) {
+                        if shape_area(&sh) > min_area {
+                            next.push(Band { fp: sh, s_lo: lo, s_hi: hi });
+                        }
+                    }
+                }
+            }
+            bands = next;
+            if bands.is_empty() {
+                break; // host fully consumed by the cutters
+            }
+        }
+
+        // Extrude every surviving band along n, back into the working frame.
+        let basis = basis_to_frame(prism.e1, prism.e2, prism.n, prism.origin);
+        let mut out = LocalMesh::new();
+        for band in &bands {
+            let poly = polygon_bool::polygon2d_from_shape(&band.fp);
+            if poly.outer.len() < 3 {
+                continue;
+            }
+            let band_origin = translate_along_axis(&basis, band.s_lo);
+            let sub = extrude_polygon(&poly, Vec3::Z, band.s_hi - band.s_lo, band_origin);
+            append(&mut out, &sub);
+        }
+
+        let handled: Vec<usize> = engaged.iter().map(|e| e.idx).collect();
+        Some((out.vertices, out.indices, handled))
+    }
+
+    /// Reduce the host mesh to a single straight prism swept along the
+    /// reference payload's plane normal, or `None` if it isn't one (the
+    /// non-reducible fallback). Computed once and reused for all cutters.
+    fn reduce_host_to_prism(
+        host: &(Vec<f32>, Vec<u32>),
+        ref_payload: &BoundedHalfspacePayload,
+    ) -> Option<HostPrism> {
+        let n = ref_payload.plane_normal.normalize_or_zero();
         if n.length_squared() < 0.5 {
             return None;
         }
@@ -326,9 +489,8 @@ mod bounded_halfspace {
             return None;
         }
         let e2 = n.cross(e1).normalize_or_zero();
-        let origin = payload.plane_point;
+        let origin = ref_payload.plane_point;
 
-        // --- Host must reduce to a 2-cap prism along n. ---------------
         // Sweep coordinate s = (v - origin)·n for every host vertex.
         let verts = &host.0;
         if verts.len() < 9 {
@@ -345,10 +507,10 @@ mod bounded_halfspace {
         if span <= 1e-4 {
             return None;
         }
-        // Every vertex must sit within CAP_CLUSTER_FRAC·span of one of
-        // the two extreme sweep planes — i.e. the host is a straight
-        // prism swept along n (the engageable case: a Z-perpendicular
-        // wall extrusion cut by a plane whose normal is the sweep axis).
+        // Every vertex must sit within CAP_CLUSTER_FRAC·span of one of the
+        // two extreme sweep planes — i.e. the host is a straight prism
+        // swept along n (a Z-perpendicular wall extrusion cut by a plane
+        // whose normal is the sweep axis).
         let cap_eps = (span * CAP_CLUSTER_FRAC).max(1e-3);
         for c in verts.chunks_exact(3) {
             let s = (Vec3::new(c[0], c[1], c[2]) - origin).dot(n);
@@ -357,109 +519,61 @@ mod bounded_halfspace {
             }
         }
 
-        // --- Host footprint = convex hull of vertices in (e1, e2). ----
-        // Exact for a convex prism cap. A non-convex host would be
-        // over-approximated, so we reject it (below) by comparing the
-        // hull's swept volume against the host mesh's signed volume.
+        // Host footprint = convex hull of vertices in (e1, e2). Exact for
+        // a convex prism cap. A non-convex host is over-approximated, so
+        // it is rejected by comparing the hull's swept volume against the
+        // host mesh's signed volume.
         let mut pts2d: Vec<Vec2> = Vec::with_capacity(verts.len() / 3);
         for c in verts.chunks_exact(3) {
             let d = Vec3::new(c[0], c[1], c[2]) - origin;
             pts2d.push(Vec2::new(d.dot(e1), d.dot(e2)));
         }
-        let host_fp = convex_hull(&pts2d)?;
-        if host_fp.len() < 3 {
+        let hull = convex_hull(&pts2d)?;
+        if hull.len() < 3 {
             return None;
         }
-        let host_fp = Polygon2D { outer: host_fp, holes: Vec::new() };
+        let fp = Polygon2D { outer: hull, holes: Vec::new() };
 
-        // Reject non-prism hosts: hull_area × span must match the host
-        // mesh volume within 2 % (a concave wall, or one with internal
-        // detail, fails here and falls back to the plane clip).
-        let hull_area = polygon_area(&host_fp.outer).abs();
+        let hull_area = polygon_area(&fp.outer).abs();
         let prism_vol = hull_area * span;
         let mesh_vol = signed_volume(&host.0, &host.1).abs();
         if mesh_vol <= 0.0 || (prism_vol - mesh_vol).abs() > 0.02 * prism_vol {
             return None;
         }
 
-        // --- Boundary footprint in (e1, e2). --------------------------
-        let boundary_fp = project_boundary(&payload.boundary, &payload.boundary_xform, origin, e1, e2);
-        if boundary_fp.outer.len() < 3 {
-            return None;
-        }
-
-        // --- Tightness test. ------------------------------------------
-        if !is_tight_boundary(&host_fp.outer, &boundary_fp.outer) {
-            return None; // boundary doesn't constrain → cheap plane clip.
-        }
-
-        // --- Sweep bands. n points into the SUBTRACTED side, so the
-        // removed band is s ∈ (s_p, s_max] and the kept band is
-        // [s_min, s_p], where s_p = (plane_point - origin)·n = 0 (origin
-        // IS the plane point). Clamp s_p into the host span; if the plane
-        // doesn't cross the host the bounded cut is a no-op / full clip,
-        // which the generic path handles — bail.
-        let s_p = 0.0_f32;
-        if s_p <= s_min + 1e-4 || s_p >= s_max - 1e-4 {
-            return None;
-        }
-
-        // --- 2D difference for the removed band: keep host_fp − boundary.
-        let host_shape = polygon_bool::shape_from_polygon2d(&host_fp);
-        let cut_shape = polygon_bool::shape_from_polygon2d(&boundary_fp);
-        let removed_band_keep = polygon_bool::difference(&host_shape, &[cut_shape]);
-
-        // --- Re-extrude both bands along n in the (e1, e2, n) frame. ---
-        let basis = basis_to_frame(e1, e2, n, origin);
-        let mut out = crate::mesh::extrusion::LocalMesh::new();
-
-        // Kept band: full host footprint, [s_min, s_p].
-        {
-            let band_origin = translate_along_axis(&basis, s_min);
-            let sub = extrude_polygon(&host_fp, Vec3::Z, s_p - s_min, band_origin);
-            append(&mut out, &sub);
-        }
-        // Removed band: (host − boundary), [s_p, s_max].
-        for shape in &removed_band_keep {
-            let poly = polygon_bool::polygon2d_from_shape(shape);
-            if poly.outer.len() < 3 {
-                continue;
-            }
-            let band_origin = translate_along_axis(&basis, s_p);
-            let sub = extrude_polygon(&poly, Vec3::Z, s_max - s_p, band_origin);
-            append(&mut out, &sub);
-        }
-
-        if out.indices.is_empty() {
-            return None;
-        }
-        Some((out.vertices, out.indices))
+        Some(HostPrism { e1, e2, n, origin, s_min, s_max, fp })
     }
 
-    /// A boundary is tight unless its AABB strictly contains the host
-    /// AABB by ≥ `TIGHT_MARGIN_FRAC` in both in-plane dims. Mirrors the
-    /// blueprint's detector: an over-sized boundary (Revit's 5×5 m
-    /// convention) is NOT tight and the cheap plane clip is correct.
-    pub(super) fn is_tight_boundary(host_outer: &[Vec2], boundary_outer: &[Vec2]) -> bool {
-        let (hmin, hmax) = aabb2(host_outer);
-        let (bmin, bmax) = aabb2(boundary_outer);
-        let hx = hmax.x - hmin.x;
-        let hy = hmax.y - hmin.y;
-        let contains_x =
-            bmin.x <= hmin.x - TIGHT_MARGIN_FRAC * hx && bmax.x >= hmax.x + TIGHT_MARGIN_FRAC * hx;
-        let contains_y =
-            bmin.y <= hmin.y - TIGHT_MARGIN_FRAC * hy && bmax.y >= hmax.y + TIGHT_MARGIN_FRAC * hy;
-        !(contains_x && contains_y)
+    /// A boundary is tight unless it effectively contains the host
+    /// footprint. Tested by polygon containment — `host − boundary` must
+    /// exceed `TIGHT_AREA_FRAC` of the host area — NOT by AABB comparison
+    /// (GH #64 #2: a genuinely-tight *rotated* rectangle inflates its
+    /// axis-aligned bbox and was mis-read as "not tight", over-cutting
+    /// angled / non-orthogonal-grid buildings). Frame-agnostic: both
+    /// footprints are already in the prism's `(e1, e2)` frame.
+    ///
+    /// A boundary entirely DISJOINT from the host is (correctly) tight:
+    /// `host − boundary = host`, so the cutter is handled here and the 2D
+    /// path removes nothing (`host ∩ boundary = ∅`) — the faithful result
+    /// for a bounded halfspace whose column misses the host. It is NOT a
+    /// candidate for the infinite-plane fallback: that clip ignores the
+    /// boundary and would shear off the whole subtracted side (the F6
+    /// over-cut). So "handled → no-op → plane dropped" is deliberate; see
+    /// `bounded_halfspace_missing_host_is_uncut` in the integration tests.
+    pub(super) fn is_tight_boundary(host_fp: &Polygon2D, boundary_fp: &Polygon2D) -> bool {
+        let host_shape = polygon_bool::shape_from_polygon2d(host_fp);
+        let boundary_shape = polygon_bool::shape_from_polygon2d(boundary_fp);
+        let remainder = polygon_bool::difference(&host_shape, &[boundary_shape]);
+        let rem_area: f64 = remainder.iter().map(shape_area).sum();
+        let host_area = shape_area(&host_shape);
+        rem_area > TIGHT_AREA_FRAC * host_area.max(1.0)
     }
 
-    fn aabb2(ring: &[Vec2]) -> (Vec2, Vec2) {
-        let mut mn = Vec2::new(f32::INFINITY, f32::INFINITY);
-        let mut mx = Vec2::new(f32::NEG_INFINITY, f32::NEG_INFINITY);
-        for p in ring {
-            mn = mn.min(*p);
-            mx = mx.max(*p);
-        }
-        (mn, mx)
+    /// Net area of a facade shape: |outer| − Σ|holes|, clamped at 0.
+    fn shape_area(s: &Shape) -> f64 {
+        let outer = s.first().map(|r| polygon_bool::signed_area(r).abs()).unwrap_or(0.0);
+        let holes: f64 = s.iter().skip(1).map(|r| polygon_bool::signed_area(r).abs()).sum();
+        (outer - holes).max(0.0)
     }
 
     fn project_boundary(
@@ -564,47 +678,62 @@ mod bounded_halfspace {
     }
 
     /// Signed mesh volume (divergence theorem) of a flat-buffer mesh.
+    /// Accumulates in f64 (GH #64 #9): the sum sits directly under the
+    /// 2 % prism-reduction gate, where f32 cancellation across many large
+    /// terms (mm-scale building coords cubed) would smear the comparison.
     fn signed_volume(vertices: &[f32], indices: &[u32]) -> f32 {
-        let mut v6 = 0.0_f32;
+        let mut v6 = 0.0_f64;
         for t in indices.chunks_exact(3) {
             let (a, b, c) = (t[0] as usize, t[1] as usize, t[2] as usize);
             if (a * 3 + 2).max(b * 3 + 2).max(c * 3 + 2) >= vertices.len() {
                 continue;
             }
-            let ax = vertices[a * 3];
-            let ay = vertices[a * 3 + 1];
-            let az = vertices[a * 3 + 2];
-            let bx = vertices[b * 3];
-            let by = vertices[b * 3 + 1];
-            let bz = vertices[b * 3 + 2];
-            let cx = vertices[c * 3];
-            let cy = vertices[c * 3 + 1];
-            let cz = vertices[c * 3 + 2];
+            let ax = vertices[a * 3] as f64;
+            let ay = vertices[a * 3 + 1] as f64;
+            let az = vertices[a * 3 + 2] as f64;
+            let bx = vertices[b * 3] as f64;
+            let by = vertices[b * 3 + 1] as f64;
+            let bz = vertices[b * 3 + 2] as f64;
+            let cx = vertices[c * 3] as f64;
+            let cy = vertices[c * 3 + 1] as f64;
+            let cz = vertices[c * 3 + 2] as f64;
             v6 += ax * (by * cz - bz * cy) + ay * (bz * cx - bx * cz) + az * (bx * cy - by * cx);
         }
-        v6 / 6.0
+        (v6 / 6.0) as f32
     }
 
     #[cfg(test)]
     mod tests {
         use super::*;
 
+        fn poly(ring: &[(f32, f32)]) -> Polygon2D {
+            Polygon2D {
+                outer: ring.iter().map(|&(x, y)| Vec2::new(x, y)).collect(),
+                holes: Vec::new(),
+            }
+        }
+
+        /// Rotate a ring by `deg` about the origin — for the rotated-
+        /// boundary test (#2).
+        fn rotate(ring: &[(f32, f32)], deg: f32) -> Polygon2D {
+            let r = deg.to_radians();
+            let (s, c) = (r.sin(), r.cos());
+            Polygon2D {
+                outer: ring
+                    .iter()
+                    .map(|&(x, y)| Vec2::new(x * c - y * s, x * s + y * c))
+                    .collect(),
+                holes: Vec::new(),
+            }
+        }
+
         #[test]
         fn tight_boundary_is_tight() {
             // Host 1000×200, boundary 300×200 centred — strictly smaller
             // in X → tight.
-            let host = vec![
-                Vec2::new(-500.0, -100.0),
-                Vec2::new(500.0, -100.0),
-                Vec2::new(500.0, 100.0),
-                Vec2::new(-500.0, 100.0),
-            ];
-            let boundary = vec![
-                Vec2::new(-150.0, -100.0),
-                Vec2::new(150.0, -100.0),
-                Vec2::new(150.0, 100.0),
-                Vec2::new(-150.0, 100.0),
-            ];
+            let host = poly(&[(-500.0, -100.0), (500.0, -100.0), (500.0, 100.0), (-500.0, 100.0)]);
+            let boundary =
+                poly(&[(-150.0, -100.0), (150.0, -100.0), (150.0, 100.0), (-150.0, 100.0)]);
             assert!(is_tight_boundary(&host, &boundary));
         }
 
@@ -612,18 +741,57 @@ mod bounded_halfspace {
         fn oversized_boundary_is_not_tight() {
             // Revit's oversize convention: boundary 5000×5000 around a
             // 1000×200 host → NOT tight (cheap plane clip is correct).
-            let host = vec![
-                Vec2::new(-500.0, -100.0),
-                Vec2::new(500.0, -100.0),
-                Vec2::new(500.0, 100.0),
-                Vec2::new(-500.0, 100.0),
-            ];
-            let boundary = vec![
-                Vec2::new(-2500.0, -2500.0),
-                Vec2::new(2500.0, -2500.0),
-                Vec2::new(2500.0, 2500.0),
-                Vec2::new(-2500.0, 2500.0),
-            ];
+            let host = poly(&[(-500.0, -100.0), (500.0, -100.0), (500.0, 100.0), (-500.0, 100.0)]);
+            let boundary = poly(&[
+                (-2500.0, -2500.0),
+                (2500.0, -2500.0),
+                (2500.0, 2500.0),
+                (-2500.0, 2500.0),
+            ]);
+            assert!(!is_tight_boundary(&host, &boundary));
+        }
+
+        /// GH #64 #2 — the case the old AABB test got WRONG. A thin
+        /// 1400×100 strip rotated 45° has an axis-aligned bbox of
+        /// ≈1061×1061 that fully CONTAINS the 800×800 host bbox — so the
+        /// old `is_tight_boundary` (AABB-containment) declared it "not
+        /// tight" and routed it to the over-cutting infinite-plane clip,
+        /// even though the strip only crosses a diagonal band of the
+        /// host. The polygon-containment test sees a large `host −
+        /// boundary` remainder and correctly classifies it as tight.
+        #[test]
+        fn rotated_strip_boundary_is_tight() {
+            let host = poly(&[(-400.0, -400.0), (400.0, -400.0), (400.0, 400.0), (-400.0, 400.0)]);
+            // 1400×100 strip about the origin, rotated 45°.
+            let strip = [(-700.0, -50.0), (700.0, -50.0), (700.0, 50.0), (-700.0, 50.0)];
+            let boundary = rotate(&strip, 45.0);
+            assert!(
+                is_tight_boundary(&host, &boundary),
+                "a rotated thin strip whose AABB engulfs the host is still tight",
+            );
+        }
+
+        /// And a genuinely-rotated rectangular boundary that IS tight in
+        /// the rotated frame stays tight (rotation invariance, the
+        /// happy-path complement to the strip case).
+        #[test]
+        fn rotated_tight_boundary_is_tight() {
+            let host_ring = [(-500.0, -100.0), (500.0, -100.0), (500.0, 100.0), (-500.0, 100.0)];
+            let bnd_ring = [(-150.0, -100.0), (150.0, -100.0), (150.0, 100.0), (-150.0, 100.0)];
+            let host = rotate(&host_ring, 30.0);
+            let boundary = rotate(&bnd_ring, 30.0);
+            assert!(is_tight_boundary(&host, &boundary));
+        }
+
+        /// A rotated oversized boundary must still read as not-tight — the
+        /// containment test is rotation-invariant in both directions.
+        #[test]
+        fn rotated_oversized_boundary_is_not_tight() {
+            let host_ring = [(-500.0, -100.0), (500.0, -100.0), (500.0, 100.0), (-500.0, 100.0)];
+            let bnd_ring =
+                [(-2500.0, -2500.0), (2500.0, -2500.0), (2500.0, 2500.0), (-2500.0, 2500.0)];
+            let host = rotate(&host_ring, 37.0);
+            let boundary = rotate(&bnd_ring, 37.0);
             assert!(!is_tight_boundary(&host, &boundary));
         }
 

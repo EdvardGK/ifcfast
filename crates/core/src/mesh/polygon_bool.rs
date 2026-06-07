@@ -74,6 +74,35 @@ pub fn difference(subject: &Shape, cutters: &[Shape]) -> Vec<Shape> {
     subj.overlay_as::<i64>(&clip, OverlayRule::Difference, FillRule::NonZero)
 }
 
+/// Intersect `subject` with the union of `clip`, returning the common
+/// region as zero or more shapes. Empty result ⇒ no overlap. The clip
+/// contours are unioned under `NonZero` (same as [`difference`]), so
+/// multiple/overlapping clip rings fold correctly. Winding is normalised
+/// here, so callers need not pre-orient.
+///
+/// Paired with [`difference`] this partitions a `subject` against a
+/// `clip` into two disjoint pieces (`subject − clip` and `subject ∩
+/// clip`) whose union is `subject` and whose intersection is empty — the
+/// W6 region-decomposition relies on exactly that disjointness to emit
+/// prisms with non-overlapping footprints (no internal double faces).
+pub fn intersection(subject: &Shape, clip: &[Shape]) -> Vec<Shape> {
+    let subj = normalized(subject);
+
+    let mut c: Shape = Vec::new();
+    for s in clip {
+        for (i, ring) in s.iter().enumerate() {
+            if ring.len() >= 3 {
+                c.push(oriented(ring, i == 0));
+            }
+        }
+    }
+    if c.is_empty() {
+        return Vec::new();
+    }
+
+    subj.overlay_as::<i64>(&c, OverlayRule::Intersect, FillRule::NonZero)
+}
+
 /// Signed area of a ring via the shoelace formula. Positive ⇒ CCW,
 /// negative ⇒ CW (in a right-handed XY frame). Degenerate rings
 /// (< 3 points) return 0.
