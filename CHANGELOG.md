@@ -7,6 +7,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.36] - 2026-06-08
+
+> Regression hotfix for the v0.4.35 half-space cut over-report on
+> millimetre-unit models (GH #65), bundled with the GH #64 W6
+> cut-openings hardening. Default builds: net cut meshes / `mesh_qto`
+> volumes change only for **non-metre** files (corrected toward
+> ifcopenshell ground truth); metre files are byte-identical.
+
+### Fixed — half-space cut over-reported volume on mm-unit models (GH #65)
+
+- **The half-space clip's "on-plane" tolerance is a numerical round-off
+  guard in source units again — not a physical 1 mm.** v0.4.35's W3
+  change resolved the guard as `1 mm / unit_scale`, which is `1.0`
+  source units in a millimetre file — coarse enough to classify
+  near-plane faces as "outside" and drop them *without a replacement
+  cap*, leaving an open shell whose `mesh_qto` volume over-integrated.
+  This re-opened the #39 half-space over-report on every mm-unit model
+  (Sannergata ARK_E walls +6 %…+136 %, incl. the original #39 headline
+  wall `2Nf9lR2y`). The guard is back to `1e-3` source units
+  (metre / mm / foot resolve identically; km-scale files tighten so the
+  band stays sub-millimetre). Sannergata ARK_E vs ifcopenshell 0.8.5:
+  383/389 walls within ±1 % (98.5 %, up from v0.4.34's 97.4 %),
+  over-reporters 6 → 1, `mesh_quality` `open_shell` → `closed` on the
+  fixed walls; metre files byte-identical. **Reverses the v0.4.35
+  "unit-aware cut tolerance" change below.**
+
+### Fixed — W6 bounded-halfspace cut-openings hardening (GH #64)
+
+- **Multi-cutter / rotated-boundary / mirror-safe** corrections to the
+  `prism-csg-fast` bounded-halfspace fast-path: reduce the host to a
+  prism once and evaluate every carried payload against the original
+  (region-decomposition into footprint-disjoint prisms — no coincident
+  internal caps); polygon-containment boundary-tightness test (replaces
+  the axis-aligned bbox compare); payload-owned exact cutting planes
+  (retires the slab-centroid plane + the float-tolerance plane match);
+  inverse-transpose normal baking for mirrored/negative-determinant
+  families. Polygon-bounded correctness + the #61 build-gating fix also
+  corrected the default path on two Sannergata walls (`2tg5mWEt`,
+  `3qxjXn6G`).
+
 ## [0.4.35] - 2026-06-07
 
 > Bundled CSG-foundation + QTO-reliability release. Cache schema → 16

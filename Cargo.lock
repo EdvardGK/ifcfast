@@ -847,7 +847,7 @@ dependencies = [
 
 [[package]]
 name = "ifcfast-core"
-version = "0.4.35"
+version = "0.4.36"
 dependencies = [
  "arrow",
  "crossbeam-channel",
