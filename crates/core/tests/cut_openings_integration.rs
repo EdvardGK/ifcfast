@@ -302,7 +302,14 @@ fn deep_bcr_with_three_halfspaces_cuts_correctly() {
         .find(|m| m.entity == "IfcWall")
         .unwrap_or_else(|| panic!("deep-clipped wall must reach the sink; got entities: {:?}", entities));
 
-    let outcome = apply(&mut mesh, 1.0);
+    // The fixture is authored in millimetres (`.MILLI.`), so the cut
+    // must run with the matching `unit_scale` (0.001) — the value the
+    // production extractor passes. Passing 1.0 here historically masked
+    // GH #65: under W3 the mm path took a physical-1 mm on-plane band
+    // (1.0 source units), which suppressed cut-caps and over-reported;
+    // the metre `unit_scale` 1.0 took the tiny band and stayed correct,
+    // so this test never exercised the broken path.
+    let outcome = apply(&mut mesh, 0.001);
     assert_eq!(
         outcome,
         Outcome::Cut,

@@ -515,15 +515,19 @@ exposed in full first so downstream parquet columns and Python
 wrappers can pivot on a stable shape. See
 `docs/plans/2026-06-05_cut-openings-manifold-replacement.md`.
 
-**Unit-aware cut tolerance (v0.4.35+, GH #58 / W3).** The half-space
-clipper's "on-plane" snap tolerance is a physical 1 mm, resolved into
-the model's source units from `ifcfast.unit_scale`. A model authored
-in metres is unchanged (the historical baseline); millimetre and
-imperial models now clip at the corrected physical scale instead of a
-constant that meant 0.001 mm or 0.0003 m respectively. Net cut meshes
-and `mesh_qto` volumes can shift for non-metre files — this is the bug
-fix, not a regression. Emergency parity is not provided; re-bundle to
-pick up the corrected geometry (cache schema bumped to 14).
+**Half-space cut on-plane guard (v0.4.36+, GH #65).** The half-space
+clipper's "on-plane" tolerance is a *numerical* round-off guard of
+`1e-3` in the model's source units — NOT a physical building tolerance.
+It is unit-robust (metre / mm / foot all resolve to `1e-3` source
+units; large-unit km-scale files tighten further so the band never
+exceeds a physical millimetre). The v0.4.35 build (GH #58 / W3) briefly
+reframed this as a physical 1 mm, which became 1.0 source units in a
+millimetre file — coarse enough to drop near-plane faces without a
+replacement cap, leaving an open shell whose `mesh_qto` volume
+over-reported (GH #65 re-opened the #39 over-report on every mm-unit
+model: +6 %…+136 % on Sannergata ARK_E). v0.4.36 restores the source-
+unit guard; metre files are byte-identical across all three versions,
+and mm/imperial `mesh_qto` volumes return to their correct (cut) values.
 
 ## What `ifcfast` does NOT do (yet)
 
