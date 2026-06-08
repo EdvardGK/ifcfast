@@ -15,6 +15,7 @@
 //! is the host", "this volume is the cut") that downstream tools and
 //! human readers need to make decisions and surgically edit the model.
 
+pub mod axis;
 pub mod boolean;
 pub mod brep;
 pub mod csg_primitive;
@@ -46,6 +47,7 @@ pub mod revolved;
 pub mod sample;
 pub mod stats;
 pub mod styles;
+pub mod voxel;
 
 use std::collections::HashMap;
 use std::time::Instant;
