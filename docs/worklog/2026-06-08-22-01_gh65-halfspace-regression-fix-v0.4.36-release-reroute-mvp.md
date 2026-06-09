@@ -33,3 +33,43 @@ Two threads. **(1)** Fixed and shipped GH #65 — a high-severity regression in 
 - Push to main + `v*` tag-push are autonomous for this repo; v0.4.36 shipped autonomously after confirming the outward-facing publish with the user. `feat/reroute-primitives` pushed at session end on user request.
 - The GH #63 design doc `docs/plans/2026-06-07_reroute-design.md` referenced in memory was never committed (lost untracked file); the GH #63 design-synthesis comment is the surviving record. Offered to reconstruct it; not done yet.
 - Reroute modules are leaf prototypes (behind `mesh`, no public API / substrate / cache change). 131 lib tests green, clippy clean throughout.
+
+## Addendum — continued session (post-worklog): reroute demo + G55 real-data extraction
+
+After the worklog the session continued on the reroute thread.
+
+**Runnable demo (`a3ab4dd`, pushed).** `crates/core/examples/reroute_demo.rs` —
+`cargo run -p ifcfast-core --no-default-features --features mesh --example reroute_demo`
+prints two ASCII scenes proving the pipeline: a `Duct` routing around a wall+column
+(plan view, 45°/90° bends) and a `GravityDrain` descending under a beam (side view,
+`MonotoneDown` → 0 uphill steps).
+
+**G55 obstacle extraction (exploration — not committed; scratch scripts reference
+private client paths).** Goal: feed the reroute occupancy from the real G55 models.
+- **G55_ARK** (156 MB, IFC2x3, mm): **0 IfcSpace** (so spaces can't drive keep-out —
+  pivoted to ceilings/slabs/walls per the user). 342 `IfcCovering` all `.CEILING.`
+  (suspended ceilings), 152 slabs, 4173 walls. Floor-banded **by geometry (placement
+  Z), not relationships** → ~9 storeys at ~3.6 m (slab/ceiling levels 2.30 / 5.90 /
+  9.45 / 13.05 / 16.68 / 20.27 / 23.84 / 27.50 m). `scripts/g55_floor_bands.py`.
+- **Memory method that worked:** `ifcopenshell.open()` WITHOUT the geometry kernel +
+  `util.placement` → placement Z only, peak **1.9 GB / 7 s** on the 156 MB ARK. This
+  sidesteps the eager-mesher trap (see Notes); per-floor geometry would use the
+  ifcopenshell `iterator` with `include=<one band's elements>` (memory-bounded).
+- **RIB (beams) pulled from ACC.** Local RIB IFCs were 0-byte failed-sync stubs; the
+  real ones live on ACC (Grønland 55 → `…/1_IFC/`). Downloaded the **Revit** one to
+  `scratch/g55/G55_RIB.ifc` (2.8 MB, Revit 25.4, **72 beams + 54 columns + 19 slabs**);
+  the 27.6 MB `G55_RIBprefab.ifc` is the **Tekla** prefab — ignored per instruction.
+  Beams band onto the same ARK floor levels; columns span floors (placement Z=0, need
+  geometry extent to band).
+
+**The gate for an actual G55 route:** `occupancy`/`routing` are Rust-only — no Python
+entry point — so extracted meshes can't reach them. Next concrete build is a **PyO3
+binding** (meshes → `occupancy::build` → `find_path`), then a one-floor proof.
+
+### Gotcha for the next session
+`Model.meshes()` / `iter_meshes()` run the **Rust mesher EAGERLY (whole model, one
+batch)** — the docstring says so explicitly ("not lower peak RAM"). Do NOT point them
+at the 156 MB ARK on the 16 GB box. For per-floor work use ifcopenshell placement
+(no-geom) for banding, and the ifcopenshell `iterator` with `include=` for per-band
+tessellation. (A true streaming/Z-banded extractor in ifcfast core is the real fix —
+candidate follow-up.)
