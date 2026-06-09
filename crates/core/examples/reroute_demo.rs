@@ -50,7 +50,9 @@ fn main() {
     demo_drain_fall();
     println!();
     println!("Legend:  # obstacle   S start   G goal   * route   . free");
-    println!("Each call is `routing::find_path(occupancy, start, goal, SystemConstraints)`.");
+    println!(
+        "Each call is `routing::find_path(occupancy, start, goal, SystemConstraints, clearance_m)`."
+    );
 }
 
 /// Demo 1 — top-down plan view: a duct routing horizontally around a wall
@@ -82,7 +84,7 @@ fn demo_plan_view() {
 
     // Ducting: level changes allowed but penalised; ≤90° bends, prefer 45°.
     let c = SystemConstraints::for_kind(SystemKind::Duct);
-    let route = find_path(&occ, start, goal, &c).expect("route exists");
+    let route = find_path(&occ, start, goal, &c, 0.0).expect("route exists");
 
     println!("=== Demo 1 — duct routing around a wall + column (plan view) ===");
     println!(
@@ -132,7 +134,7 @@ fn demo_drain_fall() {
     let goal = g.world_to_voxel(Vec3::new(5.9, 0.25, 1.0)).unwrap(); // low outlet
 
     let c = SystemConstraints::for_kind(SystemKind::GravityDrain);
-    let route = find_path(&occ, start, goal, &c).expect("drain route exists");
+    let route = find_path(&occ, start, goal, &c, 0.0).expect("drain route exists");
 
     println!();
     println!("=== Demo 2 — gravity drain, must run downhill under a beam (side view) ===");

@@ -151,20 +151,28 @@ fn bend_deg(a: [i32; 3], b: [i32; 3]) -> f32 {
 }
 
 /// Find an MEP-constrained route from `start` to `goal` through the go
-/// (free) voxels of `occ`. Returns `None` if an endpoint is occupied /
-/// out-of-bounds, or no route exists under the constraints.
+/// (free) voxels of `occ`. `clearance_m` is the room the routed object's
+/// centreline needs on every side (its radius + insulation + safety): a
+/// voxel is traversable only where the nearest obstacle is more than
+/// `clearance_m` away ([`Occupancy::is_clear`]), so the path is feasible
+/// for the real cross-section, not an infinitely-thin line. Pass `0.0` to
+/// route a bare centreline. Returns `None` if an endpoint lacks the
+/// clearance / is out-of-bounds, or no route exists under the constraints.
 pub fn find_path(
     occ: &Occupancy,
     start: [usize; 3],
     goal: [usize; 3],
     c: &SystemConstraints,
+    clearance_m: f32,
 ) -> Option<Route> {
     let [nx, ny, nz] = occ.grid.dims;
     let in_grid = |v: [usize; 3]| v[0] < nx && v[1] < ny && v[2] < nz;
     if !in_grid(start) || !in_grid(goal) {
         return None;
     }
-    if !occ.is_free(start[0], start[1], start[2]) || !occ.is_free(goal[0], goal[1], goal[2]) {
+    if !occ.is_clear(start[0], start[1], start[2], clearance_m)
+        || !occ.is_clear(goal[0], goal[1], goal[2], clearance_m)
+    {
         return None;
     }
     let cell = occ.grid.cell;
@@ -224,7 +232,7 @@ pub fn find_path(
                 continue;
             }
             let nv = [ni as usize, nj as usize, nk as usize];
-            if !occ.is_free(nv[0], nv[1], nv[2]) {
+            if !occ.is_clear(nv[0], nv[1], nv[2], clearance_m) {
                 continue;
             }
             // Step cost: geometric length, ×Z penalty if vertical, + a
@@ -351,7 +359,7 @@ mod tests {
     #[test]
     fn straight_path_has_no_bends() {
         let occ = empty(10, 3, 3);
-        let r = find_path(&occ, [0, 1, 1], [9, 1, 1], &SystemConstraints::default()).unwrap();
+        let r = find_path(&occ, [0, 1, 1], [9, 1, 1], &SystemConstraints::default(), 0.0).unwrap();
         assert_eq!(r.voxels.first(), Some(&[0, 1, 1]));
         assert_eq!(r.voxels.last(), Some(&[9, 1, 1]));
         assert_eq!(r.bends, 0);
@@ -364,7 +372,7 @@ mod tests {
         // not an L of right angles — so length ≈ 5·√2·cell < Manhattan.
         let occ = empty(6, 6, 3);
         let c = SystemConstraints { z_mode: ZMode::Planar, ..SystemConstraints::default() };
-        let r = find_path(&occ, [0, 0, 1], [5, 5, 1], &c).unwrap();
+        let r = find_path(&occ, [0, 0, 1], [5, 5, 1], &c, 0.0).unwrap();
         let manhattan = 10.0 * 0.1;
         assert!(r.length_m < manhattan - 1e-3, "diagonal route, got {} m", r.length_m);
         assert!(r.max_bend_deg <= 90.0 + 1e-3, "no hairpins, got {}", r.max_bend_deg);
@@ -382,7 +390,7 @@ mod tests {
             &[],
         )
         .unwrap();
-        let r = find_path(&occ, [0, 1, 1], [9, 1, 1], &SystemConstraints::default()).unwrap();
+        let r = find_path(&occ, [0, 1, 1], [9, 1, 1], &SystemConstraints::default(), 0.0).unwrap();
         assert!(r.bends >= 1, "must detour, got {} bends", r.bends);
         assert!(r.max_bend_deg <= 90.0 + 1e-3, "≤90° bends only, got {}", r.max_bend_deg);
         // Detour avoids the wall voxels (x col 4, y 0..7).
@@ -394,7 +402,7 @@ mod tests {
         let occ = empty(6, 6, 6);
         let c = SystemConstraints::for_kind(SystemKind::PressurePipe);
         assert_eq!(c.z_mode, ZMode::Planar);
-        let r = find_path(&occ, [0, 0, 3], [5, 5, 3], &c).unwrap();
+        let r = find_path(&occ, [0, 0, 3], [5, 5, 3], &c, 0.0).unwrap();
         assert!(r.voxels.iter().all(|v| v[2] == 3), "pressure system holds elevation");
     }
 
@@ -403,7 +411,7 @@ mod tests {
         let occ = empty(6, 3, 6);
         let c = SystemConstraints::for_kind(SystemKind::GravityDrain);
         assert_eq!(c.z_mode, ZMode::MonotoneDown);
-        let r = find_path(&occ, [0, 1, 5], [5, 1, 2], &c).unwrap();
+        let r = find_path(&occ, [0, 1, 5], [5, 1, 2], &c, 0.0).unwrap();
         for w in r.voxels.windows(2) {
             assert!(w[1][2] <= w[0][2], "drain never rises: {:?} -> {:?}", w[0], w[1]);
         }
@@ -416,8 +424,43 @@ mod tests {
         // must keep the Unknown route on the start layer.
         let occ = empty(8, 3, 4);
         let c = SystemConstraints::default(); // Unknown
-        let r = find_path(&occ, [0, 1, 1], [7, 1, 1], &c).unwrap();
+        let r = find_path(&occ, [0, 1, 1], [7, 1, 1], &c, 0.0).unwrap();
         assert!(r.voxels.iter().all(|v| v[2] == 1), "stays at elevation when system unknown");
+    }
+
+    #[test]
+    fn clearance_gates_a_narrow_gap() {
+        // Two slabs leave a ~0.4 m wide free gap down the middle of a 1 m
+        // box (walls at x 0.0..0.3 and x 0.7..1.0, full Y/Z). A thin
+        // centreline (clearance 0) threads the gap; an object needing
+        // 0.25 m of clearance on each side (0.5 m wide) cannot — the gap's
+        // half-width is only ~0.2 m.
+        let max = Vec3::new(1.0, 0.4, 0.4);
+        let p = OccupancyParams { cell_m: 0.05, default_keepout_m: 2.4 };
+        let left = box_mesh(Vec3::new(0.0, -0.1, -0.1), Vec3::new(0.3, 0.5, 0.5));
+        let right = box_mesh(Vec3::new(0.7, -0.1, -0.1), Vec3::new(1.0, 0.5, 0.5));
+        let occ = build(
+            Vec3::ZERO,
+            max,
+            p,
+            &[(&left.0, &left.1), (&right.0, &right.1)],
+            &[],
+        )
+        .unwrap();
+
+        // Endpoints sit in the open ends of the gap column (x≈0.5).
+        let g = &occ.grid;
+        let s = g.world_to_voxel(Vec3::new(0.5, 0.2, 0.05)).unwrap();
+        let t = g.world_to_voxel(Vec3::new(0.5, 0.2, 0.35)).unwrap();
+        let c = SystemConstraints::default();
+
+        // Thin centreline: routes through the gap.
+        assert!(find_path(&occ, s, t, &c, 0.0).is_some(), "thin route threads the gap");
+        // Needs 0.25 m clearance each side → 0.5 m wide → gap too narrow.
+        assert!(
+            find_path(&occ, s, t, &c, 0.25).is_none(),
+            "0.5 m-wide object must not fit a ~0.4 m gap"
+        );
     }
 
     #[test]
@@ -434,6 +477,6 @@ mod tests {
             &[],
         )
         .unwrap();
-        assert!(find_path(&occ, [0, 2, 2], [9, 2, 2], &SystemConstraints::default()).is_none());
+        assert!(find_path(&occ, [0, 2, 2], [9, 2, 2], &SystemConstraints::default(), 0.0).is_none());
     }
 }

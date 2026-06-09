@@ -63,20 +63,61 @@ pub struct KeepoutSpace {
 }
 
 /// The go/nogo voxel field. `grid.occ[idx] != 0` is **nogo** (obstacle or
-/// keep-out); zero is **go** (routable).
+/// keep-out); zero is **go** (routable). `clearance2_vox[idx]` is the
+/// **squared** distance (in voxel units) from each voxel centre to the
+/// nearest nogo voxel centre — the configuration-space clearance field.
+/// One field serves every object diameter: a route centreline that needs
+/// radius `r` is admissible exactly where `clearance(v) > r`
+/// ([`Occupancy::is_clear`]), so the same build routes a thin pipe and a
+/// fat duct, each at its own radius (GH #63).
 #[derive(Clone, Debug)]
 pub struct Occupancy {
     pub grid: VoxelGrid,
+    /// Squared distance-to-nearest-nogo in voxel² (Felzenszwalb–Huttenlocher
+    /// exact EDT). Nogo voxels are `0.0`; an empty grid is uniformly the
+    /// `big` sentinel (clear at any radius). Index with `grid.idx`.
+    pub clearance2_vox: Vec<f32>,
 }
 
 impl Occupancy {
-    /// True when voxel `(i, j, k)` is in-bounds and routable (go).
+    /// True when voxel `(i, j, k)` is in-bounds and routable (go), ignoring
+    /// object size. Equivalent to `is_clear(.., 0.0)`.
     #[inline]
     pub fn is_free(&self, i: usize, j: usize, k: usize) -> bool {
         self.grid.in_bounds(i, j, k) && !self.grid.is_occupied(i, j, k)
     }
 
-    /// Count of routable (go) voxels.
+    /// True when an object whose centreline needs `clearance_m` metres of
+    /// room can occupy voxel `(i, j, k)` — i.e. the nearest nogo voxel is
+    /// strictly more than `clearance_m` away. `clearance_m <= 0` reduces to
+    /// [`is_free`](Self::is_free) (any non-occupied voxel). This is the
+    /// C-space inflation, evaluated per-radius against the prebuilt field
+    /// so no obstacle dilation or rebuild is needed.
+    #[inline]
+    pub fn is_clear(&self, i: usize, j: usize, k: usize, clearance_m: f32) -> bool {
+        if !self.grid.in_bounds(i, j, k) {
+            return false;
+        }
+        let d2 = self.clearance2_vox[self.grid.idx(i, j, k)];
+        if clearance_m <= 0.0 {
+            return d2 > 0.0; // not the obstacle voxel itself
+        }
+        let cell = self.grid.cell;
+        d2 * cell * cell > clearance_m * clearance_m
+    }
+
+    /// World-metre clearance at voxel `(i, j, k)` — distance from its centre
+    /// to the nearest nogo. `f32::INFINITY`-large for an obstacle-free grid;
+    /// `0` for a nogo voxel. The "width of the free channel" at that point.
+    #[inline]
+    pub fn clearance_m(&self, i: usize, j: usize, k: usize) -> f32 {
+        if !self.grid.in_bounds(i, j, k) {
+            return 0.0;
+        }
+        self.clearance2_vox[self.grid.idx(i, j, k)].sqrt() * self.grid.cell
+    }
+
+    /// Count of routable (go) voxels, ignoring object size.
     pub fn free_count(&self) -> usize {
         self.grid.occ.iter().filter(|&&v| v == 0).count()
     }
@@ -119,7 +160,123 @@ pub fn build(
         rasterize_solid_3d(&mut grid, &prism.vertices, &prism.indices);
     }
 
-    Some(Occupancy { grid })
+    let clearance2_vox = edt::squared_distance_field(&grid);
+    Some(Occupancy { grid, clearance2_vox })
+}
+
+/// Exact squared Euclidean distance transform (Felzenszwalb & Huttenlocher,
+/// "Distance Transforms of Sampled Functions", 2012). Separable: a 1D
+/// lower-envelope-of-parabolas pass along X, then Y, then Z, each O(n) per
+/// line, gives the exact squared distance (voxel²) from every voxel to the
+/// nearest source. Sources here are the nogo voxels, so the result is the
+/// clearance field consumed by [`Occupancy::is_clear`].
+mod edt {
+    use crate::mesh::voxel::VoxelGrid;
+
+    /// 1D squared distance transform of seed costs `f` into `out`. `v`/`z`
+    /// are caller scratch (`v` len ≥ n, `z` len ≥ n+1) so the 3D driver
+    /// allocates once, not per line.
+    fn dt_1d(f: &[f32], out: &mut [f32], v: &mut [usize], z: &mut [f32]) {
+        let n = f.len();
+        if n == 0 {
+            return;
+        }
+        // Intersection abscissa of the parabolas seeded at q and p.
+        let para = |q: usize, p: usize| -> f32 {
+            let fq = f[q] + (q * q) as f32;
+            let fp = f[p] + (p * p) as f32;
+            (fq - fp) / (2.0 * q as f32 - 2.0 * p as f32)
+        };
+        let mut k = 0usize; // index of the rightmost parabola in the lower envelope
+        v[0] = 0;
+        z[0] = f32::NEG_INFINITY;
+        z[1] = f32::INFINITY;
+        for q in 1..n {
+            let mut s = para(q, v[k]);
+            // z[0] = -inf guards the decrement: a finite s is never <= -inf,
+            // so k never underflows past 0.
+            while s <= z[k] {
+                k -= 1;
+                s = para(q, v[k]);
+            }
+            k += 1;
+            v[k] = q;
+            z[k] = s;
+            z[k + 1] = f32::INFINITY;
+        }
+        let mut k = 0usize;
+        for (q, slot) in out.iter_mut().enumerate() {
+            while z[k + 1] < q as f32 {
+                k += 1;
+            }
+            let d = q as f32 - v[k] as f32;
+            *slot = d * d + f[v[k]];
+        }
+    }
+
+    /// Squared distance (voxel²) from every voxel to the nearest occupied
+    /// (nogo) voxel. Obstacle-free grids come back uniformly at a finite
+    /// `big` sentinel (larger than any achievable squared distance).
+    pub fn squared_distance_field(grid: &VoxelGrid) -> Vec<f32> {
+        let [nx, ny, nz] = grid.dims;
+        let n = nx * ny * nz;
+        if n == 0 {
+            return Vec::new();
+        }
+        // Sentinel strictly exceeds the largest real squared distance and
+        // stays exact in f32 (integers ≤ 2^24).
+        let big = (nx * nx + ny * ny + nz * nz) as f32 + 1.0;
+        let mut f: Vec<f32> = grid
+            .occ
+            .iter()
+            .map(|&o| if o != 0 { 0.0 } else { big })
+            .collect();
+
+        let lin = |i: usize, j: usize, k: usize| (k * ny + j) * nx + i;
+        let maxdim = nx.max(ny).max(nz);
+        let mut line = vec![0f32; maxdim];
+        let mut out = vec![0f32; maxdim];
+        let mut v = vec![0usize; maxdim];
+        let mut z = vec![0f32; maxdim + 1];
+
+        // Pass 1: along X.
+        for k in 0..nz {
+            for j in 0..ny {
+                for i in 0..nx {
+                    line[i] = f[lin(i, j, k)];
+                }
+                dt_1d(&line[..nx], &mut out[..nx], &mut v[..nx], &mut z[..nx + 1]);
+                for i in 0..nx {
+                    f[lin(i, j, k)] = out[i];
+                }
+            }
+        }
+        // Pass 2: along Y.
+        for k in 0..nz {
+            for i in 0..nx {
+                for j in 0..ny {
+                    line[j] = f[lin(i, j, k)];
+                }
+                dt_1d(&line[..ny], &mut out[..ny], &mut v[..ny], &mut z[..ny + 1]);
+                for j in 0..ny {
+                    f[lin(i, j, k)] = out[j];
+                }
+            }
+        }
+        // Pass 3: along Z.
+        for j in 0..ny {
+            for i in 0..nx {
+                for k in 0..nz {
+                    line[k] = f[lin(i, j, k)];
+                }
+                dt_1d(&line[..nz], &mut out[..nz], &mut v[..nz], &mut z[..nz + 1]);
+                for k in 0..nz {
+                    f[lin(i, j, k)] = out[k];
+                }
+            }
+        }
+        f
+    }
 }
 
 #[cfg(test)]

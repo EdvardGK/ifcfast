@@ -71,6 +71,7 @@ from .header import IFCHeader, header
 from .model import Model, ProductRow, StoreyRow, open_ifc as open
 from .bundle import bundle
 from .clash import clash
+from .reroute import reroute
 from . import cache, classify
 
 # Re-export the Rust-side IfcfastError so callers can
@@ -99,6 +100,7 @@ __all__ = [
     "example_path",
     "header",
     "open",
+    "reroute",
     "system_prompt",
 ]
 

@@ -2307,6 +2307,343 @@ mod python {
         Ok(out)
     }
 
+    // ----- reroute (constraint-aware MEP rerouting, GH #63) ------------
+
+    /// Map a free-form system string to a [`SystemKind`]. Lenient and
+    /// case-insensitive so callers can pass either our canonical keys
+    /// (`"pressure"`, `"drain"`, `"duct"`, `"unknown"`) or values lifted
+    /// straight from IFC (`"GravityDrainage"`, `"PressureSewer"`, …).
+    #[cfg(feature = "mesh")]
+    fn system_kind_from_str(s: &str) -> crate::routing::SystemKind {
+        use crate::routing::SystemKind;
+        let s = s.to_ascii_lowercase();
+        if s.contains("pressure") {
+            SystemKind::PressurePipe
+        } else if s.contains("drain") || s.contains("gravity") || s.contains("sewer") {
+            SystemKind::GravityDrain
+        } else if s.contains("duct") || s.contains("vent") || s.contains("air") {
+            SystemKind::Duct
+        } else {
+            SystemKind::Unknown
+        }
+    }
+
+    /// Constraint-aware MEP rerouting (GH #63): voxelize obstacle solids
+    /// (+ per-space keep-out prisms) into one go/nogo field, then route
+    /// each requested start→goal segment through the free voxels under
+    /// its system's MEP discipline.
+    ///
+    /// This is the **engine** layer — facts, not policy. The caller owns
+    /// the geometry: obstacles are closed triangle meshes in **world
+    /// metres** (placement + `unit_scale` already baked), which is
+    /// deliberate — it lets a memory-bounded extractor (e.g. ifcopenshell
+    /// `iterator(include=…)` on one storey at a time) feed this without
+    /// ever meshing the whole model. The occupancy field is built **once**
+    /// and shared across every request, so routing N displaced elements
+    /// after a clash run is one call.
+    ///
+    /// `obstacles`: list of `(vertices, indices)` — `vertices` flat
+    /// `[x0,y0,z0, x1,y1,z1, …]` world metres, `indices` triangle list.
+    /// `requests`: list of `((sx,sy,sz), (gx,gy,gz), system)` — start /
+    /// goal world points and a system string (see [`system_kind_from_str`]).
+    /// `keepouts`: list of `(footprint, floor_z_m, height_m)` — `footprint`
+    /// a world-metre XY ring `[(x,y), …]`, swept `[floor_z, floor_z+height]`
+    /// (height `None` → `default_keepout_m`). `bounds_min` / `bounds_max`:
+    /// world-metre AABB of the grid; `None` → auto-fit to obstacles +
+    /// requests + keepouts with a small pad. `snap_voxels`: when a
+    /// start/goal lands on a nogo voxel, search this Chebyshev radius for
+    /// the nearest free voxel (0 disables) — endpoints of the element
+    /// being rerouted commonly sit inside their own keep-out.
+    #[cfg(feature = "mesh")]
+    #[pyfunction]
+    #[pyo3(signature = (
+        obstacles,
+        requests,
+        bounds_min = None,
+        bounds_max = None,
+        cell_m = 0.1,
+        keepouts = Vec::new(),
+        default_keepout_m = 2.4,
+        snap_voxels = 2,
+        clearances = Vec::new(),
+    ))]
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+    pub fn reroute<'py>(
+        py: Python<'py>,
+        obstacles: Vec<(Vec<f32>, Vec<u32>)>,
+        requests: Vec<((f64, f64, f64), (f64, f64, f64), String)>,
+        bounds_min: Option<(f64, f64, f64)>,
+        bounds_max: Option<(f64, f64, f64)>,
+        cell_m: f64,
+        keepouts: Vec<(Vec<(f64, f64)>, f64, Option<f64>)>,
+        default_keepout_m: f64,
+        snap_voxels: usize,
+        clearances: Vec<f32>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        catch_panic(|| {
+            use glam::{Vec2, Vec3};
+
+            use crate::mesh::profile::Polygon2D;
+            use crate::occupancy::{build, KeepoutSpace, OccupancyParams};
+            use crate::routing::{find_path, SystemConstraints};
+
+            if !(cell_m.is_finite() && cell_m > 0.0) {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "reroute: cell_m must be finite and positive, got {cell_m}"
+                )));
+            }
+
+            // Per-request clearance (metres the centreline keeps from any
+            // obstacle = object radius + insulation + safety). Broadcast a
+            // scalar, accept one-per-request, or default to 0 (bare line).
+            let n = requests.len();
+            let clearances: Vec<f32> = match clearances.len() {
+                0 => vec![0.0; n],
+                1 => vec![clearances[0].max(0.0); n],
+                len if len == n => clearances.iter().map(|c| c.max(0.0)).collect(),
+                len => {
+                    return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                        "reroute: clearances must be empty, length 1, or length \
+                         {n} (one per request), got {len}"
+                    )));
+                }
+            };
+            let max_clearance = clearances.iter().copied().fold(0.0_f32, f32::max);
+
+            // Resolve grid bounds: explicit if both given, else auto-fit
+            // the AABB of every input coordinate (obstacle verts, request
+            // endpoints, keepout footprint corners at both floor and head).
+            let (min, max) = match (bounds_min, bounds_max) {
+                (Some(a), Some(b)) => (
+                    Vec3::new(a.0 as f32, a.1 as f32, a.2 as f32),
+                    Vec3::new(b.0 as f32, b.1 as f32, b.2 as f32),
+                ),
+                _ => {
+                    let mut lo = Vec3::splat(f32::INFINITY);
+                    let mut hi = Vec3::splat(f32::NEG_INFINITY);
+                    let mut acc = |p: Vec3| {
+                        lo = lo.min(p);
+                        hi = hi.max(p);
+                    };
+                    for (v, _) in &obstacles {
+                        for c in v.chunks_exact(3) {
+                            acc(Vec3::new(c[0], c[1], c[2]));
+                        }
+                    }
+                    for (s, g, _) in &requests {
+                        acc(Vec3::new(s.0 as f32, s.1 as f32, s.2 as f32));
+                        acc(Vec3::new(g.0 as f32, g.1 as f32, g.2 as f32));
+                    }
+                    for (fp, fz, h) in &keepouts {
+                        let top = *fz as f32 + h.unwrap_or(default_keepout_m) as f32;
+                        for (x, y) in fp {
+                            acc(Vec3::new(*x as f32, *y as f32, *fz as f32));
+                            acc(Vec3::new(*x as f32, *y as f32, top));
+                        }
+                    }
+                    if !lo.is_finite() || !hi.is_finite() || lo.cmpgt(hi).any() {
+                        return Err(pyo3::exceptions::PyValueError::new_err(
+                            "reroute: cannot auto-fit bounds (no finite input \
+                             coordinates); pass bounds_min / bounds_max explicitly.",
+                        ));
+                    }
+                    // Pad by the largest clearance too, so the inflated
+                    // free test has room around obstacles near the bound.
+                    let pad = Vec3::splat(2.0 * cell_m as f32 + max_clearance);
+                    (lo - pad, hi + pad)
+                }
+            };
+
+            let params = OccupancyParams {
+                cell_m: cell_m as f32,
+                default_keepout_m: default_keepout_m as f32,
+            };
+
+            // Build occupancy once. Borrow the owned mesh Vecs as slices.
+            let obstacle_refs: Vec<(&[f32], &[u32])> = obstacles
+                .iter()
+                .map(|(v, i)| (v.as_slice(), i.as_slice()))
+                .collect();
+            let keepout_spaces: Vec<KeepoutSpace> = keepouts
+                .iter()
+                .map(|(fp, fz, h)| KeepoutSpace {
+                    footprint: Polygon2D {
+                        outer: fp.iter().map(|(x, y)| Vec2::new(*x as f32, *y as f32)).collect(),
+                        holes: Vec::new(),
+                    },
+                    floor_z_m: *fz as f32,
+                    height_m: h.map(|v| v as f32),
+                })
+                .collect();
+
+            let t_occ = Instant::now();
+            let occ = py
+                .allow_threads(|| build(min, max, params, &obstacle_refs, &keepout_spaces))
+                .ok_or_else(|| {
+                    pyo3::exceptions::PyValueError::new_err(
+                        "reroute: occupancy grid could not be allocated \
+                         (check bounds are finite and cell_m is sane).",
+                    )
+                })?;
+            let occupancy_ms = t_occ.elapsed().as_secs_f64() * 1000.0;
+
+            let dims = occ.grid.dims;
+            let origin = occ.grid.origin;
+            let cell = occ.grid.cell;
+
+            // Clamp a world point into the grid's voxel index range. Always
+            // returns an in-bounds index (so snap has a valid seed even when
+            // the point is outside the padded bounds).
+            let clamp_vox = |p: Vec3| -> [usize; 3] {
+                let rel = (p - origin) / cell;
+                let cl = |x: f32, n: usize| {
+                    if !x.is_finite() || x < 0.0 {
+                        0
+                    } else {
+                        (x.floor() as usize).min(n.saturating_sub(1))
+                    }
+                };
+                [cl(rel.x, dims[0]), cl(rel.y, dims[1]), cl(rel.z, dims[2])]
+            };
+
+            // Nearest voxel with `clearance_m` room within Chebyshev radius
+            // `snap_voxels` of `seed`. Returns `(voxel, snapped)`; `snapped`
+            // is false when the seed itself already clears. `None` if nothing
+            // in range fits (endpoint sealed in for this object size).
+            let snap_clear = |seed: [usize; 3], clearance_m: f32| -> Option<([usize; 3], bool)> {
+                if occ.is_clear(seed[0], seed[1], seed[2], clearance_m) {
+                    return Some((seed, false));
+                }
+                for r in 1..=(snap_voxels as i64) {
+                    let mut best: Option<[usize; 3]> = None;
+                    let mut best_d2 = i64::MAX;
+                    for dz in -r..=r {
+                        for dy in -r..=r {
+                            for dx in -r..=r {
+                                // Only the shell at Chebyshev distance r.
+                                if dx.abs().max(dy.abs()).max(dz.abs()) != r {
+                                    continue;
+                                }
+                                let i = seed[0] as i64 + dx;
+                                let j = seed[1] as i64 + dy;
+                                let k = seed[2] as i64 + dz;
+                                if i < 0 || j < 0 || k < 0 {
+                                    continue;
+                                }
+                                let v = [i as usize, j as usize, k as usize];
+                                if occ.is_clear(v[0], v[1], v[2], clearance_m) {
+                                    let d2 = dx * dx + dy * dy + dz * dz;
+                                    if d2 < best_d2 {
+                                        best_d2 = d2;
+                                        best = Some(v);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if let Some(v) = best {
+                        return Some((v, true));
+                    }
+                }
+                None
+            };
+
+            let mut found: Vec<bool> = Vec::with_capacity(n);
+            let mut system: Vec<&'static str> = Vec::with_capacity(n);
+            let mut length_m: Vec<f32> = Vec::with_capacity(n);
+            let mut bends: Vec<u64> = Vec::with_capacity(n);
+            let mut max_bend_deg: Vec<f32> = Vec::with_capacity(n);
+            let mut start_snapped: Vec<bool> = Vec::with_capacity(n);
+            let mut goal_snapped: Vec<bool> = Vec::with_capacity(n);
+            let mut polylines: Vec<Vec<(f32, f32, f32)>> = Vec::with_capacity(n);
+
+            let t_route = Instant::now();
+            for (ri, (s, g, sys)) in requests.iter().enumerate() {
+                let clearance_m = clearances[ri];
+                let kind = system_kind_from_str(sys);
+                let c = SystemConstraints::for_kind(kind);
+                system.push(match kind {
+                    crate::routing::SystemKind::PressurePipe => "pressure",
+                    crate::routing::SystemKind::GravityDrain => "drain",
+                    crate::routing::SystemKind::Duct => "duct",
+                    crate::routing::SystemKind::Unknown => "unknown",
+                });
+
+                let sv = snap_clear(
+                    clamp_vox(Vec3::new(s.0 as f32, s.1 as f32, s.2 as f32)),
+                    clearance_m,
+                );
+                let gv = snap_clear(
+                    clamp_vox(Vec3::new(g.0 as f32, g.1 as f32, g.2 as f32)),
+                    clearance_m,
+                );
+                let (start, ssnap, goal, gsnap) = match (sv, gv) {
+                    (Some((a, sa)), Some((b, gb))) => (a, sa, b, gb),
+                    _ => {
+                        // An endpoint is sealed in — no route possible.
+                        found.push(false);
+                        length_m.push(0.0);
+                        bends.push(0);
+                        max_bend_deg.push(0.0);
+                        start_snapped.push(sv.map(|(_, s)| s).unwrap_or(false));
+                        goal_snapped.push(gv.map(|(_, s)| s).unwrap_or(false));
+                        polylines.push(Vec::new());
+                        continue;
+                    }
+                };
+                start_snapped.push(ssnap);
+                goal_snapped.push(gsnap);
+
+                match py.allow_threads(|| find_path(&occ, start, goal, &c, clearance_m)) {
+                    Some(route) => {
+                        found.push(true);
+                        length_m.push(route.length_m);
+                        bends.push(route.bends as u64);
+                        max_bend_deg.push(route.max_bend_deg);
+                        polylines.push(
+                            route.polyline.iter().map(|p| (p.x, p.y, p.z)).collect(),
+                        );
+                    }
+                    None => {
+                        found.push(false);
+                        length_m.push(0.0);
+                        bends.push(0);
+                        max_bend_deg.push(0.0);
+                        polylines.push(Vec::new());
+                    }
+                }
+            }
+            let route_ms = t_route.elapsed().as_secs_f64() * 1000.0;
+
+            let out = PyDict::new(py);
+            out.set_item("found", PyList::new(py, &found)?)?;
+            out.set_item("system", PyList::new(py, &system)?)?;
+            out.set_item("clearance_m", PyList::new(py, &clearances)?)?;
+            out.set_item("length_m", PyList::new(py, &length_m)?)?;
+            out.set_item("bends", PyList::new(py, &bends)?)?;
+            out.set_item("max_bend_deg", PyList::new(py, &max_bend_deg)?)?;
+            out.set_item("start_snapped", PyList::new(py, &start_snapped)?)?;
+            out.set_item("goal_snapped", PyList::new(py, &goal_snapped)?)?;
+            // Per-request world-metre polylines (voxel centres). Each is a
+            // list of (x, y, z) tuples; empty when no route was found.
+            let py_polys = PyList::empty(py);
+            for poly in &polylines {
+                py_polys.append(PyList::new(py, poly)?)?;
+            }
+            out.set_item("polyline", py_polys)?;
+
+            out.set_item("grid_dims", PyList::new(py, [dims[0] as u64, dims[1] as u64, dims[2] as u64])?)?;
+            out.set_item("grid_origin", PyList::new(py, [origin.x, origin.y, origin.z])?)?;
+            out.set_item("cell_m", cell as f64)?;
+            out.set_item("free_voxels", occ.free_count() as u64)?;
+            out.set_item("occupied_voxels", occ.grid.count_occupied() as u64)?;
+            out.set_item("request_count", n as u64)?;
+            out.set_item("occupancy_ms", occupancy_ms)?;
+            out.set_item("route_ms", route_ms)?;
+            Ok(out)
+        })
+    }
+
     #[pymodule]
     fn _core(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add("IfcfastError", _py.get_type::<IfcfastError>())?;
@@ -2334,6 +2671,8 @@ mod python {
         m.add_function(wrap_pyfunction!(bundle, m)?)?;
         #[cfg(feature = "clash")]
         m.add_function(wrap_pyfunction!(clash, m)?)?;
+        #[cfg(feature = "mesh")]
+        m.add_function(wrap_pyfunction!(reroute, m)?)?;
         m.add("__version__", env!("CARGO_PKG_VERSION"))?;
         Ok(())
     }

@@ -128,6 +128,8 @@ releases (additions only, never reorganisations).
 | Count of products (matches `m.products`) | `len(m)` |
 | Same data as a pandas DataFrame | `m.products_df` |
 | What changed between v1 and v2? | `m.diff(other_path)` |
+| Narrow-phase clash against a bundle | `ifcfast.clash("model.bundle/")` |
+| Reroute MEP segments around obstacles | `ifcfast.reroute(obstacles, requests, clearance_m=…)` |
 
 ## Substrate output (DuckDB-queryable parquet)
 
@@ -302,6 +304,61 @@ WHERE c.kind = 'hard'
 regardless of the source IFC's linear unit. The substrate records
 the project's unit scale as parquet schema metadata
 (`ifcfast.unit_scale`) and the clash engine converts at load time.
+
+### Constraint-aware MEP rerouting (`ifcfast.reroute()`)
+
+Given obstacle solids and a list of start→goal segments, voxelize the
+space into a go/nogo field and route each segment around the obstacles
+under per-system MEP rules. Engine, not policy — same split as
+`clash()`: it returns collision-free polylines that obey the routing
+constraints; it does not decide *which* clash to fix or *which* element
+moves.
+
+```python
+import ifcfast
+
+# Geometry is the CALLER's, already in world metres. obstacles are
+# (vertices, indices) closed triangle meshes — pass numpy or lists.
+df = ifcfast.reroute(
+    obstacles=[(wall_v, wall_i), (beam_v, beam_i)],
+    requests=[
+        ((0.0, 1.0, 2.7), (4.0, 1.0, 2.7), "duct"),    # start, goal, system
+        ((0.3, 0.5, 2.6), (3.7, 0.5, 1.2), "GravityDrainage"),
+    ],
+    clearance_m=[0.15, 0.05],   # per-request: object radius + insulation
+    cell_m=0.1,
+)
+df.loc[0, "found"]      # True
+df.loc[0, "polyline"]   # (N, 3) float32 world-metre points (voxel centres)
+```
+
+Why caller-supplied geometry (not an IFC path): on a large model you
+mesh **one storey at a time** with ifcopenshell's geometry `iterator`
+and an `include=` filter, then feed it here — never `m.meshes()`, which
+meshes the whole model eagerly and OOMs big files (GH #67).
+
+| arg | meaning |
+|-----|---------|
+| `obstacles`     | iterable of `(vertices, indices)` — flat or `(N,3)` world-metre verts + triangle list |
+| `requests`      | iterable of `(start_xyz, goal_xyz, system)`; `system` matched loosely (`"pressure"`→planar, `"drain"`/`"gravity"`→monotone-down, `"duct"`/`"vent"`→level-penalised, else `"unknown"`→stay-level). IFC `PredefinedType` strings map directly. |
+| `clearance_m`   | room the centreline keeps from every obstacle = object radius + insulation + safety. Scalar broadcasts; a sequence is one-per-request — a thin pipe and a fat duct route through the **same** build at their own sizes (C-space inflation via a prebuilt distance field; varying it costs nothing). `0.0` = bare centreline. |
+| `cell_m`        | voxel edge (default `0.1`). Fine cells stay fine — object size enters via `clearance_m`, not cell size. |
+| `keepouts`      | optional `(footprint_xy, floor_z_m, height_m)` per-space prisms marked nogo, so routes avoid the occupiable volume but the plenum above stays free. |
+| `bounds`        | `(min_xyz, max_xyz)` grid AABB; `None` auto-fits to inputs. |
+| `snap_voxels`   | snap a start/goal off a nogo voxel to the nearest clear one (default `2`); endpoints of the element being rerouted commonly sit in their own keep-out. |
+
+Returned `DataFrame` (one row per request): `found`, `system`,
+`clearance_m`, `length_m`, `bends`, `max_bend_deg`, `start_snapped`,
+`goal_snapped`, `polyline` (object — `(N,3)` float32, empty when not
+found). `df.attrs` carries `grid_dims`, `grid_origin`, `cell_m`,
+`free_voxels`, `occupied_voxels`, `request_count`, `occupancy_ms`,
+`route_ms`.
+
+**Routing model.** 26-connected A*: straight is free, bends ≤ 90° cost
+in proportion to their angle (45° preferred over 90°, hairpins
+forbidden), vertical moves are penalised per system (pressure locks to
+its layer, drainage may only descend, unknown stays level). Everything
+is world metres; the polyline is the routed **centreline**.
 
 ## Conventions you can rely on
 
