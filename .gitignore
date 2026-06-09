@@ -38,3 +38,6 @@ Thumbs.db
 !tests/fixtures/*.ifc
 !python/ifcfast/data/*.ifc
 .vercel
+
+# Scratch / exploration — may contain private client paths/data (e.g. G55). Never commit.
+scratch/
