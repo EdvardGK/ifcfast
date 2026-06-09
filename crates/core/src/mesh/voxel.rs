@@ -60,6 +60,38 @@ impl VoxelGrid {
         self.occ.get(self.idx(i, j, k)).copied().unwrap_or(0) != 0
     }
 
+    #[inline]
+    pub fn in_bounds(&self, i: usize, j: usize, k: usize) -> bool {
+        i < self.dims[0] && j < self.dims[1] && k < self.dims[2]
+    }
+
+    /// World-metre centre of voxel `(i, j, k)`.
+    #[inline]
+    pub fn voxel_center(&self, i: usize, j: usize, k: usize) -> Vec3 {
+        self.origin
+            + Vec3::new(
+                (i as f32 + 0.5) * self.cell,
+                (j as f32 + 0.5) * self.cell,
+                (k as f32 + 0.5) * self.cell,
+            )
+    }
+
+    /// Voxel containing world-metre point `p`, or `None` if outside the
+    /// grid. The inverse of [`Self::voxel_center`] (to the nearest cell).
+    #[inline]
+    pub fn world_to_voxel(&self, p: Vec3) -> Option<[usize; 3]> {
+        let rel = (p - self.origin) / self.cell;
+        if !rel.is_finite() || rel.min_element() < 0.0 {
+            return None;
+        }
+        let (i, j, k) = (rel.x as usize, rel.y as usize, rel.z as usize);
+        if self.in_bounds(i, j, k) {
+            Some([i, j, k])
+        } else {
+            None
+        }
+    }
+
     pub fn count_occupied(&self) -> usize {
         self.occ.iter().filter(|&&v| v != 0).count()
     }

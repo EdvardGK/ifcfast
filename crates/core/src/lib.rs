@@ -37,6 +37,14 @@ pub mod geom;
 #[cfg(feature = "clash")]
 pub mod clash;
 
+// Constraint-aware MEP rerouting (GH #63): occupancy go/nogo field +
+// classic A* router. Leaf prototypes on the `mesh` primitives; will move
+// behind a dedicated feature when wired to the substrate / federation.
+#[cfg(feature = "mesh")]
+pub mod occupancy;
+#[cfg(feature = "mesh")]
+pub mod routing;
+
 #[cfg(feature = "python")]
 mod python {
     use std::path::Path;
