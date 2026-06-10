@@ -93,8 +93,10 @@ def test_preview_returns_listed_dicts(tmp_path, monkeypatch):
     assert "guid" in rows[0] and "entity" in rows[0]
     # Relationship table — should not trigger extract.
     assert isinstance(m.preview("aggregates", n=2), list)
-    # Unknown table is silent.
-    assert m.preview("nope") == []
+    # Unknown table is loud (GH #71).
+    import pytest
+    with pytest.raises(ValueError, match="Unknown table"):
+        m.preview("nope")
 
 
 def test_cli_demo_json_is_valid_json():

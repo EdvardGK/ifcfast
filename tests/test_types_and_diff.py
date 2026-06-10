@@ -12,8 +12,10 @@ def test_by_type_returns_matching_products(tmp_path, monkeypatch):
     walls = m.by_type("IfcWall")
     assert len(walls) == 1
     assert walls[0].entity == "IfcWall"
-    # Unknown entity → empty list, never raises.
-    assert m.by_type("IfcDoesNotExist") == []
+    # Unknown entity → loud ValueError, never a silent empty (GH #71).
+    import pytest
+    with pytest.raises(ValueError, match="Unknown IFC entity"):
+        m.by_type("IfcDoesNotExist")
 
 
 def test_type_summary_shape(tmp_path, monkeypatch):

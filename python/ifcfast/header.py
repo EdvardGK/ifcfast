@@ -331,6 +331,35 @@ class IFCHeader:
         return self.originating_system
 
 
+_STEP_TRAILER = b"END-ISO-10303-21"
+_TRAILER_PROBE_BYTES = 256
+
+
+def _check_step_trailer(p: Path, size: int) -> None:
+    """Refuse truncated STEP files loudly (GH #70).
+
+    The Rust scan consumes records until EOF, so a file cut mid-stream
+    parses cleanly to a *partial* model — silently wrong QTO sums,
+    diffs, and clash runs. Every conformant writer terminates the
+    exchange structure with ``END-ISO-10303-21;``; its absence from the
+    file tail means a truncated download / interrupted copy. ZIP
+    containers are exempt: a truncated ZIP already fails its own
+    central-directory check (``BadZipFile``) before we get here.
+    """
+    with p.open("rb") as f:
+        magic = f.read(len(_ZIP_MAGIC))
+        if magic == _ZIP_MAGIC:
+            return
+        probe = min(_TRAILER_PROBE_BYTES, size)
+        f.seek(size - probe)
+        tail = f.read(probe)
+    if _STEP_TRAILER not in tail:
+        raise ValueError(
+            f"IFC file is truncated or unterminated (no END-ISO-10303-21 "
+            f"trailer in the last {probe} bytes): {p}"
+        )
+
+
 def header(path: str | Path) -> IFCHeader:
     """Parse the STEP header of an IFC file."""
     p = Path(path)
@@ -348,6 +377,8 @@ def header(path: str | Path) -> IFCHeader:
     if not text.lstrip().startswith("ISO-10303-21"):
         if "ISO-10303-21" not in text[:1024]:
             raise ValueError(f"Not an ISO-10303-21 STEP file: {p}")
+
+    _check_step_trailer(p, size)
 
     fd = _extract_block(text, "FILE_DESCRIPTION")
     fn = _extract_block(text, "FILE_NAME")
