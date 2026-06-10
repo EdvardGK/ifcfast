@@ -237,17 +237,19 @@ def extract_data_layers(
             out.segments = pd.read_parquet(cache_dir / SEGMENTS_FILE)
         out.timing_ms["cache_read_ms"] = (time.perf_counter() - t0) * 1000
 
+        cached_manifest = _read_manifest(cache_dir) or {}
+        drift_unavailable = bool(cached_manifest.get("drift_unavailable", False))
+
         all_cached = (
             out.psets is not None
             and out.quantities is not None
             and out.materials is not None
             and out.classifications is not None
-            and (not include_drift or (out.drift is not None and out.segments is not None))
+            and (not include_drift or drift_unavailable or (out.drift is not None and out.segments is not None))
         )
         if all_cached:
             # Surface the file-level world-coord-baked flag from the
             # cache manifest. Falls back to False on older caches.
-            cached_manifest = _read_manifest(cache_dir) or {}
             out.world_coordinate_baked = bool(
                 cached_manifest.get("world_coordinate_baked", False)
             )
@@ -375,19 +377,22 @@ def _patch_data_manifest(
     if out.classifications is not None:
         m["has_classifications"] = True
         m["classification_count"] = int(len(out.classifications))
-    if include_drift and out.drift is not None:
-        m["has_drift"] = True
-        m["drift_product_count"] = int(len(out.drift))
-        m["drift_error_count"] = int(
-            (out.drift["drift_severity"] == "error").sum()
-        )
-        m["drift_warn_count"] = int(
-            (out.drift["drift_severity"] == "warn").sum()
-        )
-        m["drift_info_count"] = int(
-            (out.drift["drift_severity"] == "info").sum()
-        )
-        m["world_coordinate_baked"] = bool(out.world_coordinate_baked)
+    if include_drift:
+        if out.drift is not None:
+            m["has_drift"] = True
+            m["drift_product_count"] = int(len(out.drift))
+            m["drift_error_count"] = int(
+                (out.drift["drift_severity"] == "error").sum()
+            )
+            m["drift_warn_count"] = int(
+                (out.drift["drift_severity"] == "warn").sum()
+            )
+            m["drift_info_count"] = int(
+                (out.drift["drift_severity"] == "info").sum()
+            )
+            m["world_coordinate_baked"] = bool(out.world_coordinate_baked)
+        else:
+            m["drift_unavailable"] = True
     if include_drift and out.segments is not None:
         m["has_segments"] = True
         m["segment_count"] = int(len(out.segments))

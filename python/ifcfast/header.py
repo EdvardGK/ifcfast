@@ -310,6 +310,7 @@ class IFCHeader:
     authorisation: Optional[str] = None
     cache_key: str = ""  # short hex digest of size + head + tail
     parse_seconds: float = 0.0
+    encoding_lossy: bool = False
 
     @property
     def size_mb(self) -> float:
@@ -331,6 +332,16 @@ class IFCHeader:
         return self.originating_system
 
 
+def _decode_x2_escapes(text: str) -> str:
+    def repl(m):
+        hex_str = m.group(1)
+        try:
+            return bytes.fromhex(hex_str).decode("utf-16be")
+        except Exception:
+            return m.group(0)
+    return re.sub(r"\\X2\\([0-9A-Fa-f]+)\\X0\\", repl, text)
+
+
 def header(path: str | Path) -> IFCHeader:
     """Parse the STEP header of an IFC file."""
     p = Path(path)
@@ -343,7 +354,15 @@ def header(path: str | Path) -> IFCHeader:
     mtime_ns = stat.st_mtime_ns
 
     prefix = _read_step_prefix(p, _HEADER_READ_BYTES)
-    text = prefix.decode("utf-8", errors="replace")
+    encoding_lossy = False
+    try:
+        text = prefix.decode("utf-8", errors="strict")
+    except UnicodeDecodeError:
+        text = prefix.decode("cp1252", errors="replace")
+        encoding_lossy = True
+
+    if "\\X2\\" in text:
+        text = _decode_x2_escapes(text)
 
     if not text.lstrip().startswith("ISO-10303-21"):
         if "ISO-10303-21" not in text[:1024]:
@@ -382,6 +401,7 @@ def header(path: str | Path) -> IFCHeader:
         authorisation=authorisation,
         cache_key=cache_key,
         parse_seconds=time.time() - started,
+        encoding_lossy=encoding_lossy,
     )
 
 
