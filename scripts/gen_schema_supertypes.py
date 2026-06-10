@@ -20,6 +20,13 @@ The generated module exports ``SUPERTYPE: dict[str, dict[str, str]]``
 keyed by schema name → entity name → immediate supertype name.
 ``IfcRoot`` (and any other top-level entity) has no entry — the
 classifier reads "missing" as "no further parent".
+
+It also exports ``ALL_ENTITIES: frozenset[str]`` — every entity
+declaration name across all supported schemas, *including* the
+supertype-less roots (IfcPerson, IfcOwnerHistory, IfcGridAxis, …) that
+SUPERTYPE structurally omits. Entity-name validation (GH #71) must
+check this set, not SUPERTYPE: a valid root entity is not a typo
+(PR #85 review F1).
 """
 
 from __future__ import annotations
@@ -57,6 +64,22 @@ def supertypes_for(schema: str) -> dict[str, str]:
     return out
 
 
+def entity_names_for(schema: str) -> set[str]:
+    """Every entity declaration name in the schema — including the
+    supertype-less roots that ``supertypes_for`` omits."""
+    sch = ifcopenshell.schema_by_name(schema)
+    out: set[str] = set()
+    for decl in sch.declarations():
+        try:
+            entity = decl.as_entity()
+        except AttributeError:
+            continue
+        if entity is None:
+            continue
+        out.add(entity.name())
+    return out
+
+
 def main() -> None:
     print('"""Per-schema IFC entity → immediate-supertype map.')
     print()
@@ -77,6 +100,17 @@ def main() -> None:
             print(f"        {entity!r}: {m[entity]!r},")
         print("    },")
     print("}")
+    print()
+    print("# Every entity name across all supported schemas, including the")
+    print("# supertype-less roots SUPERTYPE omits. The vocabulary for")
+    print("# entity-name validation (GH #71, PR #85 review F1).")
+    print("ALL_ENTITIES: frozenset[str] = frozenset({")
+    union: set[str] = set()
+    for schema in SCHEMAS:
+        union |= entity_names_for(schema)
+    for entity in sorted(union):
+        print(f"    {entity!r},")
+    print("})")
 
 
 if __name__ == "__main__":

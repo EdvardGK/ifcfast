@@ -2235,23 +2235,21 @@ def _validate_mode(mode: Optional[str]) -> None:
 def _validate_entity_name(entity: Optional[str]) -> None:
     """Raise on an entity name no IFC schema knows (GH #71).
 
-    Checks the shipped supertype tables across all schemas, so a class
-    valid in any IFC dialect passes regardless of the open file's
-    schema — the goal is to catch typos (``IfcWal``), not to police
-    schema versions.
+    Checks ``ALL_ENTITIES`` — every entity declaration across all
+    supported schemas, *including* supertype-less roots (IfcPerson,
+    IfcGridAxis, IfcOwnerHistory, …) — so a class valid in any IFC
+    dialect passes regardless of the open file's schema. The goal is
+    to catch typos (``IfcWal``), not to police schema versions; a
+    valid entity absent from the model must return empty, never raise
+    (PR #85 review F1 — validating against SUPERTYPE keys/values
+    falsely rejected ~30 root entities).
     """
     if entity is None:
         return
-    from .data.schema_supertypes import SUPERTYPE
+    from .data.schema_supertypes import ALL_ENTITIES
 
-    for table in SUPERTYPE.values():
-        if entity in table:
-            return
-    # Roots (e.g. IfcRoot) appear only as supertype *values*.
-    for table in SUPERTYPE.values():
-        for parent in table.values():
-            if entity == parent:
-                return
+    if entity in ALL_ENTITIES:
+        return
     raise ValueError(
         f"Unknown IFC entity {entity!r} (not in any supported schema). "
         f"Check the spelling — entity matching is exact and "

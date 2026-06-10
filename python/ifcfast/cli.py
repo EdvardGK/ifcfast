@@ -428,8 +428,14 @@ def main(argv: list[str] | None = None) -> int:
     except (ValueError, zipfile.BadZipFile) as e:
         # Bad *content* (not a STEP file, truncated, empty archive, …)
         # gets the same clean treatment as bad paths — agents parse
-        # stderr/exit codes, not tracebacks. GH #84.
-        print(f"ifcfast: {e}", file=sys.stderr)
+        # stderr/exit codes, not tracebacks. GH #84. BadZipFile's
+        # message ("File is not a zip file") names no file — append
+        # the subcommand's path so the error is actionable.
+        msg = str(e)
+        target = getattr(args, "file", None)
+        if target is not None and str(target) not in msg:
+            msg = f"{msg} ({target})"
+        print(f"ifcfast: {msg}", file=sys.stderr)
         return 1
 
 

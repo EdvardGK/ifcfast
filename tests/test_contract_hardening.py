@@ -188,6 +188,35 @@ def test_intact_file_still_opens(fresh_cache):
     assert len(m.products) >= 1
 
 
+def test_bundle_refuses_truncated_file(tmp_path, fresh_cache):
+    """PR #85 review: bundle() bypassed the GH #70 guard — a truncated
+    IFC streamed a silently-partial substrate for clash()."""
+    data = FIXTURE.read_bytes()
+    trunc = tmp_path / "trunc.ifc"
+    trunc.write_bytes(data[: len(data) // 2])
+    with pytest.raises(ValueError, match="truncated|unterminated"):
+        ifcfast.bundle(str(trunc), tmp_path / "out.bundle")
+
+
+def test_cli_bad_content_exits_clean(tmp_path):
+    """GH #84: bad *content* must exit 1 with a one-liner naming the
+    file — no traceback (review: clause was shipped untested)."""
+    import subprocess
+    import sys as _sys
+
+    bad = tmp_path / "not_an_ifc.txt"
+    bad.write_text("hello")
+    r = subprocess.run(
+        [_sys.executable, "-m", "ifcfast.cli", "index", str(bad), "--json"],
+        capture_output=True, text=True,
+        env={**os.environ},
+    )
+    assert r.returncode == 1
+    assert "Traceback" not in r.stderr
+    assert r.stderr.startswith("ifcfast:")
+    assert bad.name in r.stderr
+
+
 # ----------------------------------------------------------------------
 # GH #71 — loud failures on typos; namespace hygiene.
 # ----------------------------------------------------------------------
@@ -227,6 +256,29 @@ def test_filter_valid_but_absent_entity_is_empty_not_error(fresh_cache):
     assert list(m.filter(entity="IfcPile")) == []
     # supertype-only names (values, not keys, of the schema maps) pass
     assert list(m.filter(entity="IfcElement")) == []
+
+
+def test_supertype_less_roots_are_valid_entities(fresh_cache):
+    """PR #85 review F1: validating against SUPERTYPE keys/values
+    falsely rejected ~30 supertype-less root entities. Every entity
+    declaration must validate; only genuine typos raise."""
+    m = ifcfast.open(str(FIXTURE), use_cache=False, write_cache=False)
+    for root in (
+        "IfcPerson", "IfcOrganization", "IfcOwnerHistory", "IfcGridAxis",
+        "IfcApplication", "IfcRepresentationMap", "IfcMaterialList",
+        "IfcShapeAspect", "IfcRoot",
+    ):
+        assert m.by_type(root) == [], root  # valid → empty, never raises
+    with pytest.raises(ValueError, match="Unknown IFC entity"):
+        m.by_type("IfcWal")  # one char short of valid — still a typo
+
+
+def test_all_entities_superset_of_supertype_vocabulary():
+    from ifcfast.data.schema_supertypes import ALL_ENTITIES, SUPERTYPE
+
+    for table in SUPERTYPE.values():
+        missing = (set(table) | set(table.values())) - ALL_ENTITIES
+        assert not missing, missing
 
 
 def test_namespace_hygiene():
@@ -277,4 +329,10 @@ def test_mcp_psets_and_product_card(tmp_path, monkeypatch):
     assert card["product"]["guid"] == wall
     assert {r["quantity_name"] for r in card["quantities"]} >= {"Length"}
     assert card["storey_guid"] == STOREY
+    assert card["truncated"] == {}  # nothing capped at the default limit
     assert mcp_server.product_card(str(qfix), "NOTAREALGUID0000000000") is None
+
+    # PR #85 review: a bitten cap must be labelled, not silent.
+    small = mcp_server.product_card(str(qfix), wall, limit=1)
+    assert len(small["quantities"]) == 1
+    assert small["truncated"]["quantities"] > 1

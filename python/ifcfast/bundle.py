@@ -24,6 +24,7 @@ from os import PathLike
 from pathlib import Path
 
 from . import _core
+from .header import header as _header
 
 
 def bundle(
@@ -50,6 +51,11 @@ def bundle(
           counts. The instance/rep ratio is the chip-class win.
         * ``open_ms`` / ``bundle_ms`` / ``stream_ms`` — timings (ms).
     """
+    # Same admission control as Model open: existence, STEP magic, and
+    # the GH #70 truncation refusal. Without this a truncated IFC
+    # streams a silently-partial substrate and clash() exits 0 on it
+    # (PR #85 review) — the Rust side has no trailer check.
+    _header(ifc_path)
     info = _core.bundle(
         str(ifc_path),
         str(out_dir) if out_dir is not None else None,

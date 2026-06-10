@@ -162,10 +162,14 @@ def types(path: str, with_data: bool = False, samples: int = 3) -> list[dict]:
 
 @mcp.tool()
 def by_type(path: str, entity: str, limit: int = 100) -> list[dict]:
-    """All products of a given entity type (e.g. ``"IfcWall"``).
+    """All products of a given entity type — **exact match only**.
 
-    Returns up to ``limit`` rows as plain dicts. Mirrors
-    ``ifcopenshell.file.by_type(entity)``.
+    Returns up to ``limit`` rows as plain dicts. Unlike
+    ``ifcopenshell.file.by_type``, subtypes are NOT expanded:
+    ``by_type("IfcWall")`` does not include ``IfcWallStandardCase``,
+    and abstract supertypes (``"IfcElement"``) return ``[]`` — query
+    the concrete entity names from ``types()`` instead (GH #81 tracks
+    subtype expansion). Unknown entity names raise (GH #71).
     """
     from dataclasses import asdict
 
@@ -299,13 +303,20 @@ def materials(
 
 
 @mcp.tool()
-def product_card(path: str, guid: str) -> Optional[dict]:
+def product_card(path: str, guid: str, limit: int = 200) -> Optional[dict]:
     """Everything about one element in a single call.
 
     Returns the product row plus its psets, quantities, materials,
     classifications, and resolved storey/building guids — the answer
     to "tell me about this element" without five round-trips.
     ``None`` if the guid is unknown.
+
+    Each sub-table is capped at ``limit`` rows (default 200). When a
+    cap bites, the response carries ``truncated`` —
+    ``{table: total_row_count}`` for every capped table — so a
+    plausible-but-incomplete dump is impossible to mistake for the
+    full picture; re-query that table's dedicated tool with filters
+    (or a higher ``limit``) for the rest.
     """
     from dataclasses import asdict
 
@@ -314,9 +325,14 @@ def product_card(path: str, guid: str) -> Optional[dict]:
     if p is None:
         return None
     card: dict = {"product": asdict(p)}
+    truncated: dict[str, int] = {}
     for table in ("psets", "quantities", "materials", "classifications"):
         df = getattr(m, table)
-        card[table] = _records(df[df["guid"] == guid], 500) if len(df) else []
+        sub = df[df["guid"] == guid] if len(df) else df
+        card[table] = _records(sub, limit) if len(sub) else []
+        if len(sub) > limit:
+            truncated[table] = int(len(sub))
+    card["truncated"] = truncated
     card["storey_guid"] = m.storey_of(guid)
     card["building_guid"] = m.building_of(guid)
     card["ancestors"] = m.ancestors(guid)

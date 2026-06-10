@@ -42,17 +42,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed — loud failures (GH #70, #71)
 
-- **Truncated / unterminated STEP files are refused at open.** A file
-  whose tail lacks the `END-ISO-10303-21;` trailer raises
-  `ValueError` instead of silently parsing to a partial model (a 90%
-  truncation used to return 8 687 of 8 873 products with no
-  diagnostic). ZIP containers are exempt — ZIP's own integrity check
-  covers them.
+- **Truncated / unterminated STEP files are refused at open — and at
+  `bundle()`.** A file whose tail lacks the `END-ISO-10303-21;`
+  trailer raises `ValueError` instead of silently parsing to a
+  partial model (a 90% truncation used to return 8 687 of 8 873
+  products with no diagnostic). `bundle()` / `ifcfast bundle` route
+  through the same guard, so a truncated IFC can no longer stream a
+  silently-partial clash substrate (PR #85 review). ZIP containers
+  are exempt — ZIP's own integrity check covers them.
 - **`preview()` raises on unknown table names**, listing the valid
   tables; **`filter()` / `by_type()` raise on entity names no IFC
   schema defines and on unknown modes** — at call time, not first
   iteration. A typo no longer reads as "the model has none of these";
-  a valid-but-absent entity still returns empty.
+  a valid-but-absent entity still returns empty. Validation is
+  against the new `ALL_ENTITIES` vocabulary (every entity declaration
+  in IFC2X3/IFC4/IFC4X3, **including supertype-less roots** like
+  `IfcPerson` / `IfcGridAxis` — PR #85 review F1), emitted by
+  `scripts/gen_schema_supertypes.py`.
 - **`by_type` docstring no longer claims ifcopenshell parity** — it
   documents exact-match semantics and points at GH #81 (subtype
   expansion) for the gap.
@@ -65,9 +71,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   long-format rows (by `guid` / set name / property name, capped by
   `limit`, default 200), so "what's the FireRating of this door?" is
   answerable over MCP at all.
-- **New MCP tool `product_card(path, guid)`** — one element's product
-  row + psets + quantities + materials + classifications + resolved
-  storey/building/ancestors in a single round-trip.
+- **New MCP tool `product_card(path, guid, limit=200)`** — one
+  element's product row + psets + quantities + materials +
+  classifications + resolved storey/building/ancestors in a single
+  round-trip. Sub-tables cap at `limit`; a bitten cap is labelled in
+  the response's `truncated` field (`{table: total}`), never silent
+  (PR #85 review).
 - **MCP model cache is staleness-checked (GH #83).** Every tool call
   stats the file and reopens transparently when size/mtime changed
   (re-export from the authoring tool); the docstring no longer claims

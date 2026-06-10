@@ -94,7 +94,10 @@ The data tools answer the common questions in one call:
   building / ancestors, in a single round-trip.
 
 All four cap output (`limit`, default 200 rows) — filter on big
-models instead of paging. The server's in-process model cache is
+models instead of paging. When a `product_card` sub-table hits the
+cap, the response's `truncated` field maps that table to its total
+row count, so an incomplete dump is always labelled as such. The
+server's in-process model cache is
 staleness-checked: if the file's size or mtime changes between tool
 calls (re-export from the authoring tool), it is reopened
 transparently — you never query a stale model.
@@ -142,8 +145,8 @@ releases (additions only, never reorganisations).
 | Inspect a file from a shell pipeline | `ifcfast index FILE --json` |
 | Plan work without paying extract cost | `ifcfast schema FILE --json` |
 | Type catalogue (TypeBank-shaped) | `m.type_summary()` / `m.type_bank()` |
-| ifcopenshell-style `by_type` | `m.by_type("IfcWall")` |
-| Iterate every product as `ProductRow` | `for p in m:` (or `m.products`, `m.filter(entity=...)`) |
+| Products of one exact entity type | `m.by_type("IfcWallStandardCase")` — **exact match, no subtype expansion**: `by_type("IfcWall")` does NOT include `IfcWallStandardCase`, and abstract names (`"IfcElement"`) return `[]`. Get the concrete names from `m.types()` first. (GH #81 tracks expansion.) |
+| Iterate every product as `ProductRow` | `for p in m:` (or `m.products`, `m.filter(entity=...)`). Note `filter(storey_guid=…)` matches **direct containment only** — for storey contents including aggregate parts use `m.products_in(storey_guid)`. |
 | Count of products (matches `m.products`) | `len(m)` |
 | Same data as a pandas DataFrame | `m.products_df` |
 | What changed between v1 and v2? | `m.diff(other_path)` |

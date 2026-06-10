@@ -47,3 +47,22 @@ materials access.
 - products_in over 13 ARK_E storeys: 0.108 s, Σ(storeys) == building
   == 8 381 (consistency the fast path used to break); the 492
   unresolved storey_of products are exactly the opening elements.
+
+## Review round (same day)
+
+Omarchy's adversarial review (PR #85 comment) confirmed the core fixes and flagged one real
+regression + follow-ups. All addressed on the branch:
+
+- **F1 (HIGH, confirmed + fixed):** `_validate_entity_name` checked SUPERTYPE keys/values, which
+  structurally omit supertype-less roots — `IfcPerson`/`IfcGridAxis`/`IfcRepresentationMap` etc.
+  raised the typo error instead of returning `[]`. Generator now also emits `ALL_ENTITIES`
+  (1006 names, all three schemas, roots included); validator checks that. Regenerated
+  `data/schema_supertypes.py` (SUPERTYPE section byte-identical, ifcopenshell 0.8.5).
+- `bundle()` now routes through `header()` → truncated IFC refused before streaming a partial
+  clash substrate.
+- `product_card(limit=200)` + `truncated: {table: total}` signal — capped dumps are labelled.
+- AGENTS.md: by_type decision-tree row now states exact-match/no-subtype-expansion;
+  `filter(storey_guid=)` direct-containment note; product_card cap text corrected.
+- MCP `by_type` tool docstring parity claim removed; CLI BadZipFile message appends the path.
+- 4 new tests (roots-accept + typo-reject, ALL_ENTITIES ⊇ SUPERTYPE vocab, bundle guard,
+  CLI bad-content subprocess, product_card truncation). Suite: 99 passed / 12 skipped.
