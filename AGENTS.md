@@ -77,8 +77,27 @@ pip install 'ifcfast[mcp]'
 
 That gives the agent a set of tools (`open_ifc`, `summary`, `schemas`,
 `preview`, `types`, `by_type`, `parent`, `children`, `ancestors`,
-`descendants`, `storey_of`, `building_of`, `products_in`, `diff`, …)
-plus the `ifcfast://agents-guide` resource (this document).
+`descendants`, `storey_of`, `building_of`, `products_in`, `psets`,
+`quantities`, `materials`, `product_card`, `diff`, …) plus the
+`ifcfast://agents-guide` resource (this document).
+
+The data tools answer the common questions in one call:
+
+- `psets(path, guid=…, pset_name=…, prop_name=…)` — filtered
+  property rows ("what's the FireRating of this door?").
+- `quantities(path, guid=…, qto_name=…, quantity_name=…)` —
+  filtered authored-quantity rows.
+- `materials(path, guid=…, material_name=…)` — filtered material
+  assignments.
+- `product_card(path, guid)` — one element's product row + psets +
+  quantities + materials + classifications + resolved storey /
+  building / ancestors, in a single round-trip.
+
+All four cap output (`limit`, default 200 rows) — filter on big
+models instead of paging. The server's in-process model cache is
+staleness-checked: if the file's size or mtime changes between tool
+calls (re-export from the authoring tool), it is reopened
+transparently — you never query a stale model.
 
 ## The 30-second ramp
 
@@ -307,6 +326,20 @@ the project's unit scale as parquet schema metadata
 
 - **Traversal helpers never raise on unknown guids.** Missing → `None`
   for scalars, `[]` for lists. Safe to call without guarding.
+- **Typos fail loudly; absences fail quietly.** An unknown *table*
+  (`m.preview("nope")`), *entity name* (`m.by_type("IfcWal")`,
+  `m.filter(entity=…)`) or *mode* (`m.filter(mode=…)`) raises
+  `ValueError` listing the valid vocabulary — a typo must never read
+  as "the model has none of these". A *valid* entity that simply
+  isn't present in the file still returns an empty result.
+- **Truncated files are refused, not half-parsed.** A STEP file
+  missing its `END-ISO-10303-21;` trailer (interrupted download /
+  copy) raises `ValueError` at open instead of silently returning a
+  partial model. ZIP containers rely on ZIP's own integrity check.
+- **`diff()` is cache-state independent.** `None` (cold parse) and
+  `NaN` (cache hit) are the same missing value; identical files diff
+  clean regardless of which side was cached. `diff()` also accepts
+  `pathlib.Path`.
 - **DataFrames are long-format, one row per fact.** No nested fields,
   no JSON-in-cell. Easy to filter, easy to join, easy to dump to Excel.
 - **Missing values are `nan` for strings (pandas `StringDtype`).** Use
