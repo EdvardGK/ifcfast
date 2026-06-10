@@ -7,6 +7,81 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+> Agent-first contract hardening (Python layer only — no Rust core
+> changes, no cache-schema bump). Wrong-answer fixes for diff and the
+> spatial graph, loud failures where typos and truncation used to read
+> as empty/partial results, and MCP data access. GH #68, #70, #71,
+> #78, #79, #83, #84.
+
+### Fixed
+
+- **`Model.diff` no longer reports false changes when the two sides
+  are in different cache states (GH #68).** A cold-parsed Model
+  materialises missing fields as `None`, a cache-hit Model as pandas
+  `NaN`; `diff()` compared them as unequal and flagged ~99% of
+  products as changed on a one-element edit. Missing values are now
+  one equivalence class, canonicalised at the comparison boundary.
+  The MCP `diff` tool inherits the fix.
+- **`storey_of()` resolves through aggregate hops in models without an
+  `IfcBuilding` (GH #79).** "Is this container a storey?" was decided
+  by the storey having a building edge (plus a dead-code disjunct
+  keyed on the wrong guid); it now checks a storey-guid set seeded
+  from the storeys table, so storeys aggregated directly under
+  `IfcSite` (infra/landscape exports) resolve like any other.
+- **`products_in(storey)` includes aggregate sub-products (GH #78).**
+  The storey fast path returned only directly-contained elements,
+  dropping parts reached via `IfcRelAggregates` (curtain-wall plates,
+  stair flights) that `products_in(building)` included — the same
+  query now BFS-walks at every level, so per-storey results sum
+  exactly to the building result.
+- **`Model.diff` accepts `pathlib.Path` (GH #84).**
+- **CLI: bad-content errors print cleanly (GH #84).** `ValueError`
+  (not a STEP file, truncated, no-IFC archive) and `BadZipFile` now
+  exit 1 with a one-line `ifcfast: …` message instead of a traceback,
+  matching the GH #42 treatment of path errors.
+
+### Changed — loud failures (GH #70, #71)
+
+- **Truncated / unterminated STEP files are refused at open — and at
+  `bundle()`.** A file whose tail lacks the `END-ISO-10303-21;`
+  trailer raises `ValueError` instead of silently parsing to a
+  partial model (a 90% truncation used to return 8 687 of 8 873
+  products with no diagnostic). `bundle()` / `ifcfast bundle` route
+  through the same guard, so a truncated IFC can no longer stream a
+  silently-partial clash substrate (PR #85 review). ZIP containers
+  are exempt — ZIP's own integrity check covers them.
+- **`preview()` raises on unknown table names**, listing the valid
+  tables; **`filter()` / `by_type()` raise on entity names no IFC
+  schema defines and on unknown modes** — at call time, not first
+  iteration. A typo no longer reads as "the model has none of these";
+  a valid-but-absent entity still returns empty. Validation is
+  against the new `ALL_ENTITIES` vocabulary (every entity declaration
+  in IFC2X3/IFC4/IFC4X3, **including supertype-less roots** like
+  `IfcPerson` / `IfcGridAxis` — PR #85 review F1), emitted by
+  `scripts/gen_schema_supertypes.py`.
+- **`by_type` docstring no longer claims ifcopenshell parity** — it
+  documents exact-match semantics and points at GH #81 (subtype
+  expansion) for the gap.
+- **Namespace hygiene (GH #71):** `ifcfast.Path` and
+  `ifcfast.annotations` no longer leak from `ifcfast.__init__`.
+
+### Added — MCP data access (GH #83 + product-review batch)
+
+- **New MCP tools `psets`, `quantities`, `materials`** — filtered
+  long-format rows (by `guid` / set name / property name, capped by
+  `limit`, default 200), so "what's the FireRating of this door?" is
+  answerable over MCP at all.
+- **New MCP tool `product_card(path, guid, limit=200)`** — one
+  element's product row + psets + quantities + materials +
+  classifications + resolved storey/building/ancestors in a single
+  round-trip. Sub-tables cap at `limit`; a bitten cap is labelled in
+  the response's `truncated` field (`{table: total}`), never silent
+  (PR #85 review).
+- **MCP model cache is staleness-checked (GH #83).** Every tool call
+  stats the file and reopens transparently when size/mtime changed
+  (re-export from the authoring tool); the docstring no longer claims
+  an LRU that didn't exist.
+
 ## [0.4.36] - 2026-06-08
 
 > Regression hotfix for the v0.4.35 half-space cut over-report on

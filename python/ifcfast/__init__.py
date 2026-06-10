@@ -65,7 +65,7 @@ Public API:
 
 from __future__ import annotations
 
-from pathlib import Path
+from pathlib import Path as _Path
 
 from .header import IFCHeader, header
 from .model import Model, ProductRow, StoreyRow, open_ifc as open
@@ -125,8 +125,13 @@ except PackageNotFoundError:  # pragma: no cover
     __version__ = "0.0.0+unknown"
 del _pkg_version, PackageNotFoundError
 
+# Namespace hygiene (GH #71): the __future__ import binds a module
+# attribute; agents introspect dir(ifcfast), so keep it clean. The
+# compile-time directive is unaffected by deleting the name.
+del annotations
 
-def example_path() -> Path:
+
+def example_path() -> _Path:
     """Path to the bundled minimal IFC4 fixture.
 
     Lets agents and CI runs demo ``ifcfast`` without sourcing an IFC
@@ -140,7 +145,7 @@ def example_path() -> Path:
     IfcBuildingStorey, one IfcWall — so parse cost is sub-millisecond.
     For realistic benchmarks, use your own model.
     """
-    return Path(__file__).parent / "data" / "minimal.ifc"
+    return _Path(__file__).parent / "data" / "minimal.ifc"
 
 
 def system_prompt() -> str:

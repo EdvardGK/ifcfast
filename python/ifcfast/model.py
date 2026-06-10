@@ -232,12 +232,16 @@ class Model:
         return f"{scale}m-per-unit"
 
     def by_type(self, entity: str) -> list[ProductRow]:
-        """All products of a given entity type.
+        """All products of a given entity type — **exact match only**.
 
-        Mirrors ``ifcopenshell.file.by_type(entity)`` — the single most
-        common ifcopenshell pattern. Drop-in replacement; matches case
-        on the canonical title-case name (e.g. ``"IfcWall"``,
-        ``"IfcWallStandardCase"``).
+        Looks like ``ifcopenshell.file.by_type(entity)`` but is NOT a
+        drop-in replacement yet: ifcopenshell expands subtypes
+        (``by_type("IfcWall")`` includes ``IfcWallStandardCase``) and
+        matches case-insensitively; ifcfast matches the exact
+        title-case entity name and nothing else, so
+        ``by_type("IfcElement")`` returns ``[]``. Subtype expansion is
+        tracked in GH #81. Unknown entity names raise ``ValueError``
+        (GH #71).
         """
         return list(self.filter(entity=entity))
 
@@ -294,6 +298,27 @@ class Model:
         return None
 
     def filter(
+        self,
+        *,
+        entity: Optional[str] = None,
+        mode: Optional[str] = None,
+        storey_guid: Optional[str] = None,
+    ) -> Iterable[ProductRow]:
+        """Iterate products matching the given filters.
+
+        ``entity`` and ``mode`` are validated up front: an entity name
+        that exists in no IFC schema, or a mode outside
+        ``count/measure/linear/skip``, raises ``ValueError`` instead of
+        silently yielding nothing — a typo must not read as "the model
+        has none of these" (GH #71). A *valid* entity that simply isn't
+        present in this model still yields an empty result. Validation
+        happens at call time, not first iteration.
+        """
+        _validate_entity_name(entity)
+        _validate_mode(mode)
+        return self._filter_iter(entity=entity, mode=mode, storey_guid=storey_guid)
+
+    def _filter_iter(
         self,
         *,
         entity: Optional[str] = None,
@@ -1062,6 +1087,7 @@ class Model:
                 self.aggregates,
                 self.storey_building,
                 product_guids,
+                storey_guids={s.guid for s in self.storeys},
             )
         return self._graph
 
@@ -1202,9 +1228,12 @@ class Model:
         building; ``products_in(project)`` covers the whole model.
         """
         g = self._graph_index()
-        # Fast path: storey with directly-contained products only.
-        if parent_guid in g.products_in and not g.children_of.get(parent_guid):
-            return [pg for pg in g.products_in[parent_guid] if pg in g.product_guids]
+        # No fast path: a storey's directly-contained products can
+        # themselves aggregate sub-products (curtain wall → plates,
+        # stair → flights), and shortcutting to the containment list
+        # dropped those parts while products_in(building) — which
+        # always BFS-walks — included them (GH #78). The BFS is the
+        # contract; it must give the same completeness at every level.
         out: list[str] = []
         for guid in self.descendants(parent_guid):
             if guid in g.product_guids:
@@ -1474,7 +1503,9 @@ class Model:
         ``changed`` arrays in pretty/JSON output; counts are always
         exact. Set ``sample=None`` (or 0) to keep full lists.
         """
-        if isinstance(other, str):
+        import os
+
+        if isinstance(other, (str, os.PathLike)):
             other_model = open_ifc(other)
         else:
             other_model = other
@@ -1561,13 +1592,15 @@ class Model:
     def preview(self, table: str, n: int = 5) -> list[dict]:
         """Sample rows from any table as a plain list-of-dicts.
 
-        Supported tables: ``products`` / ``storeys`` / ``contained_in``
-        / ``aggregates`` / ``storey_building`` / ``psets`` /
-        ``quantities`` / ``materials`` / ``classifications`` /
-        ``drift`` / ``segments``. Triggers lazy extraction for the four
-        data layers, drift, and the per-product mesh segments table;
-        pure DataFrame slice for the rest. Returns ``[]`` for an
-        unknown table or one that's empty.
+        Supported tables: ``products`` / ``storeys`` / ``spaces`` /
+        ``type_objects`` / ``contained_in`` / ``aggregates`` /
+        ``storey_building`` / ``voids`` / ``psets`` / ``quantities`` /
+        ``materials`` / ``classifications`` / ``drift`` / ``segments``.
+        Triggers lazy extraction for the four data layers, drift, and
+        the per-product mesh segments table; pure DataFrame slice for
+        the rest. Returns ``[]`` for an empty table; raises
+        ``ValueError`` (listing the valid names) for an unknown one —
+        a typo'd table name must not read as "table is empty" (GH #71).
         """
         from dataclasses import asdict
 
@@ -1597,15 +1630,6 @@ class Model:
             if df is None or len(df) == 0:
                 return []
             return df.head(n).to_dict(orient="records")
-        # Lazy fall-through for the materialised properties that may not
-        # have been touched yet (voids/spaces_df). Letting the property
-        # build them on demand keeps preview() honest about emptiness.
-        if table in {"voids"} and df_attr is not None and getattr(self, df_attr) is None:
-            self.voids  # trigger build
-            df = getattr(self, df_attr)
-            if df is not None and len(df) > 0:
-                return df.head(n).to_dict(orient="records")
-            return []
         if table in {"psets", "quantities", "materials", "classifications", "drift", "segments"}:
             df = getattr(self, table)  # triggers extract for data layers
             if df is None or len(df) == 0:
@@ -1614,7 +1638,10 @@ class Model:
             for row in df.head(n).to_dict(orient="records"):
                 rows.append({k: _none_if_nan_simple(v) for k, v in row.items()})
             return rows
-        return []
+        raise ValueError(
+            f"Unknown table {table!r}. Valid tables: "
+            f"{', '.join(sorted(_PREVIEW_TABLES))}"
+        )
 
 
 # ----------------------------------------------------------------------
@@ -1638,9 +1665,13 @@ class _GraphIndex:
         "container_of",
         "container_kind_of",
         "product_guids",
+        "storey_guids",
     )
 
-    def __init__(self, contained_in, aggregates, storey_building, product_guids):
+    def __init__(
+        self, contained_in, aggregates, storey_building, product_guids,
+        storey_guids=None,
+    ):
         self.parent_of: dict[str, str] = {}
         self.children_of: dict[str, list[str]] = {}
         # Direct storey-containment only — populated for elements
@@ -1660,6 +1691,13 @@ class _GraphIndex:
         self.container_of: dict[str, str] = {}
         self.container_kind_of: dict[str, str] = {}
         self.product_guids: set[str] = product_guids
+        # Every guid known to be an IfcBuildingStorey. Seeded from the
+        # storeys table and unioned with containment/aggregation
+        # evidence below, so "is this container a storey?" never
+        # depends on the storey having a building edge (GH #79 — a
+        # storey aggregated directly under IfcSite has no entry in
+        # `building_of`).
+        self.storey_guids: set[str] = set(storey_guids or ())
 
         if len(aggregates) > 0:
             for child, parent in zip(
@@ -1693,6 +1731,7 @@ class _GraphIndex:
                 self.container_kind_of[product] = kind
                 if kind == "storey":
                     self.storey_of[product] = container
+                    self.storey_guids.add(container)
                 # `products_in` keyed by any container kind so
                 # `children(building)` / `children(site)` /
                 # `children(space)` surface elements that sit directly
@@ -1708,6 +1747,7 @@ class _GraphIndex:
                     continue
                 self.building_of[storey] = building
                 self.storeys_in.setdefault(building, []).append(storey)
+                self.storey_guids.add(storey)
 
 
 def _walk_to_storey(g: "_GraphIndex", guid: str, _budget: int = 16) -> Optional[str]:
@@ -1734,16 +1774,14 @@ def _walk_to_storey(g: "_GraphIndex", guid: str, _budget: int = 16) -> Optional[
         seen.add(cur)
         container = g.container_of.get(cur)
         if container is not None:
-            if g.container_kind_of.get(container) == "storey" or container in g.building_of:
-                # `building_of` is keyed on storey guids → if the
-                # container is in `building_of`, it is a storey.
+            if container in g.storey_guids:
                 return container
             cur = container
             continue
         parent = g.parent_of.get(cur)
         if parent is None:
             return None
-        if parent in g.building_of:  # parent is a storey
+        if parent in g.storey_guids:
             return parent
         cur = parent
     return None
@@ -2176,36 +2214,91 @@ def _data_layer_meta(data_layers, name: str) -> dict:
     }
 
 
+_PREVIEW_TABLES = {
+    "products", "storeys", "spaces", "type_objects", "contained_in",
+    "aggregates", "storey_building", "voids", "psets", "quantities",
+    "materials", "classifications", "drift", "segments",
+}
+
+_VALID_MODES = {"count", "measure", "linear", "skip"}
+
+
+def _validate_mode(mode: Optional[str]) -> None:
+    """Raise on a mode outside the classifier vocabulary (GH #71)."""
+    if mode is not None and mode not in _VALID_MODES:
+        raise ValueError(
+            f"Unknown mode {mode!r}. Valid modes: "
+            f"{', '.join(sorted(_VALID_MODES))}"
+        )
+
+
+def _validate_entity_name(entity: Optional[str]) -> None:
+    """Raise on an entity name no IFC schema knows (GH #71).
+
+    Checks ``ALL_ENTITIES`` — every entity declaration across all
+    supported schemas, *including* supertype-less roots (IfcPerson,
+    IfcGridAxis, IfcOwnerHistory, …) — so a class valid in any IFC
+    dialect passes regardless of the open file's schema. The goal is
+    to catch typos (``IfcWal``), not to police schema versions; a
+    valid entity absent from the model must return empty, never raise
+    (PR #85 review F1 — validating against SUPERTYPE keys/values
+    falsely rejected ~30 root entities).
+    """
+    if entity is None:
+        return
+    from .data.schema_supertypes import ALL_ENTITIES
+
+    if entity in ALL_ENTITIES:
+        return
+    raise ValueError(
+        f"Unknown IFC entity {entity!r} (not in any supported schema). "
+        f"Check the spelling — entity matching is exact and "
+        f"case-sensitive."
+    )
+
+
+def _is_missing(v) -> bool:
+    """One equivalence class for "no value": ``None`` or float NaN.
+
+    A cold-parsed Model materialises missing fields as ``None``
+    (dataclass path) while a cache-hit Model materialises them as
+    pandas ``NaN`` (DataFrame path) — the *same* missing value in two
+    representations. Comparing them as unequal made diff() flag ~99%
+    of products as changed whenever the two sides were in different
+    cache states (GH #68).
+    """
+    return v is None or (isinstance(v, float) and v != v)
+
+
 def _values_equal(a, b) -> bool:
-    """Field equality for `Model.diff`. Treats NaN==NaN and None==None
-    as equal so a model diffed against itself reports zero changes
-    (GH #40). Plain `==` falls back to Python semantics where NaN is
-    famously not equal to itself — diff() rows arrive from pandas
-    DataFrames, so missing string fields routinely materialise as
-    `nan` (`pd.NA` / `float('nan')` depending on dtype) on both sides
-    of a self-diff.
+    """Field equality for `Model.diff`. Treats every missing-value
+    representation (None / NaN) as equal to every other, so a model
+    diffed against itself — or against the same file in a *different
+    cache state* — reports zero changes (GH #40, GH #68). Plain `==`
+    falls back to Python semantics where NaN is famously not equal to
+    itself.
     """
     if a is b:
         return True
-    a_nan = isinstance(a, float) and a != a
-    b_nan = isinstance(b, float) and b != b
-    if a_nan and b_nan:
-        return True
-    if a_nan or b_nan:
-        return False
+    a_missing = _is_missing(a)
+    b_missing = _is_missing(b)
+    if a_missing or b_missing:
+        return a_missing and b_missing
     return a == b
 
 
 def _index_products_by_guid(m) -> dict[str, dict]:
     """Build ``{guid: {field: value, ...}}`` lookup over a Model's products.
 
-    Works on both eager (cold-parse) and lazy (cache-hit) Models.
+    Works on both eager (cold-parse) and lazy (cache-hit) Models, and
+    canonicalises missing values to ``None`` at the boundary so the two
+    paths produce comparable rows (GH #68).
     """
     out: dict[str, dict] = {}
     if getattr(m, "_products_df", None) is not None:
         cols = list(m._products_df.columns)
         for row in m._products_df.itertuples(index=False):
-            rec = dict(zip(cols, row))
+            rec = {k: (None if _is_missing(v) else v) for k, v in zip(cols, row)}
             guid = rec.get("guid")
             if guid:
                 out[guid] = rec

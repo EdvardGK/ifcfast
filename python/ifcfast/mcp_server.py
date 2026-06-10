@@ -20,13 +20,17 @@ Or wire into Claude Desktop / Cursor:
       }
     }
 
-The server keeps an in-process LRU cache of opened models keyed by
-path. Opening the same file twice within a session is free; the
+The server keeps an in-process cache of opened models keyed by path.
+Every tool call stats the file and transparently reopens it when the
+size or mtime changed (GH #83) — so "open model → re-export from the
+authoring tool → query again" always answers from the *current* file.
+Opening the same unchanged file twice within a session is free; the
 underlying parquet cache makes hot reloads cheap across sessions too.
 """
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Optional
 
@@ -51,15 +55,42 @@ _open_models: dict[str, ifcfast.Model] = {}
 
 
 def _resolve(path: str) -> ifcfast.Model:
-    """Open ``path`` (or return cached). Empty / "example" → bundled fixture."""
+    """Open ``path`` (or return cached). Empty / "example" → bundled fixture.
+
+    Staleness-checked (GH #83): if the file's size or mtime changed
+    since the cached Model was opened, the stale entry is dropped and
+    the file reopened — the parquet cache absorbs the reopen cost, and
+    the agent never silently queries a pre-re-export model.
+    """
     if not path or path == "example":
         path = str(ifcfast.example_path())
     p = str(Path(path).expanduser().resolve())
     m = _open_models.get(p)
+    if m is not None:
+        st = os.stat(p)
+        if (
+            st.st_size != m.header.size_bytes
+            or st.st_mtime_ns != m.header.mtime_ns
+        ):
+            del _open_models[p]
+            m = None
     if m is None:
         m = ifcfast.open(p)
         _open_models[p] = m
     return m
+
+
+def _records(df, limit: int) -> list[dict]:
+    """First ``limit`` DataFrame rows as JSON-safe dicts (NaN → None)."""
+    out = []
+    for row in df.head(limit).to_dict(orient="records"):
+        out.append(
+            {
+                k: (None if isinstance(v, float) and v != v else v)
+                for k, v in row.items()
+            }
+        )
+    return out
 
 
 # ----------------------------------------------------------------------
@@ -131,10 +162,14 @@ def types(path: str, with_data: bool = False, samples: int = 3) -> list[dict]:
 
 @mcp.tool()
 def by_type(path: str, entity: str, limit: int = 100) -> list[dict]:
-    """All products of a given entity type (e.g. ``"IfcWall"``).
+    """All products of a given entity type — **exact match only**.
 
-    Returns up to ``limit`` rows as plain dicts. Mirrors
-    ``ifcopenshell.file.by_type(entity)``.
+    Returns up to ``limit`` rows as plain dicts. Unlike
+    ``ifcopenshell.file.by_type``, subtypes are NOT expanded:
+    ``by_type("IfcWall")`` does not include ``IfcWallStandardCase``,
+    and abstract supertypes (``"IfcElement"``) return ``[]`` — query
+    the concrete entity names from ``types()`` instead (GH #81 tracks
+    subtype expansion). Unknown entity names raise (GH #71).
     """
     from dataclasses import asdict
 
@@ -192,6 +227,116 @@ def diff(left_path: str, right_path: str, sample: int = 10) -> dict:
     left = _resolve(left_path)
     right = _resolve(right_path)
     return left.diff(right, sample=sample)
+
+
+@mcp.tool()
+def psets(
+    path: str,
+    guid: Optional[str] = None,
+    pset_name: Optional[str] = None,
+    prop_name: Optional[str] = None,
+    limit: int = 200,
+) -> list[dict]:
+    """Property-set rows, filtered. The workhorse data question.
+
+    Long-format rows: ``guid`` / ``pset_name`` / ``prop_name`` /
+    ``value`` / ``value_type`` / ``source``. Filter by element
+    ``guid``, ``pset_name`` (e.g. ``"Pset_WallCommon"``), and/or
+    ``prop_name`` (e.g. ``"FireRating"``). Returns up to ``limit``
+    rows — on a big model, always filter.
+    """
+    df = _resolve(path).psets
+    if guid is not None:
+        df = df[df["guid"] == guid]
+    if pset_name is not None:
+        df = df[df["pset_name"] == pset_name]
+    if prop_name is not None:
+        df = df[df["prop_name"] == prop_name]
+    return _records(df, limit)
+
+
+@mcp.tool()
+def quantities(
+    path: str,
+    guid: Optional[str] = None,
+    qto_name: Optional[str] = None,
+    quantity_name: Optional[str] = None,
+    limit: int = 200,
+) -> list[dict]:
+    """Base-quantity rows (lengths/areas/volumes/counts/weights), filtered.
+
+    Long-format rows: ``guid`` / ``qto_name`` / ``quantity_name`` /
+    ``value`` / ``quantity_type`` / ``unit_step_id`` / ``source``.
+    These are the *authored* quantities from the file (IfcElementQuantity),
+    not geometric measurements — for measured values see ``mesh_qto``
+    in the Python API. Returns up to ``limit`` rows.
+    """
+    df = _resolve(path).quantities
+    if guid is not None:
+        df = df[df["guid"] == guid]
+    if qto_name is not None:
+        df = df[df["qto_name"] == qto_name]
+    if quantity_name is not None:
+        df = df[df["quantity_name"] == quantity_name]
+    return _records(df, limit)
+
+
+@mcp.tool()
+def materials(
+    path: str,
+    guid: Optional[str] = None,
+    material_name: Optional[str] = None,
+    limit: int = 200,
+) -> list[dict]:
+    """Material-assignment rows, filtered.
+
+    Long-format rows: ``guid`` / ``role`` / ``layer_index`` /
+    ``material_name`` / ``layer_thickness_mm`` / ``category`` /
+    ``fraction``. Returns up to ``limit`` rows.
+    """
+    df = _resolve(path).materials
+    if guid is not None:
+        df = df[df["guid"] == guid]
+    if material_name is not None:
+        df = df[df["material_name"] == material_name]
+    return _records(df, limit)
+
+
+@mcp.tool()
+def product_card(path: str, guid: str, limit: int = 200) -> Optional[dict]:
+    """Everything about one element in a single call.
+
+    Returns the product row plus its psets, quantities, materials,
+    classifications, and resolved storey/building guids — the answer
+    to "tell me about this element" without five round-trips.
+    ``None`` if the guid is unknown.
+
+    Each sub-table is capped at ``limit`` rows (default 200). When a
+    cap bites, the response carries ``truncated`` —
+    ``{table: total_row_count}`` for every capped table — so a
+    plausible-but-incomplete dump is impossible to mistake for the
+    full picture; re-query that table's dedicated tool with filters
+    (or a higher ``limit``) for the rest.
+    """
+    from dataclasses import asdict
+
+    m = _resolve(path)
+    p = m.product(guid)
+    if p is None:
+        return None
+    card: dict = {"product": asdict(p)}
+    truncated: dict[str, int] = {}
+    for table in ("psets", "quantities", "materials", "classifications"):
+        df = getattr(m, table)
+        sub = df[df["guid"] == guid] if len(df) else df
+        card[table] = _records(sub, limit) if len(sub) else []
+        if len(sub) > limit:
+            truncated[table] = int(len(sub))
+    card["truncated"] = truncated
+    card["storey_guid"] = m.storey_of(guid)
+    card["building_guid"] = m.building_of(guid)
+    card["ancestors"] = m.ancestors(guid)
+    return card
 
 
 @mcp.tool()

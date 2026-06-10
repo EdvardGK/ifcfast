@@ -18,12 +18,21 @@ EXPECTED_TOOLS = {
     "summary", "schemas", "preview", "types", "by_type",
     "parent", "children", "ancestors", "descendants",
     "storey_of", "building_of", "products_in",
+    "psets", "quantities", "materials", "product_card",
     "diff", "list_open", "close",
 }
 
 
 async def _drive_session():
-    params = StdioServerParameters(command="ifcfast-mcp")
+    # Launch the *in-repo* server (honours PYTHONPATH) rather than
+    # whatever `ifcfast-mcp` happens to be on PATH — the test must
+    # exercise the code under test, not an installed wheel.
+    import os, sys
+    params = StdioServerParameters(
+        command=sys.executable,
+        args=["-m", "ifcfast.mcp_server"],
+        env=dict(os.environ),
+    )
     async with stdio_client(params) as (read, write):
         async with ClientSession(read, write) as session:
             await session.initialize()
