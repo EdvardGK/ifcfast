@@ -287,7 +287,13 @@ _HASH_TAIL_BYTES = 4 * 1024 * 1024
 #       CHANGE: it is now the best estimate (mesh when reliable, else the
 #       prism fallback) instead of the raw mesh value — open-shell rows no
 #       longer poison `SUM(volume_m3)`. Column-shape change → re-extraction.
-_CACHE_SCHEMA_VERSION = 16
+# v17 — synthetic half-space cutter slabs stripped from every no-cut
+#       geometry surface (GH #66): drift centroid/aabb/volume
+#       columns and the segments table no longer include the ±20 000-
+#       unit stand-in fragments, so cached drift/segments parquet from
+#       v16 holds foreign-extent values for clipped products.
+#       Value change without column change → re-extraction required.
+_CACHE_SCHEMA_VERSION = 17
 
 _FIELD_RE = re.compile(r"\(\s*(.*?)\s*\)\s*;", re.DOTALL)
 
