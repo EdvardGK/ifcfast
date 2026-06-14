@@ -145,7 +145,7 @@ releases (additions only, never reorganisations).
 | Inspect a file from a shell pipeline | `ifcfast index FILE --json` |
 | Plan work without paying extract cost | `ifcfast schema FILE --json` |
 | Type catalogue (TypeBank-shaped) | `m.type_summary()` / `m.type_bank()` |
-| Products of one exact entity type | `m.by_type("IfcWallStandardCase")` — **exact match, no subtype expansion**: `by_type("IfcWall")` does NOT include `IfcWallStandardCase`, and abstract names (`"IfcElement"`) return `[]`. Get the concrete names from `m.types()` first. (GH #81 tracks expansion.) |
+| Products of an entity type (incl. subtypes) | `m.by_type("IfcWall")` — mirrors `ifcopenshell.file.by_type(type, include_subtypes=True)`: **expands subtypes by default** (`by_type("IfcWall")` includes `IfcWallStandardCase`; `by_type("IfcElement")` / `by_type("IfcProduct")` return all element/product subtypes present), and matches the entity name **case-insensitively**. Pass `include_subtypes=False` for an exact single-entity match. Counts are over the *meshable-product* substrate, so abstract supertypes resolve to the concrete products the model actually carries (e.g. `IfcProduct` excludes non-meshable products like `IfcSpace`). Unknown names raise `ValueError`. (GH #81.) |
 | Iterate every product as `ProductRow` | `for p in m:` (or `m.products`, `m.filter(entity=...)`). Note `filter(storey_guid=…)` matches **direct containment only** — for storey contents including aggregate parts use `m.products_in(storey_guid)`. |
 | Count of products (matches `m.products`) | `len(m)` |
 | Same data as a pandas DataFrame | `m.products_df` |
@@ -330,6 +330,22 @@ the project's unit scale as parquet schema metadata
 
 ## Conventions you can rely on
 
+- **Imperial files resolve to a real `unit_scale`** (since GH #73).
+  `m.unit_scale` is metres-per-model-unit and `m.length_unit` is the
+  canonical short string (`"mm"`, `"m"`, `"ft"`, `"in"`, …). Files
+  that declare length via `IfcConversionBasedUnit` (the FOOT / INCH
+  pattern US/UK exports use, never an `IfcSIUnit`) now resolve through
+  `ConversionFactor → IfcMeasureWithUnit → value × SI-base-scale` —
+  e.g. FOOT → `unit_scale == 0.3048`, `length_unit == "ft"`. Before
+  GH #73 these silently reported `unit_scale = None` / `length_unit =
+  "m"` (a 3.28× error on every derived length). **Missing-value
+  encoding:** `unit_scale` is `None` only when the file declares *no*
+  LENGTHUNIT, OR declares one that can't be resolved (a broken
+  conversion chain) — in the latter case the parser emits a loud
+  `[ifcfast] WARNING` to stderr rather than implying metres.
+  `m.length_unit` maps `None → "m"` (the metres-assumed geometry
+  default), so when correctness matters check `m.unit_scale is None`
+  directly rather than trusting `length_unit`.
 - **Traversal helpers never raise on unknown guids.** Missing → `None`
   for scalars, `[]` for lists. Safe to call without guarding.
 - **Typos fail loudly; absences fail quietly.** An unknown *table*
@@ -358,6 +374,14 @@ the project's unit scale as parquet schema metadata
   intentionally not surfaced. IFC2X3 `IfcDoor` / `IfcWindow` have no
   `PredefinedType` and stay `None` — filtering `predefined_type == 'DOOR'`
   only matches IFC4. If you cached door/window models on ≤v17, re-bundle.
+- **Strings come back as proper UTF-8.** STEP escape sequences
+  (`\X\HH`, `\X2\HHHH…\X0\`, `\S\C`) are resolved, and raw un-escaped
+  high bytes — what Bonsai/BlenderBIM and some ArchiCAD/Tekla exports
+  write for `æøå`/CJK — are decoded as UTF-8 (since GH #77). Invalid
+  byte runs fall back to per-byte Latin-1 deterministically. So a wall
+  named `Dør-æå` reads back as `Dør-æå`, not `DÃ¸r-Ã¦Ã¥`. (Caches
+  written by wheels < the v18 cache schema carry the old mojibake;
+  the schema bump forces re-extraction.)
 - **DataFrames are long-format, one row per fact.** No nested fields,
   no JSON-in-cell. Easy to filter, easy to join, easy to dump to Excel.
 - **Missing values are `nan` for strings (pandas `StringDtype`).** Use

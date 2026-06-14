@@ -315,6 +315,10 @@ fn trim_ws(s: &[u8]) -> &[u8] {
 /// Decode a STEP single-quoted string. `bytes` must include the
 /// surrounding quotes. Returns the unescaped UTF-8 string (with
 /// `\X\xx\` and `\X2\xxxx\` unicode escapes resolved best-effort).
+///
+/// Raw (un-escaped) high bytes are decoded as UTF-8 first — ISO-10303-21
+/// ed.3 streams are UTF-8 and many exporters write æøå/CJK directly — and
+/// only fall back to per-byte Latin-1 when the byte run is not valid UTF-8.
 pub fn decode_string(bytes: &[u8]) -> Option<String> {
     if bytes.len() < 2 || bytes[0] != b'\'' || *bytes.last()? != b'\'' {
         return None;
@@ -393,15 +397,42 @@ pub fn decode_string(bytes: &[u8]) -> Option<String> {
                 continue;
             }
         }
-        // Fast path: assume the byte is valid UTF-8 (Latin-1 codepoint
-        // 0x00..0x7F is identical). Outside of that we fall back to
-        // pushing the byte as Latin-1.
+        // Plain ASCII (and the low half of Latin-1) maps straight through.
         if b < 0x80 {
             out.push(b as char);
-        } else {
-            out.push(b as char); // Latin-1 → Unicode same codepoint
+            i += 1;
+            continue;
         }
-        i += 1;
+        // Raw high byte that is not part of a STEP escape. ISO-10303-21
+        // ed.3 streams are UTF-8, and several exporters (Bonsai/BlenderBIM,
+        // some ArchiCAD/Tekla configs) write raw UTF-8 æøå/CJK directly
+        // instead of `\X2\` escapes. Decode the maximal run of non-escape
+        // bytes as UTF-8 first; fall back to per-byte Latin-1 only when the
+        // run is not valid UTF-8 (legacy Latin-1 high bytes are rarely
+        // valid UTF-8, so this disambiguates the two encodings cleanly).
+        //
+        // The run stops at the next byte that could begin an escape or a
+        // doubled quote (`\` or `'`, both < 0x80), so we never swallow the
+        // escape handling above.
+        let run_start = i;
+        let mut j = i + 1;
+        while j < inner.len() && inner[j] != b'\\' && inner[j] != b'\'' {
+            j += 1;
+        }
+        let run = &inner[run_start..j];
+        match std::str::from_utf8(run) {
+            Ok(s) => {
+                out.push_str(s);
+                i = j;
+            }
+            Err(_) => {
+                // Deterministic Latin-1 fallback for this byte; the rest of
+                // the run is reconsidered on the next iteration (it may
+                // itself contain a valid UTF-8 tail).
+                out.push(b as char); // Latin-1 → Unicode same codepoint
+                i += 1;
+            }
+        }
     }
     Some(out)
 }
@@ -487,4 +518,97 @@ pub fn parse_ref_list(body: &[u8]) -> Vec<u64> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::decode_string;
+
+    fn dec(quoted: &[u8]) -> String {
+        decode_string(quoted).expect("decode_string returned None")
+    }
+
+    #[test]
+    fn ascii_unchanged() {
+        assert_eq!(dec(b"'Basic Wall'"), "Basic Wall");
+        assert_eq!(dec(b"''"), "");
+        // Doubled-quote escape still works.
+        assert_eq!(dec(b"'it''s'"), "it's");
+    }
+
+    #[test]
+    fn raw_utf8_norwegian() {
+        // Raw UTF-8 bytes for "Dør-æå" (the c5_utf8.ifc repro case).
+        let mut q = vec![b'\''];
+        q.extend_from_slice("Dør-æå".as_bytes());
+        q.push(b'\'');
+        assert_eq!(dec(&q), "Dør-æå");
+    }
+
+    #[test]
+    fn raw_utf8_multibyte_non_latin() {
+        // CJK (3-byte UTF-8) plus an emoji (4-byte) — must round-trip.
+        let mut q = vec![b'\''];
+        q.extend_from_slice("壁体🧱".as_bytes());
+        q.push(b'\'');
+        assert_eq!(dec(&q), "壁体🧱");
+    }
+
+    #[test]
+    fn raw_utf8_mixed_with_ascii_tail() {
+        let mut q = vec![b'\''];
+        q.extend_from_slice("Vegg-Ø 200mm".as_bytes());
+        q.push(b'\'');
+        assert_eq!(dec(&q), "Vegg-Ø 200mm");
+    }
+
+    #[test]
+    fn legacy_latin1_fallback() {
+        // 0xD8 = 'Ø' in Latin-1 but an invalid lone UTF-8 lead byte.
+        // Must fall back to the Latin-1 codepoint, not corrupt the rest.
+        let q = b"'\xD8 200'";
+        assert_eq!(dec(q), "Ø 200");
+    }
+
+    #[test]
+    fn step_x_short_escape() {
+        // \X\C5 -> Å (Latin-1 0xC5).
+        assert_eq!(dec(b"'\\X\\C5'"), "Å");
+    }
+
+    #[test]
+    fn step_x2_utf16_escape() {
+        // \X2\00C5\X0\ -> Å (UTF-16BE).
+        assert_eq!(dec(b"'\\X2\\00C5\\X0\\'"), "Å");
+        // Multi-unit: "ÆØÅ".
+        assert_eq!(dec(b"'\\X2\\00C600D800C5\\X0\\'"), "ÆØÅ");
+    }
+
+    #[test]
+    fn step_s_short_escape() {
+        // \S\E -> Å (E|0x80 = 0xC5).
+        assert_eq!(dec(b"'\\S\\E'"), "Å");
+    }
+
+    #[test]
+    fn g55_real_escaped_strings() {
+        // Real strings from G55_ARK.ifc (an escape-using Revit export):
+        // these MUST keep decoding correctly after the raw-UTF-8 fix.
+        assert_eq!(dec(b"'Gr\\X\\F8nland 55'"), "Grønland 55");
+        assert_eq!(
+            dec(b"'S\\X\\F8yle Betong Sirkul\\X\\E6r Eksisterende:500'"),
+            "Søyle Betong Sirkulær Eksisterende:500"
+        );
+    }
+
+    #[test]
+    fn escape_adjacent_to_raw_utf8() {
+        // Raw UTF-8 run must stop at the backslash so the escape after it
+        // is still decoded correctly.
+        let mut q = vec![b'\''];
+        q.extend_from_slice("æ".as_bytes());
+        q.extend_from_slice(b"\\X\\C5"); // -> Å
+        q.push(b'\'');
+        assert_eq!(dec(&q), "æÅ");
+    }
 }
