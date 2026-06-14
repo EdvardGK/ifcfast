@@ -23,6 +23,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Python::allow_threads` → `Python::detach` (21 GIL-release call
   sites in `crates/core/src/lib.rs`). No cache-schema / column-shape
   change.
+
 ### Fixed — parquet cache integrity: stale-on-same-size-edit + non-atomic writes (GH #80)
 
 - **Same-size mid-file edits no longer serve a stale model.** The cache
