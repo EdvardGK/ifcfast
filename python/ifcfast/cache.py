@@ -99,10 +99,79 @@ def _read_manifest(d: Path) -> Optional[dict]:
 
 def _write_manifest(d: Path, manifest: dict) -> None:
     d.mkdir(parents=True, exist_ok=True)
-    _manifest_path(d).write_text(
+    _atomic_write_text(
+        _manifest_path(d),
         json.dumps(manifest, indent=2, sort_keys=True),
-        encoding="utf-8",
     )
+
+
+def _atomic_write_text(dest: Path, text: str) -> None:
+    """Write `text` to `dest` via a temp file + atomic rename.
+
+    A crash mid-write leaves the (untouched) old file or no file, never a
+    half-written one. `os.replace` is atomic on the same filesystem on
+    both POSIX and Windows. The manifest is the last thing written by
+    `write_index`, so making it atomic is what turns a crash anywhere in
+    the multi-parquet write into a clean miss instead of a manifest that
+    advertises files that were never finished.
+    """
+    tmp = dest.with_name(dest.name + f".tmp.{os.getpid()}")
+    try:
+        with tmp.open("w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, dest)
+    finally:
+        if tmp.exists():
+            tmp.unlink(missing_ok=True)
+
+
+def _atomic_write_parquet(df, dest: Path) -> None:
+    """Write a DataFrame to a parquet `dest` via temp file + atomic rename.
+
+    Guards against the issue-#80 partial-write hazard: an interrupted
+    `to_parquet` could otherwise leave a truncated / empty-but-present
+    file that later reads as a (wrong) cache hit. Writing to a sibling
+    `.tmp` and `os.replace`-ing it means a reader only ever sees the
+    complete file or the previous one.
+    """
+    tmp = dest.with_name(dest.name + f".tmp.{os.getpid()}")
+    try:
+        df.to_parquet(
+            tmp,
+            compression=PARQUET_COMPRESSION,
+            compression_level=PARQUET_COMPRESSION_LEVEL,
+            index=False,
+        )
+        os.replace(tmp, dest)
+    finally:
+        if tmp.exists():
+            tmp.unlink(missing_ok=True)
+
+
+def _source_matches(hdr: IFCHeader, manifest: dict) -> bool:
+    """True when the cached manifest describes the *current* bytes of the
+    source file.
+
+    The cache key (`sha256(schema_version, size, head 4 MB, tail 4 MB)`)
+    is path-independent so identical copies share a cache, but it cannot
+    see a same-size edit confined to the middle of a >8 MB file — the
+    head/tail windows miss it (GH #80). The manifest records
+    `(size_bytes, mtime_ns)` at encode time; comparing those to the live
+    stat catches the in-place mid-file edit that the key alone misses.
+
+    `mtime_ns` is deliberately kept OUT of the cache key so that a plain
+    copy (new mtime, same bytes) re-validates against the existing cache
+    after a single re-hash, rather than forcing a full re-parse. A
+    mismatch here is a hard miss — fail loudly, never serve stale.
+    """
+    cached_size = manifest.get("size_bytes")
+    cached_mtime = manifest.get("mtime_ns")
+    if cached_size is None or cached_mtime is None:
+        # Manifest predates source-stat tracking — cannot vouch for it.
+        return False
+    return cached_size == hdr.size_bytes and cached_mtime == hdr.mtime_ns
 
 
 def _classifier_signature() -> str:
@@ -138,7 +207,17 @@ def is_index_cached(hdr: IFCHeader) -> bool:
         return False
     if m.get("classifier_signature") != _classifier_signature():
         return False
-    return (d / "index.parquet").exists()
+    # GH #80 (1): the key can't see a same-size mid-file edit; the
+    # stored (size, mtime_ns) can. Stale source → miss.
+    if not _source_matches(hdr, m):
+        return False
+    # GH #80 (2): only honour an index the writer says it completed, and
+    # only if the file is actually present + non-empty. A crash mid-write
+    # (or a pre-existing data-only manifest) leaves `has_index` unset or
+    # an empty index.parquet — treat that as corruption, not a hit.
+    if not m.get("has_index"):
+        return False
+    return _data_file_present(d, "index.parquet")
 
 
 # ----------------------------------------------------------------------
@@ -221,7 +300,14 @@ def extract_data_layers(
     out = DataLayers(cache_dir=cache_dir, cache_key=hdr.cache_key)
     t_total = time.perf_counter()
 
-    if use_cache:
+    # GH #80: a same-size mid-file edit keeps the cache key but must not
+    # serve stale data layers either. Only trust cached parquets when the
+    # manifest's recorded (size, mtime_ns) still matches the live source.
+    cache_fresh = bool(use_cache) and _source_matches(
+        hdr, _read_manifest(cache_dir) or {}
+    )
+
+    if cache_fresh:
         t0 = time.perf_counter()
         if _data_file_present(cache_dir, PSETS_FILE):
             out.psets = pd.read_parquet(cache_dir / PSETS_FILE)
@@ -340,12 +426,7 @@ def _write_data_parquets(cache_dir: Path, out: DataLayers) -> None:
     ):
         if df is None:
             continue
-        df.to_parquet(
-            cache_dir / name,
-            compression=PARQUET_COMPRESSION,
-            compression_level=PARQUET_COMPRESSION_LEVEL,
-            index=False,
-        )
+        _atomic_write_parquet(df, cache_dir / name)
 
 
 def _patch_data_manifest(
@@ -414,12 +495,7 @@ def write_index(model) -> Path:
         df = pd.DataFrame(
             columns=[f.name for f in ProductRow.__dataclass_fields__.values()]
         )
-    df.to_parquet(
-        d / "index.parquet",
-        compression=PARQUET_COMPRESSION,
-        compression_level=PARQUET_COMPRESSION_LEVEL,
-        index=False,
-    )
+    _atomic_write_parquet(df, d / "index.parquet")
 
     if model.storeys:
         sdf = pd.DataFrame([asdict(s) for s in model.storeys])
@@ -427,12 +503,7 @@ def write_index(model) -> Path:
         sdf = pd.DataFrame(
             columns=[f.name for f in StoreyRow.__dataclass_fields__.values()]
         )
-    sdf.to_parquet(
-        d / "storeys.parquet",
-        compression=PARQUET_COMPRESSION,
-        compression_level=PARQUET_COMPRESSION_LEVEL,
-        index=False,
-    )
+    _atomic_write_parquet(sdf, d / "storeys.parquet")
 
     # Relationship tables. Each is a small long-format DataFrame; even on
     # a 200K-product file they sum to <500 KB compressed.
@@ -444,12 +515,7 @@ def write_index(model) -> Path:
     ):
         if df is None:
             continue
-        df.to_parquet(
-            d / name,
-            compression=PARQUET_COMPRESSION,
-            compression_level=PARQUET_COMPRESSION_LEVEL,
-            index=False,
-        )
+        _atomic_write_parquet(df, d / name)
 
     # Spaces — tier-1 entities, written even when empty so the manifest
     # accurately reflects "the parser saw zero IfcSpace" vs "the cache is
@@ -460,12 +526,7 @@ def write_index(model) -> Path:
         spdf = pd.DataFrame(
             columns=[f.name for f in SpaceRow.__dataclass_fields__.values()]
         )
-    spdf.to_parquet(
-        d / SPACES_FILE,
-        compression=PARQUET_COMPRESSION,
-        compression_level=PARQUET_COMPRESSION_LEVEL,
-        index=False,
-    )
+    _atomic_write_parquet(spdf, d / SPACES_FILE)
 
     if model.type_objects:
         todf = pd.DataFrame([asdict(t) for t in model.type_objects])
@@ -475,12 +536,7 @@ def write_index(model) -> Path:
                 f.name for f in TypeObjectRow.__dataclass_fields__.values()
             ]
         )
-    todf.to_parquet(
-        d / TYPE_OBJECTS_FILE,
-        compression=PARQUET_COMPRESSION,
-        compression_level=PARQUET_COMPRESSION_LEVEL,
-        index=False,
-    )
+    _atomic_write_parquet(todf, d / TYPE_OBJECTS_FILE)
 
     m = _read_manifest(d) or {}
     m.update({
@@ -537,10 +593,28 @@ def read_index(hdr: IFCHeader):
         return None
     if m.get("classifier_signature") != _classifier_signature():
         return None
+    if not _source_matches(hdr, m):
+        return None  # GH #80: same-size mid-file edit → re-parse, not stale.
+    if not m.get("has_index"):
+        return None
     idx_path = d / "index.parquet"
     sty_path = d / "storeys.parquet"
-    if not idx_path.exists():
+    if not _data_file_present(d, "index.parquet"):
         return None
+    # GH #80: a relationship table the manifest flagged as written must
+    # actually be on disk. A crash between writing index.parquet and the
+    # relationship parquets would otherwise have the Model fabricate empty
+    # edge DataFrames, silently returning None/[] for storey_of/children/
+    # products_in. Missing-but-flagged = corruption → clean re-parse.
+    for flag, fname in (
+        ("has_contained_in", CONTAINED_IN_FILE),
+        ("has_aggregates", AGGREGATES_FILE),
+        ("has_storey_building", STOREY_BUILDING_FILE),
+        ("has_voids", VOIDS_FILE),
+        ("has_spaces", SPACES_FILE),
+    ):
+        if m.get(flag) and not (d / fname).exists():
+            return None
 
     started = time.time()
     df = pd.read_parquet(idx_path)

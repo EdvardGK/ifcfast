@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — parquet cache integrity: stale-on-same-size-edit + non-atomic writes (GH #80)
+
+- **Same-size mid-file edits no longer serve a stale model.** The cache
+  key only hashes `(schema_version, size, head 4 MB, tail 4 MB)`, so an
+  in-place edit confined to the middle of a >8 MB file (e.g. a tool
+  rewriting a value/name without changing byte length) kept the same key
+  and the old substrate was returned with no error. The manifest already
+  recorded `(size_bytes, mtime_ns)` but no read path compared it. Every
+  cache read (`is_index_cached`, `read_index`, and the lazy data-layer
+  reader) now validates the manifest's `(size, mtime_ns)` against the
+  live file stat; a mismatch is a hard miss → re-parse. `mtime_ns` is
+  deliberately kept out of the *key* so a plain copy re-validates after
+  one re-hash instead of a full re-parse.
+- **Cache writes are now atomic.** `write_index` / the data-layer writer
+  wrote each parquet (and the manifest) in place with no temp+rename, so
+  a crash mid-write could leave a truncated/empty parquet behind a
+  valid-looking manifest — read back as a (wrong) cache hit, with the
+  Model fabricating empty relationship DataFrames forever. Parquets and
+  the manifest now write to a sibling `.tmp` + `os.replace` (atomic on
+  POSIX and Windows, same filesystem). An index is only honoured when its
+  manifest carries `has_index` AND `index.parquet` is present and
+  non-empty; a relationship table the manifest flags as written but that
+  is missing on disk is treated as corruption → clean re-parse, never
+  silent empty edges.
+- **No cache-schema bump.** This is a cache-*validation* change, not a
+  cache-*key* change: the key formula is unchanged, so existing caches
+  are not orphaned. Manifests written before this change lack the
+  `(size, mtime_ns)` comparison data the new check requires, so they
+  re-validate as a miss exactly once and are rewritten — the safe
+  fail-loud direction.
+
 ### Fixed — IFC4X3 built elements no longer classify as `skip` (GH #82)
 
 - **`IfcBuiltElement` rename handled.** IFC4X3 renamed the bulk-element
