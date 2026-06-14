@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — STEP section/record framing is now comment- and string-aware (GH #72)
+
+Three silent wrong-output bugs in the DATA-section scanner, one root
+class: framing did not treat ISO-10303-21 `/* */` comments or
+single-quoted strings as inert when locating section boundaries and
+record terminators.
+
+- **A `/* */` comment between records dropped everything after it.**
+  `for_each_record` broke the record walk on the first non-`#` byte, so
+  a comment (`/* exported by FooCAD */`) sitting between two records
+  ended the DATA scan early. It now skips whitespace **and** `/* */`
+  comments between records, and a comment containing `;`/`'` inside a
+  record no longer desyncs `find_record_end`.
+- **`ENDSEC` inside a quoted value truncated the section.**
+  `endsec_position` was a raw substring search, so a wall named
+  `'SEE ENDSEC FOR DETAILS'` ended DATA at the wrong place and dropped
+  the matching record plus everything after it. The scan now skips
+  quoted strings and comments (SIMD `memchr3` fast path preserved — no
+  throughput regression on the full-section scan).
+- **`DATA;` inside a HEADER string started the section early →
+  0 products.** `data_section_start` checked only the preceding byte, so
+  `FILE_DESCRIPTION(('Bridge DATA; rev2'),'2;1')` was mistaken for the
+  section marker, emptying the parse. It now skips header strings and
+  comments and matches `DATA` only as a bare token.
+
+Files using comments between records, or containing the literal
+`ENDSEC`/`DATA;` inside a string, now parse the previously-dropped
+entities. `_CACHE_SCHEMA_VERSION` bumped **18 → 19** (value change for
+affected files; clean files are byte-identical → cache hits unchanged).
+
 ### Fixed — hierarchical classification chains lose system_name/edition/source (GH #75)
 
 - **`m.classifications` now walks the full `ReferencedSource` chain.** A

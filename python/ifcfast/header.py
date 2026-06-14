@@ -325,6 +325,18 @@ _HASH_TAIL_BYTES = 4 * 1024 * 1024
 #       `ifcfast.unit_scale` schema metadata. Metric (IfcSIUnit) files are
 #       byte-identical. Value change without column change → cached
 #       substrates of imperial models must be re-extracted.
+# v19 (GH #72) — STEP section/record framing made comment- and string-aware.
+#       The DATA-section scanner previously (a) bailed out of the record
+#       walk on the first `/* */` comment, silently dropping every record
+#       after it; (b) matched a literal `ENDSEC` substring inside a quoted
+#       value, truncating the section; and (c) matched `DATA;` inside a
+#       HEADER string, starting the section early and emptying the parse.
+#       All three were silent wrong-output. Framing now skips comments and
+#       quoted strings when locating `DATA;` / `ENDSEC;` and record
+#       terminators. Any file using `/* */` comments between records, or
+#       containing the literal `ENDSEC`/`DATA;` inside a string, now parses
+#       MORE (previously-dropped) entities → cached substrates of such
+#       files must be re-extracted. Clean files are byte-identical.
 # v19 (GH #75) — classification extractor walks the full `ReferencedSource`
 #       chain. A leaf `IfcClassificationReference` whose `ReferencedSource`
 #       points at a parent *reference* (multi-level hierarchy — ArchiCAD/

@@ -16,7 +16,7 @@
 //! locate each record and hand the (id, type, args) byte ranges to the
 //! indexer, which decides what (if anything) to extract.
 
-use memchr::memchr2;
+use memchr::memchr3;
 
 /// One STEP entity instance located in the source buffer.
 #[derive(Debug, Clone, Copy)]
@@ -30,41 +30,138 @@ pub struct Record<'a> {
 }
 
 /// Position of the `DATA;` section content, exclusive of the marker.
+///
+/// ISO-10303-21 lets `/* ... */` comments and single-quoted strings
+/// appear anywhere whitespace is allowed, so the scan must treat both as
+/// inert: a `DATA;` literal sitting inside a HEADER string value (e.g.
+/// `FILE_DESCRIPTION(('Bridge DATA; rev2'),'2;1')`) must NOT be mistaken
+/// for the real section marker. We therefore walk byte-by-byte, skipping
+/// over quoted strings and comments, and only match `DATA` when it is a
+/// bare token in the section-control stream.
 pub fn data_section_start(buf: &[u8]) -> Option<usize> {
-    // Be tolerant to `DATA ;` and case. The marker only appears in the
-    // section-control area, which is structurally before any record, so
-    // a literal byte search is fine.
     let needle = b"DATA";
+    let len = buf.len();
     let mut i = 0;
-    while let Some(pos) = find_subslice(&buf[i..], needle) {
-        let abs = i + pos;
-        // Verify token boundary: previous byte must not be alnum.
-        let prev_ok = abs == 0
-            || !buf[abs - 1].is_ascii_alphanumeric() && buf[abs - 1] != b'_';
-        if !prev_ok {
-            i = abs + needle.len();
-            continue;
+    let mut prev: u8 = 0; // last non-skipped byte seen (0 = start of file)
+    while i < len {
+        match buf[i] {
+            b'\'' => {
+                // Quoted string: contents are inert. The byte before the
+                // string for token-boundary purposes is the quote itself.
+                i = skip_quoted_string(buf, i + 1, len);
+                prev = b'\'';
+                continue;
+            }
+            b'/' if i + 1 < len && buf[i + 1] == b'*' => {
+                i = skip_block_comment(buf, i + 2, len);
+                prev = b' '; // a comment is whitespace-equivalent
+                continue;
+            }
+            b'D' | b'd' => {
+                // Token-boundary: previous meaningful byte must not be
+                // part of a longer identifier.
+                let prev_ok = !prev.is_ascii_alphanumeric() && prev != b'_';
+                if prev_ok
+                    && i + needle.len() <= len
+                    && buf[i..i + needle.len()].eq_ignore_ascii_case(needle)
+                {
+                    // Skip past 'DATA' then whitespace/comments then `;`.
+                    let mut j = i + needle.len();
+                    j = skip_ws_and_comments(buf, j, len);
+                    if j < len && buf[j] == b';' {
+                        return Some(j + 1);
+                    }
+                }
+                prev = buf[i];
+                i += 1;
+            }
+            b => {
+                prev = b;
+                i += 1;
+            }
         }
-        // Skip past 'DATA' then whitespace then expect ';'.
-        let mut j = abs + needle.len();
-        while j < buf.len() && (buf[j] as char).is_whitespace() {
-            j += 1;
-        }
-        if j < buf.len() && buf[j] == b';' {
-            return Some(j + 1);
-        }
-        i = abs + needle.len();
     }
     None
 }
 
 /// `ENDSEC;` marks the end of DATA. Returns its position if found, else
 /// the buffer length.
+///
+/// String- and comment-aware: an `ENDSEC` substring inside a quoted
+/// value (e.g. a wall named `'SEE ENDSEC FOR DETAILS'`) or inside a
+/// `/* */` comment must NOT terminate the section.
+///
+/// This scans the whole DATA section (hot path), so we keep it SIMD-fast:
+/// `memchr3` jumps directly to the next byte that matters — `'` (string
+/// start), `/` (possible comment start), or `E` (possible `ENDSEC`). Every
+/// run of ordinary bytes between them is skipped by the SIMD scan rather
+/// than inspected one at a time. STEP section keywords are uppercase per
+/// spec, so the `E`-first fast path matches the prior behaviour exactly.
 pub fn endsec_position(buf: &[u8], from: usize) -> usize {
-    if let Some(p) = find_subslice(&buf[from..], b"ENDSEC") {
-        from + p
-    } else {
-        buf.len()
+    let needle = b"ENDSEC";
+    let len = buf.len();
+    let mut i = from;
+    while i < len {
+        match memchr3(b'\'', b'/', b'E', &buf[i..len]) {
+            Some(off) => {
+                let abs = i + off;
+                match buf[abs] {
+                    b'\'' => i = skip_quoted_string(buf, abs + 1, len),
+                    b'/' => {
+                        if abs + 1 < len && buf[abs + 1] == b'*' {
+                            i = skip_block_comment(buf, abs + 2, len);
+                        } else {
+                            i = abs + 1;
+                        }
+                    }
+                    b'E' => {
+                        if abs + needle.len() <= len && &buf[abs..abs + needle.len()] == needle {
+                            return abs;
+                        }
+                        i = abs + 1;
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            None => return len,
+        }
+    }
+    len
+}
+
+/// Given that we're now inside a `/* ... */` block comment starting at
+/// `i` (the byte AFTER the opening `/*`), return the index of the byte
+/// immediately AFTER the closing `*/`. If unterminated, returns `end`.
+fn skip_block_comment(buf: &[u8], mut i: usize, end: usize) -> usize {
+    while i < end {
+        let off = match memchr::memchr(b'*', &buf[i..end]) {
+            Some(o) => o,
+            None => return end,
+        };
+        let star = i + off;
+        if star + 1 < end && buf[star + 1] == b'/' {
+            return star + 2;
+        }
+        i = star + 1;
+    }
+    end
+}
+
+/// Skip the run of whitespace and `/* */` comments starting at `i`,
+/// returning the index of the first byte that is neither. Per
+/// ISO-10303-21, a comment is whitespace-equivalent and may appear
+/// anywhere whitespace can.
+#[inline]
+fn skip_ws_and_comments(buf: &[u8], mut i: usize, end: usize) -> usize {
+    loop {
+        while i < end && is_ws(buf[i]) {
+            i += 1;
+        }
+        if i + 1 < end && buf[i] == b'/' && buf[i + 1] == b'*' {
+            i = skip_block_comment(buf, i + 2, end);
+            continue;
+        }
+        return i;
     }
 }
 
@@ -80,18 +177,19 @@ where
 {
     let mut pos = start;
     while pos < end {
-        // Skip leading whitespace/control chars.
-        while pos < end && is_ws(buf[pos]) {
-            pos += 1;
-        }
+        // Skip leading whitespace/control chars and `/* */` comments.
+        // Comments may legally sit between records (e.g. an exporter
+        // banner), so skipping them — rather than bailing — is what keeps
+        // every record after a comment visible.
+        pos = skip_ws_and_comments(buf, pos, end);
         if pos >= end {
             break;
         }
         // Records must begin with `#`.
         if buf[pos] != b'#' {
             // Could be ENDSEC; etc. Bail out of the DATA loop entirely
-            // — anything beyond a non-`#` start indicates we've left
-            // the entity stream.
+            // — a non-`#`, non-comment start indicates we've left the
+            // entity stream.
             break;
         }
         let record_start = pos;
@@ -122,15 +220,25 @@ fn find_record_end(buf: &[u8], start: usize, end: usize) -> Option<usize> {
     let mut i = start;
     let limit = end.min(buf.len());
     while i < limit {
-        // memchr2 jumps to the next `;` or `'` — the only two bytes that
-        // matter for framing. memchr is SIMD-accelerated on x86.
-        match memchr2(b';', b'\'', &buf[i..limit]) {
+        // memchr3 jumps to the next byte that matters for framing: `;`
+        // (record terminator), `'` (string start), or `/` (possible
+        // `/* */` comment start). memchr is SIMD-accelerated on x86.
+        match memchr3(b';', b'\'', b'/', &buf[i..limit]) {
             Some(off) => {
                 let abs = i + off;
                 match buf[abs] {
                     b';' => return Some(abs),
                     b'\'' => {
                         i = skip_quoted_string(buf, abs + 1, limit);
+                    }
+                    b'/' => {
+                        // Only `/*` opens a comment; a lone `/` (e.g. a
+                        // path or division in a value) is an ordinary byte.
+                        if abs + 1 < limit && buf[abs + 1] == b'*' {
+                            i = skip_block_comment(buf, abs + 2, limit);
+                        } else {
+                            i = abs + 1;
+                        }
                     }
                     _ => unreachable!(),
                 }
@@ -218,44 +326,43 @@ fn parse_record(record: &[u8]) -> Option<(u64, &[u8], &[u8])> {
     }
     let args_start = i + 1;
     // Args end at the last byte of `record` that is `)`, trimming
-    // trailing whitespace. We can't naively search for `)` because the
-    // matching one might be embedded in a quoted string — but the
-    // record's trailing `)` is, by the format, the close paren of the
-    // outer argument list. So trim from the right.
+    // trailing whitespace and `/* */` comments (a comment may legally
+    // sit between the close paren and the `;`). We can't naively search
+    // for `)` because the matching one might be embedded in a quoted
+    // string — but the record's trailing `)` is, by the format, the
+    // close paren of the outer argument list. So trim from the right.
     let mut j = record.len();
-    while j > args_start && is_ws(record[j - 1]) {
-        j -= 1;
+    loop {
+        while j > args_start && is_ws(record[j - 1]) {
+            j -= 1;
+        }
+        // Strip a trailing `*/ ... /*` comment if present.
+        if j > args_start + 1 && record[j - 1] == b'/' && record[j - 2] == b'*' {
+            // Find the matching `/*` opener scanning left.
+            let mut k = j - 2;
+            let mut found = false;
+            while k >= args_start + 1 {
+                if record[k - 1] == b'/' && record[k] == b'*' {
+                    j = k - 1;
+                    found = true;
+                    break;
+                }
+                if k == args_start + 1 {
+                    break;
+                }
+                k -= 1;
+            }
+            if found {
+                continue;
+            }
+        }
+        break;
     }
     if j == args_start || record[j - 1] != b')' {
         return None;
     }
     let args = &record[args_start..j - 1];
     Some((id, type_name, args))
-}
-
-/// Tiny substring search used only for section markers (rare path).
-fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    if needle.is_empty() || haystack.len() < needle.len() {
-        return None;
-    }
-    let first = needle[0];
-    let mut i = 0;
-    while i + needle.len() <= haystack.len() {
-        match memchr::memchr(first, &haystack[i..]) {
-            Some(off) => {
-                let abs = i + off;
-                if abs + needle.len() > haystack.len() {
-                    return None;
-                }
-                if &haystack[abs..abs + needle.len()] == needle {
-                    return Some(abs);
-                }
-                i = abs + 1;
-            }
-            None => return None,
-        }
-    }
-    None
 }
 
 // ----------------------------------------------------------------------
@@ -522,10 +629,150 @@ pub fn parse_ref_list(body: &[u8]) -> Vec<u64> {
 
 #[cfg(test)]
 mod tests {
-    use super::decode_string;
+    use super::{data_section_start, decode_string, endsec_position, for_each_record};
 
     fn dec(quoted: &[u8]) -> String {
         decode_string(quoted).expect("decode_string returned None")
+    }
+
+    // ---- Section / record framing (GH #72) -------------------------------
+
+    /// Collect every record's (id, TYPE) the way the indexer walk does:
+    /// frame the DATA section, then iterate records inside it.
+    fn collect(src: &str) -> Vec<(u64, String)> {
+        let buf = src.as_bytes();
+        let start = data_section_start(buf).unwrap_or(0);
+        let end = endsec_position(buf, start);
+        let mut out = Vec::new();
+        for_each_record(buf, start, end, |rec| {
+            out.push((
+                rec.id,
+                String::from_utf8_lossy(rec.type_name).into_owned(),
+            ));
+        });
+        out
+    }
+
+    const HEADER: &str =
+        "ISO-10303-21;\nHEADER;\nFILE_DESCRIPTION((''),'2;1');\nENDSEC;\n";
+
+    #[test]
+    fn framing_normal_file_no_regression() {
+        let src = format!(
+            "{HEADER}DATA;\n\
+             #1=IFCWALL('g1',$,$);\n\
+             #2=IFCSLAB('g2',$,$);\n\
+             ENDSEC;\nEND-ISO-10303-21;\n"
+        );
+        let recs = collect(&src);
+        assert_eq!(
+            recs,
+            vec![(1, "IFCWALL".into()), (2, "IFCSLAB".into())],
+            "normal two-record file must parse both records"
+        );
+    }
+
+    #[test]
+    fn framing_comment_between_records_keeps_following() {
+        // GH #72 bug 1: a `/* */` comment between records dropped every
+        // record after it. All three records must survive.
+        let src = format!(
+            "{HEADER}DATA;\n\
+             #1=IFCWALL('7WALL1',$,$);\n\
+             /* exported by FooCAD */\n\
+             #2=IFCWALL('7WALL2',$,$);\n\
+             /* multi\nline\ncomment */ #3=IFCSLAB('s',$,$);\n\
+             ENDSEC;\n"
+        );
+        let recs = collect(&src);
+        assert_eq!(
+            recs,
+            vec![
+                (1, "IFCWALL".into()),
+                (2, "IFCWALL".into()),
+                (3, "IFCSLAB".into())
+            ],
+            "records after a /* */ comment must still parse"
+        );
+    }
+
+    #[test]
+    fn framing_comment_inside_record_does_not_desync() {
+        // A comment containing `;` and `'` inside the arg list must not be
+        // treated as a record terminator or string.
+        let src = format!(
+            "{HEADER}DATA;\n\
+             #1=IFCWALL('a' /* ; ' note */ ,$,$);\n\
+             #2=IFCSLAB('b',$,$);\n\
+             ENDSEC;\n"
+        );
+        let recs = collect(&src);
+        assert_eq!(recs.len(), 2, "comment with ; and ' must not split the record");
+        assert_eq!(recs[0].0, 1);
+        assert_eq!(recs[1].0, 2);
+    }
+
+    #[test]
+    fn framing_endsec_inside_string_does_not_truncate() {
+        // GH #72 bug 2: literal `ENDSEC` inside a quoted value truncated
+        // the section, dropping the record and everything after it.
+        let src = format!(
+            "{HEADER}DATA;\n\
+             #1=IFCWALL('SEE ENDSEC FOR DETAILS',$,$);\n\
+             #2=IFCSLAB('after',$,$);\n\
+             ENDSEC;\nEND-ISO-10303-21;\n"
+        );
+        let recs = collect(&src);
+        assert_eq!(
+            recs,
+            vec![(1, "IFCWALL".into()), (2, "IFCSLAB".into())],
+            "ENDSEC inside a string must not end the section"
+        );
+    }
+
+    #[test]
+    fn framing_endsec_inside_comment_does_not_truncate() {
+        let src = format!(
+            "{HEADER}DATA;\n\
+             /* TODO before ENDSEC review */\n\
+             #1=IFCWALL('w',$,$);\n\
+             ENDSEC;\n"
+        );
+        let recs = collect(&src);
+        assert_eq!(recs, vec![(1, "IFCWALL".into())]);
+    }
+
+    #[test]
+    fn framing_data_inside_header_string_not_section_start() {
+        // GH #72 bug 3: `DATA;` inside a HEADER string value started the
+        // section early, emptying the parse.
+        let src = "ISO-10303-21;\nHEADER;\n\
+             FILE_DESCRIPTION(('Bridge DATA; rev2'),'2;1');\n\
+             ENDSEC;\n\
+             DATA;\n\
+             #1=IFCWALL('real',$,$);\n\
+             ENDSEC;\n";
+        let buf = src.as_bytes();
+        let start = data_section_start(buf).expect("real DATA; must be found");
+        // The real DATA; sits after the header ENDSEC, so the first record
+        // must be the genuine IFCWALL, not garbage parsed from the header.
+        let recs = collect(src);
+        assert_eq!(
+            recs,
+            vec![(1, "IFCWALL".into())],
+            "DATA; inside a header string must not be the section start"
+        );
+        // And start must point past the real marker, not the header one.
+        assert!(start > src.find("ENDSEC").unwrap());
+    }
+
+    #[test]
+    fn framing_data_token_boundary() {
+        // `_DATA;` or `METADATA;` must not be mistaken for `DATA;`.
+        let src = "HEADER;\nFILE_NAME('METADATA;',$);\nENDSEC;\n\
+             DATA;\n#1=IFCWALL('x',$,$);\nENDSEC;\n";
+        let recs = collect(src);
+        assert_eq!(recs, vec![(1, "IFCWALL".into())]);
     }
 
     #[test]
