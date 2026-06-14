@@ -183,6 +183,9 @@ describing via `pq.read_schema(...)`):
 
 - Identity / structure: `ifc_id`, `guid`, `class` (normalised — "Wall"
   not "IfcWallStandardCase"), `source_class`, `name`, `tag`,
+  `predefined_type` (the IFC `PredefinedType` enum, e.g. `DOOR`,
+  `USERDEFINED`, `NOTDEFINED`; `None` when the schema/entity has none —
+  see Conventions for the IFC4 door/window correction), `object_type`,
   `storey_guid`, `aggregates_parent_guid`, `type_guid`, `rep_id`.
 - Placement / world: `transform` (4×4 col-major), `placement_xyz`.
 - World-AABB: `bbox_min_xyz`, `bbox_max_xyz`.
@@ -359,6 +362,18 @@ the project's unit scale as parquet schema metadata
   `NaN` (cache hit) are the same missing value; identical files diff
   clean regardless of which side was cached. `diff()` also accepts
   `pathlib.Path`.
+- **`predefined_type` is the IFC `PredefinedType` enum — and only
+  that** (corrected in cache schema v18, GH #74). IFC4 `IfcDoor` /
+  `IfcWindow` (and their `*StandardCase` subtypes) carry TWO trailing
+  enums — `PredefinedType` *then* `OperationType` (door) /
+  `PartitioningType` (window) — plus a trailing `UserDefined…` string.
+  Earlier builds reported the second enum (e.g. `SINGLE_SWING_LEFT`
+  instead of `DOOR`) and turned `USERDEFINED` into `None`. Now
+  `predefined_type` is always the `PredefinedType` value, `USERDEFINED`
+  is preserved verbatim, and `OperationType` / `PartitioningType` are
+  intentionally not surfaced. IFC2X3 `IfcDoor` / `IfcWindow` have no
+  `PredefinedType` and stay `None` — filtering `predefined_type == 'DOOR'`
+  only matches IFC4. If you cached door/window models on ≤v17, re-bundle.
 - **Strings come back as proper UTF-8.** STEP escape sequences
   (`\X\HH`, `\X2\HHHH…\X0\`, `\S\C`) are resolved, and raw un-escaped
   high bytes — what Bonsai/BlenderBIM and some ArchiCAD/Tekla exports

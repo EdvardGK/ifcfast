@@ -293,7 +293,18 @@ _HASH_TAIL_BYTES = 4 * 1024 * 1024
 #       unit stand-in fragments, so cached drift/segments parquet from
 #       v16 holds foreign-extent values for clipped products.
 #       Value change without column change → re-extraction required.
-# v18 — two value-changing fixes ship together in this bump:
+# v18 — three value-changing fixes ship together in this bump:
+# v18 (GH #74) — IFC4 IfcDoor / IfcWindow `predefined_type` corrected.
+#       The indexer walked args from the right and took the first trailing
+#       enum, but IFC4 IfcDoor / IfcWindow (+ their *StandardCase subtypes)
+#       carry TWO trailing enums: PredefinedType then
+#       OperationType/PartitioningType, plus a UserDefined string. Cached
+#       substrates ≤v17 hold the WRONG value (the OperationType /
+#       PartitioningType, e.g. `SINGLE_SWING_LEFT` instead of `DOOR`), and
+#       `.USERDEFINED.` was collapsed to None. `predefined_type` is now read
+#       positionally (third-from-last attribute) and USERDEFINED is
+#       preserved. IFC2X3 unaffected (no PredefinedType on door/window).
+#       Value change without column change → re-extraction required.
 # v18 (GH #77) — raw-UTF-8 STEP string decoding fixed. `decode_string`
 #       previously forced Latin-1 on every high byte, mojibaking raw
 #       UTF-8 exports (Bonsai/BlenderBIM, some ArchiCAD/Tekla) — a wall

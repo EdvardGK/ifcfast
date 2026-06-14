@@ -894,18 +894,33 @@ fn extract_product(
     let suppress_predefined = is_ifc2x3 && is_predefined_type_unavailable_in_ifc2x3(type_name);
     let mut predefined: Option<String> = None;
     if !suppress_predefined {
-        for f in fields.iter().rev() {
-            match parse_field(f) {
-                Field::Enum(e) => {
-                    if let Ok(s) = std::str::from_utf8(e) {
-                        predefined = Some(s.to_string());
+        if !is_ifc2x3 && has_trailing_predefined_then_operation_enum(type_name) {
+            // IFC4 IfcDoor / IfcWindow carry TWO trailing enums plus a
+            // user-defined string:
+            //   IfcDoor:   …, PredefinedType, OperationType,   UserDefinedOperationType
+            //   IfcWindow: …, PredefinedType, PartitioningType, UserDefinedPartitioningType
+            // A naive walk-from-right takes OperationType/PartitioningType
+            // (wrong attribute), and when the trailing UserDefined string is
+            // set it stops on the string and returns None — even though
+            // PredefinedType is `.USERDEFINED.` in that case. PredefinedType
+            // is the SECOND enum from the right: skip the trailing string /
+            // null / star, skip exactly one enum (Operation/Partitioning),
+            // then the next enum is PredefinedType. See #74.
+            predefined = predefined_for_door_window(fields);
+        } else {
+            for f in fields.iter().rev() {
+                match parse_field(f) {
+                    Field::Enum(e) => {
+                        if let Ok(s) = std::str::from_utf8(e) {
+                            predefined = Some(s.to_string());
+                        }
+                        break;
                     }
-                    break;
+                    // Skip nulls / stars but stop at anything else so we don't
+                    // bleed across the schema-positional boundary.
+                    Field::Null | Field::Star => continue,
+                    _ => break,
                 }
-                // Skip nulls / stars but stop at anything else so we don't
-                // bleed across the schema-positional boundary.
-                Field::Null | Field::Star => continue,
-                _ => break,
             }
         }
     }
@@ -973,6 +988,45 @@ fn is_predefined_type_unavailable_in_ifc2x3(entity: &[u8]) -> bool {
         | b"IFCDISTRIBUTIONPORT"      // trailing enum is FlowDirection (IFC4 adds PredefinedType)
         | b"IFCBUILDINGELEMENTPROXY"  // trailing enum is CompositionType (IFC4 adds PredefinedType)
     )
+}
+
+/// IFC4 entities whose PredefinedType is followed by a SECOND trailing enum
+/// (Operation/Partitioning type) plus a user-defined string. For these the
+/// last enum is NOT PredefinedType — PredefinedType is the second enum from
+/// the right. Occurrence entities only; the `*Type` styles are extracted on
+/// a different path (EntityKind::TypeObject) and are not products. See #74.
+fn has_trailing_predefined_then_operation_enum(entity: &[u8]) -> bool {
+    // IfcDoorStandardCase / IfcWindowStandardCase add no direct attributes
+    // over IfcDoor / IfcWindow, so they share the identical 13-field trailing
+    // layout and the same bug.
+    matches!(
+        entity,
+        b"IFCDOOR" | b"IFCWINDOW" | b"IFCDOORSTANDARDCASE" | b"IFCWINDOWSTANDARDCASE"
+    )
+}
+
+/// Extract PredefinedType for IFC4 IfcDoor / IfcWindow.
+///
+/// Both have an identical trailing layout (13 direct attributes):
+///   …, OverallHeight(8), OverallWidth(9),
+///   PredefinedType(10), Operation/PartitioningType(11), UserDefined…(12)
+/// PredefinedType is therefore the THIRD field from the end. The two enums
+/// after it (Operation/Partitioning, plus the UserDefined string) may each be
+/// `$`, so a "second enum from the right" walk is unreliable when
+/// OperationType is unset — positional indexing from the end is the robust
+/// choice. `.USERDEFINED.` is returned as-is, never collapsed to None. See #74.
+fn predefined_for_door_window(fields: &[&[u8]]) -> Option<String> {
+    // len - 3 == PredefinedType slot. Guard against malformed/truncated
+    // records that lack the trailing block (e.g. an IFC2X3 door mislabelled
+    // IFC4) by requiring at least 11 fields (indices 0..=10).
+    if fields.len() < 11 {
+        return None;
+    }
+    let idx = fields.len() - 3;
+    match parse_field(fields[idx]) {
+        Field::Enum(e) => std::str::from_utf8(e).ok().map(|s| s.to_string()),
+        _ => None,
+    }
 }
 
 
