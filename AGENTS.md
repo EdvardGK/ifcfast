@@ -384,6 +384,17 @@ the project's unit scale as parquet schema metadata
   missing its `END-ISO-10303-21;` trailer (interrupted download /
   copy) raises `ValueError` at open instead of silently returning a
   partial model. ZIP containers rely on ZIP's own integrity check.
+- **Section/record framing is comment- and string-aware (since GH #72,
+  cache schema v19).** ISO-10303-21 `/* … */` comments and single-quoted
+  strings are treated as inert when the parser locates `DATA;` /
+  `ENDSEC;` and record terminators (`;`). So none of these silently drop
+  records anymore: a `/* exported by FooCAD */` banner *between*
+  records (everything after it used to vanish), the literal `ENDSEC`
+  inside a value like `'SEE ENDSEC FOR DETAILS'` (truncated the section),
+  or `DATA;` inside a HEADER string like `('Bridge DATA; rev2')` (started
+  the section early → 0 products). If you cached such a file on ≤v18,
+  re-bundle — it now parses the previously-dropped entities. Clean files
+  are byte-identical.
 - **`diff()` is cache-state independent.** `None` (cold parse) and
   `NaN` (cache hit) are the same missing value; identical files diff
   clean regardless of which side was cached. `diff()` also accepts
@@ -416,6 +427,19 @@ the project's unit scale as parquet schema metadata
   `'skip'` for *every* non-hardcoded entity. (`schema == 'UNKNOWN'` and
   the empty string resolve to "unset" so the caller's default applies.)
   IFC4/IFC2X3 classification is unchanged.
+- **`m.classifications` walks nested `ReferencedSource` chains (GH #75).**
+  `system_name` / `edition` / `source` come from the terminal
+  `IfcClassification`, even when the leaf `IfcClassificationReference`
+  reaches it through one or more *parent references* — the multi-level
+  hierarchy ArchiCAD/Solibri NS 3451 and Uniclass exports produce
+  (leaf → group → table → `IfcClassification`). `identification` /
+  `name` / `location` still come from the leaf reference. Before the
+  v19 cache schema only a single hop was followed, so any
+  hierarchy-exported population came back with `system_name == nan` and
+  was invisible to consumers grouping by system; re-bundle to pick the
+  fields up. The walk is depth-capped (32) and cycle-guarded, so a
+  malformed self/loop reference yields `None` system fields rather than
+  hanging.
 - **Strings come back as proper UTF-8.** STEP escape sequences
   (`\X\HH`, `\X2\HHHH…\X0\`, `\S\C`) are resolved, and raw un-escaped
   high bytes — what Bonsai/BlenderBIM and some ArchiCAD/Tekla exports

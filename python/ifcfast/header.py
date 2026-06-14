@@ -341,6 +341,28 @@ _HASH_TAIL_BYTES = 4 * 1024 * 1024
 #       pset/quantity rows. Row-count change → re-extraction required.
 #       G55_ARK (IFC2X3, Revit): 11 bare IfcTypeProduct types now visible;
 #       33 Roof/Stair/Ramp occurrences gain their type_guid.
+# v19 (GH #72) — STEP section/record framing made comment- and string-aware.
+#       The DATA-section scanner previously (a) bailed out of the record
+#       walk on the first `/* */` comment, silently dropping every record
+#       after it; (b) matched a literal `ENDSEC` substring inside a quoted
+#       value, truncating the section; and (c) matched `DATA;` inside a
+#       HEADER string, starting the section early and emptying the parse.
+#       All three were silent wrong-output. Framing now skips comments and
+#       quoted strings when locating `DATA;` / `ENDSEC;` and record
+#       terminators. Any file using `/* */` comments between records, or
+#       containing the literal `ENDSEC`/`DATA;` inside a string, now parses
+#       MORE (previously-dropped) entities → cached substrates of such
+#       files must be re-extracted. Clean files are byte-identical.
+# v19 (GH #75) — classification extractor walks the full `ReferencedSource`
+#       chain. A leaf `IfcClassificationReference` whose `ReferencedSource`
+#       points at a parent *reference* (multi-level hierarchy — ArchiCAD/
+#       Solibri NS 3451, Uniclass tables) was only resolved one hop, so the
+#       terminal `IfcClassification` was never reached and
+#       `classifications.system_name` / `.edition` / `.source` came back null.
+#       The walk now follows parent references (depth-capped 32, cycle-guarded)
+#       to the terminal `IfcClassification`. Value change without column change
+#       → cached substrates of files with hierarchical classifications must be
+#       re-extracted; flat (single-hop) classifications are byte-identical.
 _CACHE_SCHEMA_VERSION = 19
 
 _FIELD_RE = re.compile(r"\(\s*(.*?)\s*\)\s*;", re.DOTALL)

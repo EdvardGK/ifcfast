@@ -33,6 +33,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   spells both out so the `type_objects` entity column is correctly
   cased without relying on the consumer fold map.
 
+### Fixed — STEP section/record framing is now comment- and string-aware (GH #72)
+
+Three silent wrong-output bugs in the DATA-section scanner, one root
+class: framing did not treat ISO-10303-21 `/* */` comments or
+single-quoted strings as inert when locating section boundaries and
+record terminators.
+
+- **A `/* */` comment between records dropped everything after it.**
+  `for_each_record` broke the record walk on the first non-`#` byte, so
+  a comment (`/* exported by FooCAD */`) sitting between two records
+  ended the DATA scan early. It now skips whitespace **and** `/* */`
+  comments between records, and a comment containing `;`/`'` inside a
+  record no longer desyncs `find_record_end`.
+- **`ENDSEC` inside a quoted value truncated the section.**
+  `endsec_position` was a raw substring search, so a wall named
+  `'SEE ENDSEC FOR DETAILS'` ended DATA at the wrong place and dropped
+  the matching record plus everything after it. The scan now skips
+  quoted strings and comments (SIMD `memchr3` fast path preserved — no
+  throughput regression on the full-section scan).
+- **`DATA;` inside a HEADER string started the section early →
+  0 products.** `data_section_start` checked only the preceding byte, so
+  `FILE_DESCRIPTION(('Bridge DATA; rev2'),'2;1')` was mistaken for the
+  section marker, emptying the parse. It now skips header strings and
+  comments and matches `DATA` only as a bare token.
+
+Files using comments between records, or containing the literal
+`ENDSEC`/`DATA;` inside a string, now parse the previously-dropped
+entities. `_CACHE_SCHEMA_VERSION` bumped **18 → 19** (value change for
+affected files; clean files are byte-identical → cache hits unchanged).
+
+### Fixed — hierarchical classification chains lose system_name/edition/source (GH #75)
+
+- **`m.classifications` now walks the full `ReferencedSource` chain.** A
+  leaf `IfcClassificationReference` whose `ReferencedSource` points at a
+  parent *reference* (rather than directly at the `IfcClassification`) —
+  the multi-level hierarchy ArchiCAD/Solibri NS 3451 and Uniclass
+  exports produce (leaf → group → table → `IfcClassification`) — was
+  only resolved one hop. The terminal `IfcClassification` was never
+  reached, so `system_name` / `edition` / `source` came back `None` and
+  the entire hierarchy-exported population was invisible to consumers
+  grouping by `system_name` (the NS 3451 use case). The extractor now
+  follows parent references to the terminal `IfcClassification`,
+  depth-capped (32) and cycle-guarded (a self/loop reference yields
+  `None` system fields rather than hanging). `identification` / `name` /
+  `location` still come from the leaf reference.
+- **Cache schema `v18 → v19`.** Values change for files with
+  hierarchical classifications, so their cached substrates re-extract;
+  flat (single-hop) classifications are byte-identical. `AGENTS.md`
+  updated.
+
 ### Security — bump pyo3 to 0.29 (RUSTSEC-2026-0176 / -0177)
 
 - **`pyo3` bumped `0.24` → `0.29`** (with `pyo3-ffi`,

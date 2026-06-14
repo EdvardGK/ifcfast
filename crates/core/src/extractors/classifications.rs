@@ -120,7 +120,13 @@ pub fn build(
         //  - IfcClassificationReference (most common — Edvard's pattern)
         //  - IfcClassification directly (rarer)
         if let Some(r) = refs.get(&relating_id) {
-            let system = r.parent_id.and_then(|sid| systems.get(&sid));
+            // Walk the ReferencedSource chain: a leaf reference can point at a
+            // parent *reference* (multi-level hierarchies — Uniclass tables,
+            // ArchiCAD/Solibri NS 3451 nested exports) instead of directly at
+            // the terminal IfcClassification. One-hop resolution dropped
+            // system_name/edition/source on those (issue #75). Follow parent_id
+            // through `refs` until a `systems` hit, depth-capped + cycle-guarded.
+            let system = resolve_system(relating_id, r, &refs, &systems);
             out.guid.push(guid.clone());
             out.system_name.push(system.and_then(|s| s.name.clone()));
             out.edition.push(system.and_then(|s| s.edition.clone()));
@@ -140,6 +146,47 @@ pub fn build(
     }
 
     out
+}
+
+/// Maximum classification-hierarchy depth we'll walk. Real-world chains are
+/// 2–3 levels (leaf → group → table → IfcClassification); 32 is a generous
+/// ceiling that also bounds the worst case if a malformed/circular file slips
+/// past the visited-set guard.
+const MAX_CHAIN_DEPTH: usize = 32;
+
+/// Resolve the terminal `IfcClassification` for a (possibly nested) reference
+/// by walking `ReferencedSource` through `refs` until a `systems` entry is hit.
+///
+/// `start_id` is the step-id of the leaf reference `r`. Returns `None` if the
+/// chain terminates without ever reaching an `IfcClassification` (e.g. a
+/// reference with no `ReferencedSource`, or one pointing only at other
+/// references). Cycle-guarded via a visited set and depth-capped via
+/// `MAX_CHAIN_DEPTH`.
+fn resolve_system<'a>(
+    start_id: u64,
+    r: &RefRecord,
+    refs: &HashMap<u64, RefRecord>,
+    systems: &'a HashMap<u64, SystemRecord>,
+) -> Option<&'a SystemRecord> {
+    // Small inline visited set — chains are short, so a Vec linear-scan beats a
+    // HashSet allocation here. Seed with the leaf's own id so a self-reference
+    // (parent_id == start_id) is caught immediately.
+    let mut visited: Vec<u64> = vec![start_id];
+    let mut parent = r.parent_id;
+    while let Some(pid) = parent {
+        if let Some(sys) = systems.get(&pid) {
+            return Some(sys);
+        }
+        if visited.len() >= MAX_CHAIN_DEPTH || visited.contains(&pid) {
+            // Depth cap or cycle: bail rather than loop forever.
+            return None;
+        }
+        visited.push(pid);
+        // Not a system — must be another reference, keep walking. If pid is
+        // neither (dangling ref), the chain dead-ends here.
+        parent = refs.get(&pid).and_then(|next| next.parent_id);
+    }
+    None
 }
 
 struct SystemRecord {
@@ -265,6 +312,99 @@ END-ISO-10303-21;
         assert!(t.system_name[0].is_none());
         assert!(t.edition[0].is_none());
         assert!(t.source[0].is_none());
+    }
+
+    #[test]
+    fn hierarchical_chain_resolves_system_from_terminal_classification() {
+        // Issue #75: a leaf reference whose ReferencedSource points at a parent
+        // *reference* (multi-level hierarchy, as ArchiCAD/Solibri NS 3451
+        // exports nest). One-hop resolution dropped system_name/edition/source;
+        // the walk must reach the terminal IfcClassification #50.
+        //
+        //   #50 IfcClassification ('NS 3451')
+        //     ↑ ReferencedSource
+        //   #51 IfcClassificationReference ('23', group)
+        //     ↑ ReferencedSource
+        //   #52 IfcClassificationReference ('232.1', leaf) ← attached to product
+        let buf = make_buf(
+            r#"
+#50=IFCCLASSIFICATION('Standard Norge','2022',$,'NS 3451');
+#51=IFCCLASSIFICATIONREFERENCE($,'23','Yttervegger gruppe',#50);
+#52=IFCCLASSIFICATIONREFERENCE($,'232.1','Yttervegger',#51);
+#53=IFCRELASSOCIATESCLASSIFICATION('2Cls000000000000000001',$,$,$,(#10),#52);
+"#,
+        );
+        let t = run(&buf);
+        assert_eq!(t.len(), 1);
+        assert_eq!(t.guid[0], "1Wall00000000000000001");
+        // Identification/name come from the LEAF reference (#52)…
+        assert_eq!(t.identification[0].as_deref(), Some("232.1"));
+        assert_eq!(t.name[0].as_deref(), Some("Yttervegger"));
+        // …while system metadata is walked up to the terminal IfcClassification.
+        assert_eq!(t.system_name[0].as_deref(), Some("NS 3451"));
+        assert_eq!(t.edition[0].as_deref(), Some("2022"));
+        assert_eq!(t.source[0].as_deref(), Some("Standard Norge"));
+    }
+
+    #[test]
+    fn deep_chain_three_references_deep_resolves_system() {
+        // Four levels of nesting (table → division → group → leaf), as deep
+        // Uniclass-style hierarchies produce. The walk must still terminate on
+        // the IfcClassification at the top.
+        let buf = make_buf(
+            r#"
+#50=IFCCLASSIFICATION('NBS','2023',$,'Uniclass 2015');
+#51=IFCCLASSIFICATIONREFERENCE($,'Ss','Systems',#50);
+#52=IFCCLASSIFICATIONREFERENCE($,'Ss_25','Wall systems',#51);
+#53=IFCCLASSIFICATIONREFERENCE($,'Ss_25_10','Framed wall systems',#52);
+#54=IFCCLASSIFICATIONREFERENCE($,'Ss_25_10_30','Timber framed',#53);
+#55=IFCRELASSOCIATESCLASSIFICATION('2Cls000000000000000001',$,$,$,(#10),#54);
+"#,
+        );
+        let t = run(&buf);
+        assert_eq!(t.len(), 1);
+        assert_eq!(t.identification[0].as_deref(), Some("Ss_25_10_30"));
+        assert_eq!(t.system_name[0].as_deref(), Some("Uniclass 2015"));
+        assert_eq!(t.edition[0].as_deref(), Some("2023"));
+        assert_eq!(t.source[0].as_deref(), Some("NBS"));
+    }
+
+    #[test]
+    fn cyclic_reference_chain_does_not_loop_and_emits_row() {
+        // Malformed file: two references point at each other (ReferencedSource
+        // cycle, no terminal IfcClassification). The cycle guard must prevent an
+        // infinite loop; the row is still emitted with leaf identification/name
+        // and None system metadata.
+        let buf = make_buf(
+            r#"
+#51=IFCCLASSIFICATIONREFERENCE($,'A','Loop A',#52);
+#52=IFCCLASSIFICATIONREFERENCE($,'B','Loop B',#51);
+#53=IFCRELASSOCIATESCLASSIFICATION('2Cls000000000000000001',$,$,$,(#10),#52);
+"#,
+        );
+        let t = run(&buf);
+        assert_eq!(t.len(), 1);
+        assert_eq!(t.identification[0].as_deref(), Some("B"));
+        assert_eq!(t.name[0].as_deref(), Some("Loop B"));
+        assert!(t.system_name[0].is_none());
+        assert!(t.edition[0].is_none());
+        assert!(t.source[0].is_none());
+    }
+
+    #[test]
+    fn self_referencing_reference_does_not_loop() {
+        // Degenerate self-cycle: a reference whose ReferencedSource is itself.
+        // Seeding the visited set with the leaf id catches this on the first hop.
+        let buf = make_buf(
+            r#"
+#51=IFCCLASSIFICATIONREFERENCE($,'X','Self',#51);
+#52=IFCRELASSOCIATESCLASSIFICATION('2Cls000000000000000001',$,$,$,(#10),#51);
+"#,
+        );
+        let t = run(&buf);
+        assert_eq!(t.len(), 1);
+        assert_eq!(t.identification[0].as_deref(), Some("X"));
+        assert!(t.system_name[0].is_none());
     }
 
     #[test]
