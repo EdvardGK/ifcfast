@@ -12,6 +12,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > surface. Cache schema v17 (cached drift/segments from v16 hold
 > foreign-extent values for clipped products).
 
+### Fixed — IFC4 IfcDoor/IfcWindow `predefined_type` (GH #74)
+
+- **`predefined_type` for IFC4 `IfcDoor` / `IfcWindow` was the WRONG
+  enum.** The indexer found `predefined_type` by walking attributes
+  from the right and taking the first trailing enum. But IFC4 `IfcDoor`
+  / `IfcWindow` (and their `*StandardCase` subtypes) carry TWO trailing
+  enums — `PredefinedType` then `OperationType`/`PartitioningType` —
+  plus a trailing `UserDefined…` string. The walk grabbed
+  `OperationType`/`PartitioningType` (e.g. `SINGLE_SWING_LEFT` instead
+  of `DOOR`), and when the `UserDefined…` string was set it stopped on
+  the string and returned `None` even though `PredefinedType` was
+  `.USERDEFINED.`. Revit IFC4 exports set both enums on essentially
+  every door/window, so anything filtering or aggregating on
+  `predefined_type` got garbage. `predefined_type` is now read
+  positionally (third-from-last attribute) for these entities and
+  `USERDEFINED` is preserved. **Cache schema v18** (cached door/window
+  substrates from ≤v17 hold the wrong value → re-bundle).
+- **IFC2X3 unaffected:** `IfcDoor` / `IfcWindow` have no
+  `PredefinedType` in IFC2X3 and continue to return `None`; the new
+  positional path only runs for IFC4 door/window entities.
+
 ### Fixed — synthetic half-space stand-ins stripped from no-cut output (GH #66)
 
 - **`iter_meshes`/`meshes` no longer return giant degenerate planes

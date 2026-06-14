@@ -293,7 +293,18 @@ _HASH_TAIL_BYTES = 4 * 1024 * 1024
 #       unit stand-in fragments, so cached drift/segments parquet from
 #       v16 holds foreign-extent values for clipped products.
 #       Value change without column change → re-extraction required.
-_CACHE_SCHEMA_VERSION = 17
+# v18 — IFC4 IfcDoor / IfcWindow `predefined_type` corrected (GH #74).
+#       The indexer walked args from the right and took the first trailing
+#       enum, but IFC4 IfcDoor / IfcWindow (+ their *StandardCase subtypes)
+#       carry TWO trailing enums: PredefinedType then
+#       OperationType/PartitioningType, plus a UserDefined string. Cached
+#       substrates ≤v17 hold the WRONG value (the OperationType /
+#       PartitioningType, e.g. `SINGLE_SWING_LEFT` instead of `DOOR`), and
+#       `.USERDEFINED.` was collapsed to None. `predefined_type` is now read
+#       positionally (third-from-last attribute) and USERDEFINED is
+#       preserved. IFC2X3 unaffected (no PredefinedType on door/window).
+#       Value change without column change → re-extraction required.
+_CACHE_SCHEMA_VERSION = 18
 
 _FIELD_RE = re.compile(r"\(\s*(.*?)\s*\)\s*;", re.DOTALL)
 
