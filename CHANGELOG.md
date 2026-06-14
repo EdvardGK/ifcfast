@@ -38,6 +38,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   re-validate as a miss exactly once and are rewritten — the safe
   fail-loud direction.
 
+### Fixed — IFC4X3 built elements no longer classify as `skip` (GH #82)
+
+- **`IfcBuiltElement` rename handled.** IFC4X3 renamed the bulk-element
+  supertype `IfcBuildingElement` → `IfcBuiltElement`. The classifier's
+  inheritance walk (`python/ifcfast/classify.py`) only checked for
+  `IfcBuildingElement`, so every IFC4X3-only built element that chains
+  through `IfcBuiltElement` — `IfcKerb`, `IfcPavement`, `IfcCourse`, … —
+  and isn't in the hardcoded `MEASURE_ENTITIES` set fell through to
+  `mode='skip'`, silently dropping out of `mode='measure'` take-offs.
+  The walk now treats `IfcBuiltElement` and `IfcBuildingElement` as
+  equivalent.
+- **Addendum / technical-corrigendum schema suffixes resolve.**
+  `_resolve_schema` now strips `_ADD2` / `_TC1` / etc. by longest-prefix
+  match against the known schema keys, so `FILE_SCHEMA(('IFC4X3_ADD2'))`
+  resolves to `IFC4X3` (not `IFC4`) and `IFC4_ADD2` to `IFC4`. Before
+  this, any suffixed schema header missed the supertype lookup entirely
+  and the *whole* inheritance fallback went dead — every non-hardcoded
+  entity classified as `skip`. `schema == 'UNKNOWN'` (and the empty
+  string) now resolve to "unset" so the caller's default schema applies,
+  instead of being treated as a real, unknown schema.
+- IFC4 / IFC2X3 classification is unchanged. No `_core` rebuild required
+  (pure-Python classifier + static supertype map). The shipped
+  `data/schema_supertypes.py` already carried the IFC4X3 entities and the
+  `IfcWall → IfcBuiltElement` mapping, so no regeneration was needed.
+
 ### Fixed — imperial files now resolve `unit_scale` (GH #73)
 
 - **`IfcConversionBasedUnit` is now resolved for LENGTHUNIT.** Imperial
