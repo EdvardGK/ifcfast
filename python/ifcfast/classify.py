@@ -135,18 +135,11 @@ def _ancestors(entity: str, schema: str) -> tuple[str, ...]:
     if cached is not None:
         return cached
 
-    parents = SUPERTYPE.get(schema)
-    if parents is None:
-        # Unknown schema — most files declare IFC2X3/IFC4/IFC4X3 but
-        # variant casings ("Ifc4", "IFC4_ADD2") sneak through. Try a
-        # case-insensitive lookup against the keys we have.
-        for key_schema in SUPERTYPE:
-            if key_schema.casefold() == schema.casefold():
-                parents = SUPERTYPE[key_schema]
-                break
-    if parents is None:
+    schema_key = _resolve_schema(schema)
+    if schema_key is None:
         _ANCESTORS_CACHE[key] = (entity,)
         return (entity,)
+    parents = SUPERTYPE[schema_key]
 
     chain: list[str] = [entity]
     seen: set[str] = {entity}
@@ -174,13 +167,33 @@ _CHILDREN_CACHE: dict[str, dict[str, list[str]]] = {}
 
 
 def _resolve_schema(schema: str) -> Optional[str]:
-    """Return the canonical SUPERTYPE key matching ``schema`` (exact, then
-    case-insensitive), or ``None`` when the schema isn't known."""
+    """Return the canonical SUPERTYPE key matching ``schema``, or ``None``
+    when the schema isn't known.
+
+    Resolution order:
+
+    1. Exact match (``"IFC4X3"``).
+    2. Case-insensitive match (``"ifc4x3"`` / ``"Ifc4"``).
+    3. Addendum / technical-corrigendum suffix strip: real-world headers
+       declare ``FILE_SCHEMA(('IFC4X3_ADD2'))`` / ``IFC4_ADD2`` /
+       ``IFC4X3_TC1`` — none of which are SUPERTYPE keys. We match the
+       longest known key that the (folded) schema starts with, so
+       ``"ifc4x3_add2"`` resolves to ``"IFC4X3"`` rather than ``"IFC4"``.
+
+    ``"UNKNOWN"`` (and the empty string) resolve to ``None`` so the caller
+    can apply its own default schema."""
     if schema in SUPERTYPE:
         return schema
     folded = schema.casefold()
+    if not folded or folded == "unknown":
+        return None
     for key_schema in SUPERTYPE:
         if key_schema.casefold() == folded:
+            return key_schema
+    # Suffix-bearing variant: prefix-match against known keys, longest first
+    # so the more specific schema wins (IFC4X3 before IFC4).
+    for key_schema in sorted(SUPERTYPE, key=len, reverse=True):
+        if folded.startswith(key_schema.casefold()):
             return key_schema
     return None
 
@@ -305,6 +318,10 @@ def classify_by_name(entity: str, schema: str = "IFC4") -> ElementMode:
             return ElementMode.COUNT
         if p == "IfcFlowSegment":
             return ElementMode.LINEAR
-        if p == "IfcBuildingElement":
+        # IFC4/IFC2X3 root the bulk built elements at IfcBuildingElement;
+        # IFC4X3 renamed that supertype to IfcBuiltElement, so the walk
+        # must accept either (IfcKerb, IfcPavement, IfcCourse, … chain
+        # through IfcBuiltElement and would otherwise fall through to SKIP).
+        if p in ("IfcBuildingElement", "IfcBuiltElement"):
             return ElementMode.MEASURE
     return ElementMode.SKIP

@@ -56,7 +56,15 @@ Automate (Condition), a cron/Python job, or an MCP agent loop.
   looking at" without triggering extracts. Every CLI subcommand has
   `--json`.
 - **Parquet cache.** The second open of a file reuses extracted
-  tables; the cache key invalidates on any edit or library change.
+  tables. The cache key (`sha256(schema_version, size, head 4 MB,
+  tail 4 MB)`) is path-independent so identical copies share a cache,
+  and a library change that alters column meaning bumps the schema and
+  orphans old caches. On every read the cache is also validated against
+  the source's live `(size, mtime_ns)`: a same-size in-place edit — which
+  the key's head/tail windows can miss on a >8 MB file — is caught here
+  and forces a re-parse (no stale model is ever served). Writes are
+  atomic (temp file + `os.replace`), so an interrupted write never leaves
+  a partial/empty parquet that reads back as a valid hit.
 
 ## Via MCP (zero-config, any agent ecosystem)
 
@@ -241,6 +249,19 @@ JOIN 'rib/instances.parquet' b
 `python/ifcfast/header.py` — when it bumps, the column set changed.
 Old caches become orphaned automatically.
 
+**Cache freshness is verified, not assumed.** The cache key cannot see
+a same-size edit confined to the middle of a >8 MB file (its hash only
+covers the head/tail 4 MB windows). So every cache read additionally
+compares the manifest's recorded `(size_bytes, mtime_ns)` to the live
+file stat; a mismatch is a hard miss and triggers a re-parse rather than
+serving a stale model. `mtime_ns` is kept out of the *key* on purpose so
+a plain copy (new mtime, same bytes) re-validates against the existing
+cache after one re-hash instead of forcing a full re-parse. All cache
+writes go through a temp file + atomic `os.replace`, and an index is only
+honoured when its manifest carries `has_index` and the parquet is present
+and non-empty — a crash mid-write can never leave a partial cache that
+reads as a valid hit.
+
 ### Narrow-phase clash (`ifcfast.clash()`)
 
 True mesh-mesh intersection runs against the same substrate. The
@@ -374,6 +395,22 @@ the project's unit scale as parquet schema metadata
   intentionally not surfaced. IFC2X3 `IfcDoor` / `IfcWindow` have no
   `PredefinedType` and stay `None` — filtering `predefined_type == 'DOOR'`
   only matches IFC4. If you cached door/window models on ≤v17, re-bundle.
+- **`mode` covers IFC4X3 built elements (GH #82).** The take-off mode
+  on each `ProductRow` (`'count'` / `'measure'` / `'linear'` / `'skip'`,
+  also `m.filter(mode=…)`) is computed by walking the static supertype
+  map. IFC4X3 renamed the bulk-element supertype `IfcBuildingElement` →
+  `IfcBuiltElement`, so before GH #82 every IFC4X3-only built element
+  (`IfcKerb`, `IfcPavement`, `IfcCourse`, … — anything chaining through
+  `IfcBuiltElement` but not in the hardcoded `MEASURE` set) classified
+  as `'skip'` and silently dropped out of `mode='measure'` take-offs.
+  The inheritance walk now treats `IfcBuiltElement` as equivalent to
+  `IfcBuildingElement`. The same fix makes addendum/TC schema headers
+  resolve: `FILE_SCHEMA(('IFC4X3_ADD2'))` / `IFC4_ADD2` / `IFC4X3_TC1`
+  now match their base schema (longest-prefix, so `IFC4X3_ADD2 → IFC4X3`
+  not `IFC4`), where previously any suffixed schema fell through to
+  `'skip'` for *every* non-hardcoded entity. (`schema == 'UNKNOWN'` and
+  the empty string resolve to "unset" so the caller's default applies.)
+  IFC4/IFC2X3 classification is unchanged.
 - **Strings come back as proper UTF-8.** STEP escape sequences
   (`\X\HH`, `\X2\HHHH…\X0\`, `\S\C`) are resolved, and raw un-escaped
   high bytes — what Bonsai/BlenderBIM and some ArchiCAD/Tekla exports
