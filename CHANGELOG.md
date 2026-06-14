@@ -12,6 +12,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > surface. Cache schema v17 (cached drift/segments from v16 hold
 > foreign-extent values for clipped products).
 
+### Changed — `by_type` expands subtypes by default (GH #81)
+
+- **`Model.by_type(entity)` now mirrors
+  `ifcopenshell.file.by_type(type, include_subtypes=True)`.** It
+  expands subtypes by default and matches the entity name
+  case-insensitively, where it previously did an exact, case-sensitive
+  match. On a typical Revit IFC2x3 export `by_type("IfcWall")` now
+  returns the `IfcWall` **and** `IfcWallStandardCase` instances (was:
+  just the bare `IfcWall`), and the very common `by_type("IfcElement")`
+  / `by_type("IfcProduct")` idioms return all element/product subtypes
+  present instead of `[]`.
+- **New `include_subtypes` keyword** (default `True`, matching
+  ifcopenshell): pass `include_subtypes=False` for an exact
+  single-entity match (still case-insensitive on the name).
+- Expansion resolves against the static per-schema supertype map
+  already shipped with the wheel (`data/schema_supertypes.py`) — **no
+  runtime ifcopenshell dependency.** Counts remain over the
+  meshable-product substrate, so abstract supertypes resolve to the
+  concrete products the model carries (e.g. `IfcProduct` excludes
+  non-meshable products such as `IfcSpace`). Unknown entity names still
+  raise `ValueError` (GH #71).
+- New `subtypes_of` / `canonical_entity_any_schema` helpers in
+  `ifcfast.classify`.
+
 ### Fixed — synthetic half-space stand-ins stripped from no-cut output (GH #66)
 
 - **`iter_meshes`/`meshes` no longer return giant degenerate planes

@@ -261,14 +261,24 @@ def test_filter_valid_but_absent_entity_is_empty_not_error(fresh_cache):
 def test_supertype_less_roots_are_valid_entities(fresh_cache):
     """PR #85 review F1: validating against SUPERTYPE keys/values
     falsely rejected ~30 supertype-less root entities. Every entity
-    declaration must validate; only genuine typos raise."""
+    declaration must validate; only genuine typos raise.
+
+    These roots are non-product (or have no product descendants in the
+    fixture), so subtype expansion (GH #81) still yields an empty set —
+    but the contract being tested is "valid → never raises", not "empty".
+    ``IfcRoot`` is excluded here precisely because the fixture's IfcWall
+    *is* an IfcRoot descendant; that case is covered by the by_type
+    subtype-expansion tests."""
     m = ifcfast.open(str(FIXTURE), use_cache=False, write_cache=False)
     for root in (
         "IfcPerson", "IfcOrganization", "IfcOwnerHistory", "IfcGridAxis",
         "IfcApplication", "IfcRepresentationMap", "IfcMaterialList",
-        "IfcShapeAspect", "IfcRoot",
+        "IfcShapeAspect",
     ):
         assert m.by_type(root) == [], root  # valid → empty, never raises
+    # IfcRoot validates and now expands to the IfcWall (GH #81); the
+    # point here is only that it does not raise.
+    assert m.by_type("IfcRoot")  # valid root → non-empty, never raises
     with pytest.raises(ValueError, match="Unknown IFC entity"):
         m.by_type("IfcWal")  # one char short of valid — still a typo
 

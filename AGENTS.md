@@ -145,7 +145,7 @@ releases (additions only, never reorganisations).
 | Inspect a file from a shell pipeline | `ifcfast index FILE --json` |
 | Plan work without paying extract cost | `ifcfast schema FILE --json` |
 | Type catalogue (TypeBank-shaped) | `m.type_summary()` / `m.type_bank()` |
-| Products of one exact entity type | `m.by_type("IfcWallStandardCase")` — **exact match, no subtype expansion**: `by_type("IfcWall")` does NOT include `IfcWallStandardCase`, and abstract names (`"IfcElement"`) return `[]`. Get the concrete names from `m.types()` first. (GH #81 tracks expansion.) |
+| Products of an entity type (incl. subtypes) | `m.by_type("IfcWall")` — mirrors `ifcopenshell.file.by_type(type, include_subtypes=True)`: **expands subtypes by default** (`by_type("IfcWall")` includes `IfcWallStandardCase`; `by_type("IfcElement")` / `by_type("IfcProduct")` return all element/product subtypes present), and matches the entity name **case-insensitively**. Pass `include_subtypes=False` for an exact single-entity match. Counts are over the *meshable-product* substrate, so abstract supertypes resolve to the concrete products the model actually carries (e.g. `IfcProduct` excludes non-meshable products like `IfcSpace`). Unknown names raise `ValueError`. (GH #81.) |
 | Iterate every product as `ProductRow` | `for p in m:` (or `m.products`, `m.filter(entity=...)`). Note `filter(storey_guid=…)` matches **direct containment only** — for storey contents including aggregate parts use `m.products_in(storey_guid)`. |
 | Count of products (matches `m.products`) | `len(m)` |
 | Same data as a pandas DataFrame | `m.products_df` |

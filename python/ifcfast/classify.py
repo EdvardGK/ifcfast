@@ -20,8 +20,9 @@ codegen at ``scripts/gen_schema_supertypes.py``). No runtime
 from __future__ import annotations
 
 from enum import Enum
+from typing import Optional
 
-from .data.schema_supertypes import SUPERTYPE
+from .data.schema_supertypes import ALL_ENTITIES, SUPERTYPE
 
 
 class ElementMode(str, Enum):
@@ -159,6 +160,127 @@ def _ancestors(entity: str, schema: str) -> tuple[str, ...]:
         cur = nxt
     result = tuple(chain)
     _ANCESTORS_CACHE[key] = result
+    return result
+
+
+# Cached descendant sets per (entity, schema). Built once by inverting
+# the static `SUPERTYPE` table — child→parent becomes parent→{children},
+# then transitively closed. Same static map, no live IFC library.
+_DESCENDANTS_CACHE: dict[tuple[str, str], frozenset[str]] = {}
+
+# Cached inverted child-lists (parent → immediate children) per schema,
+# built from `SUPERTYPE` on first use for that schema.
+_CHILDREN_CACHE: dict[str, dict[str, list[str]]] = {}
+
+
+def _resolve_schema(schema: str) -> Optional[str]:
+    """Return the canonical SUPERTYPE key matching ``schema`` (exact, then
+    case-insensitive), or ``None`` when the schema isn't known."""
+    if schema in SUPERTYPE:
+        return schema
+    folded = schema.casefold()
+    for key_schema in SUPERTYPE:
+        if key_schema.casefold() == folded:
+            return key_schema
+    return None
+
+
+def _children_index(schema_key: str) -> dict[str, list[str]]:
+    """Immediate parent→children index for a known schema key, cached."""
+    cached = _CHILDREN_CACHE.get(schema_key)
+    if cached is not None:
+        return cached
+    children: dict[str, list[str]] = {}
+    for child, parent in SUPERTYPE[schema_key].items():
+        children.setdefault(parent, []).append(child)
+    _CHILDREN_CACHE[schema_key] = children
+    return children
+
+
+# Case-insensitive lookup table over every entity name across all
+# supported schemas (folded name → canonical name), built once.
+_ALL_ENTITIES_FOLDED: Optional[dict[str, str]] = None
+
+
+def canonical_entity_any_schema(entity: str) -> str:
+    """Return the canonical casing of ``entity`` if it is a known IFC
+    entity in *any* supported schema (case-insensitive), else ``entity``
+    unchanged. Used to give :func:`Model.by_type` case-insensitive parity
+    with ``ifcopenshell`` without policing schema versions."""
+    global _ALL_ENTITIES_FOLDED
+    if entity in ALL_ENTITIES:
+        return entity
+    if _ALL_ENTITIES_FOLDED is None:
+        _ALL_ENTITIES_FOLDED = {name.casefold(): name for name in ALL_ENTITIES}
+    return _ALL_ENTITIES_FOLDED.get(entity.casefold(), entity)
+
+
+def canonical_entity(entity: str, schema: str = "IFC4") -> str:
+    """Return the schema's canonical casing for ``entity`` (e.g.
+    ``"ifcwall" -> "IfcWall"``), or ``entity`` unchanged when the schema
+    or the name isn't known. Case-insensitive lookup against both the
+    child and supertype name spaces of the static ``SUPERTYPE`` map."""
+    schema_key = _resolve_schema(schema)
+    if schema_key is None:
+        return entity
+    parent_map = SUPERTYPE[schema_key]
+    folded = entity.casefold()
+    for name in parent_map:
+        if name.casefold() == folded:
+            return name
+    for name in parent_map.values():
+        if name.casefold() == folded:
+            return name
+    return entity
+
+
+def subtypes_of(entity: str, schema: str = "IFC4") -> frozenset[str]:
+    """All entity names that are ``entity`` or descend from it, for the
+    given schema.
+
+    Case-insensitive on ``entity``: the returned names are the canonical
+    schema-cased names (e.g. ``"IfcWallStandardCase"``). The result always
+    includes ``entity`` itself (canonically cased when the schema knows it,
+    otherwise echoed as given). Walks the static per-schema ``SUPERTYPE``
+    map shipped with the wheel — no runtime IFC library.
+
+    When the schema or the entity is unknown, returns
+    ``frozenset({entity})`` — the caller falls back to exact match, which
+    is the safe degradation.
+    """
+    key = (entity, schema)
+    cached = _DESCENDANTS_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    schema_key = _resolve_schema(schema)
+    if schema_key is None:
+        result = frozenset({entity})
+        _DESCENDANTS_CACHE[key] = result
+        return result
+
+    # Canonicalise the requested entity name against the schema's casing.
+    # An entity may appear as a key (it has a supertype) and/or as a value
+    # (it is a supertype of something); canonical_entity searches both.
+    canon = canonical_entity(entity, schema_key)
+    if canon == entity and entity not in SUPERTYPE[schema_key] \
+            and entity not in SUPERTYPE[schema_key].values():
+        # Entity not present anywhere in this schema's inheritance graph.
+        result = frozenset({entity})
+        _DESCENDANTS_CACHE[key] = result
+        return result
+
+    children = _children_index(schema_key)
+    out: set[str] = set()
+    stack = [canon]
+    while stack:
+        cur = stack.pop()
+        if cur in out:
+            continue
+        out.add(cur)
+        stack.extend(children.get(cur, ()))
+    result = frozenset(out)
+    _DESCENDANTS_CACHE[key] = result
     return result
 
 
