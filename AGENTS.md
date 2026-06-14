@@ -411,6 +411,19 @@ the project's unit scale as parquet schema metadata
   `'skip'` for *every* non-hardcoded entity. (`schema == 'UNKNOWN'` and
   the empty string resolve to "unset" so the caller's default applies.)
   IFC4/IFC2X3 classification is unchanged.
+- **`m.classifications` walks nested `ReferencedSource` chains (GH #75).**
+  `system_name` / `edition` / `source` come from the terminal
+  `IfcClassification`, even when the leaf `IfcClassificationReference`
+  reaches it through one or more *parent references* — the multi-level
+  hierarchy ArchiCAD/Solibri NS 3451 and Uniclass exports produce
+  (leaf → group → table → `IfcClassification`). `identification` /
+  `name` / `location` still come from the leaf reference. Before the
+  v19 cache schema only a single hop was followed, so any
+  hierarchy-exported population came back with `system_name == nan` and
+  was invisible to consumers grouping by system; re-bundle to pick the
+  fields up. The walk is depth-capped (32) and cycle-guarded, so a
+  malformed self/loop reference yields `None` system fields rather than
+  hanging.
 - **Strings come back as proper UTF-8.** STEP escape sequences
   (`\X\HH`, `\X2\HHHH…\X0\`, `\S\C`) are resolved, and raw un-escaped
   high bytes — what Bonsai/BlenderBIM and some ArchiCAD/Tekla exports
