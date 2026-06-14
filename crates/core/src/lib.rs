@@ -204,7 +204,7 @@ mod python {
         let (mmap, open_ms) = open_mmap(path)?;
 
         let t_index = Instant::now();
-        let idx = py.allow_threads(|| indexer::index(&mmap));
+        let idx = py.detach(|| indexer::index(&mmap));
         let index_ms = t_index.elapsed().as_secs_f64() * 1000.0;
 
         let t_marshal = Instant::now();
@@ -372,7 +372,7 @@ mod python {
         let step_to_guid = build_guid_index(&table);
         let guid_ms = t_guids.elapsed().as_secs_f64() * 1000.0;
         let t_psets = Instant::now();
-        let psets = py.allow_threads(|| crate::extractors::psets::build(&table, &step_to_guid));
+        let psets = py.detach(|| crate::extractors::psets::build(&table, &step_to_guid));
         let pset_ms = t_psets.elapsed().as_secs_f64() * 1000.0;
 
         let t_marshal = Instant::now();
@@ -404,7 +404,7 @@ mod python {
         let step_to_guid = build_guid_index(&table);
         let guid_ms = t_guids.elapsed().as_secs_f64() * 1000.0;
         let t_qto = Instant::now();
-        let qto = py.allow_threads(|| crate::extractors::quantities::build(&table, &step_to_guid));
+        let qto = py.detach(|| crate::extractors::quantities::build(&table, &step_to_guid));
         let qto_ms = t_qto.elapsed().as_secs_f64() * 1000.0;
 
         let t_marshal = Instant::now();
@@ -437,7 +437,7 @@ mod python {
         let step_to_guid = build_guid_index(&table);
         let guid_ms = t_guids.elapsed().as_secs_f64() * 1000.0;
         let t_mat = Instant::now();
-        let mats = py.allow_threads(|| {
+        let mats = py.detach(|| {
             let unit_scale = crate::indexer::extract_unit_scale(&table).unwrap_or(1.0);
             crate::extractors::materials::build(&table, &step_to_guid, unit_scale)
         });
@@ -479,7 +479,7 @@ mod python {
         let step_to_guid = build_guid_index(&table);
         let guid_ms = t_guids.elapsed().as_secs_f64() * 1000.0;
         let t_cls = Instant::now();
-        let cls = py.allow_threads(|| crate::extractors::classifications::build(&table, &step_to_guid));
+        let cls = py.detach(|| crate::extractors::classifications::build(&table, &step_to_guid));
         let cls_ms = t_cls.elapsed().as_secs_f64() * 1000.0;
 
         let t_marshal = Instant::now();
@@ -517,7 +517,7 @@ mod python {
 
         let (psets, quantities, materials, classifications,
              pset_ms, qto_ms, mat_ms, cls_ms) =
-            py.allow_threads(|| {
+            py.detach(|| {
                 // Materials needs the project's linear-unit scale to
                 // normalize LayerThickness to mm. Cheap walk over the
                 // table for IfcUnitAssignment + IfcSIUnit only — much
@@ -658,7 +658,7 @@ mod python {
         // uses. None → assume metres so geometry-derived numbers stay
         // sane on schema-incomplete files.
         let t_idx = Instant::now();
-        let idx = py.allow_threads(|| indexer::index(&mmap));
+        let idx = py.detach(|| indexer::index(&mmap));
         let idx_ms = t_idx.elapsed().as_secs_f64() * 1000.0;
         let unit_scale = idx.unit_scale.unwrap_or(1.0) as f32;
 
@@ -828,7 +828,7 @@ mod python {
         // would otherwise collapse into an f32-quantised point and report
         // surface_count = 0.
         let mesh_stats =
-            py.allow_threads(|| mesh_ifc_streaming_framed(&mmap, &mut sink, BakeFrame::Local));
+            py.detach(|| mesh_ifc_streaming_framed(&mmap, &mut sink, BakeFrame::Local));
 
         // Cross-product flush — mirror extract_meshes. Fold every
         // buffered host with its arrived openings and run the folded
@@ -897,12 +897,12 @@ mod python {
         // because the drift consumer (Python) needs SI columns by
         // contract — see `m.drift` docstring. ~indexer cost is small
         // next to the mesh pass that follows.
-        let idx = py.allow_threads(|| indexer::index(&mmap));
+        let idx = py.detach(|| indexer::index(&mmap));
         let unit_scale = idx.unit_scale.unwrap_or(1.0) as f32;
         let us_len = unit_scale;
         let us_area = unit_scale * unit_scale;
         let us_vol = unit_scale * unit_scale * unit_scale;
-        let (mut meshes, mesh_stats) = py.allow_threads(|| crate::mesh::mesh_ifc(&mmap));
+        let (mut meshes, mesh_stats) = py.detach(|| crate::mesh::mesh_ifc(&mmap));
         // Drift is the geometry-validity signal layer: its centroid /
         // AABB / volume columns must describe the ELEMENT. Strip the
         // synthetic half-space stand-in slabs first, or every clipped
@@ -1138,7 +1138,7 @@ mod python {
         let t_total = Instant::now();
         let (mmap, _open_ms) = open_mmap(path)?;
         let t_idx = Instant::now();
-        let idx = py.allow_threads(|| indexer::index(&mmap));
+        let idx = py.detach(|| indexer::index(&mmap));
         let idx_ms = t_idx.elapsed().as_secs_f64() * 1000.0;
         let unit_scale = idx.unit_scale.unwrap_or(1.0) as f32;
         let area_scale = unit_scale * unit_scale;
@@ -1261,7 +1261,7 @@ mod python {
         // georeferenced models), repositioned per-product in f64 via the
         // global shift. World-frame baking would collapse small far-from-
         // origin geometry before sampling ever ran.
-        let mesh_stats = py.allow_threads(|| {
+        let mesh_stats = py.detach(|| {
             crate::mesh::mesh_ifc_streaming_framed(&mmap, &mut sink, BakeFrame::Local)
         });
         let mesh_ms = t_mesh.elapsed().as_secs_f64() * 1000.0;
@@ -1539,9 +1539,9 @@ mod python {
             // `Receiver` is `Send` but not `Sync`, so we move it into
             // the closure rather than borrowing — pyo3's `Ungil` bound
             // requires `Send` for everything captured under
-            // `allow_threads`. After the recv returns we put the
-            // receiver back so the next `__next__` can reuse it.
-            let (rx, received) = py.allow_threads(move || {
+            // `detach` (formerly `allow_threads`). After the recv returns
+            // we put the receiver back so the next `__next__` can reuse it.
+            let (rx, received) = py.detach(move || {
                 let r = rx.recv();
                 (rx, r)
             });
@@ -1728,7 +1728,7 @@ mod python {
         // Linear-unit-to-metres factor — vertices are scaled to metres
         // so the output matches the metres contract (and mesh_qto). The
         // indexer pass is the same source point_cloud uses.
-        let idx = py.allow_threads(|| indexer::index(&mmap));
+        let idx = py.detach(|| indexer::index(&mmap));
         let unit_scale = idx.unit_scale.unwrap_or(1.0) as f32;
 
         struct MeshSink {
@@ -1888,7 +1888,7 @@ mod python {
         };
         let t_mesh = Instant::now();
         // Local frame + per-product f64 shift — see sample_point_cloud.
-        let mesh_stats = py.allow_threads(|| {
+        let mesh_stats = py.detach(|| {
             crate::mesh::mesh_ifc_streaming_framed(&mmap, &mut sink, BakeFrame::Local)
         });
 
@@ -1986,7 +1986,7 @@ mod python {
 
             let t_total = Instant::now();
             let (mmap, _open_ms) = open_mmap(path)?;
-            let idx = py.allow_threads(|| indexer::index(&mmap));
+            let idx = py.detach(|| indexer::index(&mmap));
             let unit_scale = idx.unit_scale.unwrap_or(1.0) as f32;
 
             /// Accumulating sink: collects every `ProductMesh` into a
@@ -2082,7 +2082,7 @@ mod python {
             // AABBs directly from `mesh.vertices`. The kernel already
             // applies the model-wide global shift to prevent far-from-
             // origin f32 collapse internally.
-            let mesh_stats = py.allow_threads(|| {
+            let mesh_stats = py.detach(|| {
                 crate::mesh::mesh_ifc_streaming_framed(
                     &mmap,
                     &mut sink,
@@ -2198,7 +2198,7 @@ mod python {
         let buf: &[u8] = &src;
 
         let t_bundle = Instant::now();
-        let bundle = py.allow_threads(|| Bundle::build(buf));
+        let bundle = py.detach(|| Bundle::build(buf));
         let bundle_ms = t_bundle.elapsed().as_secs_f64() * 1000.0;
         let sem = bundle.semantic_stats();
 
@@ -2210,7 +2210,7 @@ mod python {
         })?;
 
         let t_stream = Instant::now();
-        let stats = py.allow_threads(|| mesh_ifc_streaming(buf, &mut sink));
+        let stats = py.detach(|| mesh_ifc_streaming(buf, &mut sink));
         let stream_ms = t_stream.elapsed().as_secs_f64() * 1000.0;
 
         let (instances_written, reps_written) = sink.finish().map_err(|e| {
@@ -2289,14 +2289,14 @@ mod python {
 
         let t = Instant::now();
         let report = py
-            .allow_threads(|| run_clash(&bundle_dir, &opts))
+            .detach(|| run_clash(&bundle_dir, &opts))
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("clash: {e}")))?;
         let clash_ms = t.elapsed().as_secs_f64() * 1000.0;
 
         let mut written_path: Option<String> = None;
         if write_parquet {
             let out = bundle_dir.join("clashes.parquet");
-            py.allow_threads(|| write_clashes_parquet(&out, &report.pairs))
+            py.detach(|| write_clashes_parquet(&out, &report.pairs))
                 .map_err(|e| {
                     pyo3::exceptions::PyIOError::new_err(format!(
                         "write {}: {e}",
