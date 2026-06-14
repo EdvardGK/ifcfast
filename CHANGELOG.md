@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.38] - 2026-06-14
+
+> Correctness + security batch (10 issues + a pyo3 security bump). Parser:
+> STEP framing is now comment/string-aware (#72) and raw-UTF-8 strings no
+> longer mojibake (#77). Indexer/extractors: bare `IfcTypeProduct`/
+> `IfcTypeObject` types are captured (#69), IFC4 `IfcDoor`/`IfcWindow`
+> `predefined_type` is correct (#74), hierarchical classification chains
+> resolve `system_name`/`edition`/`source` (#75). Units: imperial
+> `IfcConversionBasedUnit` files resolve `unit_scale` (#73). Classifier:
+> IFC4X3 built elements no longer `skip` (#82). Python: `by_type` expands
+> subtypes (#81); the parquet cache validates source freshness + writes
+> atomically (#80); mesh no-cut surfaces strip synthetic half-space cutter
+> slabs (#66). Security: pyo3 `0.24` → `0.29` clears RUSTSEC-2026-0176 /
+> -0177. **Cache schema v16 → v19 — re-extraction required** for affected
+> files (imperial units, raw-UTF-8 strings, IFC4 door/window
+> predefined_type, hierarchical classifications, bare type objects,
+> comment/string-laden STEP, clipped-product drift/segments).
+
 ### Fixed — bare `IfcTypeProduct` / `IfcTypeObject` dropped (GH #69)
 
 - **Cache schema bumped `18` → `19`.** Bare type base classes are now
