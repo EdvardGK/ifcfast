@@ -343,6 +343,14 @@ the project's unit scale as parquet schema metadata
   `NaN` (cache hit) are the same missing value; identical files diff
   clean regardless of which side was cached. `diff()` also accepts
   `pathlib.Path`.
+- **Strings come back as proper UTF-8.** STEP escape sequences
+  (`\X\HH`, `\X2\HHHH…\X0\`, `\S\C`) are resolved, and raw un-escaped
+  high bytes — what Bonsai/BlenderBIM and some ArchiCAD/Tekla exports
+  write for `æøå`/CJK — are decoded as UTF-8 (since GH #77). Invalid
+  byte runs fall back to per-byte Latin-1 deterministically. So a wall
+  named `Dør-æå` reads back as `Dør-æå`, not `DÃ¸r-Ã¦Ã¥`. (Caches
+  written by wheels < the v18 cache schema carry the old mojibake;
+  the schema bump forces re-extraction.)
 - **DataFrames are long-format, one row per fact.** No nested fields,
   no JSON-in-cell. Easy to filter, easy to join, easy to dump to Excel.
 - **Missing values are `nan` for strings (pandas `StringDtype`).** Use
