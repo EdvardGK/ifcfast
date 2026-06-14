@@ -231,19 +231,49 @@ class Model:
                 return name
         return f"{scale}m-per-unit"
 
-    def by_type(self, entity: str) -> list[ProductRow]:
-        """All products of a given entity type — **exact match only**.
+    def by_type(
+        self, entity: str, include_subtypes: bool = True
+    ) -> list[ProductRow]:
+        """All products of a given entity type, **subtypes included**.
 
-        Looks like ``ifcopenshell.file.by_type(entity)`` but is NOT a
-        drop-in replacement yet: ifcopenshell expands subtypes
-        (``by_type("IfcWall")`` includes ``IfcWallStandardCase``) and
-        matches case-insensitively; ifcfast matches the exact
-        title-case entity name and nothing else, so
-        ``by_type("IfcElement")`` returns ``[]``. Subtype expansion is
-        tracked in GH #81. Unknown entity names raise ``ValueError``
-        (GH #71).
+        Drop-in for ``ifcopenshell.file.by_type(type, include_subtypes=True)``
+        — same signature, same defaults, same case-insensitivity:
+
+        * ``by_type("IfcWall")`` returns ``IfcWall`` **and** subtypes such
+          as ``IfcWallStandardCase`` / ``IfcWallElementedCase``.
+        * ``by_type("IfcElement")`` / ``by_type("IfcProduct")`` return
+          every element / product subtype present in the model.
+        * The entity name is matched case-insensitively
+          (``"ifcwall"`` works).
+
+        Expansion is resolved against the static per-schema supertype map
+        shipped with the wheel (no runtime ``ifcopenshell`` dependency),
+        using the model's authored schema. Note the substrate only carries
+        *meshable products* (see :meth:`types`), so the count is the
+        meshable-product subset of an entity, not every instance in the
+        STEP file — abstract supertypes still resolve to whatever concrete
+        products the model actually contains.
+
+        Pass ``include_subtypes=False`` for an exact match on the single
+        entity name (still case-insensitive). Unknown entity names raise
+        ``ValueError`` (GH #71).
         """
-        return list(self.filter(entity=entity))
+        from .classify import canonical_entity_any_schema, subtypes_of
+
+        # Case-insensitive canonicalisation across all schemas first, so
+        # validation and expansion both see the schema-cased name.
+        entity = canonical_entity_any_schema(entity)
+        _validate_entity_name(entity)
+        if include_subtypes:
+            names = subtypes_of(entity, self.schema or "IFC4")
+        else:
+            # Exact match on the single (already canonicalised) name.
+            names = frozenset({entity})
+        if self._products_df is not None:
+            df = self._products_df
+            sub = df[df["entity"].isin(names)]
+            return [_row_to_product(row) for _, row in sub.iterrows()]
+        return [p for p in self._products_list if p.entity in names]
 
     def __len__(self) -> int:
         if self._products_df is not None:

@@ -293,7 +293,8 @@ _HASH_TAIL_BYTES = 4 * 1024 * 1024
 #       unit stand-in fragments, so cached drift/segments parquet from
 #       v16 holds foreign-extent values for clipped products.
 #       Value change without column change → re-extraction required.
-# v18 — raw-UTF-8 STEP string decoding fixed (GH #77). `decode_string`
+# v18 — two value-changing fixes ship together in this bump:
+# v18 (GH #77) — raw-UTF-8 STEP string decoding fixed. `decode_string`
 #       previously forced Latin-1 on every high byte, mojibaking raw
 #       UTF-8 exports (Bonsai/BlenderBIM, some ArchiCAD/Tekla) — a wall
 #       named `Dør-æå` came back as `DÃ¸r-Ã¦Ã¥`. Un-escaped high-byte
@@ -302,6 +303,17 @@ _HASH_TAIL_BYTES = 4 * 1024 * 1024
 #       (`\X\`, `\X2\`, `\S\`) and ASCII are unchanged. String values in
 #       names / psets / materials / classifications / diff keys change
 #       for any raw-UTF-8 source file → re-extraction required.
+# v18 (GH #73) — imperial files resolve `unit_scale` from `IfcConversionBasedUnit`
+#       (GH #73). Length declared via IfcConversionBasedUnit (FOOT / INCH —
+#       never an IfcSIUnit) was never parsed, so `unit_scale` stayed null
+#       and consumers defaulted to metres: a 3.28× under-scale on every
+#       unit-scaled value. The manifest `unit_scale` now reads 0.3048 (ft)
+#       / 0.0254 (in), and every value derived through it shifts on
+#       imperial files — `materials.layer_thickness_mm`, the SI-suffixed
+#       drift columns, `mesh_qto` volumes/areas, and the parquet
+#       `ifcfast.unit_scale` schema metadata. Metric (IfcSIUnit) files are
+#       byte-identical. Value change without column change → cached
+#       substrates of imperial models must be re-extracted.
 _CACHE_SCHEMA_VERSION = 18
 
 _FIELD_RE = re.compile(r"\(\s*(.*?)\s*\)\s*;", re.DOTALL)

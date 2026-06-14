@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — imperial files now resolve `unit_scale` (GH #73)
+
+- **`IfcConversionBasedUnit` is now resolved for LENGTHUNIT.** Imperial
+  (foot/inch) files declare length via `IfcConversionBasedUnit`, never
+  `IfcSIUnit` — but unit resolution in `crates/core/src/indexer.rs`
+  only ever read the SI path, so `unit_scale` stayed `None` and
+  `length_unit` reported `'m'` on US/UK exports: a silent 3.28× error
+  on every derived length / area / volume (mesh QTO, clash tolerances,
+  `layer_thickness_mm`, parquet `ifcfast.unit_scale` metadata). The
+  parser now dispatches `IfcConversionBasedUnit` →
+  `ConversionFactor` → `IfcMeasureWithUnit(value, si_base)` and derives
+  `value × si_base_scale` (FOOT → `0.3048`, INCH → `0.0254`). The dead
+  `"FOOT"` / `"INCH"` match arms on the SI path (never reachable —
+  not legal `IfcSIUnitName` values) are removed.
+- **Fail-loud on unresolvable units.** When a file declares a LENGTHUNIT
+  whose conversion chain is missing/malformed, `unit_scale` stays
+  `None` (consumers see "unknown") and the parser emits a loud
+  `[ifcfast] WARNING` to stderr rather than silently implying metres.
+  No cache-schema/column-shape change — `unit_scale` was already a
+  manifest field; this corrects its *value* on imperial files.
+
 > Broken-mesh class fix (GH #66 / #94): synthetic half-space cutter
 > slabs no longer masquerade as element geometry on any no-cut
 > surface. Cache schema v17 (cached drift/segments from v16 hold
@@ -28,6 +49,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Cache schema **v18** — string values change for any raw-UTF-8 source
   file; caches written by ≤ v17 wheels carry the old mojibake and
   re-extract.
+
+### Changed — `by_type` expands subtypes by default (GH #81)
+
+- **`Model.by_type(entity)` now mirrors
+  `ifcopenshell.file.by_type(type, include_subtypes=True)`.** It
+  expands subtypes by default and matches the entity name
+  case-insensitively, where it previously did an exact, case-sensitive
+  match. On a typical Revit IFC2x3 export `by_type("IfcWall")` now
+  returns the `IfcWall` **and** `IfcWallStandardCase` instances (was:
+  just the bare `IfcWall`), and the very common `by_type("IfcElement")`
+  / `by_type("IfcProduct")` idioms return all element/product subtypes
+  present instead of `[]`.
+- **New `include_subtypes` keyword** (default `True`, matching
+  ifcopenshell): pass `include_subtypes=False` for an exact
+  single-entity match (still case-insensitive on the name).
+- Expansion resolves against the static per-schema supertype map
+  already shipped with the wheel (`data/schema_supertypes.py`) — **no
+  runtime ifcopenshell dependency.** Counts remain over the
+  meshable-product substrate, so abstract supertypes resolve to the
+  concrete products the model carries (e.g. `IfcProduct` excludes
+  non-meshable products such as `IfcSpace`). Unknown entity names still
+  raise `ValueError` (GH #71).
+- New `subtypes_of` / `canonical_entity_any_schema` helpers in
+  `ifcfast.classify`.
 
 ### Fixed — synthetic half-space stand-ins stripped from no-cut output (GH #66)
 
