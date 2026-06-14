@@ -327,6 +327,22 @@ the project's unit scale as parquet schema metadata
 
 ## Conventions you can rely on
 
+- **Imperial files resolve to a real `unit_scale`** (since GH #73).
+  `m.unit_scale` is metres-per-model-unit and `m.length_unit` is the
+  canonical short string (`"mm"`, `"m"`, `"ft"`, `"in"`, …). Files
+  that declare length via `IfcConversionBasedUnit` (the FOOT / INCH
+  pattern US/UK exports use, never an `IfcSIUnit`) now resolve through
+  `ConversionFactor → IfcMeasureWithUnit → value × SI-base-scale` —
+  e.g. FOOT → `unit_scale == 0.3048`, `length_unit == "ft"`. Before
+  GH #73 these silently reported `unit_scale = None` / `length_unit =
+  "m"` (a 3.28× error on every derived length). **Missing-value
+  encoding:** `unit_scale` is `None` only when the file declares *no*
+  LENGTHUNIT, OR declares one that can't be resolved (a broken
+  conversion chain) — in the latter case the parser emits a loud
+  `[ifcfast] WARNING` to stderr rather than implying metres.
+  `m.length_unit` maps `None → "m"` (the metres-assumed geometry
+  default), so when correctness matters check `m.unit_scale is None`
+  directly rather than trusting `length_unit`.
 - **Traversal helpers never raise on unknown guids.** Missing → `None`
   for scalars, `[]` for lists. Safe to call without guarding.
 - **Typos fail loudly; absences fail quietly.** An unknown *table*

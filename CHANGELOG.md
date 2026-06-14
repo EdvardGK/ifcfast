@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — imperial files now resolve `unit_scale` (GH #73)
+
+- **`IfcConversionBasedUnit` is now resolved for LENGTHUNIT.** Imperial
+  (foot/inch) files declare length via `IfcConversionBasedUnit`, never
+  `IfcSIUnit` — but unit resolution in `crates/core/src/indexer.rs`
+  only ever read the SI path, so `unit_scale` stayed `None` and
+  `length_unit` reported `'m'` on US/UK exports: a silent 3.28× error
+  on every derived length / area / volume (mesh QTO, clash tolerances,
+  `layer_thickness_mm`, parquet `ifcfast.unit_scale` metadata). The
+  parser now dispatches `IfcConversionBasedUnit` →
+  `ConversionFactor` → `IfcMeasureWithUnit(value, si_base)` and derives
+  `value × si_base_scale` (FOOT → `0.3048`, INCH → `0.0254`). The dead
+  `"FOOT"` / `"INCH"` match arms on the SI path (never reachable —
+  not legal `IfcSIUnitName` values) are removed.
+- **Fail-loud on unresolvable units.** When a file declares a LENGTHUNIT
+  whose conversion chain is missing/malformed, `unit_scale` stays
+  `None` (consumers see "unknown") and the parser emits a loud
+  `[ifcfast] WARNING` to stderr rather than silently implying metres.
+  No cache-schema/column-shape change — `unit_scale` was already a
+  manifest field; this corrects its *value* on imperial files.
+
 > Broken-mesh class fix (GH #66 / #94): synthetic half-space cutter
 > slabs no longer masquerade as element geometry on any no-cut
 > surface. Cache schema v17 (cached drift/segments from v16 hold
