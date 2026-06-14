@@ -379,6 +379,17 @@ the project's unit scale as parquet schema metadata
   missing its `END-ISO-10303-21;` trailer (interrupted download /
   copy) raises `ValueError` at open instead of silently returning a
   partial model. ZIP containers rely on ZIP's own integrity check.
+- **Section/record framing is comment- and string-aware (since GH #72,
+  cache schema v19).** ISO-10303-21 `/* … */` comments and single-quoted
+  strings are treated as inert when the parser locates `DATA;` /
+  `ENDSEC;` and record terminators (`;`). So none of these silently drop
+  records anymore: a `/* exported by FooCAD */` banner *between*
+  records (everything after it used to vanish), the literal `ENDSEC`
+  inside a value like `'SEE ENDSEC FOR DETAILS'` (truncated the section),
+  or `DATA;` inside a HEADER string like `('Bridge DATA; rev2')` (started
+  the section early → 0 products). If you cached such a file on ≤v18,
+  re-bundle — it now parses the previously-dropped entities. Clean files
+  are byte-identical.
 - **`diff()` is cache-state independent.** `None` (cold parse) and
   `NaN` (cache hit) are the same missing value; identical files diff
   clean regardless of which side was cached. `diff()` also accepts
