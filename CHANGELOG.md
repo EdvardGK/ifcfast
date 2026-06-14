@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security — bump pyo3 to 0.29 (RUSTSEC-2026-0176 / -0177)
+
+- **`pyo3` bumped `0.24` → `0.29`** (with `pyo3-ffi`,
+  `pyo3-build-config`, `pyo3-macros`, `pyo3-macros-backend` moving in
+  lockstep) to clear two RustSec advisories that `cargo audit` flagged
+  on every branch (GH #51):
+  - **RUSTSEC-2026-0176** — out-of-bounds read in `PyList` / `PyTuple`
+    iterators.
+  - **RUSTSEC-2026-0177** — missing `Sync` bound (soundness).
+  - Both fixed in pyo3 `>= 0.29.0`.
+- **No Python API change.** Pure dependency bump; the
+  `extension-module` + `abi3-py310` features and the `ifcfast._core`
+  surface are identical. The only source churn is the 0.26 rename
+  `Python::allow_threads` → `Python::detach` (21 GIL-release call
+  sites in `crates/core/src/lib.rs`). No cache-schema / column-shape
+  change.
+
 ### Fixed — parquet cache integrity: stale-on-same-size-edit + non-atomic writes (GH #80)
 
 - **Same-size mid-file edits no longer serve a stale model.** The cache

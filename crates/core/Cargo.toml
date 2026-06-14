@@ -74,7 +74,7 @@ csg = ["geom", "dep:manifold-csg"]
 prism-csg-fast = ["mesh", "dep:i_overlay"]
 
 [dependencies]
-pyo3 = { version = "0.24", features = ["extension-module", "abi3-py310"], optional = true }
+pyo3 = { version = "0.29", features = ["extension-module", "abi3-py310"], optional = true }
 memchr = "2.7"
 memmap2 = "0.9"
 zip = { version = "2.2", default-features = false, features = ["deflate"] }
