@@ -362,7 +362,13 @@ fn is_type_object(t: &[u8]) -> bool {
         && t[t.len() - 4..].eq_ignore_ascii_case(b"TYPE");
     let ifc2x3_style = t.eq_ignore_ascii_case(b"IFCDOORSTYLE")
         || t.eq_ignore_ascii_case(b"IFCWINDOWSTYLE");
-    suffix_ok || ifc2x3_style
+    // Bare base classes `IfcTypeProduct` / `IfcTypeObject` are non-abstract
+    // and emitted by Revit for types with no schema-specific `*Type`
+    // subtype; they end in `PRODUCT` / `OBJECT`, miss the suffix check, and
+    // would silently drop their inherited quantities. See #69.
+    let bare_base = t.eq_ignore_ascii_case(b"IFCTYPEPRODUCT")
+        || t.eq_ignore_ascii_case(b"IFCTYPEOBJECT");
+    suffix_ok || ifc2x3_style || bare_base
 }
 
 struct Quantity {
@@ -772,6 +778,30 @@ END-ISO-10303-21;
 #30=IFCQUANTITYWEIGHT('GrossWeight',$,$,42.5);
 #31=IFCELEMENTQUANTITY('4Qto0000000000000001',$,'Qto_TypeBase',$,$,(#30));
 #32=IFCWALLTYPE('5Type0000000000000001',$,'200mm Concrete',$,$,(#31),$,$,$,.STANDARD.);
+#33=IFCRELDEFINESBYTYPE('6RelType000000000000001',$,$,$,(#10),#32);
+"#,
+        );
+        let t = run(&buf);
+        assert_eq!(t.len(), 1, "expected one inherited quantity, got {}", t.len());
+        assert_eq!(t.guid[0], "1Wall00000000000000001");
+        assert_eq!(t.qto_name[0], "Qto_TypeBase");
+        assert_eq!(t.quantity_name[0], "GrossWeight");
+        assert_eq!(t.value[0].as_deref(), Some("42.5"));
+        assert_eq!(t.source[0], "type");
+    }
+
+    #[test]
+    fn bare_type_product_quantity_inherits_to_instance() {
+        // GH #69 — quantity-side of the bare-base-class drop. A bare
+        // `IFCTYPEPRODUCT` (HasPropertySets at slot 6) carrying an
+        // IfcElementQuantity must inherit to its related instance,
+        // tagged source="type". Before the fix `is_type_object`
+        // rejected the bare base class and the quantity dropped.
+        let buf = make_buf(
+            r#"
+#30=IFCQUANTITYWEIGHT('GrossWeight',$,$,42.5);
+#31=IFCELEMENTQUANTITY('4Qto0000000000000001',$,'Qto_TypeBase',$,$,(#30));
+#32=IFCTYPEPRODUCT('5Type0000000000000001',$,'Basic Roof',$,$,(#31),$,$);
 #33=IFCRELDEFINESBYTYPE('6RelType000000000000001',$,$,$,(#10),#32);
 "#,
         );

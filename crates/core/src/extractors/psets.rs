@@ -570,7 +570,13 @@ fn is_type_object(t: &[u8]) -> bool {
         && t[t.len() - 4..].eq_ignore_ascii_case(b"TYPE");
     let ifc2x3_style = t.eq_ignore_ascii_case(b"IFCDOORSTYLE")
         || t.eq_ignore_ascii_case(b"IFCWINDOWSTYLE");
-    suffix_ok || ifc2x3_style
+    // Bare base classes `IfcTypeProduct` / `IfcTypeObject` are non-abstract
+    // and emitted by Revit for types with no schema-specific `*Type`
+    // subtype; they end in `PRODUCT` / `OBJECT`, miss the suffix check, and
+    // would silently drop their inherited psets. See #69.
+    let bare_base = t.eq_ignore_ascii_case(b"IFCTYPEPRODUCT")
+        || t.eq_ignore_ascii_case(b"IFCTYPEOBJECT");
+    suffix_ok || ifc2x3_style || bare_base
 }
 
 /// Parse an `IfcValue` field. STEP wraps these with a type tag:
@@ -1204,6 +1210,49 @@ END-ISO-10303-21;
         assert_eq!(t.guid[0], "1Wall00000000000000001");
         assert_eq!(t.pset_name[0], "Pset_ManufacturerTypeInformation");
         assert_eq!(t.prop_name[0], "Manufacturer");
+        assert_eq!(t.value[0].as_deref(), Some("Wurth"));
+        assert_eq!(t.source[0], "type");
+    }
+
+    #[test]
+    fn bare_type_product_pset_inherits_to_instance() {
+        // GH #69: a bare `IFCTYPEPRODUCT` (no `*Type` suffix) is what
+        // Revit emits for types lacking a schema-specific subtype. Its
+        // HasPropertySets (slot 6) must inherit to every
+        // IfcRelDefinesByType-related instance, tagged source="type".
+        // Before the fix `is_type_object` rejected the bare base class
+        // (ends in PRODUCT, not TYPE) and the pset silently dropped.
+        let buf = make_buf(
+            r#"
+#30=IFCPROPERTYSINGLEVALUE('Manufacturer',$,IFCLABEL('Wurth'),$);
+#31=IFCPROPERTYSET('4PsetType00000000000001',$,'Pset_ManufacturerTypeInformation',$,(#30));
+#32=IFCTYPEPRODUCT('5Type0000000000000001',$,'Basic Roof',$,$,(#31),$,$);
+#33=IFCRELDEFINESBYTYPE('6RelType000000000000001',$,$,$,(#10),#32);
+"#,
+        );
+        let t = run(&buf);
+        assert_eq!(t.len(), 1, "expected 1 inherited row, got {}", t.len());
+        assert_eq!(t.guid[0], "1Wall00000000000000001");
+        assert_eq!(t.pset_name[0], "Pset_ManufacturerTypeInformation");
+        assert_eq!(t.prop_name[0], "Manufacturer");
+        assert_eq!(t.value[0].as_deref(), Some("Wurth"));
+        assert_eq!(t.source[0], "type");
+    }
+
+    #[test]
+    fn bare_type_object_pset_inherits_to_instance() {
+        // GH #69 sibling: the other bare base class `IFCTYPEOBJECT`
+        // (HasPropertySets at slot 6) must inherit identically.
+        let buf = make_buf(
+            r#"
+#30=IFCPROPERTYSINGLEVALUE('Manufacturer',$,IFCLABEL('Wurth'),$);
+#31=IFCPROPERTYSET('4PsetType00000000000001',$,'Pset_ManufacturerTypeInformation',$,(#30));
+#32=IFCTYPEOBJECT('5Type0000000000000001',$,'Generic Type',$,$,(#31));
+#33=IFCRELDEFINESBYTYPE('6RelType000000000000001',$,$,$,(#10),#32);
+"#,
+        );
+        let t = run(&buf);
+        assert_eq!(t.len(), 1, "expected 1 inherited row, got {}", t.len());
         assert_eq!(t.value[0].as_deref(), Some("Wurth"));
         assert_eq!(t.source[0], "type");
     }

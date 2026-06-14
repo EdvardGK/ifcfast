@@ -325,7 +325,23 @@ _HASH_TAIL_BYTES = 4 * 1024 * 1024
 #       `ifcfast.unit_scale` schema metadata. Metric (IfcSIUnit) files are
 #       byte-identical. Value change without column change → cached
 #       substrates of imperial models must be re-extracted.
-_CACHE_SCHEMA_VERSION = 18
+# v19 (GH #69) — bare `IfcTypeProduct` / `IfcTypeObject` are no longer
+#       dropped. These non-abstract base classes (no `*Type` suffix) are
+#       what Revit emits for types with no schema-specific subtype — e.g.
+#       roof/stair/ramp types on IFC2X3, which has no IfcRoofType. The
+#       indexer's TypeObject classifier and the two pset/quantity
+#       `is_type_object` membership tests rejected them (they end in
+#       PRODUCT / OBJECT, not TYPE), so the type was invisible in
+#       `type_objects.parquet`, its occurrences carried `type_guid=None`,
+#       and any type-level psets/quantities silently dropped (the GH
+#       #36/#45 silent-drop class, resurfacing through the membership
+#       filter). Caches ≤v18 are missing those `type_objects` rows, miss
+#       the `type_guid` / `type_name` linkage on the affected occurrences
+#       in `instances.parquet`, and miss the inherited `source="type"`
+#       pset/quantity rows. Row-count change → re-extraction required.
+#       G55_ARK (IFC2X3, Revit): 11 bare IfcTypeProduct types now visible;
+#       33 Roof/Stair/Ramp occurrences gain their type_guid.
+_CACHE_SCHEMA_VERSION = 19
 
 _FIELD_RE = re.compile(r"\(\s*(.*?)\s*\)\s*;", re.DOTALL)
 

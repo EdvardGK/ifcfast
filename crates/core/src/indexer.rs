@@ -631,7 +631,16 @@ pub fn index(buf: &[u8]) -> IndexedFile {
                 let suffix_ok =
                     t.len() > 7 && t.starts_with(b"IFC") && t.ends_with(b"TYPE");
                 let ifc2x3_style = t == b"IFCDOORSTYLE" || t == b"IFCWINDOWSTYLE";
-                if suffix_ok || ifc2x3_style {
+                // Bare base classes: `IfcTypeProduct` / `IfcTypeObject` are
+                // non-abstract in both IFC2x3 and IFC4. Revit emits them as
+                // the `RelatingType` of `IfcRelDefinesByType` for types that
+                // have no schema-specific `*Type` subtype (e.g. roof types on
+                // IFC2x3, which has no IfcRoofType). They end in `PRODUCT` /
+                // `OBJECT`, so they miss the `*Type` suffix check and would be
+                // skipped — dropping the type record, its type_guid linkage on
+                // occurrences, and any inherited psets/quantities. See #69.
+                let bare_base = t == b"IFCTYPEPRODUCT" || t == b"IFCTYPEOBJECT";
+                if suffix_ok || ifc2x3_style || bare_base {
                     EntityKind::TypeObject
                 } else {
                     return;
@@ -1079,6 +1088,13 @@ const ENTITY_NAME_PAIRS: &[(&[u8], &str)] = &[
         (b"IFCRAILING", "IfcRailing"),
         (b"IFCROOF", "IfcRoof"),
         (b"IFCCOVERING", "IfcCovering"),
+        // Bare type base classes (#69) — Revit emits these for types
+        // with no schema-specific *Type subtype. The fallback
+        // title-caser would render multi-word names as single words
+        // ("Ifctypeproduct"); spell them out so the entity column is
+        // correctly cased without relying on the consumer's fold map.
+        (b"IFCTYPEPRODUCT", "IfcTypeProduct"),
+        (b"IFCTYPEOBJECT", "IfcTypeObject"),
         // Generic
         (b"IFCBUILDINGELEMENTPROXY", "IfcBuildingElementProxy"),
         (b"IFCBUILDINGELEMENTPART", "IfcBuildingElementPart"),
@@ -1344,6 +1360,56 @@ END-ISO-10303-21;
         let out = index(MILLIMETRE_FIXTURE.as_bytes());
         let scale = out.unit_scale.expect("MILLI METRE must resolve");
         assert!((scale - 0.001).abs() < 1e-12, "expected 0.001, got {scale}");
+    }
+
+    /// GH #69: a bare `IFCTYPEPRODUCT` typing an IfcRoof through
+    /// IfcRelDefinesByType. Revit emits this on IFC2x3 (no IfcRoofType)
+    /// for "Basic Roof" types. The bare base class must be captured as a
+    /// TypeObject and its occurrence must link back to it.
+    const BARE_TYPE_PRODUCT_FIXTURE: &str = r#"ISO-10303-21;
+HEADER;
+FILE_DESCRIPTION((''),'2;1');
+FILE_NAME('bare.ifc','2026-06-13T00:00:00',(''),(''),'ifcfast','ifcfast','');
+FILE_SCHEMA(('IFC2X3'));
+ENDSEC;
+DATA;
+#1=IFCPROJECT('0Test000000000000000001',$,'p',$,$,$,$,(#5),#2);
+#2=IFCUNITASSIGNMENT((#3));
+#3=IFCSIUNIT(*,.LENGTHUNIT.,.MILLI.,.METRE.);
+#5=IFCGEOMETRICREPRESENTATIONCONTEXT($,'Model',3,1.0E-5,#6,$);
+#6=IFCAXIS2PLACEMENT3D(#8,$,$);
+#8=IFCCARTESIANPOINT((0.,0.,0.));
+#10=IFCROOF('1Roof00000000000000001',$,'R',$,$,$,$,'t',.NOTDEFINED.);
+#32=IFCTYPEPRODUCT('5Type0000000000000001',$,'Basic Roof',$,$,$,$,$);
+#33=IFCRELDEFINESBYTYPE('6RelType000000000000001',$,$,$,(#10),#32);
+ENDSEC;
+END-ISO-10303-21;
+"#;
+
+    #[test]
+    fn bare_type_product_is_captured_and_linked() {
+        // Before the fix the suffix check (ends_with "TYPE") rejected
+        // IFCTYPEPRODUCT, so the type was invisible AND its occurrence
+        // never got a type linkage.
+        let out = index(BARE_TYPE_PRODUCT_FIXTURE.as_bytes());
+
+        // The type entity is visible.
+        let pos = out
+            .type_object_step_id
+            .iter()
+            .position(|&s| s == 32)
+            .expect("bare IFCTYPEPRODUCT must appear in type_object table");
+        assert_eq!(out.type_object_guid[pos], "5Type0000000000000001");
+        assert_eq!(out.type_object_entity[pos], "IfcTypeProduct");
+        assert_eq!(out.type_object_name[pos].as_deref(), Some("Basic Roof"));
+
+        // The occurrence links to the type via IfcRelDefinesByType.
+        let linked = out
+            .defines_by_type_product
+            .iter()
+            .zip(out.defines_by_type_type.iter())
+            .any(|(&p, &t)| p == 10 && t == 32);
+        assert!(linked, "roof occurrence must link to its bare type");
     }
 
     #[test]

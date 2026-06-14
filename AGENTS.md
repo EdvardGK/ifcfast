@@ -195,6 +195,11 @@ describing via `pq.read_schema(...)`):
   `USERDEFINED`, `NOTDEFINED`; `None` when the schema/entity has none —
   see Conventions for the IFC4 door/window correction), `object_type`,
   `storey_guid`, `aggregates_parent_guid`, `type_guid`, `rep_id`.
+  `type_guid` / `type_name` resolve through `IfcRelDefinesByType` and
+  cover bare `IfcTypeProduct` / `IfcTypeObject` types too (since cache
+  schema v19, GH #69) — Revit emits those base classes for types with
+  no schema-specific `*Type` subtype (e.g. roof/stair/ramp types on
+  IFC2X3). They were silently dropped before v19.
 - Placement / world: `transform` (4×4 col-major), `placement_xyz`.
 - World-AABB: `bbox_min_xyz`, `bbox_max_xyz`.
 - **Geometric fingerprint** (since v0.4.19, cache schema v5):
@@ -449,6 +454,10 @@ the project's unit scale as parquet schema metadata
   the pre-v0.4.29 shape. Common payoff: manufacturer / type marks /
   fire ratings on Revit / Tekla / Archicad exports that live at the
   type level were silently dropped before this fix (GH #36).
+  Type inheritance covers bare `IfcTypeProduct` / `IfcTypeObject`
+  base classes (no `*Type` suffix) too since cache schema v19 (GH
+  #69) — before v19 their psets/quantities silently dropped because
+  the type-membership test only matched `*Type`-suffixed names.
 - **`m.quantities.unit_step_id` falls back to project defaults**
   (since v0.4.29, cache schema v8). When `IfcQuantity*.Unit` is null
   — the common Revit / ArchiCAD authoring pattern — the column now

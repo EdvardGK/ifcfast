@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — bare `IfcTypeProduct` / `IfcTypeObject` dropped (GH #69)
+
+- **Cache schema bumped `18` → `19`.** Bare type base classes are now
+  captured. The indexer's `EntityKind::TypeObject` classifier and the
+  two `is_type_object` membership tests (`extractors/psets.rs`,
+  `extractors/quantities.rs`) only accepted `*Type`-suffixed names plus
+  the IFC2x3 `IfcDoorStyle` / `IfcWindowStyle` exceptions. The
+  non-abstract base classes `IfcTypeProduct` / `IfcTypeObject` end in
+  `PRODUCT` / `OBJECT`, fell through every check, and were skipped — so:
+  - the type never appeared in `m.type_objects_df` /
+    `type_objects.parquet`;
+  - its occurrences carried `type_guid = None` (name-only fallback)
+    even with an explicit `IfcRelDefinesByType`;
+  - any type-level psets / quantities silently dropped (the GH #36 /
+    #45 silent-drop class, resurfacing through the membership filter).
+- **Why it matters:** Revit emits these base classes for types that
+  have no schema-specific subtype — e.g. roof / stair / ramp types on
+  IFC2X3, which has no `IfcRoofType`. Real export path, not a schema
+  curiosity. On `G55_ARK` (IFC2X3, Revit): 11 bare `IfcTypeProduct`
+  types now visible; 33 Roof / Stair / Ramp occurrences gain their
+  `type_guid`.
+- **Fail-loud:** the three membership rules now also match
+  `IfcTypeProduct` / `IfcTypeObject`; the proper-cased entity name map
+  spells both out so the `type_objects` entity column is correctly
+  cased without relying on the consumer fold map.
+
 ### Security — bump pyo3 to 0.29 (RUSTSEC-2026-0176 / -0177)
 
 - **`pyo3` bumped `0.24` → `0.29`** (with `pyo3-ffi`,
