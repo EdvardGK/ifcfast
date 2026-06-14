@@ -33,6 +33,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > surface. Cache schema v17 (cached drift/segments from v16 hold
 > foreign-extent values for clipped products).
 
+### Fixed — raw UTF-8 strings no longer mojibaked (GH #77)
+
+- **`decode_string` now decodes raw UTF-8 STEP strings correctly.** The
+  lexer forced Latin-1 on every byte ≥ 0x80, so exporters that write raw
+  UTF-8 `æøå`/CJK directly (Bonsai/BlenderBIM, some ArchiCAD/Tekla) came
+  back mojibaked — a wall named `Dør-æå` returned as `DÃ¸r-Ã¦Ã¥`, and the
+  garbage propagated into names, psets, materials, classifications and
+  diff keys. Un-escaped high-byte runs are now UTF-8-decoded first, with
+  per-byte Latin-1 only as the deterministic fallback for byte runs that
+  are not valid UTF-8 (legacy Latin-1 files are unaffected). STEP escapes
+  (`\X\HH`, `\X2\HHHH…\X0\`, `\S\C`) and ASCII are byte-for-byte
+  unchanged. Scoped to the encoding bug; the escape-batch and framing
+  items (GH #76, #72) are separate.
+- Cache schema **v18** — string values change for any raw-UTF-8 source
+  file; caches written by ≤ v17 wheels carry the old mojibake and
+  re-extract.
+
 ### Changed — `by_type` expands subtypes by default (GH #81)
 
 - **`Model.by_type(entity)` now mirrors
