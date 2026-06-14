@@ -337,6 +337,16 @@ _HASH_TAIL_BYTES = 4 * 1024 * 1024
 #       containing the literal `ENDSEC`/`DATA;` inside a string, now parses
 #       MORE (previously-dropped) entities → cached substrates of such
 #       files must be re-extracted. Clean files are byte-identical.
+# v19 (GH #75) — classification extractor walks the full `ReferencedSource`
+#       chain. A leaf `IfcClassificationReference` whose `ReferencedSource`
+#       points at a parent *reference* (multi-level hierarchy — ArchiCAD/
+#       Solibri NS 3451, Uniclass tables) was only resolved one hop, so the
+#       terminal `IfcClassification` was never reached and
+#       `classifications.system_name` / `.edition` / `.source` came back null.
+#       The walk now follows parent references (depth-capped 32, cycle-guarded)
+#       to the terminal `IfcClassification`. Value change without column change
+#       → cached substrates of files with hierarchical classifications must be
+#       re-extracted; flat (single-hop) classifications are byte-identical.
 _CACHE_SCHEMA_VERSION = 19
 
 _FIELD_RE = re.compile(r"\(\s*(.*?)\s*\)\s*;", re.DOTALL)

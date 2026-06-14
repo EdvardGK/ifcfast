@@ -37,6 +37,26 @@ Files using comments between records, or containing the literal
 entities. `_CACHE_SCHEMA_VERSION` bumped **18 → 19** (value change for
 affected files; clean files are byte-identical → cache hits unchanged).
 
+### Fixed — hierarchical classification chains lose system_name/edition/source (GH #75)
+
+- **`m.classifications` now walks the full `ReferencedSource` chain.** A
+  leaf `IfcClassificationReference` whose `ReferencedSource` points at a
+  parent *reference* (rather than directly at the `IfcClassification`) —
+  the multi-level hierarchy ArchiCAD/Solibri NS 3451 and Uniclass
+  exports produce (leaf → group → table → `IfcClassification`) — was
+  only resolved one hop. The terminal `IfcClassification` was never
+  reached, so `system_name` / `edition` / `source` came back `None` and
+  the entire hierarchy-exported population was invisible to consumers
+  grouping by `system_name` (the NS 3451 use case). The extractor now
+  follows parent references to the terminal `IfcClassification`,
+  depth-capped (32) and cycle-guarded (a self/loop reference yields
+  `None` system fields rather than hanging). `identification` / `name` /
+  `location` still come from the leaf reference.
+- **Cache schema `v18 → v19`.** Values change for files with
+  hierarchical classifications, so their cached substrates re-extract;
+  flat (single-hop) classifications are byte-identical. `AGENTS.md`
+  updated.
+
 ### Security — bump pyo3 to 0.29 (RUSTSEC-2026-0176 / -0177)
 
 - **`pyo3` bumped `0.24` → `0.29`** (with `pyo3-ffi`,
