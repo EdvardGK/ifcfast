@@ -56,7 +56,15 @@ Automate (Condition), a cron/Python job, or an MCP agent loop.
   looking at" without triggering extracts. Every CLI subcommand has
   `--json`.
 - **Parquet cache.** The second open of a file reuses extracted
-  tables; the cache key invalidates on any edit or library change.
+  tables. The cache key (`sha256(schema_version, size, head 4 MB,
+  tail 4 MB)`) is path-independent so identical copies share a cache,
+  and a library change that alters column meaning bumps the schema and
+  orphans old caches. On every read the cache is also validated against
+  the source's live `(size, mtime_ns)`: a same-size in-place edit — which
+  the key's head/tail windows can miss on a >8 MB file — is caught here
+  and forces a re-parse (no stale model is ever served). Writes are
+  atomic (temp file + `os.replace`), so an interrupted write never leaves
+  a partial/empty parquet that reads back as a valid hit.
 
 ## Via MCP (zero-config, any agent ecosystem)
 
@@ -240,6 +248,19 @@ JOIN 'rib/instances.parquet' b
 **Cache schema version** is at `_CACHE_SCHEMA_VERSION` in
 `python/ifcfast/header.py` — when it bumps, the column set changed.
 Old caches become orphaned automatically.
+
+**Cache freshness is verified, not assumed.** The cache key cannot see
+a same-size edit confined to the middle of a >8 MB file (its hash only
+covers the head/tail 4 MB windows). So every cache read additionally
+compares the manifest's recorded `(size_bytes, mtime_ns)` to the live
+file stat; a mismatch is a hard miss and triggers a re-parse rather than
+serving a stale model. `mtime_ns` is kept out of the *key* on purpose so
+a plain copy (new mtime, same bytes) re-validates against the existing
+cache after one re-hash instead of forcing a full re-parse. All cache
+writes go through a temp file + atomic `os.replace`, and an index is only
+honoured when its manifest carries `has_index` and the parquet is present
+and non-empty — a crash mid-write can never leave a partial cache that
+reads as a valid hit.
 
 ### Narrow-phase clash (`ifcfast.clash()`)
 
