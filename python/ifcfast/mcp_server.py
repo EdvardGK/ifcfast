@@ -161,20 +161,28 @@ def types(path: str, with_data: bool = False, samples: int = 3) -> list[dict]:
 
 
 @mcp.tool()
-def by_type(path: str, entity: str, limit: int = 100) -> list[dict]:
-    """All products of a given entity type — **exact match only**.
+def by_type(
+    path: str, entity: str, limit: int = 100, include_subtypes: bool = True
+) -> list[dict]:
+    """All products of a given entity type, **subtypes included**.
 
-    Returns up to ``limit`` rows as plain dicts. Unlike
-    ``ifcopenshell.file.by_type``, subtypes are NOT expanded:
-    ``by_type("IfcWall")`` does not include ``IfcWallStandardCase``,
-    and abstract supertypes (``"IfcElement"``) return ``[]`` — query
-    the concrete entity names from ``types()`` instead (GH #81 tracks
-    subtype expansion). Unknown entity names raise (GH #71).
+    Returns up to ``limit`` rows as plain dicts. Mirrors
+    ``ifcopenshell.file.by_type(type, include_subtypes=True)``: subtypes
+    are expanded by default (``by_type("IfcWall")`` includes
+    ``IfcWallStandardCase``; ``by_type("IfcElement")`` returns all
+    element subtypes present) and the entity name is matched
+    case-insensitively. Pass ``include_subtypes=False`` for an exact
+    single-entity match. Counts are over the meshable-product substrate,
+    so abstract supertypes resolve to the concrete products the model
+    carries. Unknown entity names raise (GH #71). (GH #81.)
     """
     from dataclasses import asdict
 
     m = _resolve(path)
-    rows = [asdict(p) for p in m.by_type(entity)[:limit]]
+    rows = [
+        asdict(p)
+        for p in m.by_type(entity, include_subtypes=include_subtypes)[:limit]
+    ]
     return rows
 
 
