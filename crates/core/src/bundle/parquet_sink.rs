@@ -212,13 +212,21 @@ impl ProductSink for ParquetSink<'_> {
         true
     }
 
-    fn on_product(&mut self, mesh: ProductMesh) {
+    fn on_product(&mut self, mut mesh: ProductMesh) {
         // Short-circuit if a prior flush failed: the writer is now in
         // an indeterminate state and pushing more rows just delays the
         // eventual `finish()` error. Drop everything quietly.
         if self.first_error.is_some() {
             return;
         }
+
+        // The substrate is measurement infrastructure: a synthetic
+        // ±20 000-unit half-space stand-in slab inside a rep poisons
+        // instance/rep bboxes and turns clash() broad+narrow phase
+        // into false positives against tool geometry (GH #66 — 26
+        // contaminated reps measured on a real architectural model).
+        // The bundle never runs cut_openings, so strip unconditionally.
+        crate::mesh::strip_synthetic_cutters(&mut mesh);
 
         let semantics = self.bundle.semantics_for(&mesh.guid);
         // IFC project's linear-unit-to-metres factor (the indexer

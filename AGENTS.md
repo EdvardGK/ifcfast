@@ -440,15 +440,34 @@ for chunk in m.iter_point_cloud(per_m2=200.0, seed=0,
 
 When the mesh pipeline meets a composite solid (`IfcBooleanResult`,
 `IfcBooleanClippingResult`, `IfcCsgSolid`) it does **not** perform the
-boolean by default. Both operands are emitted as their own visible
-mesh segments with compound tags like `boolean_first_operand|extrusion`
-(the host wall) and `boolean_second_operand|halfspace_bounded` (the
-door clip). This is deliberate: the file says "wall minus opening
-volume"; we preserve both volumes so an agent or human can SEE the
-structure, understand it, and edit it surgically rather than read a
-curated summary. The glTF emitter writes each segment's `(start, count,
+boolean by default. **Authored** operands are emitted as their own
+visible mesh segments with compound tags like
+`boolean_first_operand|extrusion` (the host wall) and
+`boolean_second_operand|extrusion` (a void modelled as a real solid).
+This is deliberate: the file says "wall minus opening volume"; we
+preserve both volumes so an agent or human can SEE the structure,
+understand it, and edit it surgically rather than read a curated
+summary. The glTF emitter writes each segment's `(start, count,
 source)` into per-node `extras.segments` so viewers can colour /
 split / filter by role.
+
+**Exception — synthetic half-space stand-ins are stripped (GH #66,
+v0.4.38+).** An *infinite* `IfcHalfSpaceSolid` cutter has no authored
+extent, so the tessellator invents a ±20 000-model-unit visualisation
+slab to stand in for it. That slab is **tool geometry, not element
+geometry** — left in the output it blew a 7 m floor strip up to a
+54 m plane, poisoned AABBs/centroids (drift, instances.parquet),
+soaked up point-cloud sampling budget, and fed `clash()` false
+positives against geometry that doesn't exist. Every no-cut surface
+(`meshes()` / `iter_meshes` / `to_gltf` / `point_cloud` / `drift` /
+`segments` / `mesh_qto(cut_openings=False)` / the bundle substrate)
+now strips fragments whose chain matches `boolean_second_operand` +
+`halfspace_plane*`/`halfspace_bounded*` before emitting. Authored
+solid subtractors still emit verbatim; union/intersection operands are
+untouched; `cut_openings=True` is unaffected (the cut consumes the
+cutters). To inspect the synthetic cutters (debugging cut placement),
+pass **`keep_cutters=True`** to `meshes()` / `iter_meshes()` — the
+`extract_meshes` stats dict reports `cutters_stripped` either way.
 
 **Source-tag chain encoding (v0.4.35+, GH #58 / W1).** The `source`
 field on `MeshSegment` / `InstancePart` / `instances.parquet.source`

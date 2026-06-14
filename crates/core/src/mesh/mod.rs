@@ -1427,3 +1427,258 @@ fn bytes_to_string(b: &[u8]) -> String {
         .unwrap_or_else(|_| String::from_utf8_lossy(b).into_owned())
 }
 
+// ----------------------------------------------------------------------
+// Synthetic-cutter stripping (GH #66)
+// ----------------------------------------------------------------------
+
+/// True when a compound segment tag names a **synthetic half-space
+/// visualisation fragment on the subtracted side of a boolean** — the
+/// `±HALFSPACE_PLANE_EXTENT` stand-in slab `boolean.rs` emits so an
+/// *infinite* `IfcHalfSpaceSolid` has something visible. That slab is
+/// tool geometry, not element geometry: it has foreign extent (a 40 m
+/// square inside a 7 m floor strip, GH #66), and when it leaks into a
+/// consumer it poisons meshes, AABBs, point-cloud sampling, drift
+/// stats, the clash substrate and glTF output.
+///
+/// Deliberately narrow: an *authored* solid on the subtracted side
+/// (`boolean_second_operand|extrusion`, a void shape modelled as a real
+/// solid) is bounded, local, authored geometry and stays revealed. Only
+/// the synthetic `halfspace_plane*` / `halfspace_bounded*` leaves under
+/// a `boolean_second_operand` role match (including their
+/// `:agree`/`:disagree` orientation-suffixed forms).
+pub fn is_synthetic_cutter_tag(tag: &str) -> bool {
+    let mut second_operand = false;
+    let mut halfspace_leaf = false;
+    for link in tag.split('|') {
+        if link == "boolean_second_operand" {
+            second_operand = true;
+        } else if link.starts_with("halfspace_plane")
+            || link.starts_with("halfspace_bounded")
+        {
+            halfspace_leaf = true;
+        }
+    }
+    second_operand && halfspace_leaf
+}
+
+/// Remove synthetic half-space cutter fragments from a tessellated
+/// product (GH #66). Runs **instead of** `cut_openings::apply` — apply
+/// consumes the cutter fragments as cut payloads and removes them
+/// itself; this pass is for every path where the cut does NOT run
+/// (`cut_openings=False`, builds without the `csg` feature, the bundle
+/// substrate, point clouds, drift). Without it the product mesh ships
+/// the `±20 000`-unit stand-in slabs as if they were element geometry.
+///
+/// Rewrites `indices`, `segments` and `parts` (kept in lockstep — they
+/// are pushed pairwise in `tessellate_one`) and **compacts `vertices`**
+/// to the referenced set, because downstream AABBs (`stats.rs`,
+/// `bundle::record`) iterate the raw vertex buffer and orphaned cutter
+/// vertices would still poison them. `bounded_halfspaces` payloads are
+/// left in place — they are inert unless `apply` runs. The legacy
+/// `source` field (dominant first-segment tag) is not rewritten; it is
+/// documented as advisory.
+///
+/// Returns the number of segments removed (0 = untouched).
+pub fn strip_synthetic_cutters(mesh: &mut ProductMesh) -> u32 {
+    let removed = mesh
+        .segments
+        .iter()
+        .filter(|s| is_synthetic_cutter_tag(&s.source))
+        .count() as u32;
+    if removed == 0 {
+        return 0;
+    }
+
+    let old_indices = std::mem::take(&mut mesh.indices);
+    let mut new_indices: Vec<u32> = Vec::with_capacity(old_indices.len());
+    let mut new_segments: Vec<MeshSegment> = Vec::with_capacity(mesh.segments.len());
+    let mut kept_ranges: Vec<(u32, u32)> = Vec::new();
+
+    for seg in mesh.segments.drain(..) {
+        if is_synthetic_cutter_tag(&seg.source) {
+            continue;
+        }
+        let start = seg.index_start as usize;
+        let end = start + seg.index_count as usize;
+        let new_start = new_indices.len() as u32;
+        if end <= old_indices.len() {
+            new_indices.extend_from_slice(&old_indices[start..end]);
+        }
+        kept_ranges.push((seg.index_start, new_start));
+        new_segments.push(MeshSegment {
+            index_start: new_start,
+            index_count: seg.index_count,
+            source: seg.source,
+        });
+    }
+
+    // Parts are pushed in lockstep with segments and share index_start;
+    // keep the ones whose old range survived, retargeted to the new one.
+    let retarget: std::collections::HashMap<u32, u32> =
+        kept_ranges.into_iter().collect();
+    mesh.parts.retain(|p| retarget.contains_key(&p.index_start));
+    for p in &mut mesh.parts {
+        if let Some(&ns) = retarget.get(&p.index_start) {
+            p.index_start = ns;
+        }
+    }
+
+    // Vertex compaction: downstream AABBs iterate the raw buffer.
+    let vert_count = mesh.vertices.len() / 3;
+    let mut remap: Vec<u32> = vec![u32::MAX; vert_count];
+    let mut new_vertices: Vec<f32> = Vec::with_capacity(mesh.vertices.len());
+    let mut next: u32 = 0;
+    for idx in &mut new_indices {
+        let old = *idx as usize;
+        if old >= vert_count {
+            continue; // malformed index — leave as-is rather than panic
+        }
+        if remap[old] == u32::MAX {
+            remap[old] = next;
+            new_vertices.extend_from_slice(&mesh.vertices[old * 3..old * 3 + 3]);
+            next += 1;
+        }
+        *idx = remap[old];
+    }
+
+    mesh.indices = new_indices;
+    mesh.segments = new_segments;
+    mesh.vertices = new_vertices;
+    removed
+}
+
+#[cfg(test)]
+mod strip_cutter_tests {
+    use super::*;
+
+    fn box_at(ox: f32, size: f32, vertices: &mut Vec<f32>, indices: &mut Vec<u32>) -> (u32, u32) {
+        let base = (vertices.len() / 3) as u32;
+        let start = indices.len() as u32;
+        let s = size;
+        let corners = [
+            [ox, 0.0, 0.0], [ox + s, 0.0, 0.0], [ox + s, s, 0.0], [ox, s, 0.0],
+            [ox, 0.0, s], [ox + s, 0.0, s], [ox + s, s, s], [ox, s, s],
+        ];
+        for c in corners { vertices.extend_from_slice(&c); }
+        const QUADS: [[u32; 4]; 6] = [
+            [0, 1, 2, 3], [4, 5, 6, 7], [0, 1, 5, 4],
+            [2, 3, 7, 6], [1, 2, 6, 5], [0, 3, 7, 4],
+        ];
+        for q in QUADS {
+            indices.extend_from_slice(&[base + q[0], base + q[1], base + q[2]]);
+            indices.extend_from_slice(&[base + q[0], base + q[2], base + q[3]]);
+        }
+        (start, indices.len() as u32 - start)
+    }
+
+    fn product_with(boxes: &[(&str, f32, f32)]) -> ProductMesh {
+        let mut vertices = Vec::new();
+        let mut indices = Vec::new();
+        let mut segments = Vec::new();
+        for (tag, ox, size) in boxes {
+            let (start, count) = box_at(*ox, *size, &mut vertices, &mut indices);
+            segments.push(MeshSegment {
+                index_start: start,
+                index_count: count,
+                source: tag.to_string(),
+            });
+        }
+        ProductMesh {
+            guid: "G".into(),
+            entity: "IfcSlab".into(),
+            ifc_id: 1,
+            vertices,
+            indices,
+            source: "extrusion",
+            segments,
+            placement_origin: [0.0; 3],
+            parts: Vec::new(),
+            world_transform: glam::Mat4::IDENTITY.to_cols_array(),
+            world_origin: [0.0; 3],
+            mesh_anchor: [0.0; 3],
+            surface_color: None,
+            bounded_halfspaces: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn tag_predicate_matches_synthetic_cutters_only() {
+        assert!(is_synthetic_cutter_tag("boolean_second_operand|halfspace_plane"));
+        assert!(is_synthetic_cutter_tag("boolean_second_operand|halfspace_bounded"));
+        assert!(is_synthetic_cutter_tag("boolean_second_operand|halfspace_plane:agree"));
+        assert!(is_synthetic_cutter_tag(
+            "boolean_second_operand|boolean_second_operand|halfspace_bounded:disagree"
+        ));
+        // authored solid subtractor: revealed, NOT stripped
+        assert!(!is_synthetic_cutter_tag("boolean_second_operand|extrusion"));
+        // host-side geometry never stripped
+        assert!(!is_synthetic_cutter_tag("boolean_first_operand|extrusion"));
+        // union operands are additive geometry
+        assert!(!is_synthetic_cutter_tag("boolean_union_operand|halfspace_plane"));
+        assert!(!is_synthetic_cutter_tag("extrusion"));
+        // halfspace leaf without a boolean role (bare clip target) stays
+        assert!(!is_synthetic_cutter_tag("halfspace_bounded"));
+    }
+
+    #[test]
+    fn strip_removes_cutters_and_compacts() {
+        // GH #66 anatomy: host extrusion + two giant halfspace caps.
+        let mut mesh = product_with(&[
+            ("boolean_first_operand|extrusion", 0.0, 1.0),
+            ("boolean_second_operand|halfspace_plane", 100.0, 40.0),
+            ("boolean_second_operand|halfspace_bounded", 200.0, 40.0),
+        ]);
+        let before_tris = mesh.indices.len() / 3;
+        let removed = strip_synthetic_cutters(&mut mesh);
+        assert_eq!(removed, 2);
+        assert_eq!(mesh.segments.len(), 1);
+        assert_eq!(mesh.indices.len() / 3, before_tris / 3); // 36 -> 12
+        assert_eq!(mesh.vertices.len() / 3, 8); // compacted to host verts
+        // AABB over the raw vertex buffer no longer sees the 40-unit caps
+        let max_x = mesh
+            .vertices
+            .chunks_exact(3)
+            .map(|c| c[0])
+            .fold(f32::MIN, f32::max);
+        assert!(max_x <= 1.0 + 1e-6, "max_x={max_x}");
+        // indices all reference the compacted buffer
+        let vc = (mesh.vertices.len() / 3) as u32;
+        assert!(mesh.indices.iter().all(|&i| i < vc));
+        assert_eq!(mesh.segments[0].index_start, 0);
+    }
+
+    #[test]
+    fn strip_noop_without_cutters() {
+        let mut mesh = product_with(&[
+            ("extrusion", 0.0, 1.0),
+            ("boolean_second_operand|extrusion", 5.0, 1.0),
+        ]);
+        let v = mesh.vertices.clone();
+        let i = mesh.indices.clone();
+        assert_eq!(strip_synthetic_cutters(&mut mesh), 0);
+        assert_eq!(mesh.vertices, v);
+        assert_eq!(mesh.indices, i);
+        assert_eq!(mesh.segments.len(), 2);
+    }
+
+    #[test]
+    fn strip_keeps_interleaved_host_segments_in_order() {
+        let mut mesh = product_with(&[
+            ("boolean_first_operand|extrusion", 0.0, 1.0),
+            ("boolean_second_operand|halfspace_plane:agree", 100.0, 40.0),
+            ("boolean_first_operand|brep", 2.0, 1.0),
+        ]);
+        let removed = strip_synthetic_cutters(&mut mesh);
+        assert_eq!(removed, 1);
+        assert_eq!(mesh.segments.len(), 2);
+        assert_eq!(mesh.segments[0].source, "boolean_first_operand|extrusion");
+        assert_eq!(mesh.segments[1].source, "boolean_first_operand|brep");
+        // contiguity: second segment starts where the first ends
+        assert_eq!(
+            mesh.segments[1].index_start,
+            mesh.segments[0].index_start + mesh.segments[0].index_count
+        );
+        assert_eq!(mesh.vertices.len() / 3, 16);
+    }
+}
+

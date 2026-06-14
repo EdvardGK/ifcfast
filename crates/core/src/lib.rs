@@ -741,7 +741,6 @@ mod python {
             }
         }
         impl ProductSink for QtoSink {
-            #[cfg_attr(not(feature = "csg"), allow(unused_mut))]
             fn on_product(&mut self, mut mesh: ProductMesh) {
                 if mesh.indices.is_empty() || mesh.vertices.is_empty() {
                     return;
@@ -766,6 +765,17 @@ mod python {
                 }
                 #[cfg(not(feature = "csg"))]
                 let _ = self.cut_openings;
+
+                // No cut ran -> the synthetic half-space stand-in slabs
+                // are still in the buffers and would be summed into the
+                // signed-tetra volume and the AABB (GH #66). QTO must
+                // measure the element, never tool geometry.
+                if !(cfg!(feature = "csg") && self.cut_openings) {
+                    crate::mesh::strip_synthetic_cutters(&mut mesh);
+                    if mesh.indices.is_empty() || mesh.vertices.is_empty() {
+                        return;
+                    }
+                }
 
                 self.record(mesh);
             }
@@ -892,7 +902,15 @@ mod python {
         let us_len = unit_scale;
         let us_area = unit_scale * unit_scale;
         let us_vol = unit_scale * unit_scale * unit_scale;
-        let (meshes, mesh_stats) = py.allow_threads(|| crate::mesh::mesh_ifc(&mmap));
+        let (mut meshes, mesh_stats) = py.allow_threads(|| crate::mesh::mesh_ifc(&mmap));
+        // Drift is the geometry-validity signal layer: its centroid /
+        // AABB / volume columns must describe the ELEMENT. Strip the
+        // synthetic half-space stand-in slabs first, or every clipped
+        // product reports a foreign-extent bbox (GH #66 — the very
+        // "broken mesh" class drift exists to catch).
+        for m in &mut meshes {
+            crate::mesh::strip_synthetic_cutters(m);
+        }
         let prod_stats: Vec<crate::mesh::stats::ProductStats> = meshes
             .iter()
             .map(crate::mesh::stats::ProductStats::from_mesh)
@@ -1155,7 +1173,11 @@ mod python {
         }
 
         impl ProductSink for CloudSink {
-            fn on_product(&mut self, mesh: ProductMesh) {
+            fn on_product(&mut self, mut mesh: ProductMesh) {
+                // Area-weighted sampling walks every triangle — a
+                // synthetic ±20 000-unit half-space slab would soak up
+                // nearly all of a product's point budget (GH #66).
+                crate::mesh::strip_synthetic_cutters(&mut mesh);
                 // Derive a per-product seed from `(seed, ifc_id)` so
                 // every product's PRNG stream is independent — adding
                 // a product to the file doesn't shift every other
@@ -1384,7 +1406,7 @@ mod python {
 
     #[cfg(feature = "mesh")]
     impl crate::mesh::ProductSink for StreamingCloudSink {
-        fn on_product(&mut self, mesh: crate::mesh::ProductMesh) {
+        fn on_product(&mut self, mut mesh: crate::mesh::ProductMesh) {
             use crate::mesh::sample::sample as sample_mesh;
             if self
                 .stop
@@ -1392,6 +1414,9 @@ mod python {
             {
                 return;
             }
+            // Same contract as the batch CloudSink: never sample the
+            // synthetic half-space stand-in slabs (GH #66).
+            crate::mesh::strip_synthetic_cutters(&mut mesh);
             // Per-product splitmix64-derived seed — same scheme as the
             // single-shot `sample_point_cloud` so bit-identical output
             // is preserved across the streaming and batch APIs at a
@@ -1675,11 +1700,12 @@ mod python {
     /// if you need those rows.
     #[cfg(feature = "mesh")]
     #[pyfunction]
-    #[pyo3(signature = (path, cut_openings = false))]
+    #[pyo3(signature = (path, cut_openings = false, keep_cutters = false))]
     pub fn extract_meshes<'py>(
         py: Python<'py>,
         path: &str,
         cut_openings: bool,
+        keep_cutters: bool,
     ) -> PyResult<Bound<'py, PyDict>> {
         catch_panic(|| {
         use crate::mesh::{BakeFrame, ProductMesh, ProductSink};
@@ -1708,6 +1734,12 @@ mod python {
         struct MeshSink {
             unit_scale: f32,
             cut_openings: bool,
+            // Reveal-all opt-in (GH #66): keep the synthetic half-space
+            // visualisation slabs in the no-cut output. Default `false`
+            // — they are tool geometry with foreign extent (±20 000
+            // model units), not element geometry.
+            keep_cutters: bool,
+            cutters_stripped: u64,
             // Model-wide global shift (CloudCompare contract), model
             // units. Same scheme as `sample_point_cloud`: set from the
             // first geometry product's f64 origin (rounded); per-product
@@ -1777,7 +1809,6 @@ mod python {
         }
 
         impl ProductSink for MeshSink {
-            #[cfg_attr(not(feature = "csg"), allow(unused_mut))]
             fn on_product(&mut self, mut mesh: ProductMesh) {
                 // Skip geometryless products — no triangles to hand back.
                 if mesh.indices.is_empty() || mesh.vertices.is_empty() {
@@ -1806,6 +1837,19 @@ mod python {
                 #[cfg(not(feature = "csg"))]
                 let _ = self.cut_openings; // silence unused-field warning
 
+                // When the cut did NOT run, the reveal-all fragments
+                // still include the synthetic half-space stand-in slabs
+                // (±20 000 model units — GH #66). Strip them unless the
+                // caller explicitly asked for reveal-all geometry.
+                let cut_applied = cfg!(feature = "csg") && self.cut_openings;
+                if !cut_applied && !self.keep_cutters {
+                    self.cutters_stripped +=
+                        crate::mesh::strip_synthetic_cutters(&mut mesh) as u64;
+                    if mesh.indices.is_empty() || mesh.vertices.is_empty() {
+                        return;
+                    }
+                }
+
                 self.encode(mesh);
             }
         }
@@ -1829,6 +1873,8 @@ mod python {
         let mut sink = MeshSink {
             unit_scale,
             cut_openings,
+            keep_cutters,
+            cutters_stripped: 0,
             shift: None,
             guid: Vec::new(),
             entity: Vec::new(),
@@ -1894,6 +1940,8 @@ mod python {
         out.set_item("total_ms", t_total.elapsed().as_secs_f64() * 1000.0)?;
         out.set_item("size_bytes", mmap.len() as u64)?;
         out.set_item("cut_openings", cut_openings)?;
+        out.set_item("keep_cutters", keep_cutters)?;
+        out.set_item("cutters_stripped", sink.cutters_stripped)?;
         set_cut_openings_stats(&out, &sink.cut_stats)?;
         Ok(out)
         })
@@ -1984,7 +2032,6 @@ mod python {
             }
 
             impl ProductSink for GltfSink {
-                #[cfg_attr(not(feature = "csg"), allow(unused_mut))]
                 fn on_product(&mut self, mut mesh: ProductMesh) {
                     #[cfg(feature = "csg")]
                     if self.cut_openings {
@@ -2000,6 +2047,12 @@ mod python {
                     }
                     #[cfg(not(feature = "csg"))]
                     let _ = self.cut_openings;
+                    // The viewer is the primary victim of the synthetic
+                    // half-space stand-in slabs (GH #66) — never ship
+                    // them in glTF output when the cut didn't run.
+                    if !(cfg!(feature = "csg") && self.cut_openings) {
+                        crate::mesh::strip_synthetic_cutters(&mut mesh);
+                    }
                     self.push_scaled(mesh);
                 }
             }

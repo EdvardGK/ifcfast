@@ -5,6 +5,46 @@ All notable changes to ifcfast will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+> Broken-mesh class fix (GH #66 / #94): synthetic half-space cutter
+> slabs no longer masquerade as element geometry on any no-cut
+> surface. Cache schema v17 (cached drift/segments from v16 hold
+> foreign-extent values for clipped products).
+
+### Fixed — synthetic half-space stand-ins stripped from no-cut output (GH #66)
+
+- **`iter_meshes`/`meshes` no longer return giant degenerate planes
+  for clipped products.** An infinite `IfcHalfSpaceSolid` cutter is
+  tessellated as a ±20 000-model-unit visualisation slab; the
+  reveal-all path emitted it inside the product mesh, so a 7 m floor
+  strip arrived as three boxes spanning 54 m (GH #66 — `iter_meshes`
+  wrong, `mesh_qto` correct, because only the cut path consumed the
+  cutters). A new `strip_synthetic_cutters` pass removes fragments
+  tagged `boolean_second_operand` + `halfspace_plane*`/
+  `halfspace_bounded*` — with vertex compaction, segment re-indexing
+  and `parts` bookkeeping — on every surface where the cut does not
+  run: `extract_meshes`, `mesh_qto(cut_openings=False)`, both
+  point-cloud sinks, `to_gltf`, `analyse_drift` (and therefore the
+  `drift` + `segments` tables), and the **bundle substrate** (26
+  contaminated representations measured on a real architectural
+  model were feeding `clash()` false positives and poisoning
+  instance bboxes).
+- **Scope discipline:** authored solid subtractors
+  (`boolean_second_operand|extrusion` — a void modelled as a real
+  solid) still emit verbatim; `boolean_union_operand` /
+  intersection operands untouched; `cut_openings=True` unchanged.
+
+### Added
+
+- **`keep_cutters=True`** on `meshes()` / `iter_meshes()` /
+  `_core.extract_meshes` — explicit reveal-all opt-in that restores
+  the synthetic cutter slabs (debugging cut placement). The
+  `extract_meshes` stats dict now reports **`cutters_stripped`** and
+  echoes `keep_cutters`.
+- Cache schema **v17** — value change in drift/segments without a
+  column change; v16 caches re-extract.
+
 ## [0.4.37] - 2026-06-10
 
 > Agent-first contract hardening (Python layer only — no Rust core

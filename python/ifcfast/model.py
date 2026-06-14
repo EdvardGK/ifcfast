@@ -820,7 +820,12 @@ class Model:
             bool(cut_openings),
         )
 
-    def meshes(self, unit: str = "m", cut_openings: bool = False):
+    def meshes(
+        self,
+        unit: str = "m",
+        cut_openings: bool = False,
+        keep_cutters: bool = False,
+    ):
         """Raw per-product triangle meshes — the fast drop-in for
         IfcOpenShell tessellation.
 
@@ -874,11 +879,23 @@ class Model:
                 Cross-product openings are suppressed from the
                 returned product list in cut mode (they're cutters,
                 not user-visible products). Default ``False``
-                preserves the reveal-all stance (both operands /
-                both products emit verbatim). Requires a wheel
-                built with the ``csg`` feature — raises
-                ``RuntimeError`` if the underlying
-                ``ifcfast._core`` was compiled without it.
+                preserves the reveal-all stance for **authored**
+                operands (a void modelled as a real solid still
+                emits verbatim). Requires a wheel built with the
+                ``csg`` feature — raises ``RuntimeError`` if the
+                underlying ``ifcfast._core`` was compiled without it.
+            keep_cutters: by default (``False``) the **synthetic
+                half-space visualisation slabs** — the ±20 000
+                model-unit stand-ins ``boolean.rs`` emits so an
+                *infinite* ``IfcHalfSpaceSolid`` cutter has something
+                visible — are stripped from no-cut output. They are
+                tool geometry, not element geometry, and they used to
+                blow a 7 m floor strip up to a 54 m plane (GH #66).
+                Pass ``True`` to get the full reveal-all geometry
+                including the synthetic cutter slabs (debugging the
+                cut pipeline, inspecting cutter placement). Ignored
+                when ``cut_openings=True`` — the cut consumes the
+                cutters entirely.
 
         Drop-in for trimesh:
 
@@ -910,6 +927,7 @@ class Model:
         d = _core.extract_meshes(
             str(native_path_for(self.header.path)),
             cut_openings=bool(cut_openings),
+            keep_cutters=bool(keep_cutters),
         )
         out = MeshList()
         for i in range(len(d["guid"])):
@@ -925,17 +943,24 @@ class Model:
         out.global_shift = [s * factor for s in gshift] if factor != 1.0 else gshift
         return out
 
-    def iter_meshes(self, unit: str = "m", cut_openings: bool = False):
+    def iter_meshes(
+        self,
+        unit: str = "m",
+        cut_openings: bool = False,
+        keep_cutters: bool = False,
+    ):
         """Generator form of :meth:`meshes` — yields ``Mesh`` namedtuples
         one at a time. Identical data; use this when you want to stream
         through products without materialising the whole list. Note the
         Rust mesher still runs eagerly (one batch pass), so this trades
         list-construction memory for iteration ergonomics, not peak RAM.
 
-        ``cut_openings`` mirrors :meth:`meshes` — see that method for
-        the full contract.
+        ``cut_openings`` / ``keep_cutters`` mirror :meth:`meshes` — see
+        that method for the full contract.
         """
-        for mesh in self.meshes(unit=unit, cut_openings=cut_openings):
+        for mesh in self.meshes(
+            unit=unit, cut_openings=cut_openings, keep_cutters=keep_cutters
+        ):
             yield mesh
 
     @property
@@ -949,9 +974,15 @@ class Model:
         Columns: ``guid`` (parent product), ``product_index`` (row index
         in ``drift``), ``segment_index`` (segment ordinal within the
         product), ``source`` (compound ``role|leaf`` tag such as
-        ``boolean_second_operand|halfspace_bounded``), ``triangle_count``,
-        ``index_start`` (first index into the product's triangle list
-        belonging to this segment).
+        ``boolean_second_operand|extrusion`` for an authored void
+        solid), ``triangle_count``, ``index_start`` (first index into
+        the product's triangle list belonging to this segment).
+
+        Synthetic half-space visualisation slabs (the ±20 000-unit
+        stand-ins for *infinite* ``IfcHalfSpaceSolid`` cutters) are
+        stripped before this table is built (GH #66), so the rows here
+        always describe geometry that :meth:`meshes` actually emits —
+        ``index_start`` ranges stay joinable across both surfaces.
         """
         return self._ensure_data().segments
 
