@@ -99,14 +99,143 @@ const APPLICATION_TYPE: &[u8] = b"IFCAPPLICATION";
 const CONTAINED_TYPE: &[u8] = b"IFCRELCONTAINEDINSPATIALSTRUCTURE";
 const AGGREGATES_TYPE: &[u8] = b"IFCRELAGGREGATES";
 const SI_UNIT_TYPE: &[u8] = b"IFCSIUNIT";
+const CONVERSION_UNIT_TYPE: &[u8] = b"IFCCONVERSIONBASEDUNIT";
+const MEASURE_WITH_UNIT_TYPE: &[u8] = b"IFCMEASUREWITHUNIT";
 const UNIT_ASSIGN_TYPE: &[u8] = b"IFCUNITASSIGNMENT";
 const VOIDS_ELEMENT_TYPE: &[u8] = b"IFCRELVOIDSELEMENT";
 const DEFINES_BY_TYPE_TYPE: &[u8] = b"IFCRELDEFINESBYTYPE";
 
+/// SI prefix + name → metres-per-unit scale. `name` is an
+/// `IfcSIUnitName` enum value (e.g. `METRE`); `prefix` is an
+/// `IfcSIPrefix` enum value or `""` for no prefix. Returns `None` for
+/// a non-length unit name (so callers can `continue` past `RADIAN`,
+/// `SQUARE_METRE`, …).
+///
+/// Note: FOOT / INCH are deliberately NOT handled here — they are not
+/// legal `IfcSIUnitName` values. Imperial length is declared via
+/// `IfcConversionBasedUnit`, resolved separately (GH #73).
+fn si_length_scale(prefix: &str, name: &str) -> Option<f64> {
+    let base = match name {
+        "METRE" | "METER" => 1.0,
+        _ => return None,
+    };
+    let scale = match prefix {
+        "" => base,
+        "EXA" => base * 1e18,
+        "PETA" => base * 1e15,
+        "TERA" => base * 1e12,
+        "GIGA" => base * 1e9,
+        "MEGA" => base * 1e6,
+        "KILO" => base * 1e3,
+        "HECTO" => base * 1e2,
+        "DECA" => base * 10.0,
+        "DECI" => base * 1e-1,
+        "CENTI" => base * 1e-2,
+        "MILLI" => base * 1e-3,
+        "MICRO" => base * 1e-6,
+        "NANO" => base * 1e-9,
+        "PICO" => base * 1e-12,
+        "FEMTO" => base * 1e-15,
+        "ATTO" => base * 1e-18,
+        _ => base,
+    };
+    Some(scale)
+}
+
+/// Parse a numeric value that may be wrapped in a defined-type
+/// constructor, e.g. `IFCLENGTHMEASURE(0.3048)` or a bare `0.3048`.
+/// `IfcMeasureWithUnit.ValueComponent` is an `IfcValue` SELECT, so on
+/// real files it almost always arrives as the wrapped form, which
+/// [`parse_field`] returns as `Field::Other`. Returns `None` if no
+/// number can be recovered.
+fn measure_number(raw: &[u8]) -> Option<f64> {
+    match parse_field(raw) {
+        Field::Number(n) => Some(n),
+        _ => {
+            // Wrapped: TYPE(<number>). Take the bytes between the first
+            // '(' and the matching trailing ')'.
+            let open = raw.iter().position(|&b| b == b'(')?;
+            let close = raw.iter().rposition(|&b| b == b')')?;
+            if close <= open + 1 {
+                return None;
+            }
+            let inner = &raw[open + 1..close];
+            std::str::from_utf8(inner).ok()?.trim().parse().ok()
+        }
+    }
+}
+
+/// Resolve a LENGTHUNIT from the assignment list to metres-per-unit.
+///
+/// Walks the `IfcUnitAssignment.Units` refs and resolves the first
+/// LENGTHUNIT entry through either:
+/// - `IfcSIUnit` — `(prefix, name)` → [`si_length_scale`], or
+/// - `IfcConversionBasedUnit` — `ConversionFactor` →
+///   `IfcMeasureWithUnit(value, si_base)` → `value × si_scale(base)`
+///   (GH #73; how imperial files declare FOOT / INCH).
+///
+/// Returns `None` when no LENGTHUNIT is declared (caller defaults to
+/// metres). When a LENGTHUNIT *is* found but cannot be resolved (e.g. a
+/// conversion-based unit whose factor chain is broken), emits a loud
+/// `eprintln!` and returns `None` rather than silently implying metres
+/// — "fail loudly" is the house rule.
+fn resolve_length_scale(
+    unit_assignment_refs: &[u64],
+    si_units: &HashMap<u64, (String, String, String)>,
+    conv_units: &HashMap<u64, (String, String, Option<u64>)>,
+    measures: &HashMap<u64, (Option<f64>, Option<u64>)>,
+) -> Option<f64> {
+    for unit_ref in unit_assignment_refs {
+        // SI length unit (metric files).
+        if let Some((ut, prefix, name)) = si_units.get(unit_ref) {
+            if ut.eq_ignore_ascii_case("LENGTHUNIT") {
+                if let Some(scale) = si_length_scale(prefix, name) {
+                    return Some(scale);
+                }
+            }
+            continue;
+        }
+        // Conversion-based length unit (imperial files: FOOT / INCH).
+        if let Some((ut, conv_name, factor_ref)) = conv_units.get(unit_ref) {
+            if !ut.eq_ignore_ascii_case("LENGTHUNIT") {
+                continue;
+            }
+            let resolved = factor_ref
+                .and_then(|fr| measures.get(&fr))
+                .and_then(|(value, base_ref)| {
+                    let v = (*value)?;
+                    let base_ref = (*base_ref)?;
+                    let (base_ut, base_prefix, base_name) = si_units.get(&base_ref)?;
+                    if !base_ut.eq_ignore_ascii_case("LENGTHUNIT") {
+                        return None;
+                    }
+                    let base_scale = si_length_scale(base_prefix, base_name)?;
+                    Some(v * base_scale)
+                });
+            match resolved {
+                Some(scale) => return Some(scale),
+                None => {
+                    eprintln!(
+                        "[ifcfast] WARNING: IfcConversionBasedUnit \
+                         (LENGTHUNIT, name={:?}, #{}) could not be resolved \
+                         to a metres-per-unit scale; its ConversionFactor → \
+                         IfcMeasureWithUnit → IfcSIUnit chain is missing or \
+                         malformed. unit_scale is left unset (consumers \
+                         default to metres, which is WRONG for this file).",
+                        conv_name, unit_ref
+                    );
+                    // Keep scanning: another LENGTHUNIT entry might resolve.
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Extract the IFC project's linear-unit-to-metres scale by walking
-/// the entity table for `IfcUnitAssignment` + `IfcSIUnit`. Returns
-/// `None` when no SI LENGTHUNIT is declared — caller should default to
-/// `1.0` (metres) in that case.
+/// the entity table for `IfcUnitAssignment` + `IfcSIUnit` /
+/// `IfcConversionBasedUnit`. Returns `None` when no LENGTHUNIT is
+/// declared — caller should default to `1.0` (metres) in that case.
 ///
 /// Mirrors the unit-scale resolution already done inside [`index`],
 /// extracted here so callers that build only the extractor tables
@@ -120,6 +249,8 @@ pub(crate) fn extract_unit_scale(table: &crate::entity_table::EntityTable) -> Op
     use crate::lexer::{parse_field, parse_ref_list, split_top_level_args, Field};
 
     let mut si_units: HashMap<u64, (String, String, String)> = HashMap::new();
+    let mut conv_units: HashMap<u64, (String, String, Option<u64>)> = HashMap::new();
+    let mut measures: HashMap<u64, (Option<f64>, Option<u64>)> = HashMap::new();
     let mut unit_assignment_refs: Vec<u64> = Vec::new();
 
     for (step_id, type_name, args) in table.iter() {
@@ -129,6 +260,23 @@ pub(crate) fn extract_unit_scale(table: &crate::entity_table::EntityTable) -> Op
             let prefix = enum_at(&fields, 2).unwrap_or_default();
             let name = enum_at(&fields, 3).unwrap_or_default();
             si_units.insert(step_id, (ut, prefix, name));
+        } else if type_name == CONVERSION_UNIT_TYPE {
+            // IfcConversionBasedUnit(Dimensions, UnitType, Name,
+            // ConversionFactor) — UnitType at [1], Name (string) at [2],
+            // ConversionFactor ref (→ IfcMeasureWithUnit) at [3].
+            let fields = split_top_level_args(args);
+            let ut = enum_at(&fields, 1).unwrap_or_default();
+            let name = string_at(&fields, 2).unwrap_or_default();
+            let factor_ref = ref_at(&fields, 3);
+            conv_units.insert(step_id, (ut, name, factor_ref));
+        } else if type_name == MEASURE_WITH_UNIT_TYPE {
+            // IfcMeasureWithUnit(ValueComponent, UnitComponent) — value
+            // (often wrapped, e.g. IFCLENGTHMEASURE(0.3048)) at [0],
+            // unit ref at [1].
+            let fields = split_top_level_args(args);
+            let value = fields.first().and_then(|f| measure_number(f));
+            let unit_ref = ref_at(&fields, 1);
+            measures.insert(step_id, (value, unit_ref));
         } else if type_name == UNIT_ASSIGN_TYPE && unit_assignment_refs.is_empty() {
             let fields = split_top_level_args(args);
             if let Some(f) = fields.first() {
@@ -139,40 +287,7 @@ pub(crate) fn extract_unit_scale(table: &crate::entity_table::EntityTable) -> Op
         }
     }
 
-    for unit_ref in &unit_assignment_refs {
-        if let Some((ut, prefix, name)) = si_units.get(unit_ref) {
-            if ut.eq_ignore_ascii_case("LENGTHUNIT") {
-                let base = match name.as_str() {
-                    "METRE" | "METER" => 1.0,
-                    "FOOT" => 0.3048,
-                    "INCH" => 0.0254,
-                    _ => continue,
-                };
-                let scale = match prefix.as_str() {
-                    "" => base,
-                    "EXA" => base * 1e18,
-                    "PETA" => base * 1e15,
-                    "TERA" => base * 1e12,
-                    "GIGA" => base * 1e9,
-                    "MEGA" => base * 1e6,
-                    "KILO" => base * 1e3,
-                    "HECTO" => base * 1e2,
-                    "DECA" => base * 10.0,
-                    "DECI" => base * 1e-1,
-                    "CENTI" => base * 1e-2,
-                    "MILLI" => base * 1e-3,
-                    "MICRO" => base * 1e-6,
-                    "NANO" => base * 1e-9,
-                    "PICO" => base * 1e-12,
-                    "FEMTO" => base * 1e-15,
-                    "ATTO" => base * 1e-18,
-                    _ => base,
-                };
-                return Some(scale);
-            }
-        }
-    }
-    None
+    resolve_length_scale(&unit_assignment_refs, &si_units, &conv_units, &measures)
 }
 
 /// Canonical "should the mesher walk this entity as a product?" check.
@@ -225,6 +340,8 @@ enum EntityKind {
     Application,
     ContainedInSpatialStructure,
     SiUnit,
+    ConversionBasedUnit,
+    MeasureWithUnit,
     UnitAssignment,
     Aggregates,
     VoidsElement,
@@ -255,6 +372,8 @@ fn dispatch_map() -> &'static HashMap<&'static [u8], EntityKind> {
         m.insert(APPLICATION_TYPE, EntityKind::Application);
         m.insert(CONTAINED_TYPE, EntityKind::ContainedInSpatialStructure);
         m.insert(SI_UNIT_TYPE, EntityKind::SiUnit);
+        m.insert(CONVERSION_UNIT_TYPE, EntityKind::ConversionBasedUnit);
+        m.insert(MEASURE_WITH_UNIT_TYPE, EntityKind::MeasureWithUnit);
         m.insert(UNIT_ASSIGN_TYPE, EntityKind::UnitAssignment);
         m.insert(AGGREGATES_TYPE, EntityKind::Aggregates);
         m.insert(VOIDS_ELEMENT_TYPE, EntityKind::VoidsElement);
@@ -467,6 +586,12 @@ pub fn index(buf: &[u8]) -> IndexedFile {
 
     // step_id -> (unit_type, prefix_name, unit_name) for SI units we see
     let mut si_units: HashMap<u64, (String, String, String)> = HashMap::new();
+    // step_id -> (unit_type, name, conversion_factor_ref) for
+    // IfcConversionBasedUnit (how imperial files declare FOOT / INCH).
+    let mut conv_units: HashMap<u64, (String, String, Option<u64>)> = HashMap::new();
+    // step_id -> (value, unit_component_ref) for IfcMeasureWithUnit,
+    // the conversion-factor target of a conversion-based unit.
+    let mut measures: HashMap<u64, (Option<f64>, Option<u64>)> = HashMap::new();
     // The first IfcUnitAssignment.Units we encounter; one project = one
     // assignment in practice.
     let mut unit_assignment_refs: Vec<u64> = Vec::new();
@@ -591,6 +716,26 @@ pub fn index(buf: &[u8]) -> IndexedFile {
                 let name = enum_at(&fields_buf, 3).unwrap_or_default();
                 si_units.insert(rec.id, (ut, prefix, name));
             }
+            EntityKind::ConversionBasedUnit => {
+                // IfcConversionBasedUnit(Dimensions, UnitType, Name,
+                // ConversionFactor) — UnitType at [1], Name (string) at
+                // [2], ConversionFactor ref (→ IfcMeasureWithUnit) at [3].
+                // How imperial files declare FOOT / INCH (GH #73).
+                split_top_level_args_into(rec.args, &mut fields_buf);
+                let ut = enum_at(&fields_buf, 1).unwrap_or_default();
+                let name = string_at(&fields_buf, 2).unwrap_or_default();
+                let factor_ref = ref_at(&fields_buf, 3);
+                conv_units.insert(rec.id, (ut, name, factor_ref));
+            }
+            EntityKind::MeasureWithUnit => {
+                // IfcMeasureWithUnit(ValueComponent, UnitComponent) —
+                // value (often wrapped, e.g. IFCLENGTHMEASURE(0.3048))
+                // at [0], unit ref at [1].
+                split_top_level_args_into(rec.args, &mut fields_buf);
+                let value = fields_buf.first().and_then(|f| measure_number(f));
+                let unit_ref = ref_at(&fields_buf, 1);
+                measures.insert(rec.id, (value, unit_ref));
+            }
             EntityKind::UnitAssignment => {
                 // IfcUnitAssignment(Units) — Units is a list of refs at arg[0].
                 split_top_level_args_into(rec.args, &mut fields_buf);
@@ -691,42 +836,11 @@ pub fn index(buf: &[u8]) -> IndexedFile {
     // containment invisible to the spatial graph (GH #32).
 
     // Resolve unit_scale (metres per model unit). Look through the
-    // IfcUnitAssignment.Units list for a LENGTHUNIT SI unit, then map
-    // (Prefix, Name) to a scale factor.
-    for unit_ref in &unit_assignment_refs {
-        if let Some((ut, prefix, name)) = si_units.get(unit_ref) {
-            if ut.eq_ignore_ascii_case("LENGTHUNIT") {
-                let base = match name.as_str() {
-                    "METRE" | "METER" => 1.0,
-                    "FOOT" => 0.3048,
-                    "INCH" => 0.0254,
-                    _ => continue,
-                };
-                let scale = match prefix.as_str() {
-                    "" => base,
-                    "EXA" => base * 1e18,
-                    "PETA" => base * 1e15,
-                    "TERA" => base * 1e12,
-                    "GIGA" => base * 1e9,
-                    "MEGA" => base * 1e6,
-                    "KILO" => base * 1e3,
-                    "HECTO" => base * 1e2,
-                    "DECA" => base * 10.0,
-                    "DECI" => base * 1e-1,
-                    "CENTI" => base * 1e-2,
-                    "MILLI" => base * 1e-3,
-                    "MICRO" => base * 1e-6,
-                    "NANO" => base * 1e-9,
-                    "PICO" => base * 1e-12,
-                    "FEMTO" => base * 1e-15,
-                    "ATTO" => base * 1e-18,
-                    _ => base,
-                };
-                out.unit_scale = Some(scale);
-                break;
-            }
-        }
-    }
+    // IfcUnitAssignment.Units list for a LENGTHUNIT — either an
+    // IfcSIUnit (metric) or an IfcConversionBasedUnit (imperial:
+    // FOOT / INCH, GH #73) — and derive metres-per-unit.
+    out.unit_scale =
+        resolve_length_scale(&unit_assignment_refs, &si_units, &conv_units, &measures);
 
     out
 }
@@ -735,6 +849,14 @@ fn enum_at(fields: &[&[u8]], idx: usize) -> Option<String> {
     let f = fields.get(idx)?;
     match parse_field(f) {
         Field::Enum(e) => std::str::from_utf8(e).ok().map(|s| s.to_string()),
+        _ => None,
+    }
+}
+
+fn ref_at(fields: &[&[u8]], idx: usize) -> Option<u64> {
+    let f = fields.get(idx)?;
+    match parse_field(f) {
+        Field::Ref(id) => Some(id),
         _ => None,
     }
 }
@@ -1050,5 +1172,136 @@ pub(crate) fn type_name_uppercase_with_proper_case(t: &[u8]) -> String {
         s
     } else {
         std::str::from_utf8(t).unwrap_or("").to_string()
+    }
+}
+
+#[cfg(test)]
+mod unit_scale_tests {
+    use super::index;
+
+    /// Imperial files declare length via IfcConversionBasedUnit, NOT
+    /// IfcSIUnit — the case that GH #73 left as silent dead code.
+    const FEET_FIXTURE: &str = r#"ISO-10303-21;
+HEADER;
+FILE_DESCRIPTION((''),'2;1');
+FILE_NAME('feet.ifc','2026-06-13T00:00:00',(''),(''),'ifcfast','ifcfast','');
+FILE_SCHEMA(('IFC4'));
+ENDSEC;
+DATA;
+#1=IFCPROJECT('0Test000000000000000001',$,'p',$,$,$,$,(#5),#2);
+#2=IFCUNITASSIGNMENT((#4));
+#3=IFCSIUNIT(*,.LENGTHUNIT.,$,.METRE.);
+#4=IFCCONVERSIONBASEDUNIT(#7,.LENGTHUNIT.,'FOOT',#9);
+#7=IFCDIMENSIONALEXPONENTS(1,0,0,0,0,0,0);
+#9=IFCMEASUREWITHUNIT(IFCLENGTHMEASURE(0.3048),#3);
+#5=IFCGEOMETRICREPRESENTATIONCONTEXT($,'Model',3,1.0E-5,#6,$);
+#6=IFCAXIS2PLACEMENT3D(#8,$,$);
+#8=IFCCARTESIANPOINT((0.,0.,0.));
+ENDSEC;
+END-ISO-10303-21;
+"#;
+
+    const INCH_FIXTURE: &str = r#"ISO-10303-21;
+HEADER;
+FILE_DESCRIPTION((''),'2;1');
+FILE_NAME('inch.ifc','2026-06-13T00:00:00',(''),(''),'ifcfast','ifcfast','');
+FILE_SCHEMA(('IFC4'));
+ENDSEC;
+DATA;
+#1=IFCPROJECT('0Test000000000000000001',$,'p',$,$,$,$,(#5),#2);
+#2=IFCUNITASSIGNMENT((#4));
+#3=IFCSIUNIT(*,.LENGTHUNIT.,$,.METRE.);
+#4=IFCCONVERSIONBASEDUNIT(#7,.LENGTHUNIT.,'INCH',#9);
+#7=IFCDIMENSIONALEXPONENTS(1,0,0,0,0,0,0);
+#9=IFCMEASUREWITHUNIT(IFCLENGTHMEASURE(0.0254),#3);
+#5=IFCGEOMETRICREPRESENTATIONCONTEXT($,'Model',3,1.0E-5,#6,$);
+#6=IFCAXIS2PLACEMENT3D(#8,$,$);
+#8=IFCCARTESIANPOINT((0.,0.,0.));
+ENDSEC;
+END-ISO-10303-21;
+"#;
+
+    const MILLIMETRE_FIXTURE: &str = r#"ISO-10303-21;
+HEADER;
+FILE_DESCRIPTION((''),'2;1');
+FILE_NAME('mm.ifc','2026-06-13T00:00:00',(''),(''),'ifcfast','ifcfast','');
+FILE_SCHEMA(('IFC4'));
+ENDSEC;
+DATA;
+#1=IFCPROJECT('0Test000000000000000001',$,'p',$,$,$,$,(#5),#2);
+#2=IFCUNITASSIGNMENT((#3));
+#3=IFCSIUNIT(*,.LENGTHUNIT.,.MILLI.,.METRE.);
+#5=IFCGEOMETRICREPRESENTATIONCONTEXT($,'Model',3,1.0E-5,#6,$);
+#6=IFCAXIS2PLACEMENT3D(#8,$,$);
+#8=IFCCARTESIANPOINT((0.,0.,0.));
+ENDSEC;
+END-ISO-10303-21;
+"#;
+
+    /// LENGTHUNIT is a conversion-based unit, but its ConversionFactor
+    /// chain is broken (the IfcMeasureWithUnit ref dangles). We must NOT
+    /// silently default to metres — unit_scale stays None and a loud
+    /// warning is emitted ("fail loudly").
+    const BROKEN_CONVERSION_FIXTURE: &str = r#"ISO-10303-21;
+HEADER;
+FILE_DESCRIPTION((''),'2;1');
+FILE_NAME('broken.ifc','2026-06-13T00:00:00',(''),(''),'ifcfast','ifcfast','');
+FILE_SCHEMA(('IFC4'));
+ENDSEC;
+DATA;
+#1=IFCPROJECT('0Test000000000000000001',$,'p',$,$,$,$,(#5),#2);
+#2=IFCUNITASSIGNMENT((#4));
+#4=IFCCONVERSIONBASEDUNIT(#7,.LENGTHUNIT.,'FOOT',#9);
+#7=IFCDIMENSIONALEXPONENTS(1,0,0,0,0,0,0);
+#5=IFCGEOMETRICREPRESENTATIONCONTEXT($,'Model',3,1.0E-5,#6,$);
+#6=IFCAXIS2PLACEMENT3D(#8,$,$);
+#8=IFCCARTESIANPOINT((0.,0.,0.));
+ENDSEC;
+END-ISO-10303-21;
+"#;
+
+    #[test]
+    fn conversion_based_foot_resolves_to_0_3048() {
+        let out = index(FEET_FIXTURE.as_bytes());
+        let scale = out
+            .unit_scale
+            .expect("FOOT conversion-based unit must resolve to a scale");
+        assert!(
+            (scale - 0.3048).abs() < 1e-9,
+            "expected 0.3048 m/ft, got {scale}"
+        );
+    }
+
+    #[test]
+    fn conversion_based_inch_resolves_to_0_0254() {
+        let out = index(INCH_FIXTURE.as_bytes());
+        let scale = out
+            .unit_scale
+            .expect("INCH conversion-based unit must resolve to a scale");
+        assert!(
+            (scale - 0.0254).abs() < 1e-9,
+            "expected 0.0254 m/in, got {scale}"
+        );
+    }
+
+    #[test]
+    fn si_millimetre_still_resolves() {
+        // Regression: the refactor must not break the metric SI path.
+        let out = index(MILLIMETRE_FIXTURE.as_bytes());
+        let scale = out.unit_scale.expect("MILLI METRE must resolve");
+        assert!((scale - 0.001).abs() < 1e-12, "expected 0.001, got {scale}");
+    }
+
+    #[test]
+    fn broken_conversion_does_not_silently_imply_metres() {
+        // Fail-loud: an unresolvable conversion-based LENGTHUNIT leaves
+        // unit_scale None (consumers know units are unknown) rather than
+        // 1.0/metres masquerading as a real value.
+        let out = index(BROKEN_CONVERSION_FIXTURE.as_bytes());
+        assert!(
+            out.unit_scale.is_none(),
+            "broken conversion factor must NOT resolve to a scale, got {:?}",
+            out.unit_scale
+        );
     }
 }

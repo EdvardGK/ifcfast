@@ -293,7 +293,18 @@ _HASH_TAIL_BYTES = 4 * 1024 * 1024
 #       unit stand-in fragments, so cached drift/segments parquet from
 #       v16 holds foreign-extent values for clipped products.
 #       Value change without column change → re-extraction required.
-_CACHE_SCHEMA_VERSION = 17
+# v18 — imperial files resolve `unit_scale` from `IfcConversionBasedUnit`
+#       (GH #73). Length declared via IfcConversionBasedUnit (FOOT / INCH —
+#       never an IfcSIUnit) was never parsed, so `unit_scale` stayed null
+#       and consumers defaulted to metres: a 3.28× under-scale on every
+#       unit-scaled value. The manifest `unit_scale` now reads 0.3048 (ft)
+#       / 0.0254 (in), and every value derived through it shifts on
+#       imperial files — `materials.layer_thickness_mm`, the SI-suffixed
+#       drift columns, `mesh_qto` volumes/areas, and the parquet
+#       `ifcfast.unit_scale` schema metadata. Metric (IfcSIUnit) files are
+#       byte-identical. Value change without column change → cached
+#       substrates of imperial models must be re-extracted.
+_CACHE_SCHEMA_VERSION = 18
 
 _FIELD_RE = re.compile(r"\(\s*(.*?)\s*\)\s*;", re.DOTALL)
 
