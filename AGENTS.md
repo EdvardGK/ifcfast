@@ -374,6 +374,22 @@ the project's unit scale as parquet schema metadata
   intentionally not surfaced. IFC2X3 `IfcDoor` / `IfcWindow` have no
   `PredefinedType` and stay `None` — filtering `predefined_type == 'DOOR'`
   only matches IFC4. If you cached door/window models on ≤v17, re-bundle.
+- **`mode` covers IFC4X3 built elements (GH #82).** The take-off mode
+  on each `ProductRow` (`'count'` / `'measure'` / `'linear'` / `'skip'`,
+  also `m.filter(mode=…)`) is computed by walking the static supertype
+  map. IFC4X3 renamed the bulk-element supertype `IfcBuildingElement` →
+  `IfcBuiltElement`, so before GH #82 every IFC4X3-only built element
+  (`IfcKerb`, `IfcPavement`, `IfcCourse`, … — anything chaining through
+  `IfcBuiltElement` but not in the hardcoded `MEASURE` set) classified
+  as `'skip'` and silently dropped out of `mode='measure'` take-offs.
+  The inheritance walk now treats `IfcBuiltElement` as equivalent to
+  `IfcBuildingElement`. The same fix makes addendum/TC schema headers
+  resolve: `FILE_SCHEMA(('IFC4X3_ADD2'))` / `IFC4_ADD2` / `IFC4X3_TC1`
+  now match their base schema (longest-prefix, so `IFC4X3_ADD2 → IFC4X3`
+  not `IFC4`), where previously any suffixed schema fell through to
+  `'skip'` for *every* non-hardcoded entity. (`schema == 'UNKNOWN'` and
+  the empty string resolve to "unset" so the caller's default applies.)
+  IFC4/IFC2X3 classification is unchanged.
 - **Strings come back as proper UTF-8.** STEP escape sequences
   (`\X\HH`, `\X2\HHHH…\X0\`, `\S\C`) are resolved, and raw un-escaped
   high bytes — what Bonsai/BlenderBIM and some ArchiCAD/Tekla exports
