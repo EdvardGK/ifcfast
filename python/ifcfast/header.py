@@ -440,7 +440,22 @@ def _resolve_step_escapes(s: str) -> str:
 #       to the terminal `IfcClassification`. Value change without column change
 #       → cached substrates of files with hierarchical classifications must be
 #       re-extracted; flat (single-hop) classifications are byte-identical.
-_CACHE_SCHEMA_VERSION = 19
+# v20 (GH #76) — Rust lexer/extractor escape + set-value correctness batch:
+#       (1) encoded literal backslash `\\` now collapses to one `\` (and is no
+#       longer misread as an escape introducer); (2) `\X4\...\X0\` non-BMP 8-hex
+#       escapes decode (emoji / supplementary-plane chars) instead of passing
+#       through as literal text; (3) `\X2\` with an unpaired surrogate is now
+#       lossy-decoded (U+FFFD) instead of dropping the whole run. (4) a dangling
+#       same-UnitType IfcSIUnit no longer clobbers the IfcUnitAssignment-backed
+#       project-default unit, so `quantities.unit_step_id` resolves where it
+#       previously came back null. (5) set-valued `RelatingPropertyDefinition`
+#       (IfcPropertySetDefinitionSet — inline list or typed wrapper) now binds
+#       all member psets/qtos instead of dropping them. (6) IfcPhysicalComplex-
+#       Quantity members surface as dot-joined `Wrapper.Leaf` quantity rows
+#       instead of vanishing. All six change extracted VALUES or add rows for
+#       affected files, so such cached substrates must be re-extracted; files
+#       without these constructs are byte-identical.
+_CACHE_SCHEMA_VERSION = 20
 
 _FIELD_RE = re.compile(r"\(\s*(.*?)\s*\)\s*;", re.DOTALL)
 

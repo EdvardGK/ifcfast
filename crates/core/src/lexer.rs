@@ -407,7 +407,7 @@ pub fn split_top_level_args_into<'a>(args: &'a [u8], out: &mut Vec<&'a [u8]>) {
     }
 }
 
-fn trim_ws(s: &[u8]) -> &[u8] {
+pub(crate) fn trim_ws(s: &[u8]) -> &[u8] {
     let mut start = 0;
     while start < s.len() && is_ws(s[start]) {
         start += 1;
@@ -437,6 +437,19 @@ pub fn decode_string(bytes: &[u8]) -> Option<String> {
         let b = inner[i];
         if b == b'\'' && i + 1 < inner.len() && inner[i + 1] == b'\'' {
             out.push('\'');
+            i += 2;
+            continue;
+        }
+        // ISO-10303-21 `\\` — an encoded literal backslash collapses to a
+        // single `\`. This MUST run before the `\S\` / `\X\` escape probes
+        // below: without it, `'C:\\path'` decodes to `C:\\path` (the
+        // doubled backslash survives), and worse, a literal backslash that
+        // happens to precede `X2`/`S`/`X` text (e.g. `\\X2 drawing`) gets
+        // misread as the start of a Unicode escape. Consuming the pair here
+        // emits exactly one `\` and skips both bytes so neither is treated
+        // as an escape introducer.
+        if b == b'\\' && i + 1 < inner.len() && inner[i + 1] == b'\\' {
+            out.push('\\');
             i += 2;
             continue;
         }
@@ -497,10 +510,50 @@ pub fn decode_string(bytes: &[u8]) -> Option<String> {
                     }
                     p += 4;
                 }
-                if let Ok(decoded) = String::from_utf16(&units) {
-                    out.push_str(&decoded);
+                // `from_utf16_lossy` (not `from_utf16`): an unpaired
+                // surrogate in a malformed export must not nuke the whole
+                // body. Erroring out pushed *nothing* — the entire `\X2\`
+                // run silently vanished. Lossy decode substitutes U+FFFD
+                // for the bad unit and keeps the surrounding text, which
+                // matches ifcopenshell's best-effort behaviour.
+                out.push_str(&String::from_utf16_lossy(&units));
+                // If the terminator `\X0\` was never found (truncated /
+                // malformed export), `k` walked to the end and the four
+                // trailing bytes can't be a real terminator — clamp so
+                // `i` doesn't run past `inner.len()`.
+                i = (k + 4).min(inner.len());
+                continue;
+            }
+            // \X4\HHHHHHHH...\X0\   full Unicode code points, 8 hex digits
+            // each (ISO-10303-21 ed.3 escape for non-BMP characters; what
+            // some exporters emit for emoji / supplementary-plane CJK
+            // instead of a `\X2\` surrogate pair). ifcopenshell decodes
+            // these; we previously passed the literal escape text through.
+            if inner[i + 2] == b'4' && i + 3 < inner.len() && inner[i + 3] == b'\\' {
+                let body_start = i + 4;
+                let mut k = body_start;
+                while k + 3 < inner.len()
+                    && !(inner[k] == b'\\'
+                        && inner[k + 1] == b'X'
+                        && inner[k + 2] == b'0'
+                        && inner[k + 3] == b'\\')
+                {
+                    k += 1;
                 }
-                i = k + 4;
+                let body = &inner[body_start..k];
+                let mut p = 0;
+                while p + 8 <= body.len() {
+                    if let Ok(hex) = std::str::from_utf8(&body[p..p + 8]) {
+                        if let Ok(v) = u32::from_str_radix(hex, 16) {
+                            // Invalid scalar values (surrogates, >U+10FFFF)
+                            // become U+FFFD, mirroring the lossy `\X2\`
+                            // path rather than dropping silently.
+                            out.push(char::from_u32(v).unwrap_or('\u{FFFD}'));
+                        }
+                    }
+                    p += 8;
+                }
+                i = (k + 4).min(inner.len());
                 continue;
             }
         }
@@ -857,5 +910,55 @@ mod tests {
         q.extend_from_slice(b"\\X\\C5"); // -> Å
         q.push(b'\'');
         assert_eq!(dec(&q), "æÅ");
+    }
+
+    // ---- GH #76 item 1: encoded literal backslash `\\` ------------------
+
+    #[test]
+    fn encoded_backslash_collapses() {
+        // `\\` is the ISO-10303-21 encoding of one literal backslash.
+        // Pre-fix `'C:\\path'` decoded to `C:\\path` (doubled).
+        assert_eq!(dec(br"'C:\\path'"), r"C:\path");
+        // A lone trailing `\\` collapses too.
+        assert_eq!(dec(br"'a\\'"), r"a\");
+    }
+
+    #[test]
+    fn encoded_backslash_before_escape_text_not_misread() {
+        // A literal backslash immediately followed by what *looks* like an
+        // escape introducer (`X2`, `S`, `X`) must NOT be parsed as an
+        // escape. `\\X2 drawing` is a literal `\` then the text `X2 ...`.
+        assert_eq!(dec(br"'\\X2 drawing'"), r"\X2 drawing");
+        assert_eq!(dec(br"'\\S note'"), r"\S note");
+        assert_eq!(dec(br"'\\X note'"), r"\X note");
+    }
+
+    // ---- GH #76 item 2: `\X4\` non-BMP, 8-hex code points --------------
+
+    #[test]
+    fn step_x4_non_bmp_escape() {
+        // `\X4\0001F600\X0\` -> 😀 (U+1F600). ifcopenshell decodes this;
+        // pre-fix we passed the literal escape text through.
+        assert_eq!(dec(br"'A\X4\0001F600\X0\B'"), "A😀B");
+        // Multiple code points in one run.
+        assert_eq!(dec(br"'\X4\0001F6000001F44D\X0\'"), "😀👍");
+        // BMP code point expressed in the 8-hex form still works.
+        assert_eq!(dec(br"'\X4\000000C5\X0\'"), "Å");
+    }
+
+    // ---- GH #76 item 3: `\X2\` unpaired surrogate is lossy, not dropped -
+
+    #[test]
+    fn x2_unpaired_surrogate_keeps_surrounding_text() {
+        // D800 is a high surrogate with no following low surrogate. Pre-fix
+        // `String::from_utf16` Err'd and pushed NOTHING for the whole body,
+        // dropping the valid `0041` ('A') too. Lossy decode keeps 'A' and
+        // substitutes U+FFFD for the bad unit.
+        let out = dec(br"'\X2\0041D800\X0\Z'");
+        assert!(out.starts_with('A'), "valid leading unit must survive: {out:?}");
+        assert!(out.ends_with('Z'), "trailing text after \\X0\\ must survive: {out:?}");
+        assert!(out.contains('\u{FFFD}'), "bad surrogate -> U+FFFD: {out:?}");
+        // A well-formed surrogate pair still decodes to the astral char.
+        assert_eq!(dec(br"'\X2\D83DDE00\X0\'"), "😀");
     }
 }

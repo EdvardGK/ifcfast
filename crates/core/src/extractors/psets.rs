@@ -183,10 +183,16 @@ pub fn build(
         } else if type_name.eq_ignore_ascii_case(b"IFCRELDEFINESBYPROPERTIES") {
             // (GlobalId, OwnerHistory, Name, Description, RelatedObjects, RelatingPropertyDefinition)
             let fields = split_top_level_args(args);
-            let pset_id = match fields.get(5).copied().map(parse_field) {
-                Some(Field::Ref(id)) => id,
-                _ => continue,
-            };
+            // RelatingPropertyDefinition is `IfcPropertySetDefinitionSelect`
+            // in IFC4 = a single IfcPropertySetDefinition OR an
+            // IfcPropertySetDefinitionSet (a LIST of them). Accept the bare
+            // ref, an inline list `((#1,#2))`, and the typed wrapper
+            // `IFCPROPERTYSETDEFINITIONSET((#1,#2))` (GH #76 item 5) — the
+            // same list-or-ref tolerance already applied to RelatedObjects.
+            let pset_ids = relating_def_refs(fields.get(5).copied());
+            if pset_ids.is_empty() {
+                continue;
+            }
             // RelatedObjects can be a list OR a single ref in IFC2X3
             // (some authoring tools emit a bare ref). Handle both.
             let relateds = match fields.get(4).copied().map(parse_field) {
@@ -195,7 +201,9 @@ pub fn build(
                 _ => continue,
             };
             for obj_id in relateds {
-                rel_pairs.push((obj_id, pset_id));
+                for pset_id in &pset_ids {
+                    rel_pairs.push((obj_id, *pset_id));
+                }
             }
         } else if type_name.eq_ignore_ascii_case(b"IFCRELDEFINESBYTYPE") {
             // (GlobalId, OwnerHistory, Name, Description, RelatedObjects, RelatingType)
@@ -820,6 +828,62 @@ fn parse_ref_list(body: &[u8]) -> Vec<u64> {
             _ => None,
         })
         .collect()
+}
+
+/// Resolve the `RelatingPropertyDefinition` field of an
+/// `IfcRelDefinesByProperties` to the pset-definition step ids it points
+/// at. The field is an `IfcPropertySetDefinitionSelect` (IFC4), which is
+/// either a single `IfcPropertySetDefinition` ref or an
+/// `IfcPropertySetDefinitionSet` (a LIST of them). Three on-disk shapes
+/// are accepted (GH #76 item 5):
+///
+/// - `#5`                              → bare ref → `[5]`
+/// - `(#1,#2)`                         → inline list → `[1, 2]`
+/// - `IFCPROPERTYSETDEFINITIONSET((#1,#2))` → typed wrapper → `[1, 2]`
+///
+/// The same list-or-ref tolerance the loop already applies to
+/// `RelatedObjects`, extended with the typed-wrapper case.
+fn relating_def_refs(raw: Option<&[u8]>) -> Vec<u64> {
+    let raw = match raw {
+        Some(r) => r,
+        None => return Vec::new(),
+    };
+    match parse_field(raw) {
+        Field::Ref(id) => vec![id],
+        Field::List(body) => parse_ref_list(body),
+        // `IFCPROPERTYSETDEFINITIONSET((...))` — a typed defined-type
+        // wrapper parses as `Field::Other`. Peel the type name and the
+        // outer `(...)`, then read the inner list of refs.
+        Field::Other(bytes) => relating_def_typed_wrapper_refs(bytes),
+        _ => Vec::new(),
+    }
+}
+
+/// Peel `IFCPROPERTYSETDEFINITIONSET((#1,#2))` to its inner ref list.
+/// The on-disk shape is the type name followed by the entity arg list
+/// `( <value> )`, whose single value is itself the `(#1,#2)` LIST — i.e.
+/// two paren layers. We strip the entity-arg layer, then parse the inner
+/// value as a `Field::List` to read its refs.
+fn relating_def_typed_wrapper_refs(bytes: &[u8]) -> Vec<u64> {
+    let t = crate::lexer::trim_ws(bytes);
+    let prefix = b"IFCPROPERTYSETDEFINITIONSET";
+    if t.len() <= prefix.len() || !t[..prefix.len()].eq_ignore_ascii_case(prefix) {
+        return Vec::new();
+    }
+    // After the type name: ` ( (#1,#2) ) `. Strip the outer entity-arg
+    // parens, leaving the inner value `(#1,#2)`.
+    let outer = crate::lexer::trim_ws(&t[prefix.len()..]);
+    if outer.first() != Some(&b'(') || outer.last() != Some(&b')') {
+        return Vec::new();
+    }
+    let inner = crate::lexer::trim_ws(&outer[1..outer.len() - 1]);
+    // `inner` is the IfcPropertySetDefinitionSet list value itself; it may
+    // be a `(#1,#2)` list (the common case) or a single bare ref.
+    match parse_field(inner) {
+        Field::List(body) => parse_ref_list(body),
+        Field::Ref(id) => vec![id],
+        _ => Vec::new(),
+    }
 }
 
 
@@ -1497,5 +1561,68 @@ END-ISO-10303-21;
         assert_eq!(t.guid[0], "1Door00000000000000001");
         assert_eq!(t.value[0].as_deref(), Some("EI60"));
         assert_eq!(t.source[0], "type");
+    }
+
+    #[test]
+    fn set_valued_relating_property_definition_inline_list() {
+        // GH #76 item 5. IFC4 RelatingPropertyDefinition can be an
+        // IfcPropertySetDefinitionSet — an inline list of pset refs
+        // `((#21,#23))`. Pre-fix the non-Ref field hit `_ => continue` and
+        // BOTH psets dropped (zero rows). Both must bind to the product.
+        let buf = make_buf(
+            r#"
+#20=IFCPROPERTYSINGLEVALUE('LoadBearing',$,IFCBOOLEAN(.T.),$);
+#21=IFCPROPERTYSET('2Pset00000000000000001',$,'Pset_A',$,(#20));
+#22=IFCPROPERTYSINGLEVALUE('FireRating',$,IFCLABEL('EI60'),$);
+#23=IFCPROPERTYSET('4Pset00000000000000001',$,'Pset_B',$,(#22));
+#25=IFCRELDEFINESBYPROPERTIES('3Rel000000000000000001',$,$,$,(#10),(#21,#23));
+"#,
+        );
+        let t = run(&buf);
+        assert_eq!(t.len(), 2, "both psets in the set must surface");
+        let by_pset: std::collections::HashMap<&str, &str> = (0..t.len())
+            .map(|i| (t.pset_name[i].as_str(), t.prop_name[i].as_str()))
+            .collect();
+        assert_eq!(by_pset.get("Pset_A"), Some(&"LoadBearing"));
+        assert_eq!(by_pset.get("Pset_B"), Some(&"FireRating"));
+    }
+
+    #[test]
+    fn set_valued_relating_property_definition_typed_wrapper() {
+        // GH #76 item 5. The typed `IFCPROPERTYSETDEFINITIONSET((...))`
+        // wrapper form of the same set.
+        let buf = make_buf(
+            r#"
+#20=IFCPROPERTYSINGLEVALUE('LoadBearing',$,IFCBOOLEAN(.T.),$);
+#21=IFCPROPERTYSET('2Pset00000000000000001',$,'Pset_A',$,(#20));
+#22=IFCPROPERTYSINGLEVALUE('FireRating',$,IFCLABEL('EI60'),$);
+#23=IFCPROPERTYSET('4Pset00000000000000001',$,'Pset_B',$,(#22));
+#25=IFCRELDEFINESBYPROPERTIES('3Rel000000000000000001',$,$,$,(#10),IFCPROPERTYSETDEFINITIONSET((#21,#23)));
+"#,
+        );
+        let t = run(&buf);
+        assert_eq!(t.len(), 2, "typed-wrapper set must surface both psets");
+        let by_pset: std::collections::HashMap<&str, &str> = (0..t.len())
+            .map(|i| (t.pset_name[i].as_str(), t.prop_name[i].as_str()))
+            .collect();
+        assert_eq!(by_pset.get("Pset_A"), Some(&"LoadBearing"));
+        assert_eq!(by_pset.get("Pset_B"), Some(&"FireRating"));
+    }
+
+    #[test]
+    fn single_ref_relating_property_definition_still_works() {
+        // Regression guard for GH #76 item 5: the common bare-ref form
+        // must keep working after the set-valued tolerance was added.
+        let buf = make_buf(
+            r#"
+#20=IFCPROPERTYSINGLEVALUE('LoadBearing',$,IFCBOOLEAN(.T.),$);
+#21=IFCPROPERTYSET('2Pset00000000000000001',$,'Pset_A',$,(#20));
+#22=IFCRELDEFINESBYPROPERTIES('3Rel000000000000000001',$,$,$,(#10),#21);
+"#,
+        );
+        let t = run(&buf);
+        assert_eq!(t.len(), 1);
+        assert_eq!(t.pset_name[0], "Pset_A");
+        assert_eq!(t.prop_name[0], "LoadBearing");
     }
 }

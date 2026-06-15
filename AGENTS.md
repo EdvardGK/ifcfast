@@ -405,8 +405,16 @@ the project's unit scale as parquet schema metadata
   isn't present in the file still returns an empty result.
 - **Truncated files are refused, not half-parsed.** A STEP file
   missing its `END-ISO-10303-21;` trailer (interrupted download /
-  copy) raises `ValueError` at open instead of silently returning a
-  partial model. ZIP containers rely on ZIP's own integrity check.
+  copy) is refused at open instead of silently returning a partial
+  model. Since GH #89 the guard lives in the Rust core
+  (`source::open`), the single choke-point every `_core.*` entry —
+  `header()`, `bundle()`, `meshes()`, `clash()`, the `ifcfast-bundle`
+  binary, all of them — loads through, so the refusal is a property of
+  the parser, not just the Python skin. It surfaces as `ValueError`
+  through `header()`/`open` and as an I/O error
+  (`InvalidData: …truncated…`) from the `_core.*` and Rust-binary
+  paths. ZIP containers (`.ifczip`) are exempt: a truncated archive
+  fails ZIP's own central-directory check first.
 - **Section/record framing is comment- and string-aware (since GH #72,
   cache schema v19).** ISO-10303-21 `/* … */` comments and single-quoted
   strings are treated as inert when the parser locates `DATA;` /
@@ -463,14 +471,20 @@ the project's unit scale as parquet schema metadata
   fields up. The walk is depth-capped (32) and cycle-guarded, so a
   malformed self/loop reference yields `None` system fields rather than
   hanging.
-- **Strings come back as proper UTF-8.** STEP escape sequences
-  (`\X\HH`, `\X2\HHHH…\X0\`, `\S\C`) are resolved, and raw un-escaped
+- **Strings come back as proper UTF-8.** STEP escape sequences are
+  resolved: `\X\HH` (Latin-1 byte), `\X2\HHHH…\X0\` (UTF-16BE),
+  `\X4\HHHHHHHH…\X0\` (full Unicode code points, 8 hex each — non-BMP
+  emoji / supplementary-plane CJK; since GH #76), `\S\C` (Latin-1 short
+  form), and `\\` (one literal backslash; since GH #76). Raw un-escaped
   high bytes — what Bonsai/BlenderBIM and some ArchiCAD/Tekla exports
   write for `æøå`/CJK — are decoded as UTF-8 (since GH #77). Invalid
-  byte runs fall back to per-byte Latin-1 deterministically. So a wall
-  named `Dør-æå` reads back as `Dør-æå`, not `DÃ¸r-Ã¦Ã¥`. (Caches
-  written by wheels < the v18 cache schema carry the old mojibake;
-  the schema bump forces re-extraction.)
+  byte runs fall back to per-byte Latin-1 deterministically; a malformed
+  `\X2\` unpaired surrogate becomes U+FFFD rather than dropping the whole
+  run (since GH #76). So a wall named `Dør-æå` reads back as `Dør-æå`,
+  not `DÃ¸r-Ã¦Ã¥`, and `C:\\path` reads back as `C:\path`, not the
+  doubled `C:\\path`. (Caches written by wheels < the v18 cache schema
+  carry the old mojibake, and < v20 carry the old escape handling; the
+  schema bump forces re-extraction.)
 - **DataFrames are long-format, one row per fact.** No nested fields,
   no JSON-in-cell. Easy to filter, easy to join, easy to dump to Excel.
 - **Missing values are `nan` for strings (pandas `StringDtype`).** Use
@@ -514,7 +528,12 @@ the project's unit scale as parquet schema metadata
   `Count` stays null — it's dimensionless. Explicit per-quantity
   `Unit` refs still win (no fallback fires when the slot is set).
   Resolution is `IfcSIUnit`-only; `IfcConversionBasedUnit` /
-  `IfcDerivedUnit` resolution is a separate feature (GH #43).
+  `IfcDerivedUnit` resolution is a separate feature (GH #43). Since
+  cache schema v20 (GH #76) the fallback prefers the `IfcSIUnit` the
+  `IfcUnitAssignment` actually references when two units share a
+  `UnitType` — a dangling duplicate (e.g. nested in an unresolved
+  `IfcConversionBasedUnit`) no longer clobbers the real default
+  regardless of declaration order.
 - **`m.quantities` inherits type-attached quantities by default**
   (since v0.4.29, cache schema v10). Mirrors the `m.psets` story
   (`IfcTypeObject.HasPropertySets` accepts ANY
@@ -527,6 +546,22 @@ the project's unit scale as parquet schema metadata
   `unit_step_id` column is usable even when the type-side quantity
   omits the explicit Unit slot. Filter `m.quantities[m.quantities.source == "instance"]`
   for pre-v0.4.29-shape behaviour (GH #45).
+- **Set-valued `RelatingPropertyDefinition` is honoured** (since cache
+  schema v20, GH #76). An IFC4 `IfcRelDefinesByProperties` may point its
+  `RelatingPropertyDefinition` at an `IfcPropertySetDefinitionSet`
+  (multiple psets/qtos in one relation) rather than a single definition.
+  Both the inline-list form `((#1,#2))` and the typed-wrapper form
+  `IFCPROPERTYSETDEFINITIONSET((#1,#2))` now bind every member set to the
+  product — `m.psets` and `m.quantities` previously dropped the whole
+  relation. The plain single-ref form is unchanged.
+- **`IfcPhysicalComplexQuantity` members surface dot-joined** (since
+  cache schema v20, GH #76). A complex quantity wrapping nested simple
+  quantities (e.g. a `Profile` bundling `Width` + `Height`) is flattened
+  into one `m.quantities` row per nested member, named `Wrapper.Leaf`
+  (`Profile.Width`, `Profile.Height`) — the same dot-join convention
+  `m.psets` uses for `IfcComplexProperty`. Before v20 the whole complex
+  quantity was dropped and its members vanished. Nesting is depth-capped
+  (8).
 - **`m.psets` marks unrecognised property classes instead of
   dropping them** (since v0.4.29, cache schema v9). Any
   `IfcSimpleProperty` subclass ifcfast doesn't have a per-class
