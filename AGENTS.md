@@ -141,6 +141,7 @@ releases (additions only, never reorganisations).
 | Property sets / quantities / materials | `m.psets` / `m.quantities` / `m.materials` |
 | Classification refs (NS 3451, OmniClass, …) | `m.classifications` |
 | Per-product triangle meshes (verts, faces) | `m.meshes()` (`unit=`, `cut_openings=` opts) |
+| One product's mesh by GlobalId (picking) | `m.mesh(guid, cut_openings=…)` → `Mesh` or `None` |
 | Sample a labeled point cloud (+ normals) | `m.point_cloud(per_m2=1000)` |
 | Stream a point cloud in bounded-RAM chunks | `m.iter_point_cloud(per_m2=1000, chunk_points=1_000_000)` |
 | One-call viewer export to glTF binary | `m.to_gltf("out.glb")` (cuts on, instancing on, quant on) |
@@ -558,8 +559,8 @@ the project's unit scale as parquet schema metadata
   **Every** native entry point catches Rust panics at the PyO3
   boundary and surfaces them as `IfcfastError` instead of the
   uncatchable `pyo3_runtime.PanicException` — the geometry pipeline
-  (`m.point_cloud`, `m.iter_point_cloud`, `m.meshes`, `m.mesh_qto`,
-  `m.drift`), the data extractors (`m.index`-backed indexing,
+  (`m.point_cloud`, `m.iter_point_cloud`, `m.meshes`, `m.mesh`,
+  `m.mesh_qto`, `m.drift`), the data extractors (`m.index`-backed indexing,
   `m.psets`, `m.quantities`, `m.materials`, `m.classifications`),
   and `ifcfast.bundle()` / `ifcfast.clash()`. So no native call can
   abort a worker via an uncatchable panic; one `except
@@ -745,6 +746,23 @@ per product tagged `cut_openings`. The substrate stays reveal-all —
 this flag only affects `m.meshes()` / `m.iter_meshes()` callers,
 not `instances.parquet` / `representations.parquet`. Requires a
 wheel built with the `csg` feature (raises `RuntimeError` otherwise).
+
+**Single product by GlobalId: `m.mesh(guid, cut_openings=…)` (GH #47,
+v0.4.38+).** For interactive picking (viewer click → mesh) and
+per-element edit pipelines, `m.mesh(guid)` tessellates **only** that
+product's placement + representation chain (and, in cut mode, the
+openings voiding it), skipping the rest of the model — O(target), not
+O(model)-then-filter. Returns one `Mesh(guid, entity, vertices,
+faces)` namedtuple or `None` (unknown GUID, geometryless product, or —
+in cut mode — the target is itself an opening, or the cut consumed the
+host). `cut_openings` / `keep_cutters` match `m.meshes()` exactly, and
+the cut result is identical to the matching product from
+`meshes(cut_openings=True)`. **Coordinate contrast:** `m.mesh()`
+returns `vertices` as **`float64` absolute world coordinates** (full
+precision, no shift) — a single product can't overflow f32 the way a
+whole georeferenced model can, so there is no `global_shift` to add
+back. Use `m.meshes()` for batch extraction (shifted `float32` +
+`MeshList.global_shift`); use `m.mesh()` for one element at a time.
 
 **`m.mesh_qto(cut_openings=True)` is the default since v0.4.28** —
 authored `Qto_*Volume` values are net (openings subtracted), and so

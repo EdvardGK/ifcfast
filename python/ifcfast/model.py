@@ -1011,6 +1011,70 @@ class Model:
         ):
             yield mesh
 
+    def mesh(
+        self,
+        guid: str,
+        *,
+        unit: str = "m",
+        cut_openings: bool = False,
+        keep_cutters: bool = False,
+    ):
+        """Tessellate a single product by GlobalId — the interactive-pick
+        / per-element analogue of :meth:`meshes`.
+
+        Returns a single :class:`Mesh` namedtuple (``guid``, ``entity``,
+        ``vertices``, ``faces``) or ``None`` when ``guid`` is absent, the
+        product is geometryless, or — in cut mode — the target is itself
+        an opening (suppressed as a cutter) or the cut consumes the host.
+
+        Walks **only** the target product's placement + representation
+        chain (and, in cut mode, the handful of openings voiding it),
+        skipping tessellation of the rest of the model — so picking one
+        element is O(target) instead of meshing the whole file and
+        filtering. Use :meth:`meshes` for batch extraction; use this for
+        hover/click and per-product edit pipelines.
+
+        Coordinates differ from :meth:`meshes` by design:
+
+        * ``vertices`` is shape ``(N, 3)`` ``float64`` in **absolute
+          world coordinates** (in ``unit``, default metres). A single
+          product is computed in f64 and returned absolute — full
+          precision, no ``global_shift`` bookkeeping. (The batch
+          :meth:`meshes` returns shifted ``float32`` + a model-wide
+          ``global_shift`` because a whole georeferenced model spans an
+          extent that overflows f32; one product does not.)
+        * ``faces`` is shape ``(M, 3)`` ``uint32`` triangle indices.
+
+        ``cut_openings`` / ``keep_cutters`` mirror :meth:`meshes` exactly
+        — cross-product ``IfcRelVoidsElement`` openings are folded via the
+        same CSG path (requires a wheel built with the ``csg`` feature),
+        and the synthetic half-space cutter slabs are stripped unless
+        ``keep_cutters`` (ignored in cut mode). The cut result is
+        identical to the matching product from ``meshes(cut_openings=True)``.
+
+        Drop-in for trimesh::
+
+            >>> tm = trimesh.Trimesh(*m.mesh(guid)[2:], process=False)
+        """
+        from . import _core
+        import numpy as np
+
+        factor = _unit_factor(unit)
+        d = _core.extract_mesh_one(
+            str(native_path_for(self.header.path)),
+            str(guid),
+            cut_openings=bool(cut_openings),
+            keep_cutters=bool(keep_cutters),
+        )
+        if d is None:
+            return None
+        verts = np.frombuffer(d["vertices"], dtype=np.float64).reshape(-1, 3)
+        if factor != 1.0:
+            # Writable scaled copy; stays float64.
+            verts = verts * float(factor)
+        faces = np.frombuffer(d["indices"], dtype=np.uint32).reshape(-1, 3)
+        return Mesh(d["guid"], d["entity"], verts, faces)
+
     @property
     def segments(self):
         """Long-format per-mesh-segment table — one row per representation

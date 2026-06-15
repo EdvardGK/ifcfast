@@ -302,6 +302,45 @@ def test_meshes_unit_parameter(tmp_path):
     assert v_mm.flags.writeable  # scaled copy is writable
 
 
+def test_mesh_single_guid(tmp_path):
+    """m.mesh(guid) returns one product's mesh (GH #47): float64 absolute
+    metres, matching the geometry the batch meshes() returns for that
+    GUID. Unknown GUID → None. unit= rescales like meshes()."""
+    np = pytest.importorskip("numpy")
+    p = _write_mm_cube(tmp_path)
+    m = ifcfast.open(p, use_cache=False, write_cache=False)
+
+    guid = "7Wall00000000000000001"
+    one = m.mesh(guid)
+    assert one is not None
+    assert one.guid == guid
+    assert one.entity == "IfcWall"
+    assert one.vertices.dtype == np.float64
+    assert one.faces.dtype == np.uint32
+    # 1000 mm cube → ~1.0 m span on every axis.
+    span = one.vertices.max(axis=0) - one.vertices.min(axis=0)
+    for axis, s in zip("xyz", span):
+        assert 0.9 < s < 1.1, f"{axis} span {s:.3f} m — expected ~1.0"
+
+    # Parity with the batch path: same geometry for the same GUID
+    # (batch is shifted float32; add global_shift for absolute).
+    ms = m.meshes()
+    batch = next(x for x in ms if x.guid == guid)
+    b_abs = batch.vertices.astype(np.float64) + np.array(ms.global_shift)
+    assert b_abs.shape == one.vertices.shape
+    # f64 single-getter is at least as precise as the f32 batch frame.
+    assert np.abs(np.sort(b_abs, 0) - np.sort(one.vertices, 0)).max() < 1e-3
+
+    # unit= rescales (mm → ~1000 span), and stays float64.
+    one_mm = m.mesh(guid, unit="mm")
+    span_mm = one_mm.vertices.max(axis=0) - one_mm.vertices.min(axis=0)
+    assert span_mm[0] == pytest.approx(1000.0, rel=0.01)
+    assert one_mm.vertices.dtype == np.float64
+
+    # Unknown GUID → None (not an error).
+    assert m.mesh("0000000000000000000000") is None
+
+
 def test_length_unit_property(tmp_path):
     """m.length_unit reflects the file's authored unit."""
     p = _write_mm_cube(tmp_path)

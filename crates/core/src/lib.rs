@@ -2059,6 +2059,202 @@ mod python {
         })
     }
 
+    // ----- extract_mesh_one (single-GUID getter, GH #47) ----------------
+
+    /// Pick the target product from a tessellated subset for the no-cut
+    /// path, stripping the synthetic half-space cutter slabs unless the
+    /// caller asked to keep them (GH #66) — mirrors `extract_meshes`.
+    #[cfg(feature = "mesh")]
+    fn pick_target_uncut(
+        meshes: Vec<crate::mesh::ProductMesh>,
+        target_step: u64,
+        keep_cutters: bool,
+    ) -> Option<crate::mesh::ProductMesh> {
+        meshes
+            .into_iter()
+            .find(|m| m.ifc_id == target_step)
+            .map(|mut m| {
+                if !keep_cutters {
+                    crate::mesh::strip_synthetic_cutters(&mut m);
+                }
+                m
+            })
+    }
+
+    /// Tessellate a single product by GlobalId — the interactive-picking
+    /// analogue of `extract_meshes`. Walks only the target product's
+    /// placement + representation chain (and, in cut mode, the openings
+    /// voiding it), skipping tessellation of the rest of the model.
+    ///
+    /// Returns `None` (Python `None`) when the GUID is absent, the product
+    /// is geometryless, or — in cut mode — the target is itself an opening
+    /// (suppressed as a non-user-visible cutter, matching `extract_meshes`)
+    /// or the cut consumed the host entirely. Otherwise a PyDict:
+    ///   * `guid`     — the product GlobalId
+    ///   * `entity`   — IFC class (`IfcWall`, …)
+    ///   * `vertices` — `bytes`, little-endian `f64`, **absolute world
+    ///     coordinates in metres** (3 per vertex). Unlike `extract_meshes`
+    ///     (which returns shifted `f32` + a model-wide `global_shift` to
+    ///     dodge the far-origin f32 cliff), a single product is computed
+    ///     in f64 and returned absolute — full precision, no shift
+    ///     bookkeeping for the caller. Decode with
+    ///     `np.frombuffer(b, np.float64).reshape(-1, 3)`.
+    ///   * `indices`  — `bytes`, little-endian `u32`, triangle vertex
+    ///     indices (`triangle_count * 3`).
+    ///
+    /// `cut_openings` / `keep_cutters` match `extract_meshes` semantics
+    /// (cross-product `IfcRelVoidsElement` folding via the same
+    /// `CrossProductCut`; synthetic half-space cutter slabs stripped
+    /// unless `keep_cutters`, ignored in cut mode).
+    #[cfg(feature = "mesh")]
+    #[pyfunction]
+    #[pyo3(signature = (path, guid, cut_openings = false, keep_cutters = false))]
+    pub fn extract_mesh_one<'py>(
+        py: Python<'py>,
+        path: &str,
+        guid: &str,
+        cut_openings: bool,
+        keep_cutters: bool,
+    ) -> PyResult<Option<Bound<'py, PyDict>>> {
+        catch_panic(|| {
+        use crate::mesh::{BakeFrame, ProductMesh};
+
+        // cut_openings requires the `csg` feature — same contract as
+        // extract_meshes: surface a clear error rather than silently
+        // ignoring the flag.
+        #[cfg(not(feature = "csg"))]
+        if cut_openings {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "mesh(cut_openings=True) requires the `csg` Cargo feature; \
+                 this wheel was built without it.",
+            ));
+        }
+
+        let (mmap, _open_ms) = open_mmap(path)?;
+        let idx = py.detach(|| indexer::index(&mmap));
+        let unit_scale = idx.unit_scale.unwrap_or(1.0) as f32;
+
+        // GlobalId → step id via the indexer's parallel product arrays.
+        let target_step = idx
+            .product_guid
+            .iter()
+            .position(|g| g == guid)
+            .map(|i| idx.product_step_id[i]);
+        let target_step = match target_step {
+            Some(s) => s,
+            None => return Ok(None), // unknown GUID
+        };
+
+        // In cut mode a directly-targeted opening is suppressed (it's a
+        // cutter, not a user-visible product) — matches extract_meshes.
+        #[cfg(feature = "csg")]
+        if cut_openings && idx.voids_opening.iter().any(|&o| o == target_step) {
+            return Ok(None);
+        }
+
+        // Tessellation set: the target, plus (cut mode) the openings
+        // voiding it so the cross-product fold has its operands. (`mut`
+        // is only exercised on the csg path that appends openings.)
+        #[cfg_attr(not(feature = "csg"), allow(unused_mut))]
+        let mut step_ids = vec![target_step];
+        #[cfg(feature = "csg")]
+        if cut_openings {
+            for (op, host) in idx.voids_opening.iter().zip(idx.voids_host.iter()) {
+                if *host == target_step && *op != target_step {
+                    step_ids.push(*op);
+                }
+            }
+        }
+
+        let meshes = py.detach(|| {
+            crate::mesh::mesh_products_by_step(&mmap, &step_ids, BakeFrame::Local)
+        });
+
+        // Resolve the final target mesh, applying cuts when requested by
+        // routing the subset through the SAME CrossProductCut the batch
+        // path uses — identical operands in, identical fold out.
+        let final_mesh: Option<ProductMesh> = {
+            #[cfg(feature = "csg")]
+            {
+                if cut_openings {
+                    let mut cross = crate::mesh::cut_openings::CrossProductCut::from_indexer(
+                        &idx.voids_opening,
+                        &idx.voids_host,
+                    );
+                    let mut passthrough_target: Option<ProductMesh> = None;
+                    for mesh in meshes {
+                        use crate::mesh::cut_openings::Routed;
+                        let is_target = mesh.ifc_id == target_step;
+                        match cross.route(mesh) {
+                            // Opening buffered / host held for the flush.
+                            Routed::Suppressed | Routed::Held => {}
+                            Routed::PassThrough(mut m) => {
+                                // Target isn't voided cross-product; still
+                                // collapse any in-rep IfcBooleanClippingResult
+                                // so the result matches the batch cut path.
+                                let _ = crate::mesh::cut_openings::apply(&mut m, unit_scale);
+                                if is_target {
+                                    passthrough_target = Some(m);
+                                }
+                            }
+                        }
+                    }
+                    // Flush the held host. `None` prism table forces the
+                    // manifold fold (geometrically equivalent to the prism
+                    // fast-path; the fast-path only matches a Local host
+                    // mesh and is a batch-throughput optimisation).
+                    let mut folded_target = None;
+                    for (folded, _outcome) in cross.flush(unit_scale, None) {
+                        if folded.ifc_id == target_step {
+                            folded_target = Some(folded);
+                        }
+                    }
+                    folded_target.or(passthrough_target)
+                } else {
+                    pick_target_uncut(meshes, target_step, keep_cutters)
+                }
+            }
+            #[cfg(not(feature = "csg"))]
+            {
+                let _ = unit_scale;
+                pick_target_uncut(meshes, target_step, keep_cutters)
+            }
+        };
+
+        let mesh = match final_mesh {
+            Some(m) if !m.indices.is_empty() && !m.vertices.is_empty() => m,
+            _ => return Ok(None), // geometryless, or cut consumed the host
+        };
+
+        // Encode absolute world coords in metres as f64 (full precision —
+        // no global shift). Absolute = (local + mesh_anchor) * unit_scale,
+        // the same identity extract_meshes' shifted-frame encode reduces
+        // to when its model-wide shift is added back.
+        let us = unit_scale as f64;
+        let anchor = mesh.mesh_anchor;
+        let mut vbytes = Vec::with_capacity(mesh.vertices.len() * 8);
+        for chunk in mesh.vertices.chunks_exact(3) {
+            let x = (chunk[0] as f64 + anchor[0]) * us;
+            let y = (chunk[1] as f64 + anchor[1]) * us;
+            let z = (chunk[2] as f64 + anchor[2]) * us;
+            vbytes.extend_from_slice(&x.to_le_bytes());
+            vbytes.extend_from_slice(&y.to_le_bytes());
+            vbytes.extend_from_slice(&z.to_le_bytes());
+        }
+        let mut ibytes = Vec::with_capacity(mesh.indices.len() * 4);
+        for i in &mesh.indices {
+            ibytes.extend_from_slice(&i.to_le_bytes());
+        }
+
+        let out = PyDict::new(py);
+        out.set_item("guid", &mesh.guid)?;
+        out.set_item("entity", &mesh.entity)?;
+        out.set_item("vertices", PyBytes::new(py, &vbytes))?;
+        out.set_item("indices", PyBytes::new(py, &ibytes))?;
+        Ok(Some(out))
+        })
+    }
+
     // ----- write_gltf --------------------------------------------------
 
     /// Write `path` (an IFC file) as `out_path` (a `.glb`), running the
@@ -2489,6 +2685,8 @@ mod python {
         m.add_class::<PointCloudIter>()?;
         #[cfg(feature = "mesh")]
         m.add_function(wrap_pyfunction!(extract_meshes, m)?)?;
+        #[cfg(feature = "mesh")]
+        m.add_function(wrap_pyfunction!(extract_mesh_one, m)?)?;
         #[cfg(feature = "mesh")]
         m.add_function(wrap_pyfunction!(write_gltf, m)?)?;
         #[cfg(feature = "bundle")]

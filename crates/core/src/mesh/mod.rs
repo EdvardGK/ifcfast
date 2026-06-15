@@ -1051,6 +1051,89 @@ fn tessellate_one(
     }
 }
 
+/// Tessellate a specific subset of products, identified by step id, into
+/// their [`ProductMesh`]es in the requested [`BakeFrame`]. Geometryless
+/// products yield no entry; output order follows `step_ids` (skipping any
+/// step that isn't a product or isn't found).
+///
+/// This is the single-product fast path behind `m.mesh(guid=…)` (GH #47).
+/// It builds the entity table + style index (one linear pass each) and
+/// resolves only the requested products' placement + representation
+/// chains, then runs the same [`tessellate_one`] the batch streaming pass
+/// uses — but skips tessellating the rest of the model. For one product
+/// (plus, in cut mode, the handful of openings voiding it) that turns an
+/// O(model) tessellation into an O(target) one.
+///
+/// No cross-product opening cutting is applied here — the caller owns
+/// that (it already holds the `IfcRelVoidsElement` index from the
+/// indexer) and routes the returned meshes through
+/// [`cut_openings::CrossProductCut`] exactly as the batch path does.
+pub fn mesh_products_by_step(
+    buf: &[u8],
+    step_ids: &[u64],
+    frame: BakeFrame,
+) -> Vec<ProductMesh> {
+    let table = EntityTable::build(buf);
+    let style_index = styles::StyleIndex::build(&table);
+    // One resolver shared across the (few) requested products — its
+    // chain caching makes resolving the host + its openings cheap, since
+    // an opening's placement chain typically shares the host's tail.
+    let mut resolver = PlacementResolver::new(&table);
+    let shape_cache: ShapeCache = ShapeCache::new();
+
+    let mut out = Vec::with_capacity(step_ids.len());
+    for &step_id in step_ids {
+        let (type_name, args) = match table.get(step_id) {
+            Some(x) => x,
+            None => continue,
+        };
+        if !is_product_type(type_name) {
+            continue;
+        }
+        // Same arg-positions the batch phase 1a parses: guid (0),
+        // ObjectPlacement (5), Representation (6).
+        let fields = split_top_level_args(args);
+        let guid = string_at(&fields, 0).unwrap_or_default();
+        let placement_id = match fields.get(5).copied().map(parse_field) {
+            Some(Field::Ref(id)) => Some(id),
+            _ => None,
+        };
+        let repr_id_opt = match fields.get(6).copied().map(parse_field) {
+            Some(Field::Ref(id)) => Some(id),
+            _ => None,
+        };
+        let entity_name = crate::indexer::type_name_uppercase_with_proper_case(type_name);
+        let world_f64 = placement_id
+            .map(|pid| resolver.world(pid))
+            .unwrap_or(DMat4::IDENTITY);
+        let world = world_f64.as_mat4();
+        let world_origin = {
+            let p = world_f64.transform_point3(DVec3::ZERO);
+            [p.x, p.y, p.z]
+        };
+        let placement_origin = {
+            let p = world * Vec4::new(0.0, 0.0, 0.0, 1.0);
+            [p.x, p.y, p.z]
+        };
+        let w = Work {
+            step_id,
+            guid,
+            entity_name,
+            repr_id_opt,
+            world_f64,
+            world,
+            world_origin,
+            placement_origin,
+        };
+        if let ProductOutcome::Mesh { product, .. } =
+            tessellate_one(&table, &shape_cache, &style_index, frame, w)
+        {
+            out.push(product);
+        }
+    }
+    out
+}
+
 /// Apply one [`ProductOutcome`] to stats + sink. Called serially from
 /// phase 3 of [`mesh_ifc_streaming_framed`] so emission order matches
 /// the IFC entity-table iteration order and stats counters need no
