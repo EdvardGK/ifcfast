@@ -326,6 +326,13 @@ class DataLayers:
     classifications: Optional[object] = None
     drift: Optional[object] = None
     segments: Optional[object] = None
+    # True when the loaded `_core` was built without the `mesh` Cargo
+    # feature (#61's no-csg path) — `analyse_drift` is absent, so the
+    # drift / segments layers can never be produced. The four non-drift
+    # data layers are still complete and cacheable; the cache gate must
+    # not block hot-reload on a layer the build structurally cannot emit
+    # (GH #87 / #84 item 2).
+    drift_unavailable: bool = False
     # File-level fact surfaced by the drift extractor: most of the
     # meshed products are placed at the origin (identity placement)
     # with their geometry authored in world coordinates. Common on
@@ -398,9 +405,18 @@ def extract_data_layers(
 
     if cache_fresh:
         t0 = time.perf_counter()
-        # GH #71 (6): coerce on read too, so a layer cached as a
-        # degenerate-empty parquet (all float64) still surfaces with the
-        # canonical dtypes.
+        cached_manifest = _read_manifest(cache_dir) or {}
+        # A cache written by a no-mesh build (or a CLI `ifcfast extract`
+        # run with include_drift=False) recorded that drift could not be
+        # produced. Honour that so the gate below doesn't demand a drift
+        # layer the build will never emit, re-extracting all four good
+        # layers on every process (GH #87 / #84 item 2).
+        out.drift_unavailable = bool(
+            cached_manifest.get("drift_unavailable", False)
+        )
+        # GH #71 (6): coerce on read too (via `_coerce_layer` below), so a
+        # layer cached as a degenerate-empty parquet (all float64) still
+        # surfaces with the canonical dtypes.
         if _data_file_present(cache_dir, PSETS_FILE):
             out.psets = _coerce_layer("psets", pd.read_parquet(cache_dir / PSETS_FILE))
         if _data_file_present(cache_dir, QUANTITIES_FILE):
@@ -426,17 +442,26 @@ def extract_data_layers(
             )
         out.timing_ms["cache_read_ms"] = (time.perf_counter() - t0) * 1000
 
+        # Drift counts toward the gate only when the caller asked for it
+        # AND the build can actually produce it. On a no-mesh build the
+        # drift / segments parquets never exist, so requiring them here
+        # would make `all_cached` permanently False and silently disable
+        # hot-reload (GH #87 / #84 item 2).
+        drift_satisfied = (
+            not include_drift
+            or out.drift_unavailable
+            or (out.drift is not None and out.segments is not None)
+        )
         all_cached = (
             out.psets is not None
             and out.quantities is not None
             and out.materials is not None
             and out.classifications is not None
-            and (not include_drift or (out.drift is not None and out.segments is not None))
+            and drift_satisfied
         )
         if all_cached:
             # Surface the file-level world-coord-baked flag from the
             # cache manifest. Falls back to False on older caches.
-            cached_manifest = _read_manifest(cache_dir) or {}
             out.world_coordinate_baked = bool(
                 cached_manifest.get("world_coordinate_baked", False)
             )
@@ -508,9 +533,12 @@ def extract_data_layers(
             out.segments = _coerce_layer("segments", pd.DataFrame(seg_cols))
             out.timing_ms["drift_ms"] = (time.perf_counter() - t0) * 1000
         except AttributeError:
-            # Built without the `mesh` Cargo feature.
+            # Built without the `mesh` Cargo feature — `analyse_drift`
+            # doesn't exist. Record this so the cache gate excludes drift
+            # instead of forcing a re-extract every process (GH #87).
             out.drift = None
             out.segments = None
+            out.drift_unavailable = True
 
     if write_cache:
         t0 = time.perf_counter()
@@ -579,6 +607,16 @@ def _patch_data_manifest(
     if include_drift and out.segments is not None:
         m["has_segments"] = True
         m["segment_count"] = int(len(out.segments))
+    # Persist the structural "this build cannot produce drift" fact (no
+    # mesh Cargo feature) so a later process knows to exclude drift from
+    # the hot-reload gate instead of re-extracting all four good layers
+    # every time (GH #87). This is deliberately NOT set for the merely
+    # `include_drift=False` writer (e.g. CLI `ifcfast extract`): that's a
+    # caller choice, and a subsequent `include_drift=True` reader must
+    # still be free to cold-parse the drift layer — the gate already
+    # short-circuits on `not include_drift` for readers that don't want it.
+    if out.drift_unavailable:
+        m["drift_unavailable"] = True
     _write_manifest(cache_dir, m)
 
 

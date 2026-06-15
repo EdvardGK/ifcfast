@@ -2297,6 +2297,18 @@ def _df_meta(df) -> dict:
     }
 
 
+def _normalize_dtype(name: str) -> str:
+    """Map a pandas dtype string to ifcfast's stable contract name.
+
+    pandas reports string columns as ``object`` on older releases but as
+    ``str`` / ``string`` on pandas >= 3.0 (and under
+    ``future.infer_string``). The substrate contract — and AGENTS.md — name
+    text columns ``object``, so normalise the string-storage variants to
+    keep ``schemas()`` version-independent (GH #71 item 6).
+    """
+    return "object" if name in ("str", "string", "String") else name
+
+
 def _df_schema(df, loaded: Optional[bool] = None) -> dict:
     """Shape + column dtypes of a DataFrame, or a not-loaded stub."""
     if df is None:
@@ -2309,7 +2321,9 @@ def _df_schema(df, loaded: Optional[bool] = None) -> dict:
     return {
         "rows": int(len(df)),
         "columns": list(df.columns),
-        "dtypes": {col: str(dtype) for col, dtype in df.dtypes.items()},
+        "dtypes": {
+            col: _normalize_dtype(str(dtype)) for col, dtype in df.dtypes.items()
+        },
         "loaded": True if loaded is None else loaded,
     }
 

@@ -41,6 +41,104 @@ bump** — no on-disk substrate column or dtype meaning changes.
   one STEP member emits a `warnings.warn` naming the chosen (largest) and
   ignored members instead of silently using one with no trace.
 
+### Fixed — header decode + no-drift cache gate (GH #87, leftovers from #84)
+
+- **`ifcfast.header()` no longer decodes with `errors="replace"`.** The
+  Tier-0 STEP-header parser turned raw cp1252 æøå in `FILE_NAME` author /
+  organization into U+FFFD silently, and passed `\X2\…\X0\` escapes
+  through verbatim. It now decodes strict-UTF-8 → lossless cp1252 /
+  latin-1 (never U+FFFD), sets a new `IFCHeader.encoding_lossy` flag on
+  the fallback, and resolves STEP string escapes (`\X2\` UTF-16BE,
+  `\X\HH` ISO-8859-1, `\S\C` Latin-1 short form) — mirroring the
+  entity-string fix (#77) on this separate Python header path. Tier-0
+  header fields only; **no cache-schema bump** (cached parquet columns
+  and the cache key are unchanged).
+- **No-mesh builds now satisfy the data-layer cache gate.** On a `_core`
+  built without the `mesh` feature, `analyse_drift` is absent so the
+  `drift` / `segments` layers never cached — `all_cached` stayed `False`
+  forever and the four good data layers (`psets`, `quantities`,
+  `materials`, `classifications`) re-extracted on every process, silently
+  defeating the documented `<200 ms` hot-reload contract. The manifest
+  now records `drift_unavailable: true` on such builds and the gate
+  excludes drift, so the four layers serve from cache. A standalone
+  `ifcfast extract` (drift not requested) does not set the flag, so a
+  later drift-wanting reader still cold-parses drift. Composes with the
+  #80 `_source_matches` freshness check + atomic writes (gate logic only;
+  no on-disk layout change).
+
+### Fixed — Rust lexer/extractor escape + set-value correctness batch (GH #76)
+
+- **Cache schema bumped `19` → `20`.** Six small Rust-core correctness
+  items from the extractor review. Each changes extracted *values* or
+  adds previously-dropped *rows* for affected files, so such cached
+  substrates must be re-extracted; files without these constructs are
+  byte-identical.
+- **(1) Encoded literal backslash `\\` collapses to one `\`.** STEP
+  encodes a literal backslash as `\\`. `decode_string` had no rule for
+  it, so `'C:\\path'` decoded to `C:\\path` (doubled), and a literal
+  backslash immediately before `X2`/`S`/`X` text could be misread as the
+  start of a Unicode/Latin-1 escape. The `\\` pair is now consumed first,
+  emitting exactly one `\` and never acting as an escape introducer.
+- **(2) `\X4\…\X0\` non-BMP escapes decode.** The ed.3 eight-hex-per-
+  code-point escape (emoji / supplementary-plane CJK) was passed through
+  as literal text. It now decodes the same way `\X2\` does, with invalid
+  scalar values mapped to U+FFFD. `A\X4\0001F600\X0\B` → `A😀B`.
+- **(3) `\X2\` unpaired surrogate no longer drops the whole run.**
+  `String::from_utf16` Err'd on a malformed surrogate and pushed nothing,
+  silently dropping every valid unit in the same `\X2\` body. Now uses
+  `from_utf16_lossy` (U+FFFD substitution), matching ifcopenshell's
+  best-effort behaviour; surrounding text survives.
+- **(4) Dangling duplicate `IfcSIUnit` no longer clobbers the project
+  default.** `extractors/quantities.rs` kept one SIUnit per `UnitType`
+  with last-write-wins *before* the `IfcUnitAssignment`-membership
+  filter. A same-type SIUnit declared after the assigned one (e.g. nested
+  in an unresolved `IfcConversionBasedUnit`) overwrote it, then the
+  membership filter dropped the survivor — leaving `unit_step_id` null
+  where the assigned unit's id was expected. Every candidate per type is
+  now kept; the post-pass picks the assignment-backed one regardless of
+  declaration order. Adjacent to the GH #43 fix.
+- **(5) Set-valued `RelatingPropertyDefinition` honoured.** An IFC4
+  `IfcRelDefinesByProperties` whose `RelatingPropertyDefinition` is an
+  `IfcPropertySetDefinitionSet` (inline list `((#1,#2))` or typed wrapper
+  `IFCPROPERTYSETDEFINITIONSET((#1,#2))`) hit `_ => continue` and dropped
+  the whole relation. Both `extractors/psets.rs` and
+  `extractors/quantities.rs` now accept ref / list / typed-wrapper —
+  the same list-or-ref tolerance already used for `RelatedObjects` —
+  and bind every member set. Single-ref form unchanged.
+- **(6) `IfcPhysicalComplexQuantity` members surface.** A complex
+  quantity bundling nested simple quantities was dropped silently
+  (nested `Width`/`Height` vanished). It now flattens into one row per
+  nested member with a dot-joined name (`Profile.Width`), mirroring the
+  `IfcComplexProperty` handling in `extractors/psets.rs`. Depth-capped
+  (8).
+- Items 1, 2, 4, 5, 6 verified on the 0.4.36 wheel by the tester; item 3
+  was traced in source. Smoke-tested on `G55_ARK.ifc` (97k pset rows,
+  Norwegian escapes decode clean, no raw escape text leaks). Adds Rust
+  unit tests per sub-item in `lexer.rs`, `extractors/psets.rs`,
+  `extractors/quantities.rs`.
+
+### Fixed — truncation refusal moved into the Rust core (GH #89)
+
+- **No cache-schema bump.** This is a behavioural open-time guard, not a
+  change to any cached column's shape or meaning — caches stay valid.
+- The truncated-file guard (refuse a STEP file missing its
+  `END-ISO-10303-21;` trailer, added in GH #70) lived only in the Python
+  `header()` wrapper. Any path that reached `_core.*` without going
+  through `header()` — and every Rust binary (`ifcfast-bundle`,
+  `ifcfast-mesh`, `ifcfast-clash`) — scanned records to EOF with no
+  trailer check, so a truncated uncompressed IFC yielded a *partial*
+  substrate at exit 0, feeding wrong QTO / clash / diff.
+- The check now lives in `crates/core/src/source.rs::open`, the single
+  choke-point every `_core.*` entry and every Rust binary funnels
+  through. A plain-STEP buffer whose final 256 bytes lack
+  `END-ISO-10303-21` is rejected with `InvalidData` before any records
+  are scanned; the Python `header()` wrapper still runs its own check
+  first, so callers see exactly one error, never a double-refusal.
+  `.ifczip` inputs are exempt (a truncated archive already fails ZIP's
+  own central-directory check in `decompress_ifczip`). AGENTS.md's
+  "refused at open" contract is now true at the core, not just the
+  Python skin.
+
 ## [0.4.38] - 2026-06-14
 
 > Correctness + security batch (10 issues + a pyo3 security bump). Parser:
