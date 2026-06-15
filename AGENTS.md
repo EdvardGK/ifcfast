@@ -496,13 +496,19 @@ the project's unit scale as parquet schema metadata
 - **Cache version is in the manifest** (`~/.cache/ifcfast/{key}/meta.json`)
   — bumping the library invalidates incompatible caches automatically.
 - **Recoverable Rust failures raise `ifcfast.IfcfastError`** (since
-  v0.4.20). The geometry-pipeline entry points
+  v0.4.20; universal across the native surface since GH #27).
+  **Every** native entry point catches Rust panics at the PyO3
+  boundary and surfaces them as `IfcfastError` instead of the
+  uncatchable `pyo3_runtime.PanicException` — the geometry pipeline
   (`m.point_cloud`, `m.iter_point_cloud`, `m.meshes`, `m.mesh_qto`,
-  `m.drift`) catch Rust panics at the PyO3 boundary and surface them
-  as `IfcfastError` instead of the uncatchable
-  `pyo3_runtime.PanicException`. Wrap geometry calls in
-  `try: ... except ifcfast.IfcfastError: ...` if you need per-file
-  resilience in a corpus pipeline.
+  `m.drift`), the data extractors (`m.index`-backed indexing,
+  `m.psets`, `m.quantities`, `m.materials`, `m.classifications`),
+  and `ifcfast.bundle()` / `ifcfast.clash()`. So no native call can
+  abort a worker via an uncatchable panic; one `except
+  ifcfast.IfcfastError:` per file is enough to make a corpus pipeline
+  resilient. (Explicit `?`-propagated errors keep their original type
+  — `OSError` for a missing/truncated file, `ValueError` for bad
+  arguments; only genuine panics map to `IfcfastError`.)
 - **`m.psets` inherits type-level properties by default** (since
   v0.4.29, cache schema v7). Properties carried on an
   `IfcTypeObject.HasPropertySets` and bound via

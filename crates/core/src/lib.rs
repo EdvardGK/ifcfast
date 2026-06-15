@@ -37,10 +37,112 @@ pub mod geom;
 #[cfg(feature = "clash")]
 pub mod clash;
 
+/// Stringify a panic payload (`Box<dyn Any + Send>`) the way the
+/// default Rust panic hook would, so a wrapped error message carries
+/// the actual panic text instead of `<non-string payload>`.
+#[cfg(feature = "python")]
+fn panic_payload_to_string(payload: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<&'static str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "<non-string panic payload>".to_string()
+    }
+}
+
+/// Run a closure, catching any unwinding panic and returning its
+/// message as `Err(String)` instead of letting the panic escape.
+///
+/// This is the pyo3-free core of the PyO3-boundary `catch_panic`
+/// wrapper (GH #23 / GH #27): keeping the `catch_unwind` here — rather
+/// than inline in the `python` module — lets it be unit-tested without
+/// linking libpython (the `extension-module` build deliberately omits
+/// libpython from test binaries, so anything touching `PyErr` won't
+/// link). The `python::catch_panic` wrapper maps the returned `Err`
+/// string onto an `IfcfastError`.
+#[cfg(feature = "python")]
+fn catch_unwind_to_message<F, R>(f: F) -> Result<R, String>
+where
+    F: FnOnce() -> R,
+{
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+    match catch_unwind(AssertUnwindSafe(f)) {
+        Ok(r) => Ok(r),
+        Err(payload) => Err(format!(
+            "ifcfast Rust panic: {}",
+            panic_payload_to_string(payload)
+        )),
+    }
+}
+
+#[cfg(all(test, feature = "python"))]
+mod panic_safety_tests {
+    use super::{catch_unwind_to_message, panic_payload_to_string};
+
+    // GH #27: every PyO3 entry point routes its body through
+    // `catch_panic`, which delegates the unwind capture to
+    // `catch_unwind_to_message`. A Rust panic crossing the boundary
+    // therefore becomes a recoverable `IfcfastError` (an `Err` here)
+    // instead of an uncatchable `PanicException` that aborts the
+    // interpreter / kills a ProcessPoolExecutor worker. These tests
+    // pin that control flow without needing the GIL.
+
+    /// Silence the default panic hook around an expected panic so the
+    /// test log stays clean; the unwind is still caught.
+    fn with_silent_hook<T>(f: impl FnOnce() -> T) -> T {
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let out = f();
+        std::panic::set_hook(prev);
+        out
+    }
+
+    #[test]
+    fn panic_becomes_err_not_abort() {
+        let r: Result<(), String> =
+            with_silent_hook(|| catch_unwind_to_message(|| panic!("boom from extractor")));
+        let msg = r.expect_err("panic must surface as Err, not abort");
+        assert!(
+            msg.contains("ifcfast Rust panic") && msg.contains("boom from extractor"),
+            "message should carry panic text: {msg}"
+        );
+    }
+
+    #[test]
+    fn success_passes_through_unchanged() {
+        // The success path is untouched: a non-panicking closure returns
+        // its value verbatim.
+        let r = catch_unwind_to_message(|| 42_i32);
+        assert_eq!(r.expect("ok closure must pass through"), 42);
+    }
+
+    #[test]
+    fn payload_stringifier_recovers_static_and_owned() {
+        let s = with_silent_hook(|| {
+            std::panic::catch_unwind(|| panic!("static message")).expect_err("panics")
+        });
+        assert_eq!(panic_payload_to_string(s), "static message");
+
+        let owned = with_silent_hook(|| {
+            std::panic::catch_unwind(|| panic!("{}", String::from("owned message")))
+                .expect_err("panics")
+        });
+        assert_eq!(panic_payload_to_string(owned), "owned message");
+    }
+}
+
 #[cfg(feature = "python")]
 mod python {
-    use std::path::Path;
+    // Used by the `iter_point_cloud` worker thread, which catches its
+    // own unwind off the PyO3 boundary so the panic can be shipped over
+    // the channel and re-raised as `IfcfastError` from `__next__`.
+    #[cfg(feature = "mesh")]
     use std::panic::{catch_unwind, AssertUnwindSafe};
+    #[cfg(feature = "mesh")]
+    use crate::panic_payload_to_string;
+
+    use std::path::Path;
     use std::time::Instant;
 
     use pyo3::prelude::*;
@@ -59,33 +161,24 @@ mod python {
     // mode reported in GH #23 (worker death under allocator pressure).
     pyo3::create_exception!(_core, IfcfastError, pyo3::exceptions::PyException);
 
-    /// Stringify a panic payload (`Box<dyn Any + Send>`) the way the
-    /// default Rust panic hook would, so the Python error message
-    /// carries the actual panic text instead of `<non-string payload>`.
-    fn panic_payload_to_string(payload: Box<dyn std::any::Any + Send>) -> String {
-        if let Some(s) = payload.downcast_ref::<&'static str>() {
-            (*s).to_string()
-        } else if let Some(s) = payload.downcast_ref::<String>() {
-            s.clone()
-        } else {
-            "<non-string panic payload>".to_string()
-        }
-    }
-
     /// Wrap a `PyResult`-returning closure in `catch_unwind` and
     /// translate any panic into an `IfcfastError`. Apply at the PyO3
     /// boundary so a Rust panic never reaches the Python interpreter
-    /// as the uncatchable `PanicException`.
+    /// as the uncatchable `PanicException`. Every `#[pyfunction]` in
+    /// this module routes its body through here (GH #27) — the
+    /// panic→`IfcfastError` guarantee is universal across the surface.
+    ///
+    /// The unwind itself is caught by the pyo3-free
+    /// [`crate::catch_unwind_to_message`] helper so the catch logic is
+    /// unit-testable without linking libpython; this wrapper only adds
+    /// the `PyErr` construction on the panic arm.
     fn catch_panic<F, R>(f: F) -> PyResult<R>
     where
         F: FnOnce() -> PyResult<R>,
     {
-        match catch_unwind(AssertUnwindSafe(f)) {
+        match crate::catch_unwind_to_message(f) {
             Ok(r) => r,
-            Err(payload) => Err(PyErr::new::<IfcfastError, _>(format!(
-                "ifcfast Rust panic: {}",
-                panic_payload_to_string(payload)
-            ))),
+            Err(message) => Err(PyErr::new::<IfcfastError, _>(message)),
         }
     }
 
@@ -201,6 +294,7 @@ mod python {
 
     #[pyfunction]
     fn index_ifc<'py>(py: Python<'py>, path: &str) -> PyResult<Bound<'py, PyDict>> {
+        catch_panic(|| {
         let (mmap, open_ms) = open_mmap(path)?;
 
         let t_index = Instant::now();
@@ -326,6 +420,7 @@ mod python {
         let marshal_ms = t_marshal.elapsed().as_secs_f64() * 1000.0;
         dict.set_item("marshal_ms", marshal_ms)?;
         Ok(dict)
+        })
     }
 
     // ----- shared GUID-index helper used by every extractor below ------
@@ -364,6 +459,7 @@ mod python {
 
     #[pyfunction]
     pub fn extract_psets<'py>(py: Python<'py>, path: &str) -> PyResult<Bound<'py, PyDict>> {
+        catch_panic(|| {
         let (mmap, open_ms) = open_mmap(path)?;
         let t_table = Instant::now();
         let table = crate::entity_table::EntityTable::build(&mmap);
@@ -390,12 +486,14 @@ mod python {
         out.set_item("marshal_ms", t_marshal.elapsed().as_secs_f64() * 1000.0)?;
         out.set_item("size_bytes", mmap.len() as u64)?;
         Ok(out)
+        })
     }
 
     // ----- extract_quantities ------------------------------------------
 
     #[pyfunction]
     pub fn extract_quantities<'py>(py: Python<'py>, path: &str) -> PyResult<Bound<'py, PyDict>> {
+        catch_panic(|| {
         let (mmap, open_ms) = open_mmap(path)?;
         let t_table = Instant::now();
         let table = crate::entity_table::EntityTable::build(&mmap);
@@ -423,12 +521,14 @@ mod python {
         out.set_item("marshal_ms", t_marshal.elapsed().as_secs_f64() * 1000.0)?;
         out.set_item("size_bytes", mmap.len() as u64)?;
         Ok(out)
+        })
     }
 
     // ----- extract_materials -------------------------------------------
 
     #[pyfunction]
     pub fn extract_materials<'py>(py: Python<'py>, path: &str) -> PyResult<Bound<'py, PyDict>> {
+        catch_panic(|| {
         let (mmap, open_ms) = open_mmap(path)?;
         let t_table = Instant::now();
         let table = crate::entity_table::EntityTable::build(&mmap);
@@ -462,6 +562,7 @@ mod python {
         out.set_item("marshal_ms", t_marshal.elapsed().as_secs_f64() * 1000.0)?;
         out.set_item("size_bytes", mmap.len() as u64)?;
         Ok(out)
+        })
     }
 
     // ----- extract_classifications -------------------------------------
@@ -471,6 +572,7 @@ mod python {
         py: Python<'py>,
         path: &str,
     ) -> PyResult<Bound<'py, PyDict>> {
+        catch_panic(|| {
         let (mmap, open_ms) = open_mmap(path)?;
         let t_table = Instant::now();
         let table = crate::entity_table::EntityTable::build(&mmap);
@@ -498,6 +600,7 @@ mod python {
         out.set_item("marshal_ms", t_marshal.elapsed().as_secs_f64() * 1000.0)?;
         out.set_item("size_bytes", mmap.len() as u64)?;
         Ok(out)
+        })
     }
 
     // ----- extract_all -------------------------------------------------
@@ -506,6 +609,7 @@ mod python {
     /// than calling them individually on big files.
     #[pyfunction]
     pub fn extract_all<'py>(py: Python<'py>, path: &str) -> PyResult<Bound<'py, PyDict>> {
+        catch_panic(|| {
         let t_total = Instant::now();
         let (mmap, open_ms) = open_mmap(path)?;
         let t_table = Instant::now();
@@ -600,6 +704,7 @@ mod python {
         out.set_item("total_ms", total_ms)?;
         out.set_item("size_bytes", mmap.len() as u64)?;
         Ok(out)
+        })
     }
 
     // ----- analyse_drift (mesh-only) -----------------------------------
@@ -2168,6 +2273,7 @@ mod python {
         ifc_path: &str,
         out_dir: Option<&str>,
     ) -> PyResult<Bound<'py, PyDict>> {
+        catch_panic(|| {
         use crate::bundle::parquet_sink::ParquetSink;
         use crate::bundle::Bundle;
         use crate::mesh::mesh_ifc_streaming;
@@ -2256,6 +2362,7 @@ mod python {
         out.set_item("entity_table_build_ms", stats.entity_table_build_ms)?;
         out.set_item("stream_ms", stream_ms)?;
         Ok(out)
+        })
     }
 
     // ----- clash --------------------------------------------------------
@@ -2277,6 +2384,7 @@ mod python {
         include_classes: Vec<String>,
         exclude_self_class: Vec<String>,
     ) -> PyResult<Bound<'py, PyDict>> {
+        catch_panic(|| {
         use crate::clash::{
             clash as run_clash, write_clashes_parquet, ClashKind, ClashOptions,
         };
@@ -2350,6 +2458,7 @@ mod python {
             out.set_item("clashes_parquet", p)?;
         }
         Ok(out)
+        })
     }
 
     #[pymodule]
