@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — Python minor batch: fail loudly on edge states (GH #71, items 4-8)
+
+Low-severity correctness items from the 0.4.36 sweep. Items 1-3 (loud
+failures on typo'd table / entity / mode + top-level namespace hygiene)
+shipped in 0.4.38 via #85; this completes the batch. **No cache schema
+bump** — no on-disk substrate column or dtype meaning changes.
+
+- **No-cache opens no longer require a home directory (item 4).**
+  `ifcfast.open(path, use_cache=False, write_cache=False)` resolves the
+  cache root (`Path.home()`) lazily, only when a read/write happens. The
+  no-cache flags now propagate to the lazy data layers
+  (`m.psets`/`m.quantities`/…), so accessing them on such a model no
+  longer raises `RuntimeError: Could not determine home directory` in a
+  stripped CI container / sandboxed subprocess.
+- **Duplicate STEP ids collapse last-wins (item 5).** A malformed file
+  repeating a record id (`#30=IFCWALL(...)` twice) no longer yields
+  duplicate-keyed product rows. The later declaration wins, `step_id`
+  stays a unique key, and `m.summary()["duplicate_step_ids"]` counts the
+  collapsed rows (0 on a well-formed file). The count persists across the
+  parquet cache.
+- **Empty tables report canonical dtypes (item 6).** A model with no
+  quantities / no geometry no longer reports `schemas["quantities"]` /
+  `schemas["drift"]` columns as all-`float64`. Empty `psets`/
+  `quantities`/`materials`/`classifications`/`drift`/`segments` layers
+  now carry their canonical per-column dtypes, on build and on cache
+  read.
+- **`spaces_df` carries name + storey (item 7).** New columns `name`,
+  `storey_guid`, `storey_name` joined from the `products` table (IfcSpace
+  is a mode-filtered product). `summary()` / `schemas` advertise the
+  enriched column set.
+- **Multi-member ifczip warns (item 8).** A ZIP container with more than
+  one STEP member emits a `warnings.warn` naming the chosen (largest) and
+  ignored members instead of silently using one with no trace.
+
 ### Fixed — header decode + no-drift cache gate (GH #87, leftovers from #84)
 
 - **`ifcfast.header()` no longer decodes with `errors="replace"`.** The
