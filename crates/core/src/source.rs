@@ -81,6 +81,56 @@ impl AsRef<[u8]> for IfcSource {
 /// First four bytes of a PKZIP local-file header.
 const ZIP_MAGIC: [u8; 4] = [b'P', b'K', 0x03, 0x04];
 
+/// STEP exchange-structure trailer. Every conformant ISO-10303-21
+/// writer terminates the file with `END-ISO-10303-21;`. We probe for
+/// the keyword without the trailing `;` so a missing or stray-whitespace
+/// terminator still matches a legitimately-complete file.
+const STEP_TRAILER: &[u8] = b"END-ISO-10303-21";
+
+/// How far back from EOF to look for [`STEP_TRAILER`]. A conformant
+/// trailer sits in the final ~20 bytes; 256 absorbs trailing whitespace,
+/// CRLF, and the occasional vendor comment after the trailer.
+const TRAILER_PROBE_BYTES: usize = 256;
+
+/// Refuse a truncated / unterminated plain-STEP buffer loudly.
+///
+/// The record scanner consumes entities until EOF, so a file cut
+/// mid-stream parses cleanly to a *partial* model — silently wrong QTO
+/// sums, diffs, and clash runs at exit 0. The absence of the
+/// `END-ISO-10303-21;` trailer in the file tail is the deterministic
+/// signal of an interrupted download / copy, so we reject it here at the
+/// single open choke-point. Because every `_core.*` entry point (bundle,
+/// mesh, clash, psets, …) loads through [`open`], they all inherit the
+/// refusal by construction rather than relying on a Python-side wrapper.
+///
+/// ZIP (`.ifczip`) inputs never reach this check: a truncated archive
+/// fails its own central-directory validation in [`decompress_ifczip`]
+/// before any bytes are returned, and the decompressed member is whole
+/// or the inflate errored. Empty buffers are left to downstream
+/// empty-file handling — they are not "truncated STEP".
+fn check_step_trailer(buf: &[u8]) -> io::Result<()> {
+    if buf.is_empty() {
+        return Ok(());
+    }
+    let probe_start = buf.len().saturating_sub(TRAILER_PROBE_BYTES);
+    let tail = &buf[probe_start..];
+    if tail
+        .windows(STEP_TRAILER.len())
+        .any(|w| w == STEP_TRAILER)
+    {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "IFC file is truncated or unterminated (no END-ISO-10303-21 \
+                 trailer in the last {} bytes)",
+                tail.len()
+            ),
+        ))
+    }
+}
+
 /// Detect whether a buffer starts with the PKZIP local-file-header
 /// signature. Used by [`open`] and exposed for callers that already
 /// have a byte buffer in hand (testing, in-memory inputs).
@@ -111,6 +161,10 @@ pub fn open(path: &Path) -> io::Result<IfcSource> {
     } else {
         // Plain IFC: mmap. SAFETY contract documented in callers.
         let mmap = unsafe { Mmap::map(&file)? };
+        // Refuse a truncated plain-STEP file at the choke-point so every
+        // `_core.*` entry inherits the guard (GH #89). ZIP inputs took
+        // the branch above and never reach here.
+        check_step_trailer(&mmap)?;
         Ok(IfcSource::Mmap(mmap))
     }
 }
@@ -259,5 +313,59 @@ mod tests {
 
         let _ = std::fs::remove_file(&tmp);
         let _ = std::fs::remove_file(&plain);
+    }
+
+    #[test]
+    fn trailer_guard_accepts_terminated_buffer() {
+        let whole = b"ISO-10303-21;\nHEADER;\nENDSEC;\nDATA;\nENDSEC;\nEND-ISO-10303-21;\n";
+        assert!(check_step_trailer(whole).is_ok());
+        // Trailer in the very last bytes (no trailing newline) still ok.
+        let tight = b"ISO-10303-21;\nDATA;\nENDSEC;\nEND-ISO-10303-21;";
+        assert!(check_step_trailer(tight).is_ok());
+        // Empty buffer is not "truncated STEP" — left to empty-file handling.
+        assert!(check_step_trailer(b"").is_ok());
+    }
+
+    #[test]
+    fn trailer_guard_refuses_truncated_buffer() {
+        // A file cut mid-DATA: well-formed prefix, no trailer.
+        let truncated =
+            b"ISO-10303-21;\nHEADER;\nENDSEC;\nDATA;\n#1=IFCWALL('guid',$,$,$,$,$,$,$,$";
+        let err = check_step_trailer(truncated).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("truncated"));
+    }
+
+    #[test]
+    fn open_refuses_truncated_plain_ifc() {
+        // The whole point of GH #89: a direct `open` (the choke-point
+        // every `_core.*` entry funnels through) must refuse a truncated
+        // plain IFC, not just the Python `header()` wrapper.
+        let truncated =
+            b"ISO-10303-21;\nHEADER;\nENDSEC;\nDATA;\n#1=IFCWALL('g',$,$,$,$,$,$,$";
+        let tmp = std::env::temp_dir().join(format!(
+            "ifcfast-trunc-test-{}.ifc",
+            std::process::id()
+        ));
+        std::fs::write(&tmp, truncated).unwrap();
+        let err = match open(&tmp) {
+            Ok(_) => panic!("truncated plain IFC must be refused at open"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn open_accepts_terminated_plain_ifc() {
+        let whole = b"ISO-10303-21;\nHEADER;\nENDSEC;\nDATA;\nENDSEC;\nEND-ISO-10303-21;\n";
+        let tmp = std::env::temp_dir().join(format!(
+            "ifcfast-whole-test-{}.ifc",
+            std::process::id()
+        ));
+        std::fs::write(&tmp, whole).unwrap();
+        let src = open(&tmp).expect("terminated plain IFC opens");
+        assert_eq!(src.as_bytes(), whole);
+        let _ = std::fs::remove_file(&tmp);
     }
 }
