@@ -126,6 +126,83 @@ _HEADER_READ_BYTES = 64 * 1024
 _HASH_HEAD_BYTES = 4 * 1024 * 1024
 _HASH_TAIL_BYTES = 4 * 1024 * 1024
 
+
+def _decode_header_prefix(prefix: bytes) -> tuple[str, bool]:
+    """Decode the raw STEP header prefix, refusing to silently drop bytes.
+
+    ISO-10303-21 ed.3 streams are UTF-8, so we try strict UTF-8 first.
+    Legacy exporters (Revit / ArchiCAD / Tekla on some locales) emit raw
+    cp1252 (Windows-Latin-1 superset) æøå directly in the `FILE_NAME`
+    author / organization slots. Those byte runs are not valid UTF-8, so
+    we fall back to a *lossless* cp1252 decode (latin-1 for the five
+    cp1252-undefined positions) and flag the file `encoding_lossy=True`.
+
+    The old `errors="replace"` path turned those high bytes into U+FFFD
+    silently — æøå vanished with no signal, contaminating the cache key's
+    sibling fields and any header-derived display. Here the bytes
+    round-trip through cp1252/latin-1 (never U+FFFD) and the
+    `encoding_lossy` flag tells a caller the file is not spec-clean UTF-8,
+    so it can decide whether to trust the decoded text. Mirrors the
+    fail-loud-or-decode-correctly stance of the Rust `decode_string`
+    fix (GH #77); this Tier-0 path is independent of the Rust lexer.
+
+    Returns `(text, encoding_lossy)`.
+    """
+    try:
+        return prefix.decode("utf-8"), False
+    except UnicodeDecodeError:
+        try:
+            return prefix.decode("cp1252"), True
+        except UnicodeDecodeError:
+            # cp1252 leaves five byte positions undefined; latin-1 maps
+            # every byte 0x00-0xFF to a codepoint, so this never raises.
+            return prefix.decode("latin-1"), True
+
+
+# STEP encoded-string escapes that occur inside header FILE_NAME /
+# FILE_DESCRIPTION string slots. Header values are single-quoted strings
+# just like entity attributes, so the same escape forms apply. Mirrors
+# the Rust `lexer::decode_string` (GH #77) for the forms real exporters
+# emit in headers.
+_X2_RE = re.compile(r"\\X2\\((?:[0-9A-Fa-f]{4})+)\\X0\\")
+_X1_RE = re.compile(r"\\X\\([0-9A-Fa-f]{2})")
+_S_RE = re.compile(r"\\S\\(.)", re.DOTALL)
+
+
+def _resolve_step_escapes(s: str) -> str:
+    r"""Resolve ``\X2\…\X0\`` (UTF-16BE), ``\X\HH`` (ISO-8859-1) and
+    ``\S\C`` (Latin-1 short form) escapes in a header string value.
+
+    These appear in `FILE_NAME` author / organization slots from
+    Revit / Tekla / ArchiCAD exports (e.g. ``\X2\00C5\X0\sgaten`` for
+    ``Åsgaten``). Pre-fix they were passed through verbatim, so a header
+    author of ``Åsmund`` surfaced as the raw escape text. Anything that
+    isn't a recognised escape is left untouched.
+    """
+    if "\\" not in s:
+        return s
+
+    def _x2(m: "re.Match[str]") -> str:
+        hexs = m.group(1)
+        units = bytes.fromhex(hexs)
+        try:
+            return units.decode("utf-16-be")
+        except UnicodeDecodeError:
+            return m.group(0)
+
+    def _x1(m: "re.Match[str]") -> str:
+        return chr(int(m.group(1), 16))
+
+    def _s(m: "re.Match[str]") -> str:
+        o = ord(m.group(1))
+        return chr(o | 0x80) if o < 0x80 else m.group(0)
+
+    s = _X2_RE.sub(_x2, s)
+    s = _X1_RE.sub(_x1, s)
+    s = _S_RE.sub(_s, s)
+    return s
+
+
 # Bump this whenever the *meaning* of a cached parquet column changes —
 # i.e. when the same input IFC, run through a new parser version, would
 # yield different output bytes in any of the cached tables (products,
@@ -401,6 +478,11 @@ class IFCHeader:
     authorisation: Optional[str] = None
     cache_key: str = ""  # short hex digest of size + head + tail
     parse_seconds: float = 0.0
+    # True when the header bytes were not valid UTF-8 and were decoded
+    # via the cp1252 / latin-1 fallback (legacy non-UTF-8 exporters).
+    # The text fields are still populated losslessly; this flag just
+    # tells a caller the source isn't spec-clean UTF-8 (GH #87).
+    encoding_lossy: bool = False
 
     @property
     def size_mb(self) -> float:
@@ -463,7 +545,7 @@ def header(path: str | Path) -> IFCHeader:
     mtime_ns = stat.st_mtime_ns
 
     prefix = _read_step_prefix(p, _HEADER_READ_BYTES)
-    text = prefix.decode("utf-8", errors="replace")
+    text, encoding_lossy = _decode_header_prefix(prefix)
 
     if not text.lstrip().startswith("ISO-10303-21"):
         if "ISO-10303-21" not in text[:1024]:
@@ -504,6 +586,7 @@ def header(path: str | Path) -> IFCHeader:
         authorisation=authorisation,
         cache_key=cache_key,
         parse_seconds=time.time() - started,
+        encoding_lossy=encoding_lossy,
     )
 
 
@@ -526,7 +609,7 @@ def _parse_string(body: str, position: int) -> Optional[str]:
     if raw in ("$", "*", ""):
         return None
     if raw.startswith("'") and raw.endswith("'"):
-        return raw[1:-1].replace("''", "'")
+        return _resolve_step_escapes(raw[1:-1].replace("''", "'"))
     return raw
 
 
@@ -542,7 +625,7 @@ def _parse_string_list(body: str, position: int) -> list[str]:
     for part in _split_top_level(inner):
         s = part.strip()
         if s.startswith("'") and s.endswith("'"):
-            out.append(s[1:-1].replace("''", "'"))
+            out.append(_resolve_step_escapes(s[1:-1].replace("''", "'")))
         elif s in ("$", "*", ""):
             continue
         else:

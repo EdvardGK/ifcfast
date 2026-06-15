@@ -267,6 +267,17 @@ honoured when its manifest carries `has_index` and the parquet is present
 and non-empty — a crash mid-write can never leave a partial cache that
 reads as a valid hit.
 
+**Drift is gated on availability, not assumed.** The four core data
+layers (`psets`, `quantities`, `materials`, `classifications`) are
+cacheable on any build. The `drift` / `segments` layers need the `mesh`
+Cargo feature; a wheel built without it (the no-csg path) cannot produce
+them. On such a build the manifest records `drift_unavailable: true`, and
+the hot-reload gate excludes drift so the four good layers still serve
+from cache (`<200 ms`) instead of re-extracting every process. `m.drift`
+is `None` on those builds — check it before aggregating. A standalone
+`ifcfast extract` (no drift requested) does **not** set the flag, so a
+later drift-wanting reader still cold-parses drift.
+
 ### Narrow-phase clash (`ifcfast.clash()`)
 
 True mesh-mesh intersection runs against the same substrate. The
@@ -372,6 +383,18 @@ the project's unit scale as parquet schema metadata
   `m.length_unit` maps `None → "m"` (the metres-assumed geometry
   default), so when correctness matters check `m.unit_scale is None`
   directly rather than trusting `length_unit`.
+- **Header text never silently drops bytes** (since GH #87).
+  `ifcfast.header(path)` decodes the STEP prelude strict-UTF-8 first
+  (ISO-10303-21 ed.3 is UTF-8), then falls back to a *lossless* cp1252 /
+  latin-1 decode for legacy non-UTF-8 exporters — never the old
+  `errors="replace"` U+FFFD substitution that ate raw æøå in
+  `FILE_NAME` author / organization. When the fallback fires, the
+  returned `IFCHeader.encoding_lossy` is `True` (the text is still
+  complete; the flag just says "not spec-clean UTF-8"). STEP string
+  escapes in header values (`\X2\…\X0\` UTF-16BE, `\X\HH` ISO-8859-1,
+  `\S\C` Latin-1 short form) are resolved, mirroring the entity-string
+  decode (GH #77). This is a Tier-0 header-field change only; it does
+  not alter any cached parquet column or the cache key.
 - **Traversal helpers never raise on unknown guids.** Missing → `None`
   for scalars, `[]` for lists. Safe to call without guarding.
 - **Typos fail loudly; absences fail quietly.** An unknown *table*
