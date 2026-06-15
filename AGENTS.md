@@ -382,8 +382,16 @@ the project's unit scale as parquet schema metadata
   isn't present in the file still returns an empty result.
 - **Truncated files are refused, not half-parsed.** A STEP file
   missing its `END-ISO-10303-21;` trailer (interrupted download /
-  copy) raises `ValueError` at open instead of silently returning a
-  partial model. ZIP containers rely on ZIP's own integrity check.
+  copy) is refused at open instead of silently returning a partial
+  model. Since GH #89 the guard lives in the Rust core
+  (`source::open`), the single choke-point every `_core.*` entry —
+  `header()`, `bundle()`, `meshes()`, `clash()`, the `ifcfast-bundle`
+  binary, all of them — loads through, so the refusal is a property of
+  the parser, not just the Python skin. It surfaces as `ValueError`
+  through `header()`/`open` and as an I/O error
+  (`InvalidData: …truncated…`) from the `_core.*` and Rust-binary
+  paths. ZIP containers (`.ifczip`) are exempt: a truncated archive
+  fails ZIP's own central-directory check first.
 - **Section/record framing is comment- and string-aware (since GH #72,
   cache schema v19).** ISO-10303-21 `/* … */` comments and single-quoted
   strings are treated as inert when the parser locates `DATA;` /

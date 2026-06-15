@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — truncation refusal moved into the Rust core (GH #89)
+
+- **No cache-schema bump.** This is a behavioural open-time guard, not a
+  change to any cached column's shape or meaning — caches stay valid.
+- The truncated-file guard (refuse a STEP file missing its
+  `END-ISO-10303-21;` trailer, added in GH #70) lived only in the Python
+  `header()` wrapper. Any path that reached `_core.*` without going
+  through `header()` — and every Rust binary (`ifcfast-bundle`,
+  `ifcfast-mesh`, `ifcfast-clash`) — scanned records to EOF with no
+  trailer check, so a truncated uncompressed IFC yielded a *partial*
+  substrate at exit 0, feeding wrong QTO / clash / diff.
+- The check now lives in `crates/core/src/source.rs::open`, the single
+  choke-point every `_core.*` entry and every Rust binary funnels
+  through. A plain-STEP buffer whose final 256 bytes lack
+  `END-ISO-10303-21` is rejected with `InvalidData` before any records
+  are scanned; the Python `header()` wrapper still runs its own check
+  first, so callers see exactly one error, never a double-refusal.
+  `.ifczip` inputs are exempt (a truncated archive already fails ZIP's
+  own central-directory check in `decompress_ifczip`). AGENTS.md's
+  "refused at open" contract is now true at the core, not just the
+  Python skin.
+
 ## [0.4.38] - 2026-06-14
 
 > Correctness + security batch (10 issues + a pyo3 security bump). Parser:
