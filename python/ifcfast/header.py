@@ -17,6 +17,7 @@ import os
 import re
 import tempfile
 import time
+import warnings
 import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -51,7 +52,23 @@ def _largest_step_member(zf: zipfile.ZipFile) -> zipfile.ZipInfo:
     ]
     if not steps:
         raise ValueError("Archive contains no .ifc / .step / .stp member")
-    return max(steps, key=lambda info: info.file_size)
+    chosen = max(steps, key=lambda info: info.file_size)
+    # GH #71 (8): a multi-model archive silently used to pick one member
+    # with no hint the others were dropped. Warn loudly which member we
+    # read so a two-model zip can't read as "the model" with no trace.
+    if len(steps) > 1:
+        others = sorted(
+            (i.filename for i in steps if i is not chosen)
+        )
+        warnings.warn(
+            "ifczip archive contains "
+            f"{len(steps)} STEP members; using the largest "
+            f"({chosen.filename!r}, {chosen.file_size} bytes) and "
+            f"ignoring {others}. Extract the intended member explicitly "
+            "if this is wrong.",
+            stacklevel=2,
+        )
+    return chosen
 
 
 def _read_step_prefix(p: Path, n_bytes: int) -> bytes:

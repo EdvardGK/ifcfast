@@ -181,6 +181,12 @@ class Model:
     type_counts: dict[str, int]
     parse_seconds: float
 
+    # GH #71 (5): count of products dropped by last-wins dedup of
+    # repeated STEP ids in a malformed source file. 0 for well-formed
+    # input. Surfaced in `summary()` so consumers see the warning rather
+    # than a silently non-unique key column.
+    duplicate_step_ids: int = field(default=0)
+
     # All of these are typed as Optional[pandas.DataFrame] in practice;
     # using `object` keeps the import-graph cheap (model.py shouldn't
     # force pandas at import time).
@@ -194,6 +200,14 @@ class Model:
     _spaces_df: Optional["object"] = field(repr=False, default=None)
     _type_objects_df: Optional["object"] = field(repr=False, default=None)
     _graph: Optional["object"] = field(repr=False, default=None)
+
+    # GH #71 (4): remember the cache policy the model was opened with so
+    # the lazy data-layer extract honours it. A model opened with
+    # `use_cache=False, write_cache=False` must never touch the cache
+    # root (which can require a resolvable home dir) when an agent later
+    # accesses `m.psets` / `m.quantities` / etc.
+    _use_cache: bool = field(repr=False, default=True)
+    _write_cache: bool = field(repr=False, default=True)
 
     # ------------------------------------------------------------------
     # Tier-1 queries
@@ -407,7 +421,11 @@ class Model:
         if self._data_layers is None:
             from .cache import extract_data_layers
 
-            self._data_layers = extract_data_layers(self.header.path)
+            self._data_layers = extract_data_layers(
+                self.header.path,
+                use_cache=self._use_cache,
+                write_cache=self._write_cache,
+            )
         return self._data_layers
 
     @property
@@ -1093,22 +1111,45 @@ class Model:
     def spaces_df(self):
         """Tier-1 space index as a pandas DataFrame.
 
-        Columns: ``guid``, ``step_id``. Built from ``self.spaces`` on
-        first access. Mirrors ``products_df`` for spaces.
+        Columns: ``guid``, ``step_id``, ``name``, ``storey_guid``,
+        ``storey_name``. The Rust indexer only emits ``guid`` + ``step_id``
+        for IfcSpace, but spaces are products too (mode-filtered into their
+        own collection), so their ``name`` and spatial container live in
+        the ``products`` table. GH #71 (7): rather than hand back a
+        two-column table that can't tell you a space's name — which invites
+        a wrong first query — we left-join those fields from ``products``
+        on ``guid``. Spaces with no matching product row (none expected on
+        a well-formed file) get ``None`` for the joined columns.
         """
         import pandas as pd
         from dataclasses import asdict
 
         if self._spaces_df is not None:
             return self._spaces_df
+
+        join_cols = ["name", "storey_guid", "storey_name"]
         if self.spaces:
-            self._spaces_df = pd.DataFrame([asdict(s) for s in self.spaces])
+            base = pd.DataFrame([asdict(s) for s in self.spaces])
         else:
-            self._spaces_df = pd.DataFrame(
+            base = pd.DataFrame(
                 columns=[
                     f.name for f in SpaceRow.__dataclass_fields__.values()
                 ]
             )
+
+        # Pull name / storey from the products table (spaces are products).
+        prod = self.products_df
+        if prod is not None and len(prod) > 0 and len(base) > 0:
+            cols = [c for c in (["guid"] + join_cols) if c in prod.columns]
+            lookup = prod[cols].drop_duplicates(subset="guid", keep="last")
+            enriched = base.merge(lookup, on="guid", how="left")
+        else:
+            enriched = base.copy()
+            for c in join_cols:
+                if c not in enriched.columns:
+                    enriched[c] = None
+
+        self._spaces_df = enriched
         return self._spaces_df
 
     @property
@@ -1336,9 +1377,8 @@ class Model:
             },
             "spaces": {
                 "rows": len(self.spaces),
-                "columns": [
-                    f.name for f in SpaceRow.__dataclass_fields__.values()
-                ],
+                # GH #71 (7): name/storey joined from products in spaces_df.
+                "columns": _SPACES_DF_COLUMNS,
                 "loaded": True,
             },
             "type_objects": {
@@ -1370,6 +1410,11 @@ class Model:
             "top_types": dict(top_types[:20]),
             "tables": tables,
             "parse_seconds": self.parse_seconds,
+            # GH #71 (5): non-zero only for malformed files that repeat a
+            # STEP id; equals how many duplicate-keyed product rows were
+            # collapsed (last-wins). A loud flag instead of a silently
+            # non-unique key column.
+            "duplicate_step_ids": self.duplicate_step_ids,
         }
 
     @property
@@ -1384,7 +1429,9 @@ class Model:
         out: dict[str, dict] = {
             "products": _df_schema_from_dataclass(ProductRow, rows=len(self)),
             "storeys": _df_schema_from_dataclass(StoreyRow, rows=len(self.storeys)),
-            "spaces": _df_schema_from_dataclass(SpaceRow, rows=len(self.spaces)),
+            # GH #71 (7): spaces_df is enriched with name/storey joined from
+            # products, so advertise those columns here too.
+            "spaces": _spaces_schema(rows=len(self.spaces)),
             "type_objects": _df_schema_from_dataclass(
                 TypeObjectRow, rows=len(self.type_objects)
             ),
@@ -1879,9 +1926,13 @@ def open_ifc(
             cached = _cache.read_index(hdr)
             if cached is not None:
                 cached.parse_seconds = time.time() - started
+                cached._use_cache = use_cache
+                cached._write_cache = write_cache
                 return cached
 
     model = _index_native(p, hdr, started)
+    model._use_cache = use_cache
+    model._write_cache = write_cache
 
     if write_cache:
         from . import cache as _cache
@@ -2098,6 +2149,14 @@ def _index_native(p: Path, hdr: IFCHeader, started: float) -> Model:
             product_type_by_step[int(psid)] = meta
 
     products: list[ProductRow] = []
+    # GH #71 (5): a malformed file can declare the same STEP id twice
+    # (e.g. `#30=IFCWALL(...)` repeated). The Rust indexer surfaces both,
+    # which hands consumers a non-unique key column (duplicate guid, same
+    # step_id). Dedup last-wins on step_id and remember how many rows we
+    # dropped so `summary()` can flag the malformed input loudly instead
+    # of silently shipping a non-unique `step_id` / `guid`.
+    _product_index_by_step: dict[int, int] = {}
+    duplicate_step_ids = 0
     pdata = raw["products"]
     n = len(pdata["step_id"])
     for i in range(n):
@@ -2117,28 +2176,34 @@ def _index_native(p: Path, hdr: IFCHeader, started: float) -> Model:
             type_guid, type_name, type_source = None, object_type, "objecttype"
         else:
             type_guid, type_name, type_source = None, None, "none"
-        products.append(
-            ProductRow(
-                guid=pdata["guid"][i],
-                entity=entity,
-                name=pdata["name"][i],
-                predefined_type=pdata["predefined_type"][i],
-                object_type=object_type,
-                tag=pdata["tag"][i],
-                storey_guid=storey_guid,
-                storey_name=(
-                    storey_name_by_guid.get(storey_guid)
-                    if storey_guid
-                    else None
-                ),
-                parent_guid=parent_lookup.get(sid),
-                mode=mode.value if isinstance(mode, ElementMode) else str(mode),
-                step_id=sid,
-                type_guid=type_guid,
-                type_name=type_name,
-                type_source=type_source,
-            )
+        row = ProductRow(
+            guid=pdata["guid"][i],
+            entity=entity,
+            name=pdata["name"][i],
+            predefined_type=pdata["predefined_type"][i],
+            object_type=object_type,
+            tag=pdata["tag"][i],
+            storey_guid=storey_guid,
+            storey_name=(
+                storey_name_by_guid.get(storey_guid)
+                if storey_guid
+                else None
+            ),
+            parent_guid=parent_lookup.get(sid),
+            mode=mode.value if isinstance(mode, ElementMode) else str(mode),
+            step_id=sid,
+            type_guid=type_guid,
+            type_name=type_name,
+            type_source=type_source,
         )
+        prev = _product_index_by_step.get(sid)
+        if prev is None:
+            _product_index_by_step[sid] = len(products)
+            products.append(row)
+        else:
+            # Last-wins: overwrite the earlier row for this step_id.
+            duplicate_step_ids += 1
+            products[prev] = row
 
     # Spaces — Rust core emits step_id + guid only; richer fields (name,
     # elevation, long_name) land later as the indexer learns them.
@@ -2204,6 +2269,7 @@ def _index_native(p: Path, hdr: IFCHeader, started: float) -> Model:
         type_objects=type_objects,
         type_counts=type_counts,
         parse_seconds=time.time() - started,
+        duplicate_step_ids=duplicate_step_ids,
         _contained_in_df=contained_in_df,
         _aggregates_df=aggregates_df,
         _storey_building_df=storey_building_df,
@@ -2263,6 +2329,18 @@ def _df_meta(df) -> dict:
     }
 
 
+def _normalize_dtype(name: str) -> str:
+    """Map a pandas dtype string to ifcfast's stable contract name.
+
+    pandas reports string columns as ``object`` on older releases but as
+    ``str`` / ``string`` on pandas >= 3.0 (and under
+    ``future.infer_string``). The substrate contract — and AGENTS.md — name
+    text columns ``object``, so normalise the string-storage variants to
+    keep ``schemas()`` version-independent (GH #71 item 6).
+    """
+    return "object" if name in ("str", "string", "String") else name
+
+
 def _df_schema(df, loaded: Optional[bool] = None) -> dict:
     """Shape + column dtypes of a DataFrame, or a not-loaded stub."""
     if df is None:
@@ -2275,8 +2353,33 @@ def _df_schema(df, loaded: Optional[bool] = None) -> dict:
     return {
         "rows": int(len(df)),
         "columns": list(df.columns),
-        "dtypes": {col: str(dtype) for col, dtype in df.dtypes.items()},
+        "dtypes": {
+            col: _normalize_dtype(str(dtype)) for col, dtype in df.dtypes.items()
+        },
         "loaded": True if loaded is None else loaded,
+    }
+
+
+# GH #71 (7): spaces_df is SpaceRow (guid, step_id) left-joined with
+# name/storey from the products table. Keep the advertised column set in
+# one place so summary() and schemas() agree with the actual frame.
+_SPACES_DF_COLUMNS = ["guid", "step_id", "name", "storey_guid", "storey_name"]
+_SPACES_DF_DTYPES = {
+    "guid": "str",
+    "step_id": "int",
+    "name": "Optional[str]",
+    "storey_guid": "Optional[str]",
+    "storey_name": "Optional[str]",
+}
+
+
+def _spaces_schema(rows: int = 0) -> dict:
+    """Schema entry for the enriched spaces_df (GH #71)."""
+    return {
+        "rows": rows,
+        "columns": list(_SPACES_DF_COLUMNS),
+        "dtypes": dict(_SPACES_DF_DTYPES),
+        "loaded": True,
     }
 
 

@@ -535,6 +535,107 @@ fn cartesian_point_list_2d(table: &EntityTable, id: u64) -> Option<Vec<Vec2>> {
 mod tests {
     use super::*;
 
+    /// World normal of a mesh's FIRST triangle — exactly what
+    /// `cut_openings::derive_plane_from_slab` reads off the half-space
+    /// slab to build the clipping plane. The slab's first triangle is
+    /// its top cap (CCW), so this normal is the direction the cut
+    /// removes (the agreement direction).
+    fn first_triangle_normal(mesh: &LocalMesh) -> Vec3 {
+        assert!(mesh.indices.len() >= 3, "slab has no triangles");
+        let idx = |k: usize| {
+            let i = mesh.indices[k] as usize;
+            Vec3::new(
+                mesh.vertices[i * 3],
+                mesh.vertices[i * 3 + 1],
+                mesh.vertices[i * 3 + 2],
+            )
+        };
+        let (v0, v1, v2) = (idx(0), idx(1), idx(2));
+        (v1 - v0).cross(v2 - v0).normalize()
+    }
+
+    /// GH #52: the half-space's cutting-plane normal must come from
+    /// `BaseSurface.Position` (the IfcPlane's axis placement), NOT from
+    /// the `IfcPolygonalBoundedHalfSpace.Position` polygon frame. When
+    /// the two diverge, deriving the normal from the polygon frame
+    /// clips the host against the wrong plane and empties it (the
+    /// Sannergata `3_6AbaPP55…` regression).
+    ///
+    /// This fixture reproduces that divergence: BaseSurface.Axis is the
+    /// tilted, nearly-horizontal `(-0.02, 0, -0.9998)` from the issue;
+    /// the polygon Position uses the schema-default `(0, 0, 1)`. We
+    /// assert the slab's first-triangle normal lands on the BaseSurface
+    /// axis (up to the AgreementFlag sign), never on world +Z.
+    const DIVERGENT_HALFSPACE_IFC: &str = r#"ISO-10303-21;
+HEADER;
+FILE_DESCRIPTION(('ViewDefinition [ReferenceView]'),'2;1');
+FILE_NAME('hs.ifc','2026-06-13T00:00:00',('test'),('skiplum'),'ifcfast','ifcfast','');
+FILE_SCHEMA(('IFC4'));
+ENDSEC;
+DATA;
+/* BaseSurface plane: tilted axis (-0.02, 0, -0.9998), refdir (-0.9998, 0, 0.02) */
+#10=IFCCARTESIANPOINT((0.,0.,0.));
+#11=IFCDIRECTION((-0.02,0.,-0.9998));
+#12=IFCDIRECTION((-0.9998,0.,0.02));
+#13=IFCAXIS2PLACEMENT3D(#10,#11,#12);
+#14=IFCPLANE(#13);
+/* Polygon Position: schema-default frame (Axis=$ -> (0,0,1), RefDir=$ -> (1,0,0)) */
+#20=IFCCARTESIANPOINT((0.,0.,0.));
+#21=IFCAXIS2PLACEMENT3D(#20,$,$);
+/* PolygonalBoundary: 2D rectangle in the polygon frame */
+#30=IFCCARTESIANPOINT((0.,0.));
+#31=IFCCARTESIANPOINT((6626.,0.));
+#32=IFCCARTESIANPOINT((6626.,100.));
+#33=IFCCARTESIANPOINT((0.,100.));
+#34=IFCPOLYLINE((#30,#31,#32,#33,#30));
+#40=IFCPOLYGONALBOUNDEDHALFSPACE(#14,.T.,#21,#34);
+ENDSEC;
+END-ISO-10303-21;
+"#;
+
+    #[test]
+    fn polygonal_bounded_halfspace_normal_from_base_surface() {
+        let table = EntityTable::build(DIVERGENT_HALFSPACE_IFC.as_bytes());
+        let (mesh, agreement, payload) =
+            polygonal_bounded_halfspace(&table, 40).expect("halfspace #40 parses");
+        assert!(agreement, "AgreementFlag .T. -> agreement = true");
+
+        let base_axis = Vec3::new(-0.02, 0.0, -0.9998).normalize();
+        let got = first_triangle_normal(&mesh);
+
+        // The slab's first-triangle normal (the direction cut_openings
+        // removes) must lie along the BaseSurface plane axis, NOT the
+        // polygon frame's +Z. `.T.` builds the slab on the -axis side
+        // (Y-180° rotation) so the cut keeps the +axis side — the
+        // first-triangle normal points along -base_axis.
+        let align_base = got.dot(base_axis).abs();
+        assert!(
+            align_base > 0.999,
+            "slab normal {got:?} must align with BaseSurface axis \
+             {base_axis:?} (|dot| = {align_base}), not the polygon frame"
+        );
+
+        // Guard against the pre-#52 bug: if the normal had come from the
+        // polygon's default frame it would be ±world-Z, whose dot with
+        // the near-horizontal base axis is ~0.9998 in Z but the X
+        // component (-0.02) would be lost. Assert the X component is
+        // actually present — proving we used the tilted BaseSurface
+        // frame, not the axis-aligned polygon frame.
+        assert!(
+            got.x.abs() > 0.01,
+            "slab normal {got:?} has no X tilt -> it came from the \
+             polygon's (0,0,1) frame, not the tilted BaseSurface"
+        );
+
+        // The payload carries the same orientation for the W6 fast path.
+        let align_payload = payload.plane_normal.dot(base_axis).abs();
+        assert!(
+            align_payload > 0.999,
+            "payload plane_normal {:?} must also align with BaseSurface axis",
+            payload.plane_normal
+        );
+    }
+
     #[test]
     fn second_operand_role_maps_operator() {
         // DIFFERENCE (and the clipping-result default) → cutter tag.

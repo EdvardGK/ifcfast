@@ -233,6 +233,81 @@ DRIFT_FILE = "drift.parquet"
 SEGMENTS_FILE = "segments.parquet"
 
 
+# GH #71 (6): canonical column dtypes for the long-format data layers.
+# An empty extractor result yields a pandas DataFrame whose every column
+# defaults to `float64` (the empty-DataFrame fallback), so on a model
+# with no quantities `schemas['quantities']['dtypes']` would report
+# `guid: float64, qto_name: float64, …` — contradicting the documented
+# column types and tripping any consumer that branches on dtype. We pin
+# the canonical dtype per column and re-impose it whenever a built or
+# cached layer comes back empty, so the schema is stable regardless of
+# row count. These mirror the non-empty Rust-marshalled dtypes exactly
+# (object for strings, int64 for counts/indices, float64 for measures and
+# the nullable `unit_step_id`; `layer_thickness_mm` / `fraction` stay
+# object because they are nullable mixed-type columns).
+_LAYER_DTYPES: dict[str, dict[str, str]] = {
+    "psets": {
+        "guid": "object", "pset_name": "object", "prop_name": "object",
+        "value": "object", "value_type": "object", "source": "object",
+    },
+    "quantities": {
+        "guid": "object", "qto_name": "object", "quantity_name": "object",
+        "value": "object", "quantity_type": "object",
+        "unit_step_id": "float64", "source": "object",
+    },
+    "materials": {
+        "guid": "object", "role": "object", "layer_index": "int64",
+        "material_name": "object", "layer_thickness_mm": "object",
+        "category": "object", "fraction": "object",
+    },
+    "classifications": {
+        "guid": "object", "system_name": "object", "edition": "object",
+        "identification": "object", "name": "object", "location": "object",
+        "source": "object",
+    },
+    "drift": {
+        "guid": "object", "entity": "object", "source": "object",
+        "triangle_count": "int64", "surface_area_m2": "float64",
+        "volume_abs_m3": "float64", "aabb_volume_m3": "float64",
+        "placement_x_m": "float64", "placement_y_m": "float64",
+        "placement_z_m": "float64", "centroid_x_m": "float64",
+        "centroid_y_m": "float64", "centroid_z_m": "float64",
+        "drift_distance_m": "float64", "max_extent_m": "float64",
+        "drift_ratio": "float64", "drift_severity": "object",
+        "mesh_quality": "object",
+    },
+    "segments": {
+        "guid": "object", "product_index": "int64", "segment_index": "int64",
+        "source": "object", "triangle_count": "int64", "index_start": "int64",
+    },
+}
+
+
+def _canonical_empty(layer: str):
+    """Empty DataFrame for `layer` with its canonical column dtypes."""
+    import pandas as pd
+
+    dtypes = _LAYER_DTYPES[layer]
+    return pd.DataFrame(
+        {col: pd.Series([], dtype=dt) for col, dt in dtypes.items()}
+    )
+
+
+def _coerce_layer(layer: str, df):
+    """Re-impose canonical dtypes on an empty `layer` DataFrame (GH #71).
+
+    Pandas types an all-empty DataFrame's columns as `float64`; that
+    leaks into ``schemas`` and the on-disk parquet. When the layer is
+    empty we rebuild it with the documented dtypes; non-empty frames are
+    returned untouched (the Rust marshaller already types them right).
+    """
+    if df is None or layer not in _LAYER_DTYPES:
+        return df
+    if len(df) == 0:
+        return _canonical_empty(layer)
+    return df
+
+
 @dataclass
 class DataLayers:
     """Bundle of extractor outputs + drift report.
@@ -241,7 +316,9 @@ class DataLayers:
     cache.
     """
 
-    cache_dir: Path
+    # None when the model was opened with no cache I/O requested (GH #71
+    # item 4): we never resolve the cache root in that case.
+    cache_dir: Optional[Path]
     cache_key: str
     psets: Optional[object] = None           # pandas.DataFrame
     quantities: Optional[object] = None
@@ -301,8 +378,18 @@ def extract_data_layers(
 
     p = Path(path)
     hdr = _header(p)
-    cache_dir = cache_dir_for(hdr)
-    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    # GH #71 (4): resolve the cache directory lazily. `cache_dir_for`
+    # → `cache_root` → `Path.home()` can raise `RuntimeError: Could not
+    # determine home directory` in an env with no resolvable home
+    # (stripped CI containers, sandboxed subprocesses). When the caller
+    # asks for no cache I/O at all (`use_cache=False, write_cache=False`)
+    # we must never touch the home dir. Compute it only when a read or a
+    # write actually needs it, and only `mkdir` on the write path.
+    need_cache_dir = bool(use_cache) or bool(write_cache)
+    cache_dir = cache_dir_for(hdr) if need_cache_dir else None
+    if write_cache and cache_dir is not None:
+        cache_dir.mkdir(parents=True, exist_ok=True)
 
     out = DataLayers(cache_dir=cache_dir, cache_key=hdr.cache_key)
     t_total = time.perf_counter()
@@ -310,8 +397,10 @@ def extract_data_layers(
     # GH #80: a same-size mid-file edit keeps the cache key but must not
     # serve stale data layers either. Only trust cached parquets when the
     # manifest's recorded (size, mtime_ns) still matches the live source.
-    cache_fresh = bool(use_cache) and _source_matches(
-        hdr, _read_manifest(cache_dir) or {}
+    cache_fresh = (
+        bool(use_cache)
+        and cache_dir is not None
+        and _source_matches(hdr, _read_manifest(cache_dir) or {})
     )
 
     if cache_fresh:
@@ -325,18 +414,32 @@ def extract_data_layers(
         out.drift_unavailable = bool(
             cached_manifest.get("drift_unavailable", False)
         )
+        # GH #71 (6): coerce on read too (via `_coerce_layer` below), so a
+        # layer cached as a degenerate-empty parquet (all float64) still
+        # surfaces with the canonical dtypes.
         if _data_file_present(cache_dir, PSETS_FILE):
-            out.psets = pd.read_parquet(cache_dir / PSETS_FILE)
+            out.psets = _coerce_layer("psets", pd.read_parquet(cache_dir / PSETS_FILE))
         if _data_file_present(cache_dir, QUANTITIES_FILE):
-            out.quantities = pd.read_parquet(cache_dir / QUANTITIES_FILE)
+            out.quantities = _coerce_layer(
+                "quantities", pd.read_parquet(cache_dir / QUANTITIES_FILE)
+            )
         if _data_file_present(cache_dir, MATERIALS_FILE):
-            out.materials = pd.read_parquet(cache_dir / MATERIALS_FILE)
+            out.materials = _coerce_layer(
+                "materials", pd.read_parquet(cache_dir / MATERIALS_FILE)
+            )
         if _data_file_present(cache_dir, CLASSIFICATIONS_FILE):
-            out.classifications = pd.read_parquet(cache_dir / CLASSIFICATIONS_FILE)
+            out.classifications = _coerce_layer(
+                "classifications",
+                pd.read_parquet(cache_dir / CLASSIFICATIONS_FILE),
+            )
         if include_drift and _data_file_present(cache_dir, DRIFT_FILE):
-            out.drift = pd.read_parquet(cache_dir / DRIFT_FILE)
+            out.drift = _coerce_layer(
+                "drift", pd.read_parquet(cache_dir / DRIFT_FILE)
+            )
         if include_drift and _data_file_present(cache_dir, SEGMENTS_FILE):
-            out.segments = pd.read_parquet(cache_dir / SEGMENTS_FILE)
+            out.segments = _coerce_layer(
+                "segments", pd.read_parquet(cache_dir / SEGMENTS_FILE)
+            )
         out.timing_ms["cache_read_ms"] = (time.perf_counter() - t0) * 1000
 
         # Drift counts toward the gate only when the caller asked for it
@@ -384,10 +487,14 @@ def extract_data_layers(
             out.timing_ms[k] = raw[k]
 
     t0 = time.perf_counter()
-    out.psets = pd.DataFrame(raw["psets"])
-    out.quantities = pd.DataFrame(raw["quantities"])
-    out.materials = pd.DataFrame(raw["materials"])
-    out.classifications = pd.DataFrame(raw["classifications"])
+    # GH #71 (6): coerce empty layers to their canonical dtypes so an
+    # empty table never reports float64 across every column.
+    out.psets = _coerce_layer("psets", pd.DataFrame(raw["psets"]))
+    out.quantities = _coerce_layer("quantities", pd.DataFrame(raw["quantities"]))
+    out.materials = _coerce_layer("materials", pd.DataFrame(raw["materials"]))
+    out.classifications = _coerce_layer(
+        "classifications", pd.DataFrame(raw["classifications"])
+    )
     out.timing_ms["df_build_ms"] = (time.perf_counter() - t0) * 1000
 
     if include_drift:
@@ -411,7 +518,7 @@ def extract_data_layers(
                     "mesh_quality",
                 )
             }
-            out.drift = pd.DataFrame(df_cols)
+            out.drift = _coerce_layer("drift", pd.DataFrame(df_cols))
             out.world_coordinate_baked = bool(
                 drift_raw.get("world_coordinate_baked", False)
             )
@@ -423,7 +530,7 @@ def extract_data_layers(
                 "triangle_count": drift_raw["seg_triangle_count"],
                 "index_start": drift_raw["seg_index_start"],
             }
-            out.segments = pd.DataFrame(seg_cols)
+            out.segments = _coerce_layer("segments", pd.DataFrame(seg_cols))
             out.timing_ms["drift_ms"] = (time.perf_counter() - t0) * 1000
         except AttributeError:
             # Built without the `mesh` Cargo feature — `analyse_drift`
@@ -590,6 +697,9 @@ def write_index(model) -> Path:
         "unit_scale": model.unit_scale,
         "product_count": len(model.products),
         "storey_count": len(model.storeys),
+        # GH #71 (5): persist the dedup count so a cache-hit Model still
+        # reports it in summary().
+        "duplicate_step_ids": int(getattr(model, "duplicate_step_ids", 0)),
         "type_counts": model.type_counts,
         "encoded_at": time.time(),
         "has_index": True,
@@ -708,6 +818,7 @@ def read_index(hdr: IFCHeader):
         type_objects=type_objects,
         type_counts=dict(m.get("type_counts", {})),
         parse_seconds=time.time() - started,
+        duplicate_step_ids=int(m.get("duplicate_step_ids", 0)),
         _products_df=df,
         _contained_in_df=contained_in_df,
         _aggregates_df=aggregates_df,
