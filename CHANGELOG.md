@@ -7,6 +7,65 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.39] - 2026-06-15
+
+Tractable-backlog batch: a single-product mesh getter, a tighter QTO
+prism bound, and a build-config fix. **Cache schema bumped `21` → `22`**
+for the prism change (non-closed QTO rows only; closed rows are
+byte-identical).
+
+### Added — `m.mesh(guid)` single-product mesh getter (GH #47)
+
+- **`Model.mesh(guid, *, unit="m", cut_openings=False, keep_cutters=False)
+  -> Mesh | None`.** Tessellates *only* the target product's placement +
+  representation chain (and, in cut mode, the openings voiding it),
+  skipping the rest of the model — O(target) instead of meshing the whole
+  file and filtering, the right shape for interactive picking (viewer
+  click → mesh) and per-element edit pipelines. Returns one `Mesh(guid,
+  entity, vertices, faces)` or `None` (unknown GUID, geometryless product,
+  or — in cut mode — the target is itself an opening, or the cut consumed
+  the host). New Rust entry `_core.extract_mesh_one` + the
+  `mesh::mesh_products_by_step` primitive (tessellates a subset of
+  products by step id via the same `tessellate_one` the batch streaming
+  pass uses).
+- **Cut parity by construction.** The host + its openings are routed
+  through the *same* `CrossProductCut` the batch path uses, so the cut
+  result is identical to the matching product from
+  `meshes(cut_openings=True)`. Validated on G55_RIB + Duplex_A.
+- **Coordinate contrast (deliberate).** `m.mesh()` returns `vertices` as
+  **`float64` absolute world coordinates** — full precision, no
+  `global_shift` to add back, because a single product can't overflow f32
+  the way a whole georeferenced model can. Batch `meshes()` keeps shifted
+  `float32` + `MeshList.global_shift`.
+
+### Changed — QTO prism bound is now the min over three axis projections (GH #62)
+
+- **`volume_prism_bound_m3` = min(footprint × perpendicular-extent) over
+  X, Y, Z**, not the Z-axis prism alone. The Z-only prism over-counted a
+  horizontal beam by its bounding slab; the min of the three per-axis
+  prisms is the tightest valid upper bound regardless of orientation —
+  tight for beams, columns, and slabs alike. `footprint_xy_raw` is
+  generalised to `footprint_raw(u_axis, v_axis, …)`; the two extra rasters
+  run only on the non-closed minority (~0.3 %), so the closed hot path
+  stays raster-free. Because the prism is also the reliability tripwire
+  and the fallback value, a tighter bound can flip `volume_reliable` /
+  `volume_method` and change `volume_m3` / `volume_best_m3` for non-closed
+  rows. **Cache schema `21` → `22`**; cached substrates of files with
+  non-closed QTO rows must be re-extracted, closed-manifold rows
+  (prism = `NaN`) are byte-identical. Refinement 2 from the issue (exact
+  `i_overlay` 2D union instead of the raster) remains deferred.
+
+### Fixed — `python`-without-`mesh` build no longer fails to compile (GH #112)
+
+- **`set_cut_openings_stats` is now gated on `feature = "mesh"`.** The
+  helper and its `CutOpeningsStats` type live under `crate::mesh`, but the
+  fn definition lacked the `#[cfg(feature = "mesh")]` guard its only
+  callers (the mesh-gated `extract_meshes` / `write_gltf` / `mesh_qto`
+  pyfunctions) had, so `cargo build --no-default-features --features
+  python` failed to compile. Default and pure-Rust builds were unaffected
+  (CI builds the default feature set), so this never shipped in a wheel.
+  No cache-schema impact.
+
 ### Fixed — denormalised `storey_guid` now agrees with `products_in` (GH #88)
 
 - **Cache schema bumped `20` → `21`.** The denormalised `storey_guid` /
