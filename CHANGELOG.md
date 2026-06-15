@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed — panic-safety guarantee is now universal (GH #27)
+
+- **Every native PyO3 entry point now catches Rust panics at the
+  boundary and re-raises them as the catchable `ifcfast.IfcfastError`**,
+  instead of letting an uncatchable `pyo3_runtime.PanicException` abort
+  the interpreter / kill a `ProcessPoolExecutor` worker. v0.4.20 (GH #23)
+  applied the `catch_panic` wrapper only to the geometry-pipeline
+  entries; the data-layer extractors were unwrapped. Now wrapped:
+  `index_ifc`, `extract_psets`, `extract_quantities`,
+  `extract_materials`, `extract_classifications`, `extract_all`,
+  `bundle`, and `clash`. Hygiene + future-proofing — these paths
+  aren't known to panic today, but the guarantee is now consistent
+  across the whole surface so a panic introduced by a future extractor
+  feature can't silently break corpus pipelines. **Behavioural on the
+  failure path only**: the success path is byte-identical and explicit
+  `?`-propagated errors keep their original type (`OSError`,
+  `ValueError`); no cache-schema bump. The unwind capture moved into a
+  pyo3-free `catch_unwind_to_message` helper so the panic→error
+  translation is covered by Rust unit tests that link without libpython.
+
 ### Tested — IfcPolygonalBoundedHalfSpace base-surface normal (GH #52)
 
 - **Regression test locking in the GH #52 fix.** Added a Rust unit test

@@ -470,6 +470,35 @@ def test_ifcfast_error_is_exposed():
     assert issubclass(ifcfast.IfcfastError, Exception)
 
 
+def test_data_extractors_panic_safe_success_path_unchanged():
+    """GH #27: the data-layer `_core` entry points (`index_ifc`,
+    `extract_psets`, `extract_quantities`, `extract_materials`,
+    `extract_classifications`, `extract_all`) are now wrapped in the
+    same `catch_panic` boundary as the geometry entries, so a Rust
+    panic surfaces as a catchable `IfcfastError` instead of an
+    uncatchable `PanicException` that aborts the interpreter.
+
+    Wrapping must not perturb the success path: each extractor still
+    returns its dict on the valid fixture. (The panic→`IfcfastError`
+    translation itself is pinned by the Rust `panic_safety_tests`
+    unit tests, which can run without linking libpython.)
+    """
+    from ifcfast import _core
+
+    p = str(FIXTURE)
+    for fn in (
+        _core.index_ifc,
+        _core.extract_psets,
+        _core.extract_quantities,
+        _core.extract_materials,
+        _core.extract_classifications,
+        _core.extract_all,
+    ):
+        out = fn(p)
+        assert isinstance(out, dict), f"{fn.__name__} should return a dict"
+        assert "size_bytes" in out
+
+
 def test_to_gltf_writes_valid_glb_with_extensions(tmp_path):
     """`m.to_gltf` produces a glTF 2.0 binary with the magic header
     and declares the two extensions our writer uses. Both
