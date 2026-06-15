@@ -62,6 +62,15 @@ pub fn build(
     //         Also index each physical-simple-quantity record.
     let mut qtos: HashMap<u64, (String, Vec<u64>)> = HashMap::with_capacity(1024);
     let mut quantities: HashMap<u64, Quantity> = HashMap::with_capacity(8192);
+    // IfcPhysicalComplexQuantity groups nested IfcPhysicalQuantity refs
+    // under a named wrapper (GH #76 item 6) — the quantity-side analogue
+    // of IfcComplexProperty in extractors/psets.rs. Pre-fix these were
+    // dropped silently: a complex quantity bundling `Width`/`Height` lost
+    // both nested members, surfacing nothing. We flatten in pass 2 with
+    // dot-joined names (`Wrapper.Width`, `Wrapper.Height`), matching the
+    // pset flattening convention so the data is revealed, not just marked.
+    let mut complex_quantities: HashMap<u64, (String, Vec<u64>)> =
+        HashMap::with_capacity(256);
     let mut rel_pairs: Vec<(u64, u64)> = Vec::with_capacity(8192);
     // Project-default unit fallback (GH #43). Real-world Revit/ArchiCAD
     // exports almost always leave the per-quantity `Unit` slot as `$`
@@ -79,7 +88,16 @@ pub fn build(
     // `unit_type` is the raw enum body without dots, uppercased
     // (e.g. `LENGTHUNIT`, `AREAUNIT`). Matched against the
     // `quantity_kind → unit_type` table below.
-    let mut si_unit_by_type: HashMap<String, u64> = HashMap::with_capacity(16);
+    //
+    // ALL SIUnits per type are kept (a Vec), not last-write-wins (GH #76
+    // item 4). Pass order is undefined relative to the IfcUnitAssignment,
+    // so a dangling same-UnitType SIUnit declared *after* the assigned one
+    // would otherwise clobber it here — and then the post-pass membership
+    // filter drops the survivor for not being in `project_unit_refs`,
+    // losing the project default entirely (`unit_step_id=None` where the
+    // assigned SIUnit's id was expected). Keeping every candidate lets the
+    // post-pass pick the assigned one regardless of declaration order.
+    let mut si_unit_by_type: HashMap<String, Vec<u64>> = HashMap::with_capacity(16);
     // Type inheritance (GH #45) — mirror of the GH #36 path in
     // extractors/psets.rs. Types can carry quantities the same way
     // they carry psets because `IfcTypeObject.HasPropertySets` is
@@ -117,19 +135,37 @@ pub fn build(
                 step_id,
                 Quantity { name, kind, value, unit_step_id: unit },
             );
+        } else if type_name.eq_ignore_ascii_case(b"IFCPHYSICALCOMPLEXQUANTITY") {
+            // (Name, Description, HasQuantities, Discrimination, Quality,
+            //  Usage). HasQuantities (index 2) is a SET of nested
+            // IfcPhysicalQuantity refs. IfcPhysicalComplexQuantity does
+            // NOT inherit IfcRoot, so the leading arg is the name. Captured
+            // here, flattened in pass 2 (GH #76 item 6).
+            let fields = split_top_level_args(args);
+            let name = string_at(&fields, 0).unwrap_or_default();
+            let inner_ids = ref_list_at(&fields, 2);
+            complex_quantities.insert(step_id, (name, inner_ids));
         } else if type_name.eq_ignore_ascii_case(b"IFCRELDEFINESBYPROPERTIES") {
             let fields = split_top_level_args(args);
-            let rel_obj = match fields.get(5).copied().map(parse_field) {
-                Some(Field::Ref(id)) => id,
-                _ => continue,
-            };
+            // RelatingPropertyDefinition is set-valued in IFC4
+            // (IfcPropertySetDefinitionSet). Accept bare ref, inline list,
+            // and the typed `IFCPROPERTYSETDEFINITIONSET((...))` wrapper
+            // (GH #76 item 5). Refs that aren't IfcElementQuantity simply
+            // don't resolve in pass 2's `qtos` map and are skipped — the
+            // pset side of the same set is handled by extractors/psets.rs.
+            let rel_objs = relating_def_refs(fields.get(5).copied());
+            if rel_objs.is_empty() {
+                continue;
+            }
             let relateds = match fields.get(4).copied().map(parse_field) {
                 Some(Field::List(body)) => parse_ref_list(body),
                 Some(Field::Ref(id)) => vec![id],
                 _ => continue,
             };
             for obj_id in relateds {
-                rel_pairs.push((obj_id, rel_obj));
+                for rel_obj in &rel_objs {
+                    rel_pairs.push((obj_id, *rel_obj));
+                }
             }
         } else if type_name.eq_ignore_ascii_case(b"IFCRELDEFINESBYTYPE") {
             // (GlobalId, OwnerHistory, Name, Description,
@@ -180,9 +216,11 @@ pub fn build(
             let fields = split_top_level_args(args);
             if let Some(raw) = fields.get(1).copied() {
                 if let Some(unit_type) = parse_enum_uppercase(raw) {
-                    // last-write-wins on collisions. A well-formed
-                    // file has at most one SIUnit per UnitType.
-                    si_unit_by_type.insert(unit_type, step_id);
+                    // Collect every SIUnit per UnitType. A well-formed
+                    // file has one, but dangling/duplicate SIUnits exist
+                    // (GH #76 item 4); the post-pass membership filter
+                    // disambiguates by IfcUnitAssignment reachability.
+                    si_unit_by_type.entry(unit_type).or_default().push(step_id);
                 }
             }
         }
@@ -194,12 +232,20 @@ pub fn build(
     // as a project default.
     let mut project_default_unit: HashMap<&'static str, u64> = HashMap::with_capacity(8);
     if !project_unit_refs.is_empty() {
-        for (unit_type, step_id) in &si_unit_by_type {
-            if !project_unit_refs.contains(step_id) {
-                continue;
-            }
-            if let Some(canonical) = canonical_unit_type(unit_type) {
-                project_default_unit.insert(canonical, *step_id);
+        for (unit_type, step_ids) in &si_unit_by_type {
+            let canonical = match canonical_unit_type(unit_type) {
+                Some(c) => c,
+                None => continue,
+            };
+            // Pick the SIUnit of this type that the IfcUnitAssignment
+            // actually references. Dangling same-type SIUnits (e.g. one
+            // nested in an unresolved IfcConversionBasedUnit) are skipped,
+            // so a stray duplicate can no longer shadow the real default
+            // regardless of where it sits in the file (GH #76 item 4).
+            if let Some(assigned) =
+                step_ids.iter().find(|id| project_unit_refs.contains(id))
+            {
+                project_default_unit.insert(canonical, *assigned);
             }
         }
     }
@@ -227,20 +273,26 @@ pub fn build(
             Some(g) => g.as_str(),
             None => continue,
         };
+        let mut emitted_names: Vec<String> = Vec::new();
         for qid in qty_ids {
-            if let Some(name) = emit_quantity(
+            emit_quantity(
                 qid,
+                "",
                 guid,
                 qto_name,
                 "instance",
                 &quantities,
+                &complex_quantities,
                 &project_default_unit,
                 &mut out,
-            ) {
-                seen_per_product
-                    .entry(guid)
-                    .or_default()
-                    .insert(format!("{qto_name}\t{name}"));
+                &mut emitted_names,
+                0,
+            );
+        }
+        if !emitted_names.is_empty() {
+            let set = seen_per_product.entry(guid).or_default();
+            for name in emitted_names {
+                set.insert(format!("{qto_name}\t{name}"));
             }
         }
     }
@@ -271,13 +323,16 @@ pub fn build(
                 for qid in qty_ids {
                     emit_quantity_dedup(
                         qid,
+                        "",
                         guid,
                         qto_name,
                         "type",
                         &quantities,
+                        &complex_quantities,
                         &project_default_unit,
                         &mut out,
                         already_seen,
+                        0,
                     );
                 }
             }
@@ -287,67 +342,139 @@ pub fn build(
     out
 }
 
-/// Append one quantity row to `out`. Returns the resolved quantity
-/// name (the dedup-set key, sans qto_name prefix) when the row is
-/// actually written so the caller can stamp `seen_per_product` for the
-/// type-inheritance pass.
+/// Cap on IfcPhysicalComplexQuantity nesting depth — mirrors the pset
+/// side. The schema permits arbitrary nesting; real files stay shallow.
+/// A self-referential or pathologically deep chain stops here rather
+/// than overflowing the stack.
+const MAX_COMPLEX_QUANTITY_DEPTH: usize = 8;
+
+/// Emit the row(s) for one quantity ref. A simple quantity yields one
+/// row; an IfcPhysicalComplexQuantity yields one row per nested member
+/// with the wrapper's name dot-prefixed (`Wrapper.Width`), recursing.
+/// Each emitted name (full dot-joined path) is appended to
+/// `emitted_names` so the caller can stamp `seen_per_product` for the
+/// type-inheritance dedup.
+#[allow(clippy::too_many_arguments)]
 fn emit_quantity(
     qid: &u64,
+    prefix: &str,
     guid: &str,
     qto_name: &str,
     source: &str,
     quantities: &HashMap<u64, Quantity>,
+    complex_quantities: &HashMap<u64, (String, Vec<u64>)>,
     project_default_unit: &HashMap<&'static str, u64>,
     out: &mut QuantityTable,
-) -> Option<String> {
-    let q = quantities.get(qid)?;
-    let unit = q.unit_step_id.or_else(|| {
-        unit_type_for_quantity_kind(q.kind)
-            .and_then(|ut| project_default_unit.get(ut).copied())
-    });
-    out.guid.push(guid.to_string());
-    out.qto_name.push(qto_name.to_string());
-    out.quantity_name.push(q.name.clone());
-    out.value.push(q.value.clone());
-    out.quantity_type.push(q.kind.to_string());
-    out.unit_step_id.push(unit);
-    out.source.push(source.to_string());
-    Some(q.name.clone())
+    emitted_names: &mut Vec<String>,
+    depth: usize,
+) {
+    if let Some(q) = quantities.get(qid) {
+        let name = join_name(prefix, &q.name);
+        let unit = q.unit_step_id.or_else(|| {
+            unit_type_for_quantity_kind(q.kind)
+                .and_then(|ut| project_default_unit.get(ut).copied())
+        });
+        out.guid.push(guid.to_string());
+        out.qto_name.push(qto_name.to_string());
+        out.quantity_name.push(name.clone());
+        out.value.push(q.value.clone());
+        out.quantity_type.push(q.kind.to_string());
+        out.unit_step_id.push(unit);
+        out.source.push(source.to_string());
+        emitted_names.push(name);
+        return;
+    }
+    // IfcPhysicalComplexQuantity (GH #76 item 6): recurse into nested
+    // members, dot-prefixing with this wrapper's name.
+    if let Some((cname, inner_ids)) = complex_quantities.get(qid) {
+        if depth >= MAX_COMPLEX_QUANTITY_DEPTH {
+            return;
+        }
+        let nested_prefix = join_name(prefix, cname);
+        for inner in inner_ids {
+            emit_quantity(
+                inner,
+                &nested_prefix,
+                guid,
+                qto_name,
+                source,
+                quantities,
+                complex_quantities,
+                project_default_unit,
+                out,
+                emitted_names,
+                depth + 1,
+            );
+        }
+    }
 }
 
 /// Dedup-aware variant. Skips emit when the instance side already
-/// surfaced a row at `(qto_name, q.name)`. Same shape contract as the
+/// surfaced a row at `(qto_name, full_name)`. Same shape contract as the
 /// pset-side `emit_property_dedup` — instance wins on collision.
 #[allow(clippy::too_many_arguments)]
 fn emit_quantity_dedup(
     qid: &u64,
+    prefix: &str,
     guid: &str,
     qto_name: &str,
     source: &str,
     quantities: &HashMap<u64, Quantity>,
+    complex_quantities: &HashMap<u64, (String, Vec<u64>)>,
     project_default_unit: &HashMap<&'static str, u64>,
     out: &mut QuantityTable,
     already_seen: &std::collections::HashSet<String>,
+    depth: usize,
 ) {
-    let q = match quantities.get(qid) {
-        Some(q) => q,
-        None => return,
-    };
-    let key = format!("{qto_name}\t{}", q.name);
-    if already_seen.contains(&key) {
+    if let Some(q) = quantities.get(qid) {
+        let name = join_name(prefix, &q.name);
+        let key = format!("{qto_name}\t{name}");
+        if already_seen.contains(&key) {
+            return;
+        }
+        let unit = q.unit_step_id.or_else(|| {
+            unit_type_for_quantity_kind(q.kind)
+                .and_then(|ut| project_default_unit.get(ut).copied())
+        });
+        out.guid.push(guid.to_string());
+        out.qto_name.push(qto_name.to_string());
+        out.quantity_name.push(name);
+        out.value.push(q.value.clone());
+        out.quantity_type.push(q.kind.to_string());
+        out.unit_step_id.push(unit);
+        out.source.push(source.to_string());
         return;
     }
-    let unit = q.unit_step_id.or_else(|| {
-        unit_type_for_quantity_kind(q.kind)
-            .and_then(|ut| project_default_unit.get(ut).copied())
-    });
-    out.guid.push(guid.to_string());
-    out.qto_name.push(qto_name.to_string());
-    out.quantity_name.push(q.name.clone());
-    out.value.push(q.value.clone());
-    out.quantity_type.push(q.kind.to_string());
-    out.unit_step_id.push(unit);
-    out.source.push(source.to_string());
+    if let Some((cname, inner_ids)) = complex_quantities.get(qid) {
+        if depth >= MAX_COMPLEX_QUANTITY_DEPTH {
+            return;
+        }
+        let nested_prefix = join_name(prefix, cname);
+        for inner in inner_ids {
+            emit_quantity_dedup(
+                inner,
+                &nested_prefix,
+                guid,
+                qto_name,
+                source,
+                quantities,
+                complex_quantities,
+                project_default_unit,
+                out,
+                already_seen,
+                depth + 1,
+            );
+        }
+    }
+}
+
+/// Dot-join a name prefix with a leaf name (`""` prefix → leaf as-is).
+fn join_name(prefix: &str, leaf: &str) -> String {
+    if prefix.is_empty() {
+        leaf.to_string()
+    } else {
+        format!("{prefix}.{leaf}")
+    }
 }
 
 /// Detect an IfcTypeObject / IfcXxxType subclass by entity-name
@@ -491,6 +618,46 @@ fn parse_ref_list(body: &[u8]) -> Vec<u64> {
             _ => None,
         })
         .collect()
+}
+
+/// Resolve `IfcRelDefinesByProperties.RelatingPropertyDefinition` to the
+/// definition step ids it references. Mirrors the psets-side helper of
+/// the same name (GH #76 item 5): accepts a bare ref, an inline list, and
+/// the typed `IFCPROPERTYSETDEFINITIONSET((...))` wrapper. Refs that turn
+/// out to be psets (not IfcElementQuantity) simply don't resolve in the
+/// quantity pass and are dropped there.
+fn relating_def_refs(raw: Option<&[u8]>) -> Vec<u64> {
+    let raw = match raw {
+        Some(r) => r,
+        None => return Vec::new(),
+    };
+    match parse_field(raw) {
+        Field::Ref(id) => vec![id],
+        Field::List(body) => parse_ref_list(body),
+        Field::Other(bytes) => relating_def_typed_wrapper_refs(bytes),
+        _ => Vec::new(),
+    }
+}
+
+/// Peel `IFCPROPERTYSETDEFINITIONSET((#1,#2))` to its inner ref list.
+/// Mirror of the psets-side helper: two paren layers (entity-arg list,
+/// then the inner LIST value).
+fn relating_def_typed_wrapper_refs(bytes: &[u8]) -> Vec<u64> {
+    let t = crate::lexer::trim_ws(bytes);
+    let prefix = b"IFCPROPERTYSETDEFINITIONSET";
+    if t.len() <= prefix.len() || !t[..prefix.len()].eq_ignore_ascii_case(prefix) {
+        return Vec::new();
+    }
+    let outer = crate::lexer::trim_ws(&t[prefix.len()..]);
+    if outer.first() != Some(&b'(') || outer.last() != Some(&b')') {
+        return Vec::new();
+    }
+    let inner = crate::lexer::trim_ws(&outer[1..outer.len() - 1]);
+    match parse_field(inner) {
+        Field::List(body) => parse_ref_list(body),
+        Field::Ref(id) => vec![id],
+        _ => Vec::new(),
+    }
 }
 
 #[cfg(test)]
@@ -900,6 +1067,115 @@ END-ISO-10303-21;
         );
         let t = run(&buf);
         assert_eq!(t.len(), 0);
+    }
+
+    #[test]
+    fn dangling_dup_si_unit_does_not_clobber_assigned_default() {
+        // GH #76 item 4. Two SIUnits share UnitType LENGTHUNIT: #3 is the
+        // one the IfcUnitAssignment references; #80 is a dangling duplicate
+        // declared AFTER it (e.g. nested in an unresolved
+        // IfcConversionBasedUnit). Pre-fix the last-write-wins map let #80
+        // overwrite #3, then the membership filter dropped #80 (not
+        // assigned) — leaving unit_step_id=None. The assigned #3 must win.
+        let buf = format!(
+            r#"ISO-10303-21;
+HEADER;
+FILE_DESCRIPTION(('ViewDefinition [ReferenceView]'),'2;1');
+FILE_NAME('qto_test.ifc','2026-06-13T00:00:00',('test'),('test'),'ifcfast','ifcfast','');
+FILE_SCHEMA(('IFC4'));
+ENDSEC;
+DATA;
+#1=IFCPROJECT('0Test000000000000000001',$,'p',$,$,$,$,(#5),#2);
+#2=IFCUNITASSIGNMENT((#3));
+#3=IFCSIUNIT(*,.LENGTHUNIT.,.MILLI.,.METRE.);
+#5=IFCGEOMETRICREPRESENTATIONCONTEXT($,'Model',3,1.0E-5,#6,$);
+#6=IFCAXIS2PLACEMENT3D(#7,$,$);
+#7=IFCCARTESIANPOINT((0.,0.,0.));
+#10=IFCWALL('1Wall00000000000000001',$,'W',$,$,$,$,'t',.STANDARD.);
+#41=IFCQUANTITYLENGTH('Length',$,$,3.0);
+#47=IFCELEMENTQUANTITY('2Qto000000000000000001',$,'Qto_X',$,$,(#41));
+#48=IFCRELDEFINESBYPROPERTIES('3Rel000000000000000001',$,$,$,(#10),#47);
+#80=IFCSIUNIT(*,.LENGTHUNIT.,$,.METRE.);
+ENDSEC;
+END-ISO-10303-21;
+"#
+        );
+        let t = run(&buf);
+        assert_eq!(t.len(), 1);
+        // The assigned SIUnit #3 must resolve, not None and not #80.
+        assert_eq!(t.unit_step_id[0], Some(3));
+    }
+
+    #[test]
+    fn set_valued_relating_property_definition_inline_list() {
+        // GH #76 item 5. RelatingPropertyDefinition given as an inline
+        // IfcPropertySetDefinitionSet list `((#21,#23))`. Both element
+        // quantities must bind to the product. Pre-fix the non-Ref field
+        // hit `_ => continue` and zero rows came through.
+        let buf = make_buf(
+            r#"
+#20=IFCQUANTITYAREA('NetArea',$,$,12.5);
+#21=IFCELEMENTQUANTITY('2Qto000000000000000001',$,'Qto_A',$,$,(#20));
+#22=IFCQUANTITYVOLUME('NetVolume',$,$,2.5);
+#23=IFCELEMENTQUANTITY('4Qto000000000000000001',$,'Qto_B',$,$,(#22));
+#25=IFCRELDEFINESBYPROPERTIES('3Rel000000000000000001',$,$,$,(#10),(#21,#23));
+"#,
+        );
+        let t = run(&buf);
+        assert_eq!(t.len(), 2, "both element quantities in the set must bind");
+        let names: std::collections::HashSet<&str> =
+            t.quantity_name.iter().map(String::as_str).collect();
+        assert!(names.contains("NetArea"));
+        assert!(names.contains("NetVolume"));
+    }
+
+    #[test]
+    fn set_valued_relating_property_definition_typed_wrapper() {
+        // GH #76 item 5. The typed `IFCPROPERTYSETDEFINITIONSET((...))`
+        // wrapper form.
+        let buf = make_buf(
+            r#"
+#20=IFCQUANTITYAREA('NetArea',$,$,12.5);
+#21=IFCELEMENTQUANTITY('2Qto000000000000000001',$,'Qto_A',$,$,(#20));
+#22=IFCQUANTITYVOLUME('NetVolume',$,$,2.5);
+#23=IFCELEMENTQUANTITY('4Qto000000000000000001',$,'Qto_B',$,$,(#22));
+#25=IFCRELDEFINESBYPROPERTIES('3Rel000000000000000001',$,$,$,(#10),IFCPROPERTYSETDEFINITIONSET((#21,#23)));
+"#,
+        );
+        let t = run(&buf);
+        assert_eq!(t.len(), 2, "typed-wrapper set must bind both quantities");
+        let names: std::collections::HashSet<&str> =
+            t.quantity_name.iter().map(String::as_str).collect();
+        assert!(names.contains("NetArea"));
+        assert!(names.contains("NetVolume"));
+    }
+
+    #[test]
+    fn physical_complex_quantity_nested_members_surface() {
+        // GH #76 item 6. An IfcPhysicalComplexQuantity bundling two nested
+        // simple quantities. Pre-fix the whole complex was dropped and the
+        // nested `Width`/`Height` vanished. Now they surface as
+        // dot-prefixed rows `Profile.Width` / `Profile.Height`.
+        let buf = make_buf(
+            r#"
+#18=IFCQUANTITYLENGTH('Width',$,$,0.3);
+#19=IFCQUANTITYLENGTH('Height',$,$,0.6);
+#20=IFCPHYSICALCOMPLEXQUANTITY('Profile',$,(#18,#19),'shape','geometry',$);
+#21=IFCQUANTITYAREA('NetArea',$,$,12.5);
+#24=IFCELEMENTQUANTITY('2Qto000000000000000001',$,'Qto_Wall',$,$,(#20,#21));
+#25=IFCRELDEFINESBYPROPERTIES('3Rel000000000000000001',$,$,$,(#10),#24);
+"#,
+        );
+        let t = run(&buf);
+        let by_name: std::collections::HashMap<&str, Option<&str>> = (0..t.len())
+            .map(|i| (t.quantity_name[i].as_str(), t.value[i].as_deref()))
+            .collect();
+        // Sibling plain quantity still there.
+        assert_eq!(by_name.get("NetArea"), Some(&Some("12.5")));
+        // Nested members surface dot-prefixed with the wrapper name.
+        assert_eq!(by_name.get("Profile.Width"), Some(&Some("0.3")));
+        assert_eq!(by_name.get("Profile.Height"), Some(&Some("0.6")));
+        assert_eq!(t.len(), 3);
     }
 
     #[test]

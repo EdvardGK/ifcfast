@@ -7,6 +7,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — Rust lexer/extractor escape + set-value correctness batch (GH #76)
+
+- **Cache schema bumped `19` → `20`.** Six small Rust-core correctness
+  items from the extractor review. Each changes extracted *values* or
+  adds previously-dropped *rows* for affected files, so such cached
+  substrates must be re-extracted; files without these constructs are
+  byte-identical.
+- **(1) Encoded literal backslash `\\` collapses to one `\`.** STEP
+  encodes a literal backslash as `\\`. `decode_string` had no rule for
+  it, so `'C:\\path'` decoded to `C:\\path` (doubled), and a literal
+  backslash immediately before `X2`/`S`/`X` text could be misread as the
+  start of a Unicode/Latin-1 escape. The `\\` pair is now consumed first,
+  emitting exactly one `\` and never acting as an escape introducer.
+- **(2) `\X4\…\X0\` non-BMP escapes decode.** The ed.3 eight-hex-per-
+  code-point escape (emoji / supplementary-plane CJK) was passed through
+  as literal text. It now decodes the same way `\X2\` does, with invalid
+  scalar values mapped to U+FFFD. `A\X4\0001F600\X0\B` → `A😀B`.
+- **(3) `\X2\` unpaired surrogate no longer drops the whole run.**
+  `String::from_utf16` Err'd on a malformed surrogate and pushed nothing,
+  silently dropping every valid unit in the same `\X2\` body. Now uses
+  `from_utf16_lossy` (U+FFFD substitution), matching ifcopenshell's
+  best-effort behaviour; surrounding text survives.
+- **(4) Dangling duplicate `IfcSIUnit` no longer clobbers the project
+  default.** `extractors/quantities.rs` kept one SIUnit per `UnitType`
+  with last-write-wins *before* the `IfcUnitAssignment`-membership
+  filter. A same-type SIUnit declared after the assigned one (e.g. nested
+  in an unresolved `IfcConversionBasedUnit`) overwrote it, then the
+  membership filter dropped the survivor — leaving `unit_step_id` null
+  where the assigned unit's id was expected. Every candidate per type is
+  now kept; the post-pass picks the assignment-backed one regardless of
+  declaration order. Adjacent to the GH #43 fix.
+- **(5) Set-valued `RelatingPropertyDefinition` honoured.** An IFC4
+  `IfcRelDefinesByProperties` whose `RelatingPropertyDefinition` is an
+  `IfcPropertySetDefinitionSet` (inline list `((#1,#2))` or typed wrapper
+  `IFCPROPERTYSETDEFINITIONSET((#1,#2))`) hit `_ => continue` and dropped
+  the whole relation. Both `extractors/psets.rs` and
+  `extractors/quantities.rs` now accept ref / list / typed-wrapper —
+  the same list-or-ref tolerance already used for `RelatedObjects` —
+  and bind every member set. Single-ref form unchanged.
+- **(6) `IfcPhysicalComplexQuantity` members surface.** A complex
+  quantity bundling nested simple quantities was dropped silently
+  (nested `Width`/`Height` vanished). It now flattens into one row per
+  nested member with a dot-joined name (`Profile.Width`), mirroring the
+  `IfcComplexProperty` handling in `extractors/psets.rs`. Depth-capped
+  (8).
+- Items 1, 2, 4, 5, 6 verified on the 0.4.36 wheel by the tester; item 3
+  was traced in source. Smoke-tested on `G55_ARK.ifc` (97k pset rows,
+  Norwegian escapes decode clean, no raw escape text leaks). Adds Rust
+  unit tests per sub-item in `lexer.rs`, `extractors/psets.rs`,
+  `extractors/quantities.rs`.
+
 ### Fixed — truncation refusal moved into the Rust core (GH #89)
 
 - **No cache-schema bump.** This is a behavioural open-time guard, not a
