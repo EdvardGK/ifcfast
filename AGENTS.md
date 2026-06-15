@@ -26,7 +26,7 @@ want.
 choose between speed and correctness; route between them. ifcfast's QTO
 rows self-label confidence: every product carries a `volume_reliable`
 flag (`false` ⇒ the mesh volume isn't trustworthy — open shell,
-degenerate rep, inverted winding) and a `footprint × height` prism
+degenerate rep, inverted winding) and a min-over-three-axes prism
 fallback already substituted into `volume_m3`. Run ifcfast on
 everything, then send **only** the `volume_reliable = false` rows to an
 authoritative kernel (`ifcopenshell`, Solibri, or a human-review queue).
@@ -216,7 +216,7 @@ describing via `pq.read_schema(...)`):
   `"degenerate"`).
 - Volume reliability (since cache schema v16, GH #60): `volume_m3` is
   the **best** estimate (mesh volume when trustworthy, else a
-  `footprint × height` prism fallback — so `SUM(volume_m3)` no longer
+  min-over-three-axes prism fallback — so `SUM(volume_m3)` no longer
   mixes open-shell garbage into totals). `volume_reliable` (bool) is the
   routing flag — `true` when `volume_m3` is the mesh value and it's
   trustworthy (closed manifold, or a non-manifold whose volume is still
@@ -225,9 +225,10 @@ describing via `pq.read_schema(...)`):
   fallback, or the rep is degenerate. Send `false` rows to an
   authoritative kernel. `volume_method` is `"mesh"` / `"prism_fallback"`;
   `volume_mesh_m3` is the raw mesh volume regardless of reliability;
-  `volume_prism_bound_m3` is the prism bound, computed for every
-  non-closed row (`NaN` on closed rows — the watertight hot path stays
-  raster-free).
+  `volume_prism_bound_m3` is the prism bound — the min over the three
+  axis projections of `footprint × perpendicular-extent`, tight for
+  beams/columns/slabs alike — computed for every non-closed row (`NaN`
+  on closed rows — the watertight hot path stays raster-free).
 - Semantic payload: `materials`, `psets`, `quantities`,
   `classifications` (list-of-struct columns — `UNNEST` in DuckDB).
   Each `psets` and `quantities` struct carries `source`

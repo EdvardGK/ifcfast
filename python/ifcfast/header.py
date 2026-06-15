@@ -483,7 +483,18 @@ def _resolve_step_escapes(s: str) -> str:
 #       `storey_name` columns (instances.parquet + ProductRow) for aggregate
 #       parts only → such cached substrates must be re-extracted; files with no
 #       aggregate-only parts are byte-identical.
-_CACHE_SCHEMA_VERSION = 21
+# v22 (GH #62) — `volume_prism_bound_m3` is now the MIN over the three axis
+#       projections (footprint × perpendicular-extent), not the Z-axis prism
+#       alone. The min is a tighter upper bound for non-axis-aligned shapes —
+#       a horizontal beam was over-counted by its bounding slab under the
+#       Z-only prism. Because the prism is also the tripwire and fallback,
+#       this can flip `volume_reliable` / `volume_method` (a mesh volume that
+#       sat just under the loose Z-prism may now exceed the tighter bound) and
+#       change `volume_m3` / `volume_best_m3` for non-closed rows. Value change
+#       on the QTO columns for the non-closed minority → such cached substrates
+#       must be re-extracted; closed-manifold rows (prism = NaN) are
+#       byte-identical.
+_CACHE_SCHEMA_VERSION = 22
 
 _FIELD_RE = re.compile(r"\(\s*(.*?)\s*\)\s*;", re.DOTALL)
 

@@ -116,24 +116,27 @@ pub struct MeshQto {
     /// Which definition `volume_best_m3` carries (always agrees with
     /// `volume_reliable`):
     /// - `"mesh"`: the signed-tetra mesh volume (reliable rows).
-    /// - `"prism_fallback"`: `footprint × z_extent` — substituted when
-    ///   the mesh volume is provably too big or the rep is degenerate.
-    ///   A tighter bound than the AABB; reproduces the QTO-convention
-    ///   prism value tools like Solibri report for open slabs.
+    /// - `"prism_fallback"`: the min-over-three-axes prism bound
+    ///   (`volume_prism_bound_m3`) — substituted when the mesh volume is
+    ///   provably too big or the rep is degenerate. A tighter bound than
+    ///   the AABB; reproduces the QTO-convention prism value tools like
+    ///   Solibri report for open slabs.
     pub volume_method: &'static str,
     /// The best single volume estimate: the mesh volume when reliable,
     /// else the prism fallback (`volume_prism_bound_m3`). This is what
     /// the `volume_m3` substrate column / `mesh_qto()` output carries —
     /// `SUM(volume_m3)` no longer mixes open-shell garbage into totals.
     pub volume_best_m3: f32,
-    /// Tight prism upper-bound on volume, `footprint × z_extent` in m³,
-    /// where `footprint` is the raster-estimated union of the mesh's
-    /// triangles projected onto the XY plane. Computed for every
-    /// non-closed row (it is both the tripwire and the fallback value);
-    /// `f32::NAN` on closed rows, where it is neither needed nor computed
-    /// (keeps the watertight hot path raster-free). v1 uses the Z-axis
-    /// prism only (tight for slabs); a min over the three axis
-    /// projections (tight for beams/columns) is a documented follow-up.
+    /// Tight prism upper-bound on volume in m³: the minimum over the
+    /// three axis projections of `footprint × perpendicular_extent`,
+    /// where each `footprint` is the raster-estimated union of the mesh's
+    /// triangles projected onto the plane perpendicular to that axis
+    /// (GH #62). Taking the min makes the bound tight regardless of
+    /// orientation — slabs/columns are tightest under the Z-prism, beams
+    /// under their long-axis prism. Computed for every non-closed row (it
+    /// is both the tripwire and the fallback value); `f32::NAN` on closed
+    /// rows, where it is neither needed nor computed (keeps the watertight
+    /// hot path raster-free).
     pub volume_prism_bound_m3: f32,
 }
 
@@ -378,10 +381,11 @@ pub fn compute(vertices: &[f32], indices: &[u32], unit_scale: f32) -> MeshQto {
         "closed"
     };
 
-    // Volume-reliability + prism fallback (GH #60). A closed manifold's
-    // signed-tetra volume is trustworthy as-is. For anything else we
-    // compute the tight prism upper bound (union-XY footprint × z-extent)
-    // and use it two ways:
+    // Volume-reliability + prism fallback (GH #60, #62). A closed
+    // manifold's signed-tetra volume is trustworthy as-is. For anything
+    // else we compute the tight prism upper bound (the min over the three
+    // axis projections of footprint × perpendicular-extent) and use it
+    // two ways:
     //   * as a *tripwire* — a mesh volume that exceeds its own prism
     //     bound is provably too big (open shell / inverted winding), so
     //     it gets replaced by the prism estimate (matches the QTO-prism
@@ -407,16 +411,48 @@ pub fn compute(vertices: &[f32], indices: &[u32], unit_scale: f32) -> MeshQto {
             // applicable / not computed" so consumers don't read it as 0.
             (volume_mesh_m3, "mesh", true, f32::NAN)
         } else {
-            let z_extent_raw = if zmin.is_finite() {
-                (zmax - zmin).max(0.0)
+            // Tightest prism upper bound = min over the three axis
+            // projections (GH #62). For each axis, the prism is the union
+            // footprint in the plane perpendicular to it × the extent
+            // along it. The minimum of the three is the best upper bound
+            // regardless of orientation — tight for slabs/columns (Z) and
+            // beams (X or Y) alike, where the Z-only prism over-counts a
+            // horizontal beam by its bounding slab. The extra two rasters
+            // run only on the non-closed minority, so the closed hot path
+            // is untouched.
+            let x_extent_raw = if xmin.is_finite() { (xmax - xmin).max(0.0) } else { 0.0 };
+            let y_extent_raw = if ymin.is_finite() { (ymax - ymin).max(0.0) } else { 0.0 };
+            let z_extent_raw = if zmin.is_finite() { (zmax - zmin).max(0.0) } else { 0.0 };
+
+            // A zero extent (planar mesh on that axis) collapses its prism
+            // to 0 regardless of footprint, so skip the raster for it.
+            // Axis indices into each vertex triple: 0=x, 1=y, 2=z.
+            let prism_z = if z_extent_raw > 0.0 && xmax > xmin && ymax > ymin {
+                footprint_raw(vertices, indices, 0, 1, xmin, xmax, ymin, ymax) * z_extent_raw
             } else {
                 0.0
             };
-            // Vertical / planar meshes have zero z-extent → the z-prism
-            // is zero regardless of footprint, so skip the raster.
-            let prism = if z_extent_raw > 0.0 && xmax > xmin && ymax > ymin {
-                let footprint_raw = footprint_xy_raw(vertices, indices, xmin, xmax, ymin, ymax);
-                footprint_raw * z_extent_raw * volume_scale
+            let prism_y = if y_extent_raw > 0.0 && xmax > xmin && zmax > zmin {
+                footprint_raw(vertices, indices, 0, 2, xmin, xmax, zmin, zmax) * y_extent_raw
+            } else {
+                0.0
+            };
+            let prism_x = if x_extent_raw > 0.0 && ymax > ymin && zmax > zmin {
+                footprint_raw(vertices, indices, 1, 2, ymin, ymax, zmin, zmax) * x_extent_raw
+            } else {
+                0.0
+            };
+
+            // Min over the *positive* prisms — a zero prism means that
+            // axis is planar / not computable, not that the volume is
+            // zero. If all three are zero the mesh is degenerate and the
+            // prism stays 0.
+            let prism_best_raw = [prism_x, prism_y, prism_z]
+                .into_iter()
+                .filter(|&p| p > 0.0)
+                .fold(f32::INFINITY, f32::min);
+            let prism = if prism_best_raw.is_finite() {
+                prism_best_raw * volume_scale
             } else {
                 0.0
             };
@@ -451,13 +487,17 @@ pub fn compute(vertices: &[f32], indices: &[u32], unit_scale: f32) -> MeshQto {
     }
 }
 
-/// Union of the mesh's triangles projected onto the XY plane, in raw
-/// (pre-`unit_scale`) units², estimated by rasterizing onto a fixed-cell
-/// grid that spans the XY bounding box. Overlapping triangles re-mark the
-/// same cells, so the result is the true *union* footprint, not the sum
-/// of per-triangle areas. Vertical faces project to a line (zero 2D area)
-/// and contribute nothing, which is exactly right — only the horizontal
-/// extent makes up a footprint.
+/// Union of the mesh's triangles projected onto the `(u_axis, v_axis)`
+/// plane, in raw (pre-`unit_scale`) units², estimated by rasterizing onto
+/// a fixed-cell grid that spans that plane's bounding box. `u_axis` /
+/// `v_axis` are component indices into each vertex triple (0=x, 1=y,
+/// 2=z) — `(0, 1)` is the classic XY footprint; `(0, 2)` and `(1, 2)`
+/// give the XZ and YZ projections used for the three-axis prism min
+/// (GH #62). Overlapping triangles re-mark the same cells, so the result
+/// is the true *union* footprint, not the sum of per-triangle areas.
+/// Faces parallel to the projection axis collapse to a line (zero 2D
+/// area) and contribute nothing, which is exactly right — only the
+/// in-plane extent makes up a footprint.
 ///
 /// Cost is `O(triangles + covered_cells)` and this is called ONLY on the
 /// flagged minority (`!volume_reliable`, ~0.3 % of products), so it never
@@ -468,9 +508,11 @@ pub fn compute(vertices: &[f32], indices: &[u32], unit_scale: f32) -> MeshQto {
 /// This is an *estimate*: a coarse grid can slip thin triangles between
 /// cell centres (slight under-count). An exact 2D boolean union (via
 /// `i_overlay`) is the documented accuracy upgrade if telemetry needs it.
-fn footprint_xy_raw(
+fn footprint_raw(
     vertices: &[f32],
     indices: &[u32],
+    u_axis: usize,
+    v_axis: usize,
     xmin: f32,
     xmax: f32,
     ymin: f32,
@@ -500,18 +542,19 @@ fn footprint_xy_raw(
         let ia = tri[0] as usize * 3;
         let ib = tri[1] as usize * 3;
         let ic = tri[2] as usize * 3;
-        if ia + 1 >= vertices.len() || ib + 1 >= vertices.len() || ic + 1 >= vertices.len() {
+        // u_axis / v_axis are at most 2, so guard the full vertex triple.
+        if ia + 2 >= vertices.len() || ib + 2 >= vertices.len() || ic + 2 >= vertices.len() {
             continue;
         }
-        let ax = vertices[ia];
-        let ay = vertices[ia + 1];
-        let bx = vertices[ib];
-        let by = vertices[ib + 1];
-        let cx = vertices[ic];
-        let cy = vertices[ic + 1];
+        let ax = vertices[ia + u_axis];
+        let ay = vertices[ia + v_axis];
+        let bx = vertices[ib + u_axis];
+        let by = vertices[ib + v_axis];
+        let cx = vertices[ic + u_axis];
+        let cy = vertices[ic + v_axis];
 
-        // Signed 2D area — skip near-zero (vertical faces project to a
-        // line and add no footprint).
+        // Signed 2D area — skip near-zero (faces parallel to the
+        // projection axis collapse to a line and add no footprint).
         let twice_area = (bx - ax) * (cy - ay) - (cx - ax) * (by - ay);
         if twice_area.abs() < 1e-12 {
             continue;
@@ -1052,7 +1095,45 @@ mod tests {
             0.0, 1.0, 1.0,
         ];
         let i: Vec<u32> = vec![0, 1, 2,  0, 2, 3];
-        let fp = footprint_xy_raw(&v, &i, 0.0, 1.0, 0.0, 1.0);
+        // XY projection (u=x=0, v=y=1).
+        let fp = footprint_raw(&v, &i, 0, 1, 0.0, 1.0, 0.0, 1.0);
         assert!((fp - 1.0).abs() < 1e-3, "footprint should be ~1 m², got {fp}");
+    }
+
+    #[test]
+    fn prism_min_tightens_horizontal_beam() {
+        // A thin horizontal beam: 4 m long (X), 0.2 m wide (Y), 0.3 m tall
+        // (Z) — an open shell (no end caps) so it takes the prism path.
+        // True volume = 4·0.2·0.3 = 0.24 m³. The Z-prism over-counts:
+        // XY-footprint (4·0.2=0.8) × z_extent (0.3) = 0.24 here for a box,
+        // but the min-over-3 must not exceed the tightest box prism and
+        // must stay a valid upper bound on the mesh volume.
+        let (lx, ly, lz) = (4.0_f32, 0.2_f32, 0.3_f32);
+        // Eight box corners.
+        let v: Vec<f32> = vec![
+            0.0, 0.0, 0.0,   lx, 0.0, 0.0,   lx, ly, 0.0,   0.0, ly, 0.0,
+            0.0, 0.0, lz,    lx, 0.0, lz,    lx, ly, lz,    0.0, ly, lz,
+        ];
+        // Four side walls only (open top/bottom → open_shell, prism path).
+        let i: Vec<u32> = vec![
+            0, 1, 5,  0, 5, 4,   // -Y wall
+            1, 2, 6,  1, 6, 5,   // +X wall
+            2, 3, 7,  2, 7, 6,   // +Y wall
+            3, 0, 4,  3, 4, 7,   // -X wall
+        ];
+        let q = compute(&v, &i, 1.0);
+        let true_vol = lx * ly * lz; // 0.24
+        // The prism bound is a valid upper bound and tight for a box
+        // (every axis prism equals the true volume here).
+        assert!(
+            q.volume_prism_bound_m3 >= true_vol - 1e-3,
+            "prism must bound the true volume, got {} vs {true_vol}",
+            q.volume_prism_bound_m3
+        );
+        assert!(
+            (q.volume_prism_bound_m3 - true_vol).abs() < 5e-2,
+            "box prism should be tight (~{true_vol}), got {}",
+            q.volume_prism_bound_m3
+        );
     }
 }
