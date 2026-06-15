@@ -38,7 +38,7 @@
 pub mod parquet_sink;
 pub mod record;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::entity_table::EntityTable;
@@ -229,6 +229,14 @@ impl Bundle {
             }
         }
 
+        // Step-ids that ARE IfcBuildingStorey. `storey_name_by_id` cannot
+        // serve as the "is a storey" predicate — a storey with no Name
+        // (legal IFC) would be missing from it, and it deliberately also
+        // carries building/site names. The transitive storey resolver
+        // (GH #88) needs an exact storey set to decide where to stop the
+        // upward walk.
+        let storey_ids: HashSet<u64> = idx.storey_step_id.iter().copied().collect();
+
         // Product step_id -> containing storey step_id, from
         // IfcRelContainedInSpatialStructure. Many products fall into the
         // building or site directly rather than a storey — we record
@@ -317,28 +325,16 @@ impl Bundle {
             let source_class = intern(&mut str_cache, entity);
             let class = intern(&mut str_cache, normalize_class(&source_class));
 
-            // Two ways an IFC declares "this product is in storey X":
-            //   1. IfcRelContainedInSpatialStructure (the common case
-            //      for walls, slabs, doors, etc.)
-            //   2. IfcRelAggregates with a storey as the parent (used
-            //      for IfcSpace in many authoring tools — Duplex's
-            //      Revit export aggregates all spaces under storeys).
-            // The contained_in path is checked first; the aggregate
-            // fallback walks up to a depth limit, picking the first
-            // storey ancestor it finds.
-            let storey_sid = contained_in.get(&sid).copied().or_else(|| {
-                let mut cur = sid;
-                for _ in 0..32 {
-                    match agg_parent.get(&cur).copied() {
-                        Some(parent) if storey_name_by_id.contains_key(&parent) => {
-                            return Some(parent);
-                        }
-                        Some(parent) => cur = parent,
-                        None => return None,
-                    }
-                }
-                None
-            });
+            // Resolve the storey this product ultimately sits in, walking
+            // BOTH IfcRelContainedInSpatialStructure and IfcRelAggregates
+            // edges upward. A product directly contained in a storey uses
+            // that storey; otherwise an aggregate part inherits the storey
+            // of the host it decomposes (a curtain-wall plate inherits the
+            // wall's storey, a stair flight the stair's). See GH #88 — this
+            // makes the denormalised `storey_guid` agree with the graph
+            // walk that `m.products_in(storey)` performs.
+            let storey_sid =
+                resolve_storey_sid(sid, &contained_in, &agg_parent, &storey_ids);
             let storey_guid = storey_sid.and_then(|s| step_to_guid.get(&s).cloned());
             let storey_name = storey_sid
                 .and_then(|s| storey_name_by_id.get(&s).cloned())
@@ -585,9 +581,81 @@ fn normalize_class(source: &str) -> String {
     trimmed.to_string()
 }
 
+/// Resolve the IfcBuildingStorey step-id a product ultimately sits in.
+///
+/// Walks the spatial + decomposition graph upward from `start`, mirroring
+/// the Python `_walk_to_storey` resolver that `m.products_in(storey)` is
+/// built on, so the denormalised `storey_guid` column on
+/// `instances.parquet` agrees with the graph walk (GH #88).
+///
+/// Resolution, in order:
+///   1. **Direct storey containment wins.** If `start` is contained
+///      (`IfcRelContainedInSpatialStructure`) directly in a storey, that
+///      storey is returned — an ancestor's storey never overrides it.
+///   2. Otherwise walk upward. At each node, an `IfcRelContainedInSpatial-
+///      Structure` container is followed first (a storey container stops
+///      the walk; a non-storey container — e.g. an `IfcSpace` — is walked
+///      through), then the `IfcRelAggregates` parent. This is how an
+///      aggregate part (a curtain-wall plate, a stair flight) inherits the
+///      storey of the host it decomposes when that host is the one actually
+///      contained in the storey.
+///
+/// Returns `None` for products with no storey above them (placed directly
+/// under an `IfcSite` / `IfcBuilding` with no intervening storey).
+///
+/// `contained_in` maps child step-id → its `IfcRelContainedInSpatial-
+/// Structure` container step-id (any spatial kind). `agg_parent` maps
+/// child step-id → its `IfcRelAggregates` parent step-id. `storey_ids` is
+/// the exact set of `IfcBuildingStorey` step-ids.
+///
+/// Cycle-safe: a `seen` set bounds the walk so malformed aggregate /
+/// containment cycles in the wild terminate with `None` rather than loop.
+fn resolve_storey_sid(
+    start: u64,
+    contained_in: &HashMap<u64, u64>,
+    agg_parent: &HashMap<u64, u64>,
+    storey_ids: &HashSet<u64>,
+) -> Option<u64> {
+    // Direct storey containment takes precedence over any inherited storey.
+    if let Some(&container) = contained_in.get(&start) {
+        if storey_ids.contains(&container) {
+            return Some(container);
+        }
+    }
+
+    let mut seen: HashSet<u64> = HashSet::new();
+    let mut cur = start;
+    loop {
+        if !seen.insert(cur) {
+            // Cycle detected — give up rather than spin forever.
+            return None;
+        }
+        // Containment edge first (a non-storey container such as an
+        // IfcSpace is walked through to its own container/parent).
+        if let Some(&container) = contained_in.get(&cur) {
+            if storey_ids.contains(&container) {
+                return Some(container);
+            }
+            cur = container;
+            continue;
+        }
+        // No containment edge — follow the aggregation parent.
+        match agg_parent.get(&cur).copied() {
+            Some(parent) => {
+                if storey_ids.contains(&parent) {
+                    return Some(parent);
+                }
+                cur = parent;
+            }
+            None => return None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::normalize_class;
+    use super::{normalize_class, resolve_storey_sid};
+    use std::collections::{HashMap, HashSet};
 
     #[test]
     fn normalize_strips_ifc_prefix() {
@@ -604,5 +672,114 @@ mod tests {
     #[test]
     fn normalize_passes_through_unknown() {
         assert_eq!(normalize_class("IfcCustomThing"), "CustomThing");
+    }
+
+    // ---- GH #88: transitive storey resolution ----------------------------
+    //
+    // Step-id legend used across these tests:
+    //   100 = IfcBuildingStorey
+    //   200 = IfcWall (host), directly contained in storey 100
+    //   201 = IfcPlate (aggregate part of the wall, NO direct containment)
+    //   300 = IfcSpace, directly contained in storey 100
+    //   301 = a product placed directly in the space 300
+    //   999 = a product placed directly under a building, no storey above
+
+    #[test]
+    fn aggregate_part_inherits_host_storey() {
+        // The plate (201) is aggregated into the wall (200), and only the
+        // wall is spatially contained in the storey (100). The plate must
+        // inherit the wall's storey — this is the case `products_in(100)`
+        // includes but the old direct-containment-only column dropped.
+        let storey_ids: HashSet<u64> = [100u64].into_iter().collect();
+        let contained_in: HashMap<u64, u64> = [(200u64, 100u64)].into_iter().collect();
+        let agg_parent: HashMap<u64, u64> = [(201u64, 200u64)].into_iter().collect();
+
+        assert_eq!(
+            resolve_storey_sid(201, &contained_in, &agg_parent, &storey_ids),
+            Some(100),
+            "aggregate part should inherit its host's storey"
+        );
+        // And the host itself still resolves directly.
+        assert_eq!(
+            resolve_storey_sid(200, &contained_in, &agg_parent, &storey_ids),
+            Some(100),
+        );
+    }
+
+    #[test]
+    fn direct_containment_takes_precedence_over_ancestor() {
+        // The part (201) is BOTH directly contained in storey 100 AND
+        // aggregated into a host (200) that is contained in a *different*
+        // storey (101). Direct containment must win.
+        let storey_ids: HashSet<u64> = [100u64, 101u64].into_iter().collect();
+        let contained_in: HashMap<u64, u64> =
+            [(201u64, 100u64), (200u64, 101u64)].into_iter().collect();
+        let agg_parent: HashMap<u64, u64> = [(201u64, 200u64)].into_iter().collect();
+
+        assert_eq!(
+            resolve_storey_sid(201, &contained_in, &agg_parent, &storey_ids),
+            Some(100),
+            "direct storey containment must override the aggregate ancestor"
+        );
+    }
+
+    #[test]
+    fn resolves_through_non_storey_container() {
+        // A product (301) directly contained in an IfcSpace (300) resolves
+        // to the space's storey — the space is walked through, not treated
+        // as the storey.
+        let storey_ids: HashSet<u64> = [100u64].into_iter().collect();
+        let contained_in: HashMap<u64, u64> =
+            [(300u64, 100u64), (301u64, 300u64)].into_iter().collect();
+        let agg_parent: HashMap<u64, u64> = HashMap::new();
+
+        assert_eq!(
+            resolve_storey_sid(301, &contained_in, &agg_parent, &storey_ids),
+            Some(100),
+        );
+    }
+
+    #[test]
+    fn no_storey_above_returns_none() {
+        // Placed directly under a building (999 -> 500), no storey present.
+        let storey_ids: HashSet<u64> = [100u64].into_iter().collect();
+        let contained_in: HashMap<u64, u64> = [(999u64, 500u64)].into_iter().collect();
+        let agg_parent: HashMap<u64, u64> = HashMap::new();
+
+        assert_eq!(
+            resolve_storey_sid(999, &contained_in, &agg_parent, &storey_ids),
+            None,
+        );
+    }
+
+    #[test]
+    fn aggregate_cycle_terminates() {
+        // Malformed data: 201 aggregates into 200, 200 aggregates into 201.
+        // No storey anywhere. The walk must terminate (cycle guard) and
+        // return None rather than loop forever.
+        let storey_ids: HashSet<u64> = [100u64].into_iter().collect();
+        let contained_in: HashMap<u64, u64> = HashMap::new();
+        let agg_parent: HashMap<u64, u64> =
+            [(201u64, 200u64), (200u64, 201u64)].into_iter().collect();
+
+        assert_eq!(
+            resolve_storey_sid(201, &contained_in, &agg_parent, &storey_ids),
+            None,
+            "aggregate cycle must not hang and resolves to no storey"
+        );
+    }
+
+    #[test]
+    fn containment_cycle_terminates() {
+        // Malformed containment cycle (no storey): 201 -> 200 -> 201.
+        let storey_ids: HashSet<u64> = [100u64].into_iter().collect();
+        let contained_in: HashMap<u64, u64> =
+            [(201u64, 200u64), (200u64, 201u64)].into_iter().collect();
+        let agg_parent: HashMap<u64, u64> = HashMap::new();
+
+        assert_eq!(
+            resolve_storey_sid(201, &contained_in, &agg_parent, &storey_ids),
+            None,
+        );
     }
 }

@@ -455,7 +455,18 @@ def _resolve_step_escapes(s: str) -> str:
 #       instead of vanishing. All six change extracted VALUES or add rows for
 #       affected files, so such cached substrates must be re-extracted; files
 #       without these constructs are byte-identical.
-_CACHE_SCHEMA_VERSION = 20
+# v21 (GH #88) — denormalised `storey_guid` / `storey_name` now inherit
+#       transitively through `IfcRelAggregates`. A product with no direct
+#       `IfcRelContainedInSpatialStructure` but an aggregate ancestor that IS
+#       spatially contained (a curtain-wall plate under its wall, a stair
+#       flight under its stair) now carries that ancestor's storey instead of
+#       null — making the columnar `filter(storey_guid=…)` path agree with the
+#       `products_in(storey)` graph walk. Direct containment keeps precedence;
+#       the upward walk is cycle-guarded. Value change on the `storey_guid` /
+#       `storey_name` columns (instances.parquet + ProductRow) for aggregate
+#       parts only → such cached substrates must be re-extracted; files with no
+#       aggregate-only parts are byte-identical.
+_CACHE_SCHEMA_VERSION = 21
 
 _FIELD_RE = re.compile(r"\(\s*(.*?)\s*\)\s*;", re.DOTALL)
 

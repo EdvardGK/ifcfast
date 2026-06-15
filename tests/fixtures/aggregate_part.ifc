@@ -1,0 +1,39 @@
+ISO-10303-21;
+HEADER;
+FILE_DESCRIPTION(('ViewDefinition [ReferenceView]'),'2;1');
+FILE_NAME('aggregate_part.ifc','2026-06-13T00:00:00',('ifcfast tests'),('Skiplum'),'ifcfast','ifcfast-tests','');
+FILE_SCHEMA(('IFC4'));
+ENDSEC;
+DATA;
+#1=IFCPROJECT('0YvctVUKr0kugbFTf53O9L',$,'Aggregate Part Project',$,$,$,$,(#5),#2);
+#2=IFCUNITASSIGNMENT((#3,#4));
+#3=IFCSIUNIT(*,.LENGTHUNIT.,$,.METRE.);
+#4=IFCSIUNIT(*,.PLANEANGLEUNIT.,$,.RADIAN.);
+#5=IFCGEOMETRICREPRESENTATIONCONTEXT($,'Model',3,1.0E-5,#6,$);
+#6=IFCAXIS2PLACEMENT3D(#7,$,$);
+#7=IFCCARTESIANPOINT((0.,0.,0.));
+#10=IFCSITE('1XvctVUKr0kugbFTf53O9L',$,'Site',$,$,#15,$,$,.ELEMENT.,(59,56,0),(10,45,0),0.,$,$);
+#11=IFCBUILDING('2XvctVUKr0kugbFTf53O9L',$,'Building A',$,$,#15,$,$,.ELEMENT.,$,$,$);
+#12=IFCBUILDINGSTOREY('3XvctVUKr0kugbFTf53O9L',$,'Plan 01',$,$,#15,$,'Plan 01',.ELEMENT.,0.0);
+#15=IFCLOCALPLACEMENT($,#6);
+#16=IFCLOCALPLACEMENT(#15,#6);
+#20=IFCRELAGGREGATES('4XvctVUKr0kugbFTf53O9L',$,$,$,#1,(#10));
+#21=IFCRELAGGREGATES('5XvctVUKr0kugbFTf53O9L',$,$,$,#10,(#11));
+#22=IFCRELAGGREGATES('6XvctVUKr0kugbFTf53O9L',$,$,$,#11,(#12));
+/* A curtain wall (host) directly contained in the storey #12. */
+#30=IFCCURTAINWALL('7XvctVUKr0kugbFTf53O9L',$,'CurtainWall-001',$,$,#16,$,'tag-cw');
+#31=IFCRELCONTAINEDINSPATIALSTRUCTURE('8XvctVUKr0kugbFTf53O9L',$,$,$,(#30),#12);
+/* A plate that is an AGGREGATE PART of the curtain wall — it has NO
+   direct IfcRelContainedInSpatialStructure of its own. Its storey must
+   be inherited from the host (#30 → storey #12). GH #88. */
+#32=IFCPLATE('9XvctVUKr0kugbFTf53O9L',$,'Plate-001',$,$,#16,$,'tag-plate');
+#33=IFCRELAGGREGATES('AXvctVUKr0kugbFTf53O9L',$,$,$,#30,(#32));
+/* A second-level aggregate part: a member aggregated into the plate, to
+   prove inheritance walks more than one aggregation hop. */
+#34=IFCMEMBER('BXvctVUKr0kugbFTf53O9L',$,'Mullion-001',$,$,#16,$,'tag-mullion');
+#35=IFCRELAGGREGATES('CXvctVUKr0kugbFTf53O9L',$,$,$,#32,(#34));
+/* A plain wall directly contained in the storey, as a control. */
+#40=IFCWALL('DXvctVUKr0kugbFTf53O9L',$,'Wall-001',$,$,#16,$,'tag-wall',.STANDARD.);
+#41=IFCRELCONTAINEDINSPATIALSTRUCTURE('EXvctVUKr0kugbFTf53O9L',$,$,$,(#40),#12);
+ENDSEC;
+END-ISO-10303-21;
