@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — header decode + no-drift cache gate (GH #87, leftovers from #84)
+
+- **`ifcfast.header()` no longer decodes with `errors="replace"`.** The
+  Tier-0 STEP-header parser turned raw cp1252 æøå in `FILE_NAME` author /
+  organization into U+FFFD silently, and passed `\X2\…\X0\` escapes
+  through verbatim. It now decodes strict-UTF-8 → lossless cp1252 /
+  latin-1 (never U+FFFD), sets a new `IFCHeader.encoding_lossy` flag on
+  the fallback, and resolves STEP string escapes (`\X2\` UTF-16BE,
+  `\X\HH` ISO-8859-1, `\S\C` Latin-1 short form) — mirroring the
+  entity-string fix (#77) on this separate Python header path. Tier-0
+  header fields only; **no cache-schema bump** (cached parquet columns
+  and the cache key are unchanged).
+- **No-mesh builds now satisfy the data-layer cache gate.** On a `_core`
+  built without the `mesh` feature, `analyse_drift` is absent so the
+  `drift` / `segments` layers never cached — `all_cached` stayed `False`
+  forever and the four good data layers (`psets`, `quantities`,
+  `materials`, `classifications`) re-extracted on every process, silently
+  defeating the documented `<200 ms` hot-reload contract. The manifest
+  now records `drift_unavailable: true` on such builds and the gate
+  excludes drift, so the four layers serve from cache. A standalone
+  `ifcfast extract` (drift not requested) does not set the flag, so a
+  later drift-wanting reader still cold-parses drift. Composes with the
+  #80 `_source_matches` freshness check + atomic writes (gate logic only;
+  no on-disk layout change).
+
 ## [0.4.38] - 2026-06-14
 
 > Correctness + security batch (10 issues + a pyo3 security bump). Parser:
