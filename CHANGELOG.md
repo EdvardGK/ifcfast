@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Tested — IfcPolygonalBoundedHalfSpace base-surface normal (GH #52)
+
+- **Regression test locking in the GH #52 fix.** Added a Rust unit test
+  (`mesh::boolean::polygonal_bounded_halfspace_normal_from_base_surface`)
+  that builds an `IfcPolygonalBoundedHalfSpace` whose `BaseSurface.Position`
+  axis (`(-0.02, 0, -0.9998)`, the Sannergata `3_6AbaPP55…` tilt) diverges
+  from the polygon's own `Position` frame (schema-default `(0, 0, 1)`), and
+  asserts the slab's first-triangle normal — the direction
+  `cut_openings::derive_plane_from_slab` removes — and the W6
+  `BoundedHalfspacePayload.plane_normal` both follow the `BaseSurface`
+  axis, never the polygon frame. Guards the `ac3b1ae` plane-normal fix and
+  its interaction with the `!AgreementFlag` convention (GH #39) against
+  regression. No behaviour change, no cut-result change, no cache-schema
+  bump.
+
 ### Fixed — header decode + no-drift cache gate (GH #87, leftovers from #84)
 
 - **`ifcfast.header()` no longer decodes with `errors="replace"`.** The
