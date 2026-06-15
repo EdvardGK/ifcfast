@@ -224,6 +224,13 @@ mod python {
     // Always emit every counter — csg-off builds carry zeros. The
     // shape stays stable so the parquet substrate and Python wrappers
     // never need to discriminate on feature flags.
+    //
+    // Gated on `mesh`: the only callers are the mesh-gated pyfunctions
+    // (extract_meshes / write_gltf / mesh_qto) and the `CutOpeningsStats`
+    // type lives under `crate::mesh`. Without this gate, a
+    // `--no-default-features --features python` build fails to compile
+    // (GH #112).
+    #[cfg(feature = "mesh")]
     fn set_cut_openings_stats(
         out: &Bound<'_, PyDict>,
         stats: &crate::mesh::cut_stats::CutOpeningsStats,
