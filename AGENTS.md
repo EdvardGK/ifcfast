@@ -154,7 +154,7 @@ releases (additions only, never reorganisations).
 | Plan work without paying extract cost | `ifcfast schema FILE --json` |
 | Type catalogue (TypeBank-shaped) | `m.type_summary()` / `m.type_bank()` |
 | Products of an entity type (incl. subtypes) | `m.by_type("IfcWall")` — mirrors `ifcopenshell.file.by_type(type, include_subtypes=True)`: **expands subtypes by default** (`by_type("IfcWall")` includes `IfcWallStandardCase`; `by_type("IfcElement")` / `by_type("IfcProduct")` return all element/product subtypes present), and matches the entity name **case-insensitively**. Pass `include_subtypes=False` for an exact single-entity match. Counts are over the *meshable-product* substrate, so abstract supertypes resolve to the concrete products the model actually carries (e.g. `IfcProduct` excludes non-meshable products like `IfcSpace`). Unknown names raise `ValueError`. (GH #81.) |
-| Iterate every product as `ProductRow` | `for p in m:` (or `m.products`, `m.filter(entity=...)`). Note `filter(storey_guid=…)` matches **direct containment only** — for storey contents including aggregate parts use `m.products_in(storey_guid)`. |
+| Iterate every product as `ProductRow` | `for p in m:` (or `m.products`, `m.filter(entity=...)`). `filter(storey_guid=…)` returns the **same set** as `m.products_in(storey_guid)` — the denormalised `storey_guid` inherits transitively through `IfcRelAggregates`, so aggregate parts (curtain-wall plates, stair flights) are included (GH #88, cache schema v21). |
 | Count of products (matches `m.products`) | `len(m)` |
 | Same data as a pandas DataFrame | `m.products_df` |
 | What changed between v1 and v2? | `m.diff(other_path)` |
@@ -194,7 +194,12 @@ describing via `pq.read_schema(...)`):
   `predefined_type` (the IFC `PredefinedType` enum, e.g. `DOOR`,
   `USERDEFINED`, `NOTDEFINED`; `None` when the schema/entity has none —
   see Conventions for the IFC4 door/window correction), `object_type`,
-  `storey_guid`, `aggregates_parent_guid`, `type_guid`, `rep_id`.
+  `storey_guid` (the storey the product resolves to — **transitive**:
+  inherited through `IfcRelAggregates` when the product itself has no
+  direct `IfcRelContainedInSpatialStructure`, so it agrees with the
+  graph walk; `None` only when no storey sits above it, e.g. placed
+  straight under a building/site — GH #88, cache schema v21),
+  `aggregates_parent_guid`, `type_guid`, `rep_id`.
   `type_guid` / `type_name` resolve through `IfcRelDefinesByType` and
   cover bare `IfcTypeProduct` / `IfcTypeObject` types too (since cache
   schema v19, GH #69) — Revit emits those base classes for types with
@@ -397,6 +402,22 @@ the project's unit scale as parquet schema metadata
   not alter any cached parquet column or the cache key.
 - **Traversal helpers never raise on unknown guids.** Missing → `None`
   for scalars, `[]` for lists. Safe to call without guarding.
+- **Storey membership is one answer, not two (since GH #88, cache
+  schema v21).** The denormalised `storey_guid` / `storey_name` on
+  `ProductRow` and on `instances.parquet` is the storey a product
+  *resolves* to, walking up **both** `IfcRelContainedInSpatialStructure`
+  and `IfcRelAggregates`. A product with no direct spatial containment
+  inherits the storey of the aggregate ancestor that *is* contained — a
+  curtain-wall plate takes its wall's storey, a stair flight its stair's.
+  Direct containment keeps precedence (a directly-contained product uses
+  *its* storey, never an ancestor's), and the upward walk is
+  cycle-guarded. Consequence: `m.filter(storey_guid=S)`, a DuckDB
+  `WHERE storey_guid = S` on `instances.parquet`, `m.storey_of(p)`, and
+  `m.products_in(S)` all return the **same** membership. Before v21 the
+  column was direct-containment-only, so the columnar filter silently
+  dropped aggregate parts the graph walk included. `storey_guid` is
+  `None` only when no storey sits above the product at all (placed
+  straight under an `IfcSite` / `IfcBuilding`).
 - **Typos fail loudly; absences fail quietly.** An unknown *table*
   (`m.preview("nope")`), *entity name* (`m.by_type("IfcWal")`,
   `m.filter(entity=…)`) or *mode* (`m.filter(mode=…)`) raises

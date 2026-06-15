@@ -18,6 +18,7 @@ import ifcfast
 
 FIXTURE = Path(__file__).parent / "fixtures" / "minimal.ifc"
 SITE_ANNOTATION = Path(__file__).parent / "fixtures" / "site_annotation.ifc"
+AGGREGATE_PART = Path(__file__).parent / "fixtures" / "aggregate_part.ifc"
 SANNERGATA = Path(
     "/home/edkjo/workspace/inbox/ifc-workbench/data/samples/_big/"
     "Sannergata_bygg_ARK_E.ifc"
@@ -49,6 +50,17 @@ def site_annotation(fresh_cache):
     Exercises the GH #32 fix where non-storey containment used to be
     silently dropped."""
     return ifcfast.open(str(SITE_ANNOTATION), use_cache=False, write_cache=False)
+
+
+@pytest.fixture
+def aggregate_part(fresh_cache):
+    """IFC4 fixture for GH #88. A curtain wall (#30) is directly contained
+    in storey #12; a plate (#32) is an aggregate part of the wall with NO
+    direct containment of its own, and a member (#34) is a second-level
+    aggregate part of the plate. Both must inherit the wall's storey."""
+    return ifcfast.open(
+        str(AGGREGATE_PART), use_cache=False, write_cache=False
+    )
 
 
 @pytest.fixture
@@ -137,16 +149,102 @@ def test_building_children_are_storeys(sannergata):
     )
 
 
-def test_storey_products_cardinality_matches_contained_in(sannergata):
-    """``products_in(storey)`` matches the contained_in row count for it."""
-    ci = sannergata.contained_in
-    storey_edges = ci[ci.container_kind == "storey"]
-    by_storey = storey_edges.groupby("container_guid").size().to_dict()
+def test_storey_products_cardinality_matches_resolved_storey(sannergata):
+    """``products_in(storey)`` matches the count of products whose *resolved*
+    storey is that storey.
+
+    Pre-GH #78 this was compared against the raw direct-containment row
+    count, but ``products_in`` is graph-complete (it includes aggregate
+    parts — curtain-wall plates, stair flights — that have no direct
+    ``IfcRelContainedInSpatialStructure`` of their own). After GH #88 the
+    denormalised ``ProductRow.storey_guid`` is graph-complete too, so the
+    right cardinality reference is the resolved-storey grouping, which is
+    exactly what ``filter(storey_guid=…)`` now returns."""
+    by_resolved: dict[str, int] = {}
+    for p in sannergata:
+        if p.storey_guid is not None:
+            by_resolved[p.storey_guid] = by_resolved.get(p.storey_guid, 0) + 1
     for storey in sannergata.storeys:
-        expected = by_storey.get(storey.guid, 0)
+        expected = by_resolved.get(storey.guid, 0)
         actual = len(sannergata.products_in(storey.guid))
         assert actual == expected, (
             f"storey {storey.name}: expected {expected}, got {actual}"
+        )
+
+
+def test_aggregate_part_inherits_host_storey(aggregate_part):
+    """GH #88: a product aggregated into a spatially-contained host, with no
+    direct containment of its own, inherits the host's storey on the
+    denormalised ``ProductRow.storey_guid`` column."""
+    m = aggregate_part
+    storey = m.storeys[0].guid
+    by_name = {p.name: p for p in m}
+
+    plate = by_name["Plate-001"]
+    # The plate has no direct IfcRelContainedInSpatialStructure — its
+    # storey is inherited via its aggregate host (the curtain wall).
+    ci = m.contained_in
+    directly_contained = set(ci.product_guid.values)
+    assert plate.guid not in directly_contained, (
+        "fixture invariant broken: plate must NOT be directly contained"
+    )
+    assert plate.storey_guid == storey, (
+        f"plate inherited storey {plate.storey_guid!r}, expected {storey!r}"
+    )
+    assert plate.storey_name == m.storeys[0].name
+
+    # Inheritance walks more than one aggregation hop (member → plate → wall).
+    mullion = by_name["Mullion-001"]
+    assert mullion.guid not in directly_contained
+    assert mullion.storey_guid == storey
+
+    # The denormalised column now agrees with the graph resolver.
+    assert m.storey_of(plate.guid) == storey
+    assert m.storey_of(mullion.guid) == storey
+
+
+def test_filter_storey_guid_equals_products_in(aggregate_part):
+    """GH #88: ``filter(storey_guid=S)`` returns the SAME set as
+    ``products_in(S)`` — the two storey-membership APIs no longer disagree
+    on aggregate parts."""
+    m = aggregate_part
+    for storey in m.storeys:
+        by_filter = {p.guid for p in m.filter(storey_guid=storey.guid)}
+        by_walk = set(m.products_in(storey.guid))
+        assert by_filter == by_walk, (
+            f"storey {storey.name}: filter-only={by_filter - by_walk}, "
+            f"products_in-only={by_walk - by_filter}"
+        )
+    # And specifically: the aggregate parts ARE in the filtered set.
+    storey = m.storeys[0].guid
+    names = {p.name for p in m.filter(storey_guid=storey)}
+    assert {"Plate-001", "Mullion-001"} <= names
+
+
+def test_direct_containment_precedence_over_aggregate(aggregate_part):
+    """A directly-contained product uses its own containment storey, never an
+    ancestor's. The control wall in the fixture is directly contained and
+    must resolve to that storey."""
+    m = aggregate_part
+    storey = m.storeys[0].guid
+    wall = next(p for p in m if p.name == "Wall-001")
+    ci = m.contained_in
+    assert wall.guid in set(ci.product_guid.values)
+    assert wall.storey_guid == storey
+
+
+def test_filter_equals_products_in_on_real_model(sannergata):
+    """GH #88 on a real model: every storey's ``filter(storey_guid)`` matches
+    ``products_in`` exactly. Pre-fix, aggregate parts (e.g. curtain-wall
+    plates, stair flights) were silently dropped from the filtered set."""
+    m = sannergata
+    for storey in m.storeys:
+        by_filter = {p.guid for p in m.filter(storey_guid=storey.guid)}
+        by_walk = set(m.products_in(storey.guid))
+        assert by_filter == by_walk, (
+            f"storey {storey.name}: "
+            f"products_in-only={len(by_walk - by_filter)}, "
+            f"filter-only={len(by_filter - by_walk)}"
         )
 
 

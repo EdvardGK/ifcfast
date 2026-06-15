@@ -1994,17 +1994,13 @@ def _index_native(p: Path, hdr: IFCHeader, started: float) -> Model:
     for row, sid in zip(storeys, s["step_id"]):
         row.building_guid = storey_step_to_building_guid.get(int(sid))
 
-    # Containment: child step_id → storey guid (storey-only — used
-    # below to populate ProductRow.storey_guid as a denormalised
-    # accessor for the common case). The full containment table that
-    # includes site/building/space containers is built further down
-    # against `parent_step_to_guid`.
+    # Raw IfcRelContainedInSpatialStructure edges. The denormalised
+    # per-product `storey_guid` is no longer read off a storey-only direct
+    # map here — it's resolved transitively through aggregation further
+    # down (GH #88) so it agrees with `products_in` / `storey_of`. The
+    # full long-format containment table (including site/building/space
+    # containers) is built against `parent_step_to_guid` below.
     contained_raw = raw["contained_in"]
-    contained_in: dict[int, str] = {}
-    for child, struct in zip(contained_raw["child"], contained_raw["structure"]):
-        guid = storey_step_to_guid.get(int(struct))
-        if guid is not None:
-            contained_in[int(child)] = guid
 
     # Aggregate parent map — unified across product / storey / building /
     # site / project / space step ids.
@@ -2097,6 +2093,41 @@ def _index_native(p: Path, hdr: IFCHeader, started: float) -> Model:
     # Storey name lookup (small list, linear scan is fine).
     storey_name_by_guid = {sr.guid: sr.name for sr in storeys}
 
+    # Denormalised storey resolution (GH #88). The `storey_guid` /
+    # `storey_name` columns on ProductRow must agree with the graph walk
+    # that `m.products_in(storey)` / `m.storey_of(guid)` perform — an
+    # aggregate part (a curtain-wall plate, a stair flight) inherits the
+    # storey of the host it decomposes when only the host is spatially
+    # contained. Resolving from the direct-storey-containment map alone
+    # (the old `contained_in` lookup) silently dropped those parts, so
+    # `filter(storey_guid=S)` and `products_in(S)` disagreed.
+    #
+    # Build the SAME `_GraphIndex` the Model uses and reuse
+    # `_walk_to_storey`, so the two paths cannot drift. Resolve once per
+    # product into a step_id → storey_guid map; direct storey containment
+    # keeps precedence (it's the first thing `_walk_to_storey` checks),
+    # and the walk is cycle-guarded by its depth budget + seen-set.
+    import pandas as _pd_resolve
+
+    _resolve_graph = _GraphIndex(
+        _pd_resolve.DataFrame(
+            contained_in_rows,
+            columns=["product_guid", "container_guid", "container_kind"],
+        ),
+        _pd_resolve.DataFrame(
+            aggregates_rows,
+            columns=["child_guid", "parent_guid", "parent_kind"],
+        ),
+        _pd_resolve.DataFrame(
+            storey_building_pairs, columns=["storey_guid", "building_guid"]
+        ),
+        set(product_step_to_guid.values()),
+        storey_guids={sr.guid for sr in storeys},
+    )
+    storey_guid_by_step: dict[int, Optional[str]] = {}
+    for _sid_int, _guid in product_step_to_guid.items():
+        storey_guid_by_step[_sid_int] = _walk_to_storey(_resolve_graph, _guid)
+
     # Type linkage from IfcRelDefinesByType. Build two lookups: type
     # step_id → (type_guid, type_name) and product step_id → that pair.
     type_meta_by_step: dict[int, tuple[str, Optional[str]]] = {}
@@ -2132,7 +2163,8 @@ def _index_native(p: Path, hdr: IFCHeader, started: float) -> Model:
         sid = int(pdata["step_id"][i])
         entity = pdata["entity"][i]
         mode = classify_by_name(entity, schema or "IFC4")
-        storey_guid = contained_in.get(sid)
+        # Transitive storey (GH #88) — agrees with products_in / storey_of.
+        storey_guid = storey_guid_by_step.get(sid)
         object_type = pdata["object_type"][i]
         # Three-tier resolution: IfcRelDefinesByType wins, then
         # IfcRoot.ObjectType as the Revit-export fallback, then nothing.

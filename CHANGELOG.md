@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — denormalised `storey_guid` now agrees with `products_in` (GH #88)
+
+- **Cache schema bumped `20` → `21`.** The denormalised `storey_guid` /
+  `storey_name` columns (on `ProductRow` and on `instances.parquet`) now
+  **inherit transitively through `IfcRelAggregates`.** Before this fix
+  the columns were populated from direct
+  `IfcRelContainedInSpatialStructure` containment only, so an aggregate
+  part — a curtain-wall plate under its wall, a stair flight under its
+  stair, where only the host is spatially contained — had
+  `storey_guid = None`. Meanwhile `m.products_in(storey)` walks the
+  unified graph and **includes** those parts (since GH #78), so the two
+  storey-membership APIs disagreed and the columnar
+  `m.filter(storey_guid=S)` / DuckDB `WHERE storey_guid = S` path silently
+  returned a plausible-but-incomplete set ("exit 0, silently wrong").
+  The column is now resolved by the same upward graph walk
+  (`_walk_to_storey`) that backs `m.storey_of` / `m.products_in`: a
+  product with no direct containment inherits the storey of the
+  aggregate ancestor that *is* contained. **After the fix,
+  `m.filter(storey_guid=S)` returns the exact same set as
+  `m.products_in(S)`.** Direct storey containment keeps precedence (a
+  directly-contained product uses its own storey, never an ancestor's),
+  and the walk is cycle-guarded against malformed aggregate / containment
+  loops. Both the Python indexer path (`ProductRow`) and the Rust bundle
+  path (`instances.parquet`, via a new `resolve_storey_sid` resolver)
+  were fixed in lockstep. On a real model (Grønland 55 ARK, 13 652
+  products) this attaches a storey to 1 754 aggregate parts that the old
+  column dropped; files with no aggregate-only parts are byte-identical.
+  Cached substrates of affected files must be re-extracted.
+
 ### Changed — panic-safety guarantee is now universal (GH #27)
 
 - **Every native PyO3 entry point now catches Rust panics at the
