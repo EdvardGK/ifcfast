@@ -380,6 +380,42 @@ the project's unit scale as parquet schema metadata
   `ValueError` listing the valid vocabulary — a typo must never read
   as "the model has none of these". A *valid* entity that simply
   isn't present in the file still returns an empty result.
+- **No-cache opens never need a home directory (GH #71).**
+  `ifcfast.open(path, use_cache=False, write_cache=False)` resolves the
+  cache root (`~/.cache/ifcfast` → `Path.home()`) *lazily* — only when a
+  read or write actually happens. The no-cache flags propagate to the
+  lazy data layers too, so `m.psets` / `m.quantities` / `m.materials` /
+  `m.classifications` / `m.drift` on such a model also stay off the
+  cache root. Safe in stripped CI containers / sandboxed subprocesses
+  with no resolvable `HOME` / `USERPROFILE`.
+- **Duplicate STEP ids collapse last-wins (GH #71).** A malformed file
+  that declares the same record id twice (e.g. `#30=IFCWALL(...)`
+  repeated) used to yield duplicate rows sharing a `step_id` — a
+  non-unique key column. The later declaration now wins, `step_id`
+  stays unique, and `m.summary()["duplicate_step_ids"]` reports how many
+  rows were collapsed (0 on a well-formed file). Treat a non-zero count
+  as a loud "this source is malformed" signal.
+- **Empty tables report canonical dtypes (GH #71).** A model with no
+  quantities / no geometry used to report `schemas["quantities"]` /
+  `schemas["drift"]` columns as all-`float64` (the empty-DataFrame
+  default), contradicting the documented types. Empty data layers now
+  carry their canonical per-column dtypes (`object` for strings,
+  `int64` for counts/indices, `float64` for measures), so a dtype check
+  behaves the same whether the table has rows or not.
+- **`spaces_df` carries name + storey (GH #71).** Columns are now
+  `guid`, `step_id`, `name`, `storey_guid`, `storey_name` — the
+  name/container joined from the `products` table (IfcSpace *is* a
+  product, mode-filtered into its own collection). Previously the bare
+  `(guid, step_id)` couldn't tell you a space's name, inviting a wrong
+  first query. `summary()` / `schemas` advertise the enriched column
+  set.
+- **Multi-member ifczip warns which member it used (GH #71).** A ZIP
+  container (the `.ifczip` convention, or an ifczip mis-extensioned
+  `.ifc`) with more than one `.ifc` / `.step` / `.stp` member now emits
+  a `warnings.warn` naming the chosen (largest) member and the ignored
+  ones, instead of silently reading one model with no trace. A
+  single-member archive and a no-STEP archive are unchanged (the latter
+  still raises `ValueError`).
 - **Truncated files are refused, not half-parsed.** A STEP file
   missing its `END-ISO-10303-21;` trailer (interrupted download /
   copy) raises `ValueError` at open instead of silently returning a
