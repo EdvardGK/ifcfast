@@ -42,16 +42,22 @@ The must. Definition of done for every item = **oracle-clean over the corpus**.
    meaning of "100%". Build it FIRST; every existing bug fixture becomes a
    regression test for free. Truth source = ifcopenshell (automatable), per
    product decision 2026-06-20.
-2. **Far-origin precision sweep** — the f32 signed-tetrahedra accumulator suffers
-   catastrophic cancellation on far-origin geometry (G55 lives 100 m+ out).
-   Root-caused in `crates/core/src/mesh/qto.rs:191/260` and
-   `crates/core/src/mesh/stats.rs:99/118`: **rebase to a local origin + accumulate
-   in f64**. trimesh (f64) matches Solibri; ifcfast (f32) reads 9–18% low → #114.
-   Audit *every* world-coord reduction, not just QTO.
-3. **QTO correctness cluster** — #114 (precision), #56 (~0-vol Revit walls),
-   #62 (prism bound), shell-closing so `open_shell` elements yield real mesh
-   volume instead of falling back. Keep the confidence flags; keep
-   escalate-to-kernel as the honest escape.
+2. **Far-origin precision (World/substrate path)** — the f32 signed-tetra
+   accumulator (`qto.rs:191/260`, `stats.rs:99/118`) suffers catastrophic
+   cancellation, but **only at UTM-scale georef on the `BakeFrame::World` path**
+   (`ifcfast.bundle()` / `ifcfast-bundle`). Verified numerically (recon skeptic):
+   ~0% error below ~1 km offset, sign-flipped garbage above (≈-52 000 for a 1 m³
+   cube at UTM). Fix = rebase to AABB-min + f64 accumulate; regression test =
+   1 m cube at `[6e8, 6.7e9, 0]`. **This is a real bug but NOT #114** — filed as
+   its own issue (see Corrections). `mesh_qto()` runs Local frame → precision-safe.
+3. **QTO correctness cluster** — **#56 is ALREADY FIXED** (W4 operator-aware
+   IfcBooleanResult, `f8b4cf2`) → recommend closing. Live residual = the **W6
+   polygonal-bounded-halfspace over-report** (`halfspace_clip.rs`, opposite sign).
+   Plus: a **coordinate-welding pre-pass** before `is_closed_manifold` (kills the
+   `open_shell` false-negatives that demote watertight walls to the prism path),
+   a **lower-bound tripwire** (closes the one-sided #60 gap so a future
+   collapse-to-~0 can't pass `reliable=True`), and #62 exact i_overlay 2D-union
+   footprint. Keep confidence flags + escalate-to-kernel as the honest escape.
 4. **Mesh extraction incl. cut-openings** — openings are *base logic*: a wall
    with a door hole is the truth. Pull the cut-openings CSG (#21/#64, W-programme
    #58) into the core, **reframed strictly as "match the kernel," not "expand
@@ -99,13 +105,41 @@ instead of plausible-looking demos.
 - **Capability-expansion in the kernel** — W-programme depth beyond
   oracle-required cut-openings, exact-union plans. Correctness, not capability.
 
+## Corrections from the 2026-06-20 recon swarm (7 agents, verified)
+- **#114 is NOT a precision bug.** Refuted by numeric proof + code-path analysis:
+  `mesh_qto()` runs `BakeFrame::Local` (rebased, near-origin, precision-safe), and
+  f32 cancellation produces ~0% error at the offsets named, never a clean 9–18%.
+  **Real cause: a void/opening-subtraction discrepancy** — `mesh_qto`'s mesh has
+  `IfcRelVoidsElement` openings subtracted (or void shells double-counted) vs the
+  reporter's `iter_meshes` mesh that does not. **This is a cut-openings correctness
+  bug → Layer 1.** Confirm by instrumenting GUID `3$cCJEdtT26ukdYWGUYR_6` (needs
+  the G55 file); the oracle sweep (worklist 3) measures it directly.
+- **The far-origin f32 cancellation is real but on the World/substrate `bundle()`
+  path** (UTM georef) → its own issue, not #114.
+- **#56 already fixed** by W4 (`f8b4cf2`); live residual is W6 over-report (#58).
+- **MCP psets/quantities/materials/product_card already shipped** (PR #85,
+  `a3f4047`), as did #70/#71 loud failures. Remaining MCP = `mesh_qto` + `sql`;
+  remaining loud-failure = #72 (framing) + #73 (units, silently-wrong metres).
+- **The oracle (#59) is the keystone:** every pillar's plan ends "stand it up
+  first, then the correctness work has a measurement." `prism-csg-fast` (the
+  kernel-matching pure-Rust CSG) is OFF by default — promote only on oracle parity.
+
 ## Sequenced worklist (Layer 1, in order)
-1. #59 oracle scaffold (corpus runner + ifcopenshell adapter + CI hook).
-2. #114 far-origin f32→f64+rebase fix in `qto.rs` + `stats.rs` + regression test.
-3. Oracle sweep → triage QTO divergences (#56, #62, shell-closing) by magnitude.
-4. Cut-openings oracle parity pass (#21/#64) — match-the-kernel scope.
-5. `strict=True` loud-failure pass (#70–#73).
-6. Tag **v0.5.0** on oracle-clean; release notes explain the correctness pivot.
+1. **#59 oracle scaffold** — `tests/oracle/{conftest,normalize,report}.py`, lift the
+   existing `test_matches_ifcopenshell_ground_truth` quantities diff, add greenfield
+   psets+materials adapters, pin `ifcopenshell==0.8.5`, add an oracle CI job.
+   KEYSTONE — every pillar gates on it. RAM-safe (tiny fixtures, no rebuild).
+2. **World-path f32→f64+rebase** fix + UTM regression test (new issue, not #114).
+3. **Oracle sweep** over G55/Sannergata → triage QTO + cut-mesh divergences by
+   magnitude (this is where #114's void hypothesis is confirmed/measured). On CI/edkjo.
+4. **QTO correctness:** coordinate-welding pre-pass + lower-bound tripwire + W6
+   over-report fix (`halfspace_clip.rs`) + #62 footprint — each gated by the oracle.
+5. **Cut-openings:** promote `prism-csg-fast` (W6+W9) to default IF the oracle shows
+   kernel-parity on wall-minus-door; hybrid-escalate the `Unsupported` cutter classes.
+6. **`strict=True` loud-failure** pass — #73 units (highest value: silently-wrong
+   numbers) + #72 framing (#70/#71 already shipped).
+7. **`mesh_qto` + `sql` MCP tools** (the rest of the data surface already shipped).
+8. Tag **v0.5.0** on oracle-clean; release notes explain the correctness pivot.
 
 ## Keep AGENTS.md in lockstep
 Any agent-facing surface change (MCP tools 6, write-back 8, strict default 5,
