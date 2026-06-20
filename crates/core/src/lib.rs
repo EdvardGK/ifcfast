@@ -1025,7 +1025,7 @@ mod python {
         }
         let prod_stats: Vec<crate::mesh::stats::ProductStats> = meshes
             .iter()
-            .map(crate::mesh::stats::ProductStats::from_mesh)
+            .map(|m| crate::mesh::stats::ProductStats::from_mesh(m, unit_scale))
             .collect();
         let file_stats = crate::mesh::stats::FileStats::from_products(&prod_stats);
 

@@ -221,9 +221,15 @@ describing via `pq.read_schema(...)`):
   mixes open-shell garbage into totals). `volume_reliable` (bool) is the
   routing flag — `true` when `volume_m3` is the mesh value and it's
   trustworthy (closed manifold, or a non-manifold whose volume is still
-  within its tight prism upper bound); `false` when the mesh volume was
-  provably too big (exceeded the prism bound) so `volume_m3` is the prism
-  fallback, or the rep is degenerate. Send `false` rows to an
+  within its tight prism upper bound); `false` when the mesh volume is
+  out of bounds either way — provably too big (exceeded the prism bound)
+  **or** collapsed to ~0 against a multi-litre prism bound (a CSG
+  over-subtraction signature) — so `volume_m3` is the prism fallback, or
+  the rep is degenerate. The open-shell classifier first welds
+  coincident fragment-duplicate vertices (brep step_id dedup /
+  CSG-fragment stitching) on a ~0.1 mm grid before flagging, so
+  genuinely-watertight meshes are not demoted on a vertex-dedup
+  technicality. Send `false` rows to an
   authoritative kernel. `volume_method` is `"mesh"` / `"prism_fallback"`;
   `volume_mesh_m3` is the raw mesh volume regardless of reliability;
   `volume_prism_bound_m3` is the prism bound — the min over the three

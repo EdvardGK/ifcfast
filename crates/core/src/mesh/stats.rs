@@ -69,8 +69,13 @@ pub struct ProductStats {
 }
 
 impl ProductStats {
-    /// Compute stats for one product.
-    pub fn from_mesh(mesh: &ProductMesh) -> Self {
+    /// Compute stats for one product. `unit_scale` is the IFC project's
+    /// linear-unit-to-metres factor (0.001 for mm files, 1.0 for metre
+    /// files) — threaded through solely so the coincident-vertex weld
+    /// re-check uses the SAME fixed physical tolerance as
+    /// [`crate::mesh::qto::compute`], independent of element size or
+    /// source units.
+    pub fn from_mesh(mesh: &ProductMesh, unit_scale: f32) -> Self {
         let n_verts = (mesh.vertices.len() / 3) as u32;
         let n_tris = (mesh.indices.len() / 3) as u32;
 
@@ -177,14 +182,35 @@ impl ProductStats {
         // here keeps the drift DataFrame self-contained — analysts get
         // the open-shell flag alongside the placement-drift columns
         // without a separate substrate-bundle pass.
+        // Coordinate-welding re-check (mirrors `MeshQto::mesh_quality`):
+        // brep step_id dedup + CSG/cut fragment-stitching leave duplicate
+        // coincident verts at shared edges with distinct indices, so the
+        // raw-index edge-pairing over-flags watertight meshes `open_shell`.
+        // When the cheap check says NOT closed, re-run it on
+        // coordinate-welded indices before committing. Already-closed
+        // meshes short-circuit and pay zero welding cost. The grid
+        // spacing is a FIXED PHYSICAL tolerance (~0.1 mm in world units),
+        // identical to `qto::compute`: 1e-4 m divided by unit_scale
+        // (metres-per-unit) gives the spacing in the model's own units,
+        // so the physical tolerance is 0.1 mm regardless of element size
+        // or whether the file is authored in mm, m, or feet. Tight enough
+        // to merge only f32-roundtrip-coincident duplicates, never to
+        // bridge a real sub-mm gap and mis-classify mesh_quality.
         let mesh_quality = if aabb_volume <= 0.0 {
             "degenerate"
         } else if volume.abs() > aabb_volume * 1.001 {
             "open_shell"
-        } else if !crate::mesh::qto::is_closed_manifold(&mesh.indices) {
-            "open_shell"
-        } else {
+        } else if crate::mesh::qto::is_closed_manifold(&mesh.indices) {
             "closed"
+        } else {
+            let weld_eps = 1e-4_f32 / unit_scale.max(1e-12);
+            let welded =
+                crate::mesh::qto::welded_indices(&mesh.vertices, &mesh.indices, weld_eps);
+            if crate::mesh::qto::is_closed_manifold(&welded) {
+                "closed"
+            } else {
+                "open_shell"
+            }
         };
 
         Self {

@@ -97,11 +97,15 @@ fn main() -> ExitCode {
         }
     };
     // Always compute stats — cheap relative to meshing, and feeds the
-    // CLI summary regardless of output format.
+    // CLI summary regardless of output format. Index once for the
+    // project unit_scale (metres per model unit); the mesh-quality weld
+    // re-check needs it for its fixed ~0.1 mm physical tolerance, and
+    // the index pass is small next to the mesh pass already done.
+    let unit_scale = _core::indexer::index(&mmap).unit_scale.unwrap_or(1.0) as f32;
     let t_stats = Instant::now();
     let prod_stats: Vec<mesh::stats::ProductStats> = meshes
         .iter()
-        .map(mesh::stats::ProductStats::from_mesh)
+        .map(|m| mesh::stats::ProductStats::from_mesh(m, unit_scale))
         .collect();
     let file_stats = mesh::stats::FileStats::from_products(&prod_stats);
     let stats_ms = t_stats.elapsed().as_secs_f64() * 1000.0;
