@@ -95,15 +95,28 @@ impl ProductStats {
             xmax = 0.0; ymax = 0.0; zmax = 0.0;
         }
 
-        let mut surface_area: f32 = 0.0;
-        let mut volume_x6: f32 = 0.0; // volume × 6, divided out at end
+        // GH #116: rebase by the AABB-min origin before forming the
+        // signed-tetra / cross-product terms, and accumulate in f64.
+        // Absolute UTM-georef coords (x≈6e8 mm, y≈6.7e9 mm) overflow f32's
+        // mantissa in the triple products and the small per-element
+        // differences cancel — a 1 m³ cube reads as sign-flipped garbage.
+        // The AABB-min is the element's own corner, so rebased coords are
+        // bounded to its extent; the signed-tetra sum is translation-
+        // invariant so the volume is unchanged. bbox columns stay absolute.
+        let ox = xmin as f64;
+        let oy = ymin as f64;
+        let oz = zmin as f64;
+
+        let mut surface_area: f64 = 0.0;
+        let mut volume_x6: f64 = 0.0; // volume × 6, divided out at end
 
         for tri in mesh.indices.chunks_exact(3) {
             let (a, b, c) = (tri[0] as usize, tri[1] as usize, tri[2] as usize);
-            // Bounds-safe — we wrote these triangles ourselves.
-            let ax = mesh.vertices[a * 3];     let ay = mesh.vertices[a * 3 + 1]; let az = mesh.vertices[a * 3 + 2];
-            let bx = mesh.vertices[b * 3];     let by = mesh.vertices[b * 3 + 1]; let bz = mesh.vertices[b * 3 + 2];
-            let cx = mesh.vertices[c * 3];     let cy = mesh.vertices[c * 3 + 1]; let cz = mesh.vertices[c * 3 + 2];
+            // Bounds-safe — we wrote these triangles ourselves. Rebase in
+            // f64 so the subtraction is exact at far georef.
+            let ax = mesh.vertices[a * 3] as f64 - ox;     let ay = mesh.vertices[a * 3 + 1] as f64 - oy; let az = mesh.vertices[a * 3 + 2] as f64 - oz;
+            let bx = mesh.vertices[b * 3] as f64 - ox;     let by = mesh.vertices[b * 3 + 1] as f64 - oy; let bz = mesh.vertices[b * 3 + 2] as f64 - oz;
+            let cx = mesh.vertices[c * 3] as f64 - ox;     let cy = mesh.vertices[c * 3 + 1] as f64 - oy; let cz = mesh.vertices[c * 3 + 2] as f64 - oz;
 
             // ((b - a) × (c - a)) — un-normalised area normal
             let ux = bx - ax; let uy = by - ay; let uz = bz - az;
@@ -119,7 +132,9 @@ impl ProductStats {
                        + ay * (bz * cx - bx * cz)
                        + az * (bx * cy - by * cx);
         }
-        let volume = volume_x6 / 6.0;
+        // Cast the f64 accumulators back to f32 only at the struct boundary.
+        let surface_area = surface_area as f32;
+        let volume = (volume_x6 / 6.0) as f32;
 
         let aabb_volume = (xmax - xmin) * (ymax - ymin) * (zmax - zmin);
 

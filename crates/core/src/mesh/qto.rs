@@ -187,20 +187,46 @@ pub fn compute(vertices: &[f32], indices: &[u32], unit_scale: f32) -> MeshQto {
     let area_scale = unit_scale * unit_scale; // m² scaling
     let volume_scale = unit_scale * unit_scale * unit_scale; // m³ scaling
 
-    let mut surface_area_raw: f32 = 0.0;
-    let mut volume_x6_raw: f32 = 0.0;
-    let mut area_top_raw: f32 = 0.0;
-    let mut area_bottom_raw: f32 = 0.0;
-    let mut area_side_raw: f32 = 0.0;
-    let mut area_inclined_raw: f32 = 0.0;
-
-    // AABB tracked inline so the volume_box stays free of a second pass.
+    // GH #116: rebase every vertex by the AABB-min before forming the
+    // signed-tetra products. The divergence accumulator sums products of
+    // three coordinates; at a UTM georef (x≈6e5, y≈6.7e6, in mm that's
+    // ~6e8 / 6.7e9) those products overflow f32's 24-bit mantissa and the
+    // small per-element differences cancel catastrophically — the recon
+    // measured a 1 m³ cube reading ~-52428 (sign-flipped garbage). The
+    // AABB-min is the element's own corner, so rebased coords are bounded
+    // to the element's size (sub-metre … tens of metres) regardless of
+    // world placement; the signed-tetra sum is translation-invariant so
+    // the volume is unchanged. AABB-min (not first-vertex) so the bound is
+    // the element extent, never the distance between two far vertices.
+    //
+    // The AABB needs a pre-pass because the rebase origin must be known
+    // before the main accumulation loop. Walk all vertices once for the
+    // full AABB; this also serves the aabb_volume_m3 / prism columns.
     let mut xmin = f32::INFINITY;
     let mut ymin = f32::INFINITY;
     let mut zmin = f32::INFINITY;
     let mut xmax = f32::NEG_INFINITY;
     let mut ymax = f32::NEG_INFINITY;
     let mut zmax = f32::NEG_INFINITY;
+    for chunk in vertices.chunks_exact(3) {
+        let (x, y, z) = (chunk[0], chunk[1], chunk[2]);
+        if x < xmin { xmin = x; } if x > xmax { xmax = x; }
+        if y < ymin { ymin = y; } if y > ymax { ymax = y; }
+        if z < zmin { zmin = z; } if z > zmax { zmax = z; }
+    }
+    // Rebase origin (f64 to keep the subtraction exact at far georef).
+    let (ox, oy, oz) = if xmin.is_finite() {
+        (xmin as f64, ymin as f64, zmin as f64)
+    } else {
+        (0.0, 0.0, 0.0)
+    };
+
+    let mut surface_area_raw: f64 = 0.0;
+    let mut volume_x6_raw: f64 = 0.0;
+    let mut area_top_raw: f32 = 0.0;
+    let mut area_bottom_raw: f32 = 0.0;
+    let mut area_side_raw: f32 = 0.0;
+    let mut area_inclined_raw: f32 = 0.0;
 
     // Planar-surface aggregation. Small linear-probe map keyed by the
     // 3-int quantized normal — typical building elements have 6-20
@@ -218,30 +244,24 @@ pub fn compute(vertices: &[f32], indices: &[u32], unit_scale: f32) -> MeshQto {
         let off_a = a * 3;
         let off_b = b * 3;
         let off_c = c * 3;
-        if off_c + 2 >= vertices.len() {
+        if off_a.max(off_b).max(off_c) + 2 >= vertices.len() {
             continue;
         }
 
-        let ax = vertices[off_a];
-        let ay = vertices[off_a + 1];
-        let az = vertices[off_a + 2];
-        let bx = vertices[off_b];
-        let by = vertices[off_b + 1];
-        let bz = vertices[off_b + 2];
-        let cx = vertices[off_c];
-        let cy = vertices[off_c + 1];
-        let cz = vertices[off_c + 2];
-
-        // AABB update — cheaper to do here than to rewalk later.
-        if ax < xmin { xmin = ax; } if ax > xmax { xmax = ax; }
-        if ay < ymin { ymin = ay; } if ay > ymax { ymax = ay; }
-        if az < zmin { zmin = az; } if az > zmax { zmax = az; }
-        if bx < xmin { xmin = bx; } if bx > xmax { xmax = bx; }
-        if by < ymin { ymin = by; } if by > ymax { ymax = by; }
-        if bz < zmin { zmin = bz; } if bz > zmax { zmax = bz; }
-        if cx < xmin { xmin = cx; } if cx > xmax { xmax = cx; }
-        if cy < ymin { ymin = cy; } if cy > ymax { ymax = cy; }
-        if cz < zmin { zmin = cz; } if cz > zmax { zmax = cz; }
+        // Rebase by the AABB-min origin (GH #116). Done in f64 so the
+        // subtraction is exact even when the source coord is a far-georef
+        // value whose magnitude already exceeds f32 mantissa precision.
+        // ax..cz are therefore element-local (bounded to the AABB extent),
+        // and every product below is formed in f64.
+        let ax = vertices[off_a] as f64 - ox;
+        let ay = vertices[off_a + 1] as f64 - oy;
+        let az = vertices[off_a + 2] as f64 - oz;
+        let bx = vertices[off_b] as f64 - ox;
+        let by = vertices[off_b + 1] as f64 - oy;
+        let bz = vertices[off_b + 2] as f64 - oz;
+        let cx = vertices[off_c] as f64 - ox;
+        let cy = vertices[off_c + 1] as f64 - oy;
+        let cz = vertices[off_c + 2] as f64 - oz;
 
         // Triangle area + normal direction via the cross product.
         let ux = bx - ax; let uy = by - ay; let uz = bz - az;
@@ -255,29 +275,35 @@ pub fn compute(vertices: &[f32], indices: &[u32], unit_scale: f32) -> MeshQto {
         }
         let area_raw = 0.5 * mag;
         surface_area_raw += area_raw;
+        // Per-triangle area as f32 for the orientation/planar buckets —
+        // those are differences-of-nearby-coords (no far-origin
+        // cancellation), so f32 there is fine and keeps the bucket maps
+        // and PlanarSurface fields unchanged.
+        let area_raw_f = area_raw as f32;
 
-        // Signed-tetrahedra divergence accumulator.
+        // Signed-tetrahedra divergence accumulator (f64; rebased coords).
         volume_x6_raw += ax * (by * cz - bz * cy)
                       + ay * (bz * cx - bx * cz)
                       + az * (bx * cy - by * cx);
 
         // Unit normal — used for orientation bucket + quantized key.
+        // Direction only; f32 is ample for the 0.1-quantized bucket key.
         let inv = 1.0 / mag;
-        let nx = nrx * inv;
-        let ny = nry * inv;
-        let nz = nrz * inv;
+        let nx = (nrx * inv) as f32;
+        let ny = (nry * inv) as f32;
+        let nz = (nrz * inv) as f32;
 
         // Orientation bucket. Disjoint thresholds: a triangle either
         // is "top" (within 20° of +Z), "bottom" (within 20° of -Z),
         // "side" (within 20° of horizontal plane), or "inclined".
         if nz > COS_TOP_THRESHOLD {
-            area_top_raw += area_raw;
+            area_top_raw += area_raw_f;
         } else if nz < -COS_TOP_THRESHOLD {
-            area_bottom_raw += area_raw;
+            area_bottom_raw += area_raw_f;
         } else if nz.abs() < SIN_SIDE_THRESHOLD {
-            area_side_raw += area_raw;
+            area_side_raw += area_raw_f;
         } else {
-            area_inclined_raw += area_raw;
+            area_inclined_raw += area_raw_f;
         }
 
         // Planar-surface bucket — quantize normal direction, accumulate area.
@@ -285,25 +311,25 @@ pub fn compute(vertices: &[f32], indices: &[u32], unit_scale: f32) -> MeshQto {
         // truth — small_buckets stays empty thereafter.
         let key = quantize_normal(nx, ny, nz);
         if !overflow_buckets.is_empty() {
-            *overflow_buckets.entry(key).or_insert(0.0) += area_raw;
+            *overflow_buckets.entry(key).or_insert(0.0) += area_raw_f;
         } else {
             let mut placed = false;
             for entry in small_buckets.iter_mut() {
                 if entry.0 == key {
-                    entry.1 += area_raw;
+                    entry.1 += area_raw_f;
                     placed = true;
                     break;
                 }
             }
             if !placed {
                 if small_buckets.len() < 64 {
-                    small_buckets.push((key, area_raw));
+                    small_buckets.push((key, area_raw_f));
                 } else {
                     // Migrate to HashMap once the linear scan gets expensive.
                     for (k, v) in small_buckets.drain(..) {
                         overflow_buckets.insert(k, v);
                     }
-                    *overflow_buckets.entry(key).or_insert(0.0) += area_raw;
+                    *overflow_buckets.entry(key).or_insert(0.0) += area_raw_f;
                 }
             }
         }
@@ -354,7 +380,8 @@ pub fn compute(vertices: &[f32], indices: &[u32], unit_scale: f32) -> MeshQto {
     let smallest = if smallest.is_finite() { smallest } else { 0.0 };
     let surface_count = surfaces.len() as u32;
 
-    let volume_m3 = volume_raw * volume_scale;
+    // Cast the f64 accumulator back to f32 only at this boundary (GH #116).
+    let volume_m3 = (volume_raw * volume_scale as f64) as f32;
     let aabb_volume_m3 = aabb_volume_raw * volume_scale;
 
     // Mesh validity classifier — see field docs on `MeshQto.mesh_quality`.
@@ -470,7 +497,7 @@ pub fn compute(vertices: &[f32], indices: &[u32], unit_scale: f32) -> MeshQto {
     MeshQto {
         volume_m3,
         aabb_volume_m3,
-        surface_area_m2: surface_area_raw * area_scale,
+        surface_area_m2: (surface_area_raw * area_scale as f64) as f32,
         area_top_m2: area_top_raw * area_scale,
         area_bottom_m2: area_bottom_raw * area_scale,
         area_side_m2: area_side_raw * area_scale,
@@ -734,6 +761,61 @@ mod tests {
     }
 
     #[test]
+    fn far_origin_utm_cube_volume_is_one_m3() {
+        // GH #116 regression — the signed-tetra accumulator on the
+        // BakeFrame::World path (ifcfast.bundle / ifcfast-bundle).
+        //
+        // A 1 m cube placed at a real UTM-scale world origin:
+        // x = 6e5 m (600 km easting), y = 6.7e6 m (6 700 km northing) —
+        // i.e. the absolute world coordinates the bundle path bakes for a
+        // georeferenced metre-unit model. The signed-tetra divergence
+        // accumulator sums products of three ABSOLUTE coordinates; pre-fix
+        // those products were formed and summed in f32, blowing past the
+        // 24-bit mantissa so the tiny per-element differences cancelled
+        // catastrophically. Measured pre-fix at these coords: ~6672 m³ for
+        // a 1 m³ cube (the recon saw the same family of garbage / sign-
+        // flipped values, e.g. ~-52428). Post-fix compute() rebases every
+        // vertex by the AABB-min and accumulates in f64, recovering 1 m³
+        // exactly (the rebase is translation-invariant).
+        //
+        // Note on magnitude: at these coords (and unit_scale = 1.0) the
+        // f32 INPUT vertices are still exactly representable — span of a
+        // 1 m cube stores cleanly — so the residual is the accumulator's,
+        // which the fix drives to ~0. The same georef expressed in
+        // millimetres (x = 6e8, y = 6.7e9, unit_scale = 0.001) additionally
+        // loses precision in the f32 INPUT itself (a 1000 mm span quantizes
+        // to ~512 mm at 6.7e9), so even a perfect accumulator caps near
+        // ~1.05 m³ there — an input-representability floor outside this
+        // accumulator fix's reach. We test at the metre-scale origin to
+        // isolate (and tightly assert) the accumulator behaviour the fix
+        // owns.
+        let ox = 6.0e5_f32; // 600 km easting, metres
+        let oy = 6.7e6_f32; // 6 700 km northing, metres
+        let oz = 0.0_f32;
+        let (mut v, i) = unit_cube_world(); // ±0.5 cube, 8 verts, 1 m side
+        for c in v.chunks_exact_mut(3) {
+            c[0] += ox;
+            c[1] += oy;
+            c[2] += oz;
+        }
+        let q = compute(&v, &i, 1.0);
+        assert!(
+            (q.volume_m3.abs() - 1.0).abs() < 1e-3,
+            "far-origin UTM cube volume must be ~1 m³ (GH #116), got {} \
+             (pre-fix measured ~6672 / sign-flipped garbage)",
+            q.volume_m3
+        );
+        // The cube is a closed manifold; rebase must not change that, and
+        // the best estimate is the (now-correct) mesh volume.
+        assert_eq!(q.mesh_quality, "closed");
+        assert!(
+            (q.volume_best_m3 - 1.0).abs() < 1e-3,
+            "got {}",
+            q.volume_best_m3
+        );
+    }
+
+    #[test]
     fn unit_cube_unit_scale_mm_to_m() {
         // Same cube but expressed in mm: 1000 mm side, file authored
         // in mm so unit_scale = 0.001. Output must still be 1 m³.
@@ -893,15 +975,20 @@ mod tests {
 
     #[test]
     fn mesh_quality_open_shell_for_unclosed_box() {
-        // Unit cube translated far from origin, missing its bottom
-        // face. The divergence theorem implicitly closes the surface
-        // by joining the open boundary to the origin — when the mesh
-        // is far from origin the resulting "phantom" tetrahedra dwarf
-        // the AABB. This is the classifier's intended target: it
-        // catches *unambiguously* invalid volumes, not every open
-        // shell. (A cube centered at origin with a face removed gives
-        // |volume| ≈ 5/6 · aabb — wrong but inside the AABB; the
-        // classifier won't flag it. That's a known under-detection.)
+        // Unit cube translated off-origin, missing its bottom face.
+        //
+        // HISTORY (GH #116): this test originally relied on far-origin
+        // f32 cancellation — at `offset = 10` the signed-tetra
+        // accumulator summed products of absolute coords in f32 and the
+        // "phantom" tetrahedra dwarfed the AABB, so the cheap
+        // `|volume| > aabb` tier flagged it. That inflation WAS the bug.
+        // Post-rebase the open box now computes a correct ~1 m³ volume
+        // (within the AABB), so the cheap tier no longer fires — and it
+        // shouldn't. Open-shell detection now comes from the robust
+        // edge-pairing classifier, which is frame-agnostic and the right
+        // mechanism. We keep `offset = 10` to prove the rebase removed
+        // the false-inflation, and assert the edge-pairing path still
+        // labels the box "open_shell".
         let offset = 10.0_f32;
         let v: Vec<f32> = vec![
             offset + -0.5, offset + -0.5, offset + -0.5,
@@ -931,13 +1018,16 @@ mod tests {
         // AABB still 1.0 m³ — the missing face's vertices are still
         // referenced by adjacent faces.
         assert!((q.aabb_volume_m3 - 1.0).abs() < 1e-5);
-        let exceeds = q.volume_m3.abs() > q.aabb_volume_m3 * 1.001;
+        // Post-rebase the volume is correct and sits INSIDE the AABB —
+        // the old phantom-tetra inflation is gone (this assertion would
+        // have failed pre-fix, where |volume| was huge).
         assert!(
-            exceeds,
-            "open-shell translated cube: |volume_m3|={:.6} should \
-             exceed aabb_volume_m3={:.6}",
+            q.volume_m3.abs() <= q.aabb_volume_m3 * 1.001,
+            "post-rebase the open box volume must sit within the AABB \
+             (no more far-origin inflation): |volume_m3|={:.6}, aabb={:.6}",
             q.volume_m3, q.aabb_volume_m3
         );
+        // Edge-pairing still classifies it open (bottom face missing).
         assert_eq!(q.mesh_quality, "open_shell");
     }
 
@@ -1008,36 +1098,33 @@ mod tests {
 
     #[test]
     fn prism_fallback_replaces_garbage_volume_on_open_shell() {
-        // The far-offset cube missing its bottom face: the signed-tetra
-        // volume is enormous garbage (volume > aabb), but the footprint
-        // (1 m²) × z_extent (1 m) prism is a clean ~1 m³ estimate. The
-        // best estimate must switch to the prism, NOT the mesh garbage.
-        let offset = 10.0_f32;
-        let v: Vec<f32> = vec![
-            offset + -0.5, offset + -0.5, offset + -0.5,
-            offset +  0.5, offset + -0.5, offset + -0.5,
-            offset +  0.5, offset +  0.5, offset + -0.5,
-            offset + -0.5, offset +  0.5, offset + -0.5,
-            offset + -0.5, offset + -0.5, offset +  0.5,
-            offset +  0.5, offset + -0.5, offset +  0.5,
-            offset +  0.5, offset +  0.5, offset +  0.5,
-            offset + -0.5, offset +  0.5, offset +  0.5,
-        ];
-        // Same wind as unit_cube_world with the bottom face removed.
-        let i: Vec<u32> = vec![
-            4, 5, 6,  4, 6, 7,
-            0, 1, 5,  0, 5, 4,
-            3, 7, 6,  3, 6, 2,
-            0, 4, 7,  0, 7, 3,
-            1, 2, 6,  1, 6, 5,
-        ];
+        // A mesh whose signed-tetra volume PROVABLY exceeds its own prism
+        // bound → the tripwire must replace it with the prism estimate.
+        //
+        // HISTORY (GH #116): this test used to lean on a far-offset cube
+        // whose volume the f32-cancellation bug inflated to garbage. That
+        // inflation was the bug; post-rebase the far-offset open box gives
+        // a correct ~5/6 m³ (within the AABB), so it no longer trips the
+        // fallback. To keep exercising the fallback frame-agnostically we
+        // build a mesh that is genuinely over-volume: the closed unit cube
+        // with EVERY triangle duplicated at the same winding. The
+        // divergence volume double-counts to ~2 m³, but edge-pairing sees
+        // each edge 4× (open_shell) and the prism bound is a clean ~1 m³.
+        // 2 m³ > 1 m³ · margin → the prism fallback fires.
+        let (v, i_once) = unit_cube_world();
+        let mut i = i_once.clone();
+        i.extend_from_slice(&i_once); // duplicate every triangle, same wind
         let q = compute(&v, &i, 1.0);
         assert_eq!(q.mesh_quality, "open_shell");
         assert!(!q.volume_reliable);
         assert_eq!(q.volume_method, "prism_fallback");
-        // Raw mesh garbage is preserved on `volume_m3` (signed) but the
-        // best estimate is the prism, ~1 m³ (footprint 1 m² × 1 m).
-        assert!(q.volume_m3.abs() > q.aabb_volume_m3, "setup: mesh vol should be garbage");
+        // Raw doubled mesh volume is preserved on `volume_m3` (~2 m³) and
+        // provably exceeds the AABB (1 m³); the best estimate is the prism.
+        assert!(
+            q.volume_m3.abs() > q.aabb_volume_m3 * 1.5,
+            "setup: doubled-winding mesh volume should be ~2× the AABB, got {}",
+            q.volume_m3
+        );
         assert!(
             (q.volume_best_m3 - 1.0).abs() < 0.02,
             "prism fallback should reconstruct ~1 m³, got {}",

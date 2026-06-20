@@ -494,7 +494,20 @@ def _resolve_step_escapes(s: str) -> str:
 #       on the QTO columns for the non-closed minority → such cached substrates
 #       must be re-extracted; closed-manifold rows (prism = NaN) are
 #       byte-identical.
-_CACHE_SCHEMA_VERSION = 22
+# v23 (GH #116) — the signed-tetra volume + surface-area accumulators in
+#       qto::compute and stats::ProductStats now rebase every vertex by the
+#       element AABB-min and accumulate in f64 before casting back to f32.
+#       Previously the products of three ABSOLUTE vertex coordinates were
+#       summed in f32, so at a UTM georef (x≈6e5 m, y≈6.7e6 m — in mm that's
+#       ~6e8 / 6.7e9) the products overflowed f32's mantissa and cancelled
+#       catastrophically: a 1 m³ cube on the world-coord bundle path read as
+#       sign-flipped garbage. The rebase is translation-invariant, so for
+#       near-origin models the values are byte-identical; for far-origin
+#       (georeferenced) models `volume_m3` / `volume_best_m3` /
+#       `surface_area_m2` (and the stats `volume` / `surface_area`) change
+#       from garbage to correct → such cached substrates must be
+#       re-extracted. centroid_xyz / bbox_*_xyz stay absolute (unchanged).
+_CACHE_SCHEMA_VERSION = 23
 
 _FIELD_RE = re.compile(r"\(\s*(.*?)\s*\)\s*;", re.DOTALL)
 
