@@ -60,3 +60,22 @@ jobs:
         run: pip install pytest
       - name: Run pytest
         run: pytest -q
+
+  oracle-tests:
+    # Differential-testing oracle (GH #59 M1): opens each committed tiny
+    # fixture in BOTH ifcfast and ifcopenshell and diffs the agent-visible
+    # surfaces (quantities/psets/materials) through tests/oracle. ifcopenshell
+    # is a dev-only extra, never in the wheel — so this gate runs in its own
+    # job on a single interpreter rather than across the wheel-test matrix.
+    # Gated on the committed tests/fixtures/quantities.ifc fixture; ~30s target.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - name: Install ifcfast with dev extra (pulls ifcopenshell oracle)
+        run: pip install ".[dev]"
+      - name: Run oracle tests
+        run: pytest tests/oracle -q

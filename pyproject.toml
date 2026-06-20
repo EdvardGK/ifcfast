@@ -31,8 +31,13 @@ dependencies = [
 dev = [
     "pytest>=7.4.0",
     "openpyxl>=3.1.0",          # used by validate.py for Solibri ITO reads
-    "ifcopenshell>=0.8.0",      # codegen-only: regenerates python/ifcfast/data/schema_supertypes.py
-                                # via scripts/gen_schema_supertypes.py. NOT a runtime dep.
+    "ifcopenshell==0.8.5",      # (1) codegen: regenerates python/ifcfast/data/schema_supertypes.py
+                                #     via scripts/gen_schema_supertypes.py, and
+                                # (2) differential-testing oracle for tests/oracle (GH #59) —
+                                #     opens each tiny fixture in both libs and diffs the
+                                #     agent-visible surfaces (quantities/psets/materials).
+                                # Pinned for reproducible oracle ground truth.
+                                # Test-only / codegen-only — NEVER a runtime dep, never in the wheel.
 ]
 mcp = [
     "mcp[cli]>=1.0",            # ifcfast-mcp server (Claude Desktop / Cursor / etc.)
