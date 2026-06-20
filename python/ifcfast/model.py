@@ -25,6 +25,27 @@ from typing import Iterable, Optional
 
 from .header import IFCHeader, header as _header, native_path_for
 
+
+def _strict_signal(msg: str, strict: bool) -> None:
+    """Single loud-failure channel for data anomalies (GH #73 / #72).
+
+    The whole strict-mode surface funnels through here so the
+    raise-vs-warn decision lives in exactly one place and is never a
+    bare ``print``:
+
+    - ``strict=True``  → raise :class:`ValueError` (agents parse
+      tracebacks / exit codes; a wrong NUMBER must stop the pipeline).
+    - ``strict=False`` → :func:`warnings.warn` a :class:`UserWarning`
+      (capturable with ``warnings.catch_warnings`` / ``pytest.warns``;
+      never printed, so it can't be lost in a noisy log).
+    """
+    if strict:
+        raise ValueError(msg)
+    import warnings
+
+    warnings.warn(msg, UserWarning, stacklevel=2)
+
+
 #: One product's raw triangle mesh, as returned by :meth:`Model.meshes`.
 #: ``vertices`` is a ``float32[N, 3]`` numpy array of world-coordinate
 #: positions; ``faces`` is a ``uint32[M, 3]`` numpy array of triangle
@@ -209,6 +230,23 @@ class Model:
     _use_cache: bool = field(repr=False, default=True)
     _write_cache: bool = field(repr=False, default=True)
 
+    # GH #73 / #72: loud-failure policy. When True (the default for
+    # `open_ifc`), data anomalies that would otherwise produce silently
+    # wrong NUMBERS raise; when False they `warnings.warn(UserWarning)`.
+    # The flag is threaded onto the model so lazy / derived accessors
+    # honour the same policy the file was opened under.
+    _strict: bool = field(repr=False, default=True)
+
+    # GH #73: True iff the file declared a LENGTHUNIT that resolved to a
+    # concrete metres-per-unit scale (`unit_scale is not None`), OR
+    # declared no LENGTHUNIT at all (truly unit-less — the geometry
+    # pipeline assumes metres, which is at least an explicit assumption).
+    # False ONLY when a LENGTHUNIT *was* declared but could not be
+    # resolved (a broken IfcConversionBasedUnit chain) — in which case
+    # `unit_scale is None` masks a real unit the consumer can't recover.
+    # Under strict that case raises; non-strict warns.
+    unit_resolved: bool = field(default=True)
+
     # ------------------------------------------------------------------
     # Tier-1 queries
     # ------------------------------------------------------------------
@@ -223,15 +261,19 @@ class Model:
         derived from :attr:`unit_scale` (metres per model unit).
 
         Mirrors ifcopenshell's milli/metre mental model. Returns
-        ``"m"`` when no SI length unit was declared (``unit_scale`` is
-        ``None``) — that's the metres-assumed default the geometry
-        pipeline uses. Unrecognised scales fall back to a
-        ``f"{scale}m-per-unit"`` descriptor so the information isn't
-        lost.
+        ``"unknown"`` when no resolvable SI length unit was declared
+        (``unit_scale`` is ``None``) — GH #73. The old behaviour folded
+        this case into ``"m"``, which silently implied a metres scale on
+        files that declared none (or declared a unit that couldn't be
+        resolved). ``"unknown"`` makes the missing scale legible at the
+        property level; the geometry pipeline still *assumes* metres, but
+        the string no longer lies about it. Unrecognised numeric scales
+        fall back to a ``f"{scale}m-per-unit"`` descriptor so the
+        information isn't lost.
         """
         scale = self.unit_scale
         if scale is None:
-            return "m"
+            return "unknown"
         # Match against the known unit scales (metres per unit).
         for name, factor in (
             ("mm", 0.001),
@@ -1467,6 +1509,13 @@ class Model:
             "project_name": self.project_name,
             "authoring_app": self.authoring_app,
             "unit_scale": self.unit_scale,
+            # GH #73: loud unit signal in the first-call snapshot. False
+            # ONLY when a LENGTHUNIT was declared but couldn't be
+            # resolved (a broken conversion chain masking a real unit
+            # behind unit_scale=None); True for resolved OR truly
+            # unit-less files. Pairs with length_unit -> "unknown".
+            "unit_resolved": self.unit_resolved,
+            "length_unit": self.length_unit,
             "cache_key": getattr(self.header, "cache_key", None),
             "products": len(self),
             "storeys": len(self.storeys),
@@ -1678,7 +1727,7 @@ class Model:
         import os
 
         if isinstance(other, (str, os.PathLike)):
-            other_model = open_ifc(other)
+            other_model = open_ifc(other, strict=self._strict)
         else:
             other_model = other
 
@@ -1969,6 +2018,7 @@ def open_ifc(
     *,
     use_cache: bool = True,
     write_cache: bool = True,
+    strict: bool = True,
 ) -> Model:
     """Open an IFC file and build the tier-1 index.
 
@@ -1978,10 +2028,20 @@ def open_ifc(
 
     Data layers (psets/quantities/materials/classifications/drift) are
     lazy on the returned model.
+
+    ``strict`` (default ``True``, GH #73 / #72) controls loud failure on
+    data anomalies that would otherwise produce silently wrong NUMBERS —
+    chiefly a LENGTHUNIT that was declared but could not be resolved (a
+    broken IfcConversionBasedUnit chain), which masks a real unit behind
+    ``unit_scale is None``. ``strict=True`` raises ``ValueError``;
+    ``strict=False`` emits a capturable ``UserWarning`` instead. The
+    policy is also threaded onto :attr:`Model._strict` and passed to
+    :func:`ifcfast.header`. Hard structural failures (truncated file,
+    GH #70) raise regardless of ``strict``.
     """
     started = time.time()
     p = Path(path)
-    hdr = _header(p)
+    hdr = _header(p, strict=strict)
 
     if use_cache:
         from . import cache as _cache
@@ -1992,11 +2052,18 @@ def open_ifc(
                 cached.parse_seconds = time.time() - started
                 cached._use_cache = use_cache
                 cached._write_cache = write_cache
+                cached._strict = strict
+                # Re-evaluate the unit signal on the cache-hit path: the
+                # cached model carries `unit_scale` but not necessarily
+                # the freshly-computed `unit_resolved`. Fire the loud
+                # signal so a cache hit is as strict as a cold parse.
+                _signal_unresolved_unit(cached, p, strict)
                 return cached
 
-    model = _index_native(p, hdr, started)
+    model = _index_native(p, hdr, started, strict=strict)
     model._use_cache = use_cache
     model._write_cache = write_cache
+    model._strict = strict
 
     if write_cache:
         from . import cache as _cache
@@ -2011,7 +2078,74 @@ def open_ifc(
     return model
 
 
-def _index_native(p: Path, hdr: IFCHeader, started: float) -> Model:
+def _lengthunit_declared(p: Path) -> bool:
+    """True iff the file's STEP body declares a LENGTHUNIT entity.
+
+    Pure-Python, cheap, and `_core`-free (the Rust binding returns only
+    the resolved ``unit_scale`` and never tells us whether the *attempt*
+    was made). We only ever call this when ``unit_scale is None``, so the
+    scan happens on the rare unit-less / broken-conversion files, not the
+    hot path. The `.LENGTHUNIT.` enumeration token (dot-delimited — it's
+    an `IfcUnitEnum` value) appears in every `IfcSIUnit` /
+    `IfcConversionBasedUnit` length declaration and nowhere else in the
+    DATA section. We match the *dotted* form and only scan inside DATA,
+    so a file merely *named* `..._lengthunit.ifc` (its FILE_NAME lands in
+    the HEADER) never trips the probe. ZIP containers (.ifczip)
+    decompress via the native path, not here; on a probe failure we
+    conservatively return False (treat as truly absent) rather than crash
+    the open.
+    """
+    try:
+        with p.open("rb") as f:
+            head = f.read(4)
+            if head[:2] == b"PK":  # ZIP container — can't cheaply scan
+                return False
+            f.seek(0)
+            blob = f.read()
+    except OSError:
+        return False
+    up = blob.upper()
+    # Restrict to the DATA section so the HEADER's FILE_NAME can't match
+    # (a file literally named "*_lengthunit.ifc" otherwise false-positives).
+    data_at = up.find(b"\nDATA;")
+    if data_at < 0:
+        data_at = up.find(b"DATA;")
+    body = up[data_at:] if data_at >= 0 else up
+    return b".LENGTHUNIT." in body
+
+
+def _signal_unresolved_unit(model: Model, p: Path, strict: bool) -> None:
+    """GH #73: fire the loud signal when a LENGTHUNIT was declared but
+    could not be resolved, and stamp :attr:`Model.unit_resolved`.
+
+    ``unit_scale is None`` covers two very different cases:
+      - truly unit-less (no LENGTHUNIT at all) → `unit_resolved=True`,
+        silent; the metres assumption is at least explicit.
+      - declared-but-unresolved (broken IfcConversionBasedUnit chain) →
+        `unit_resolved=False`, raise under strict / warn otherwise; a
+        real unit is masked behind ``None`` and every derived length is
+        silently wrong.
+    """
+    if model.unit_scale is not None:
+        model.unit_resolved = True
+        return
+    if _lengthunit_declared(p):
+        model.unit_resolved = False
+        _strict_signal(
+            f"IFC file declares a LENGTHUNIT that could not be resolved "
+            f"(broken IfcConversionBasedUnit / IfcMeasureWithUnit chain); "
+            f"unit_scale is None and every derived length is in unknown "
+            f"units: {p}. Pass strict=False to downgrade this to a warning.",
+            strict,
+        )
+    else:
+        # Truly unit-less: explicit metres assumption, not a masked unit.
+        model.unit_resolved = True
+
+
+def _index_native(
+    p: Path, hdr: IFCHeader, started: float, *, strict: bool = True
+) -> Model:
     """Drive the native Rust tier-1 indexer."""
     from . import _core
     from .classify import classify_by_name, ElementMode
@@ -2321,7 +2455,7 @@ def _index_native(p: Path, hdr: IFCHeader, started: float) -> Model:
         voids_rows, columns=["opening_guid", "host_guid"]
     )
 
-    return Model(
+    model = Model(
         header=hdr,
         schema=schema or "",
         unit_scale=raw.get("unit_scale"),
@@ -2338,7 +2472,12 @@ def _index_native(p: Path, hdr: IFCHeader, started: float) -> Model:
         _aggregates_df=aggregates_df,
         _storey_building_df=storey_building_df,
         _voids_df=voids_df,
+        _strict=strict,
     )
+    # GH #73: classify the unit signal and fire the loud channel. Done
+    # here (cold parse) and again on the cache-hit path in `open_ifc`.
+    _signal_unresolved_unit(model, p, strict)
+    return model
 
 
 # ----------------------------------------------------------------------

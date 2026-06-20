@@ -54,13 +54,17 @@ mcp = FastMCP(
 _open_models: dict[str, ifcfast.Model] = {}
 
 
-def _resolve(path: str) -> ifcfast.Model:
+def _resolve(path: str, *, strict: bool = True) -> ifcfast.Model:
     """Open ``path`` (or return cached). Empty / "example" → bundled fixture.
 
     Staleness-checked (GH #83): if the file's size or mtime changed
     since the cached Model was opened, the stale entry is dropped and
     the file reopened — the parquet cache absorbs the reopen cost, and
     the agent never silently queries a pre-re-export model.
+
+    ``strict`` (GH #73 / #72) is threaded into ``ifcfast.open`` on a
+    fresh open. A model already memoised under a *different* strict
+    policy is reopened so the loud-failure behaviour matches the call.
     """
     if not path or path == "example":
         path = str(ifcfast.example_path())
@@ -71,11 +75,12 @@ def _resolve(path: str) -> ifcfast.Model:
         if (
             st.st_size != m.header.size_bytes
             or st.st_mtime_ns != m.header.mtime_ns
+            or getattr(m, "_strict", True) != strict
         ):
             del _open_models[p]
             m = None
     if m is None:
-        m = ifcfast.open(p)
+        m = ifcfast.open(p, strict=strict)
         _open_models[p] = m
     return m
 
@@ -112,21 +117,29 @@ def example_path() -> str:
 
 
 @mcp.tool()
-def open_ifc(path: str) -> dict:
+def open_ifc(path: str, strict: bool = True) -> dict:
     """Open an IFC and return its summary.
 
     Pass ``"example"`` to use the bundled fixture. The model stays
-    cached for follow-up tool calls.
+    cached for follow-up tool calls. ``strict`` (default ``True``,
+    GH #73) raises ``ValueError`` on data anomalies that would silently
+    corrupt NUMBERS — chiefly an unresolvable LENGTHUNIT (the returned
+    summary's ``unit_resolved`` is the same signal). Pass
+    ``strict=False`` to downgrade those to warnings.
     """
-    m = _resolve(path)
+    m = _resolve(path, strict=strict)
     return m.summary()
 
 
 @mcp.tool()
-def summary(path: str) -> dict:
+def summary(path: str, strict: bool = True) -> dict:
     """Cheap snapshot of an opened IFC — schema, counts, available
-    tables with shape + loaded-state. Does not trigger extracts."""
-    return _resolve(path).summary()
+    tables with shape + loaded-state. Does not trigger extracts.
+
+    Carries ``unit_resolved`` / ``length_unit`` so the first-call
+    snapshot exposes the GH #73 loud unit signal; ``strict`` mirrors
+    :func:`open_ifc`."""
+    return _resolve(path, strict=strict).summary()
 
 
 @mcp.tool()
@@ -136,14 +149,15 @@ def schemas(path: str) -> dict:
 
 
 @mcp.tool()
-def preview(path: str, table: str, n: int = 5) -> list[dict]:
+def preview(path: str, table: str, n: int = 5, strict: bool = True) -> list[dict]:
     """Sample rows from any table as plain list-of-dicts.
 
     Tables: ``products`` / ``storeys`` / ``contained_in`` /
     ``aggregates`` / ``storey_building`` / ``psets`` / ``quantities``
-    / ``materials`` / ``classifications`` / ``drift``.
+    / ``materials`` / ``classifications`` / ``drift``. ``strict``
+    mirrors :func:`open_ifc` (GH #73).
     """
-    return _resolve(path).preview(table, n=n)
+    return _resolve(path, strict=strict).preview(table, n=n)
 
 
 @mcp.tool()

@@ -378,24 +378,83 @@ regardless of the source IFC's linear unit. The substrate records
 the project's unit scale as parquet schema metadata
 (`ifcfast.unit_scale`) and the clash engine converts at load time.
 
+## Strict mode (loud failure — default ON)
+
+`ifcfast.open(path, strict=True)` is the **default**. Strict mode
+raises `ValueError` on data anomalies that would otherwise produce
+*silently wrong numbers* rather than empty results — so a bad file
+stops your pipeline instead of poisoning it. `strict=False` downgrades
+the same anomalies to a capturable `UserWarning`
+(`warnings.warn(UserWarning)`, never a `print`); catch it with
+`warnings.catch_warnings()` / `pytest.warns`.
+
+What `strict=True` raises on (GH #73 / #72):
+
+- **Unresolvable length unit.** The file declares a `LENGTHUNIT` but it
+  can't be resolved to a metres-per-unit scale (a broken
+  `IfcConversionBasedUnit → IfcMeasureWithUnit` chain). `unit_scale`
+  ends up `None`, masking a real unit — every derived length would be
+  silently wrong. (A file that declares *no* `LENGTHUNIT` at all is
+  *not* an error: it's an explicit metres assumption, so it stays
+  silent even under strict.)
+- **Missing / `UNKNOWN` `FILE_SCHEMA`**, gated when you call
+  `ifcfast.header(path, strict=True)`. An unknown schema can steer the
+  parser to the wrong entity definitions and misparse DATA (wrong
+  numbers), so it's inside the wrong-number contract. (Plain
+  `ifcfast.header(path)` stays lenient by default for introspection.)
+
+What `strict=True` **does not** raise on (warn-only, always):
+
+- **Non-UTF-8 (lossy) header decode.** A file whose STEP header isn't
+  spec-clean UTF-8 and falls back to a lossless cp1252 / latin-1 decode
+  (`encoding_lossy=True`) only ever corrupts *strings*, never numbers —
+  and the fallback itself is lossless (bytes round-trip, never U+FFFD).
+  Real Norwegian Revit / ArchiCAD exports carrying æ/ø/å as raw
+  ISO-8859-1 are routine and valid, so this stays a capturable
+  `UserWarning` even under the `strict=True` default. Opening a
+  valid-but-Latin-1 IFC never raises.
+
+Hard structural failures — a truncated / unterminated file (GH #70),
+not-a-STEP-file, a typo'd table / entity / mode (GH #71) — raise
+**regardless** of `strict`; they're never silenced.
+
+Surfaces that honour `strict`: `ifcfast.open` / `open_ifc`,
+`ifcfast.header`, the MCP `open_ifc` / `summary` / `preview` tools
+(`strict: bool = True` arg), and the CLI `index` / `schema` / `extract` /
+`types` / `drift` subcommands (`--strict` default, `--no-strict` to
+downgrade; a strict `ValueError` maps to the clean stderr + exit-1
+path). `Model.diff(other)` inherits the caller model's `strict` policy
+when it opens the right-hand file. The MCP server
+reopens a memoised model if you ask for a different `strict` policy.
+
+The loud unit signal also rides in the first-call snapshot:
+`m.summary()` (and the MCP `summary` tool) carry `unit_resolved` and
+`length_unit`, so an agent sees the problem without a second call.
+
 ## Conventions you can rely on
 
-- **Imperial files resolve to a real `unit_scale`** (since GH #73).
-  `m.unit_scale` is metres-per-model-unit and `m.length_unit` is the
-  canonical short string (`"mm"`, `"m"`, `"ft"`, `"in"`, …). Files
+- **Length unit: `unit_scale` / `unit_resolved` / `length_unit`**
+  (GH #73). `m.unit_scale` is metres-per-model-unit. Imperial files
   that declare length via `IfcConversionBasedUnit` (the FOOT / INCH
-  pattern US/UK exports use, never an `IfcSIUnit`) now resolve through
+  pattern US/UK exports use, never an `IfcSIUnit`) resolve through
   `ConversionFactor → IfcMeasureWithUnit → value × SI-base-scale` —
-  e.g. FOOT → `unit_scale == 0.3048`, `length_unit == "ft"`. Before
-  GH #73 these silently reported `unit_scale = None` / `length_unit =
-  "m"` (a 3.28× error on every derived length). **Missing-value
-  encoding:** `unit_scale` is `None` only when the file declares *no*
-  LENGTHUNIT, OR declares one that can't be resolved (a broken
-  conversion chain) — in the latter case the parser emits a loud
-  `[ifcfast] WARNING` to stderr rather than implying metres.
-  `m.length_unit` maps `None → "m"` (the metres-assumed geometry
-  default), so when correctness matters check `m.unit_scale is None`
-  directly rather than trusting `length_unit`.
+  e.g. FOOT → `unit_scale == 0.3048`. **Missing-value encoding:**
+  `unit_scale` is `None` in two cases, now disambiguated by
+  `m.unit_resolved` (also in `summary()`):
+  - **truly unit-less** (no `LENGTHUNIT` declared) →
+    `unit_resolved == True`; the geometry pipeline assumes metres, which
+    is at least an explicit assumption.
+  - **declared-but-unresolved** (broken conversion chain) →
+    `unit_resolved == False`; a real unit is masked. Under
+    `strict=True` (the default) this *raises*; `strict=False` warns.
+
+  `m.length_unit` is the canonical short string (`"mm"`, `"cm"`,
+  `"dm"`, `"m"`, `"in"`, `"ft"`, …) and **returns `"unknown"` — not
+  `"m"` — whenever `unit_scale is None`.** (Pre-GH #73 it folded `None`
+  into `"m"`, silently implying a metres scale on files that declared
+  none.) You no longer have to check `m.unit_scale is None` yourself:
+  trust `length_unit == "unknown"` / `unit_resolved`, or just open in
+  the default `strict=True` and let a masked unit raise.
 - **Header text never silently drops bytes** (since GH #87).
   `ifcfast.header(path)` decodes the STEP prelude strict-UTF-8 first
   (ISO-10303-21 ed.3 is UTF-8), then falls back to a *lossless* cp1252 /

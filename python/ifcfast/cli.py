@@ -90,7 +90,12 @@ def _cmd_demo(args: argparse.Namespace) -> int:
 def _cmd_index(args: argparse.Namespace) -> int:
     import ifcfast
 
-    m = ifcfast.open(args.file, use_cache=not args.no_cache, write_cache=not args.no_cache)
+    m = ifcfast.open(
+        args.file,
+        use_cache=not args.no_cache,
+        write_cache=not args.no_cache,
+        strict=args.strict,
+    )
     summary = m.summary()
     top = list(summary["top_types"].items())[:10]
     pretty = [
@@ -113,7 +118,12 @@ def _cmd_index(args: argparse.Namespace) -> int:
 def _cmd_schema(args: argparse.Namespace) -> int:
     import ifcfast
 
-    m = ifcfast.open(args.file, use_cache=not args.no_cache, write_cache=not args.no_cache)
+    m = ifcfast.open(
+        args.file,
+        use_cache=not args.no_cache,
+        write_cache=not args.no_cache,
+        strict=args.strict,
+    )
     payload = {"path": str(m.header.path), "schemas": m.schemas}
     pretty = [f"path: {payload['path']}", ""]
     for name, info in payload["schemas"].items():
@@ -130,7 +140,12 @@ def _cmd_types(args: argparse.Namespace) -> int:
     """Type-first extraction — sprucelab-shaped TypeBank seed."""
     import ifcfast
 
-    m = ifcfast.open(args.file, use_cache=not args.no_cache, write_cache=not args.no_cache)
+    m = ifcfast.open(
+        args.file,
+        use_cache=not args.no_cache,
+        write_cache=not args.no_cache,
+        strict=args.strict,
+    )
     rows = m.type_bank(sample_guids=args.samples) if args.with_data else m.type_summary(
         sample_guids=args.samples
     )
@@ -155,8 +170,13 @@ def _cmd_types(args: argparse.Namespace) -> int:
 
 
 def _cmd_extract(args: argparse.Namespace) -> int:
+    import ifcfast
     from ifcfast.cache import extract_data_layers
 
+    # GH #73: fire the loud header + unit signal under the chosen policy
+    # before extracting. open() is cheap (cache-hit) and the ValueError
+    # routes to the existing clean stderr + exit-1 path in main().
+    ifcfast.open(args.file, strict=args.strict)
     layers = extract_data_layers(args.file, include_drift=False)
     counts = {
         "psets":           0 if layers.psets is None else int(len(layers.psets)),
@@ -183,7 +203,7 @@ def _cmd_extract(args: argparse.Namespace) -> int:
 def _cmd_drift(args: argparse.Namespace) -> int:
     import ifcfast
 
-    m = ifcfast.open(args.file)
+    m = ifcfast.open(args.file, strict=args.strict)
     df = m.drift
     if df is None:
         msg = "drift unavailable: _core built without `mesh` feature"
@@ -345,6 +365,21 @@ def main(argv: list[str] | None = None) -> int:
             help="emit machine-parseable JSON instead of text",
         )
 
+    def _add_strict(parser):
+        # GH #73 / #72: --strict (default) raises on data anomalies that
+        # would silently corrupt numbers (chiefly an unresolvable
+        # LENGTHUNIT); --no-strict downgrades them to warnings. The
+        # ValueError maps to the existing clean stderr + exit-1 path.
+        grp = parser.add_mutually_exclusive_group()
+        grp.add_argument(
+            "--strict", dest="strict", action="store_true", default=True,
+            help="raise on data anomalies (default)",
+        )
+        grp.add_argument(
+            "--no-strict", dest="strict", action="store_false",
+            help="downgrade data-anomaly failures to warnings",
+        )
+
     pd0 = sub.add_parser("demo", help="run against bundled minimal IFC")
     _add_json(pd0)
     pd0.set_defaults(func=_cmd_demo)
@@ -352,12 +387,14 @@ def main(argv: list[str] | None = None) -> int:
     pi = sub.add_parser("index", help="tier-1 index + counts")
     pi.add_argument("file", type=Path)
     pi.add_argument("--no-cache", action="store_true")
+    _add_strict(pi)
     _add_json(pi)
     pi.set_defaults(func=_cmd_index)
 
     ps = sub.add_parser("schema", help="dump full schema for every table")
     ps.add_argument("file", type=Path)
     ps.add_argument("--no-cache", action="store_true")
+    _add_strict(ps)
     _add_json(ps)
     ps.set_defaults(func=_cmd_schema)
 
@@ -380,17 +417,20 @@ def main(argv: list[str] | None = None) -> int:
         "--samples", type=int, default=3,
         help="sample GUIDs per type",
     )
+    _add_strict(pt)
     _add_json(pt)
     pt.set_defaults(func=_cmd_types)
 
     pe = sub.add_parser("extract", help="extract data layers")
     pe.add_argument("file", type=Path)
+    _add_strict(pe)
     _add_json(pe)
     pe.set_defaults(func=_cmd_extract)
 
     pdc = sub.add_parser("drift", help="placement / mesh drift report")
     pdc.add_argument("file", type=Path)
     pdc.add_argument("--top", type=int, default=10, help="show top-N errors")
+    _add_strict(pdc)
     _add_json(pdc)
     pdc.set_defaults(func=_cmd_drift)
 

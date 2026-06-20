@@ -585,8 +585,35 @@ def _check_step_trailer(p: Path, size: int) -> None:
         )
 
 
-def header(path: str | Path) -> IFCHeader:
-    """Parse the STEP header of an IFC file."""
+def header(path: str | Path, *, strict: bool = False) -> IFCHeader:
+    """Parse the STEP header of an IFC file.
+
+    ``strict`` (GH #73 / #72) gates header anomalies. The contract of
+    strict mode is narrow: *raise on anything that makes a NUMBER
+    silently wrong*; never raise on a benign-but-imperfect real file.
+
+    - ``encoding_lossy`` (the non-UTF-8 cp1252 / latin-1 fallback fired):
+      **always warn, never raise — even under strict.** Encoding lossiness
+      corrupts some STRING fields, not numbers, and the fallback decode is
+      itself lossless (bytes round-trip through cp1252/latin-1, never
+      U+FFFD). Real Revit / ArchiCAD exports — especially Norwegian ones
+      carrying æ/ø/å as raw ISO-8859-1 — are routinely non-UTF-8, so
+      raising here would reject a huge swath of legitimate files. It is
+      outside strict's "wrong-number" contract, so it routes through the
+      same warn channel regardless of ``strict``.
+    - ``FILE_SCHEMA`` missing / ``UNKNOWN``: kept raising under strict. An
+      unknown schema steers which entity definitions the parser applies
+      and so *can* produce misparsed DATA (wrong attribute positions →
+      wrong numbers), which is squarely inside strict's contract. This is
+      the one defensible raise; a genuinely missing schema is rare and
+      not the benign-real-file case the encoding fallback covers.
+
+    Under ``strict=False`` both pass as a capturable ``UserWarning``
+    (the historical default, kept so a bare ``ifcfast.header(path)``
+    introspection call never throws on a merely legacy-encoded file).
+    Hard failures — not a STEP file, truncated / unterminated (GH #70) —
+    raise regardless of ``strict``.
+    """
     p = Path(path)
     if not p.exists():
         raise FileNotFoundError(f"IFC file not found: {p}")
@@ -622,6 +649,30 @@ def header(path: str | Path) -> IFCHeader:
     authorisation = _parse_string(fn, 6) if fn else None
 
     cache_key = _compute_cache_key(p, size)
+
+    # FILE_SCHEMA: raises under strict (can misparse DATA → wrong numbers).
+    if strict and (schema == "UNKNOWN" or not schema):
+        raise ValueError(
+            f"IFC file declares no FILE_SCHEMA (schema is UNKNOWN); "
+            f"refusing under strict=True: {p}. "
+            f"Pass strict=False to downgrade this to a silent skip."
+        )
+
+    # encoding_lossy: WARN-only regardless of strict. The non-UTF-8 decode
+    # is itself lossless (cp1252/latin-1, never U+FFFD) and only ever
+    # touches STRING fields — never numbers. Latin-1 Norwegian (æ/ø/å)
+    # IFCs are legitimate and common; raising would reject them under the
+    # strict=True default, so this is outside strict's wrong-number
+    # contract and stays a loud-but-non-fatal UserWarning either way.
+    if encoding_lossy:
+        warnings.warn(
+            f"IFC header text is not spec-clean UTF-8 (lossless "
+            f"cp1252/latin-1 fallback fired): {p}. The field values are "
+            f"complete; this is a non-UTF-8 legacy export, not a data "
+            f"error.",
+            UserWarning,
+            stacklevel=2,
+        )
 
     return IFCHeader(
         path=str(p.resolve()),
