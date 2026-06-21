@@ -213,21 +213,20 @@ pub fn polygonal_bounded_halfspace(
     // BaseSurface.Position. W6 needs it to place the boundary polygon in
     // world for the bounded cut. Defaults to identity when absent.
     //
-    // Only the `prism-csg-fast` bounded fast-path ever reads this; default
-    // builds skip the placement-chain walk and carry an inert identity
-    // xform (the payload is constructed but never re-baked or consumed).
-    let boundary_position = if cfg!(feature = "prism-csg-fast") {
-        fields
-            .get(2)
-            .copied()
-            .and_then(|f| match parse_field(f) {
-                Field::Ref(pid) => Some(axis_placement_3d_from_id(table, pid)),
-                _ => None,
-            })
-            .unwrap_or(Mat4::IDENTITY)
-    } else {
-        Mat4::IDENTITY
-    };
+    // Read in ALL builds (GH #64 W6 default-path fix): the default
+    // halfspace clip now honours the polygon bound too (it clips only the
+    // boundary column, matching the ifcopenshell / Solibri kernel), so the
+    // boundary frame must be resolved whether or not `prism-csg-fast` is
+    // on. Previously this was gated and default builds carried an inert
+    // identity xform, which silently dropped the boundary and over-cut.
+    let boundary_position = fields
+        .get(2)
+        .copied()
+        .and_then(|f| match parse_field(f) {
+            Field::Ref(pid) => Some(axis_placement_3d_from_id(table, pid)),
+            _ => None,
+        })
+        .unwrap_or(Mat4::IDENTITY);
     let boundary_id = match fields.get(3).copied().map(parse_field) {
         Some(Field::Ref(bid)) => bid,
         _ => return None,

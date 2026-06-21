@@ -832,9 +832,10 @@ fn tessellate_one(
     let mut parts: Vec<InstancePart> = Vec::new();
     let mut mesh_anchor_f64: Option<DVec3> = None;
     let mut unhandled_types: Vec<String> = Vec::new();
-    // Only mutated under `prism-csg-fast` (the rebake loop below); stays an
-    // empty, never-pushed Vec on default builds.
-    #[cfg_attr(not(feature = "prism-csg-fast"), allow(unused_mut))]
+    // Carried in ALL builds since the W6 default-path fix: the default
+    // halfspace clip consumes these payloads to honour the polygon bound
+    // (clip only the boundary column), and the `prism-csg-fast` fast-path
+    // consumes them for its 2D region decomposition.
     let mut bounded_halfspaces: Vec<BoundedHalfspacePayload> = Vec::new();
 
     for item_id in items {
@@ -906,12 +907,10 @@ fn tessellate_one(
                     // (World) or the per-fragment offset (Local). Apply
                     // that exact map to the payload's points + xform and
                     // the linear part to its normal.
-                    // Only the `prism-csg-fast` bounded fast-path consumes
-                    // `bounded_halfspaces`; default builds skip the per-
-                    // product re-bake entirely (the payload is dropped).
-                    #[cfg(not(feature = "prism-csg-fast"))]
-                    let _ = bounded_halfspace;
-                    #[cfg(feature = "prism-csg-fast")]
+                    // Consumed in ALL builds since the W6 default-path fix:
+                    // the default halfspace clip uses the baked boundary to
+                    // clip only the boundary column; the `prism-csg-fast`
+                    // fast-path uses it for 2D region decomposition.
                     if let Some(p) = bounded_halfspace {
                         let bake_translation = match frame {
                             BakeFrame::World => anchor_f32,
@@ -1372,20 +1371,20 @@ pub(crate) fn mesh_item(
     // to re-derive. Composite handlers (boolean / csg) don't cache the
     // outer node either; their operand caches do the work.
     //
-    // `IfcPolygonalBoundedHalfSpace` is excluded ONLY under
-    // `prism-csg-fast`: there its fragment carries a `bounded_halfspace`
-    // payload that the cache tuple `(LocalMesh, &str)` cannot hold, and a
-    // cache hit would reconstruct the fragment with
-    // `bounded_halfspace: None`, silently dropping the bounded-cut params.
-    // Default builds never read the payload, so they keep caching this
-    // leaf (re-extruding the slab per repeated instance would be pure
-    // waste on facade-heavy IfcRepresentationMap files).
+    // `IfcPolygonalBoundedHalfSpace` is excluded in ALL builds: its
+    // fragment carries a `bounded_halfspace` payload that the cache tuple
+    // `(LocalMesh, &str)` cannot hold, and a cache hit would reconstruct
+    // the fragment with `bounded_halfspace: None`, silently dropping the
+    // bounded-cut params. Since the W6 default-path fix, default builds
+    // consume that payload too (the bounded halfspace clip honours the
+    // polygon column), so the leaf must not be cached anywhere. (Bounded
+    // halfspaces are rare per product; re-extruding the thin slab is
+    // cheap relative to dropping the boundary and over-cutting.)
     let is_composite = type_name.eq_ignore_ascii_case(b"IFCMAPPEDITEM")
         || type_name.eq_ignore_ascii_case(b"IFCBOOLEANRESULT")
         || type_name.eq_ignore_ascii_case(b"IFCBOOLEANCLIPPINGRESULT")
         || type_name.eq_ignore_ascii_case(b"IFCCSGSOLID")
-        || (cfg!(feature = "prism-csg-fast")
-            && type_name.eq_ignore_ascii_case(b"IFCPOLYGONALBOUNDEDHALFSPACE"));
+        || type_name.eq_ignore_ascii_case(b"IFCPOLYGONALBOUNDEDHALFSPACE");
     if !is_composite {
         let cacheable: Vec<(LocalMesh, &'static str)> = result
             .iter()

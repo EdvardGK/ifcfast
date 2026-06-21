@@ -85,16 +85,17 @@ pub fn apply(mesh: &mut ProductMesh, unit_scale: f32) -> Outcome {
     let mut halfspace_planes: Vec<(Vec3, Vec3)> = Vec::new();
     let mut solid_cutters: Vec<(Vec<f32>, Vec<u32>)> = Vec::new();
     for seg in &cutter_segs {
-        // In `prism-csg-fast` builds a polygonal-bounded-halfspace cutter
-        // is represented by its carried `BoundedHalfspacePayload` (exact
-        // plane + boundary polygon), not a slab-derived plane. Skip its
-        // slab here; the bounded fast-path below handles the tight cases
-        // and feeds the *exact* payload plane to the infinite clip for the
-        // rest (GH #64 #3 — retires the slab-centroid plane + the
-        // float-tolerance `drop_matching_plane` correlation). Default
-        // builds carry no payloads, so they keep deriving the slab plane
-        // and stay byte-identical.
-        #[cfg(feature = "prism-csg-fast")]
+        // A polygonal-bounded-halfspace cutter is represented by its
+        // carried `BoundedHalfspacePayload` (exact plane + boundary
+        // polygon), not a slab-derived plane — skip its slab here. In
+        // `prism-csg-fast` builds the bounded fast-path below handles the
+        // tight cases via 2D region decomposition; in default builds the
+        // payload becomes a finite solid cutter (the boundary column
+        // extruded through the host) that the CSG kernel subtracts so only
+        // the bounded strip is removed — NOT the infinite-plane shear that
+        // over-cut material outside the boundary (GH #64 W6). Every product
+        // now carries the payload (the slab plane derivation is retired for
+        // bounded halfspaces), so this skip applies in all builds.
         if is_bounded_halfspace_cutter(&seg.source) {
             continue;
         }
@@ -119,12 +120,47 @@ pub fn apply(mesh: &mut ProductMesh, unit_scale: f32) -> Outcome {
     // A product whose only cutters are bounded-halfspace slabs has empty
     // `halfspace_planes` / `solid_cutters` here (the slabs were skipped),
     // but it still has work to do via the carried payloads — don't bail.
-    #[cfg(feature = "prism-csg-fast")]
+    // Both build flavours now carry payloads (the slab plane derivation is
+    // retired for bounded halfspaces).
     let has_bounded_payloads = !mesh.bounded_halfspaces.is_empty();
-    #[cfg(not(feature = "prism-csg-fast"))]
-    let has_bounded_payloads = false;
     if halfspace_planes.is_empty() && solid_cutters.is_empty() && !has_bounded_payloads {
         return Outcome::Passthrough;
+    }
+
+    // Unit-aware "on-plane" tolerance (W3 / F2): a physical 1 mm in the
+    // model's source units, so mm / imperial files clip at the same
+    // physical scale as the metre files the clipper was tuned on. Resolved
+    // here (ahead of both bounded paths) because the default-build bounded
+    // cutter uses it to size its keep-side overlap margin.
+    let on_plane_eps = cut_validate::on_plane_eps(unit_scale);
+
+    // ---- W6 bounded polygonal-halfspace, default build (csg, no
+    // prism-csg-fast). ---------------------------------------------------
+    // Turn each carried `BoundedHalfspacePayload` into a FINITE solid
+    // cutter: the boundary polygon extruded along the cutting-plane normal
+    // so it spans the host on the removed side and ONLY inside the boundary
+    // column. The CSG kernel then computes `host − (halfspace ∩ boundary)`,
+    // which removes exactly the bounded strip — matching ifcopenshell /
+    // Solibri — instead of the bare-plane shear that over-cut material
+    // outside the boundary (G55_RIB wall 47.04 → 53.01 m³). A payload that
+    // can't form a cutter (boundary entirely off the remove side, or
+    // degenerate) is simply skipped: it removes nothing, which is the
+    // faithful result for a bounded column that misses the host body.
+    #[cfg(not(feature = "prism-csg-fast"))]
+    {
+        let bounded = std::mem::take(&mut mesh.bounded_halfspaces);
+        for p in &bounded {
+            if let Some(cutter) = halfspace_clip::bounded_halfspace_cutter(
+                &host.0,
+                &p.boundary,
+                p.boundary_xform,
+                p.plane_point,
+                p.plane_normal,
+                on_plane_eps,
+            ) {
+                solid_cutters.push(cutter);
+            }
+        }
     }
 
     // ---- W6 bounded polygonal-halfspace fast-path (prism-csg-fast). ----
@@ -159,11 +195,6 @@ pub fn apply(mesh: &mut ProductMesh, unit_scale: f32) -> Outcome {
             }
         }
     }
-
-    // Unit-aware "on-plane" tolerance (W3 / F2): a physical 1 mm in the
-    // model's source units, so mm / imperial files clip at the same
-    // physical scale as the metre files the clipper was tuned on.
-    let on_plane_eps = cut_validate::on_plane_eps(unit_scale);
 
     // Apply half-space clips sequentially. Each clip reduces the
     // host; if the host empties part-way we're done — the remaining
@@ -229,13 +260,13 @@ fn is_halfspace_cutter(source: &str) -> bool {
         || chain_contains(source, "halfspace_bounded:disagree")
 }
 
-/// Recognise specifically a *polygonal-bounded* half-space slab. In
-/// `prism-csg-fast` builds these are owned by their carried
-/// `BoundedHalfspacePayload`, so `apply` skips deriving a slab plane for
-/// them (see the cutter loop). Unbounded `halfspace_plane:*` slabs are
-/// NOT matched here — they have no payload and must keep their derived
-/// plane.
-#[cfg(feature = "prism-csg-fast")]
+/// Recognise specifically a *polygonal-bounded* half-space slab. These
+/// are owned by their carried `BoundedHalfspacePayload` in all builds, so
+/// `apply` skips deriving a slab plane for them (see the cutter loop) and
+/// instead consumes the payload — as a finite solid cutter (default) or 2D
+/// region decomposition (prism-csg-fast). Unbounded `halfspace_plane:*`
+/// slabs are NOT matched here — they have no payload and must keep their
+/// derived plane.
 fn is_bounded_halfspace_cutter(source: &str) -> bool {
     chain_contains(source, "halfspace_bounded:agree")
         || chain_contains(source, "halfspace_bounded:disagree")

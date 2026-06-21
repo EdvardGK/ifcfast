@@ -415,10 +415,152 @@ fn triangulate_cap_loop(
     }
 }
 
-// `Polygon2D` is unused here but imported transitively for the
-// crate's mesh module layout; silence unused-import warnings.
-#[allow(dead_code)]
-const _USES_POLYGON: Option<Polygon2D> = None;
+/// Build a finite, closed solid cutter for an `IfcPolygonalBoundedHalfSpace`
+/// — the polygon bound extruded along the cutting-plane normal so it
+/// spans the host on the **removed** side of the plane, and only there.
+///
+/// Why this exists (GH #64 W6, default-build fix): a polygonal-bounded
+/// half-space is NOT an infinite plane. Clipping the host by the bare
+/// plane ([`clip_by_plane`]) shears off *everything* on the remove side,
+/// including material that lies outside the boundary polygon's column —
+/// over-removal (G55_RIB wall lost its top slab: 47.04 vs the correct
+/// 53.01 m³). Production kernels (ifcopenshell via OpenCASCADE
+/// `BRepPrimAPI_MakeHalfSpace` intersected with the bounded prism, Revit,
+/// Solibri) treat the polygon as a real finite bound. This builds the same
+/// finite solid so the caller can subtract it with the CSG kernel:
+/// `host − (halfspace ∩ boundary_column)` removes exactly the bounded
+/// strip and leaves the rest of the host intact.
+///
+/// Geometry: the boundary 2D polygon (in its own `Position` frame) is
+/// mapped to the host's working frame by `boundary_xform`, then extruded
+/// from `eps` *behind* the plane (keep side, for a clean boolean overlap)
+/// through `host_span + 2·eps` along `+plane_normal` (the remove
+/// direction — [`clip_by_plane`] keeps the `-plane_normal` side). `host`
+/// is read only to size the sweep depth so the cutter fully spans the
+/// host's extent on the remove side; an empty/degenerate result yields
+/// `None` (caller falls back to the plane clip).
+///
+/// The output is a closed-manifold triangle mesh (caps + side strip from
+/// [`extrude_polygon`]) ready for `geom::csg::subtract_many`.
+pub fn bounded_halfspace_cutter(
+    host_vertices: &[f32],
+    boundary: &Polygon2D,
+    boundary_xform: glam::Mat4,
+    plane_point: Vec3,
+    plane_normal: Vec3,
+    on_plane_eps: f32,
+) -> Option<(Vec<f32>, Vec<u32>)> {
+    use crate::mesh::extrusion::extrude_polygon;
+    use crate::mesh::profile::Polygon2D as P2D;
+    use glam::{Mat4, Vec2, Vec4};
+
+    if boundary.outer.len() < 3 || host_vertices.len() < 9 {
+        return None;
+    }
+    let n = plane_normal.normalize_or_zero();
+    if n.length_squared() < 0.5 {
+        return None;
+    }
+
+    // In-plane orthonormal basis (e1, e2) ⟂ n. Same construction the
+    // prism-csg-fast path uses, so the two W6 routes agree on the
+    // boundary footprint frame.
+    let helper = if n.x.abs() < 0.9 { Vec3::X } else { Vec3::Y };
+    let e1 = n.cross(helper).normalize_or_zero();
+    if e1.length_squared() < 0.5 {
+        return None;
+    }
+    let e2 = n.cross(e1).normalize_or_zero();
+
+    // Map each boundary 2D point (its own `Position` frame, z = 0) into the
+    // working frame via `boundary_xform`, then PROJECT onto the cutting
+    // plane's `(e1, e2)` basis — dropping the normal component. This is the
+    // proven-correct treatment from the prism fast-path's `project_boundary`:
+    // it makes the cut robust when the boundary `Position` frame diverges
+    // from the BaseSurface plane (the GH #52 tilted-axis case), because the
+    // swept column always runs along the BaseSurface normal, not the
+    // polygon frame's local Z.
+    let to_footprint = |v: &Vec2| -> Vec2 {
+        let w = boundary_xform * Vec4::new(v.x, v.y, 0.0, 1.0);
+        let d = Vec3::new(w.x, w.y, w.z) - plane_point;
+        Vec2::new(d.dot(e1), d.dot(e2))
+    };
+    let mut outer: Vec<Vec2> = boundary.outer.iter().map(to_footprint).collect();
+    if outer.len() < 3 {
+        return None;
+    }
+    // Force the outer ring CCW so `extrude_polygon`'s caps + side strip
+    // wind outward (the CSG kernel needs an outward-facing closed cutter).
+    // The boundary may be authored either way; projecting it through
+    // `boundary_xform` can also flip its sense for a mirrored placement.
+    if ring_signed_area(&outer) < 0.0 {
+        outer.reverse();
+    }
+    let mut holes: Vec<Vec<Vec2>> = boundary
+        .holes
+        .iter()
+        .map(|h| h.iter().map(to_footprint).collect())
+        .collect();
+    // Holes must wind opposite the outer ring (CW) for the triangulator.
+    for h in &mut holes {
+        if h.len() >= 3 && ring_signed_area(h) > 0.0 {
+            h.reverse();
+        }
+    }
+    let footprint = P2D { outer, holes };
+
+    // Host extent along +n measured from the plane: how far the host
+    // reaches into the removed half-space. Size the cutter to span that
+    // plus a margin so the boolean has clean through-overlap and never
+    // leaves a coplanar-face sliver at the far cap.
+    let mut s_max = f32::NEG_INFINITY;
+    for c in host_vertices.chunks_exact(3) {
+        let s = (Vec3::new(c[0], c[1], c[2]) - plane_point).dot(n);
+        if s > s_max {
+            s_max = s;
+        }
+    }
+    // Nothing of the host is on the remove side → no bounded cut to make.
+    let eps = on_plane_eps.max(1.0e-4);
+    if s_max <= eps {
+        return None;
+    }
+    let depth = s_max + 2.0 * eps;
+
+    // Build the cutter in the `(e1, e2, n)` frame: footprint on local z = 0,
+    // swept along local +Z, with `xform` rotating that frame onto
+    // `(e1, e2, n)` in the working frame and translating to `eps` behind
+    // the plane on the KEEP side (so the near cap sits inside the host body
+    // for a clean boolean). `extrude_polygon` with `dir = +Z` and this
+    // basis produces a closed manifold prism in world coordinates.
+    let base = plane_point - n * eps;
+    let xform = Mat4::from_cols(
+        Vec4::new(e1.x, e1.y, e1.z, 0.0),
+        Vec4::new(e2.x, e2.y, e2.z, 0.0),
+        Vec4::new(n.x, n.y, n.z, 0.0),
+        Vec4::new(base.x, base.y, base.z, 1.0),
+    );
+    let cutter = extrude_polygon(&footprint, Vec3::Z, depth, xform);
+    if cutter.indices.is_empty() || cutter.vertices.len() < 9 {
+        return None;
+    }
+    Some((cutter.vertices, cutter.indices))
+}
+
+/// Signed area (shoelace) of a 2D ring; CCW positive.
+fn ring_signed_area(ring: &[glam::Vec2]) -> f32 {
+    let n = ring.len();
+    if n < 3 {
+        return 0.0;
+    }
+    let mut a = 0.0_f32;
+    for i in 0..n {
+        let p = ring[i];
+        let q = ring[(i + 1) % n];
+        a += p.x * q.y - q.x * p.y;
+    }
+    a * 0.5
+}
 
 // ----- Tests ------------------------------------------------------
 
@@ -537,6 +679,130 @@ mod tests {
         assert!(
             (vol - expected).abs() < 5e-4,
             "expected ~{expected} after corner cut, got {vol}"
+        );
+    }
+
+    use crate::mesh::profile::Polygon2D;
+    use glam::{Mat4, Vec2};
+
+    /// A 2D rectangle polygon `[x0,x1] × [y0,y1]` in its own frame.
+    fn rect(x0: f32, x1: f32, y0: f32, y1: f32) -> Polygon2D {
+        Polygon2D {
+            outer: vec![
+                Vec2::new(x0, y0),
+                Vec2::new(x1, y0),
+                Vec2::new(x1, y1),
+                Vec2::new(x0, y1),
+            ],
+            holes: Vec::new(),
+        }
+    }
+
+    fn axis_extent(verts: &[f32], axis: usize) -> (f32, f32) {
+        let mut lo = f32::INFINITY;
+        let mut hi = f32::NEG_INFINITY;
+        for c in verts.chunks_exact(3) {
+            lo = lo.min(c[axis]);
+            hi = hi.max(c[axis]);
+        }
+        (lo, hi)
+    }
+
+    /// W6 default-build core: the finite bounded cutter must span ONLY the
+    /// boundary column in the in-plane directions, and reach through the
+    /// host on the removed side. Host is a 2×1×3 box (X∈[0,2], Y∈[0,1],
+    /// Z∈[0,3]); the cutting plane is z = 2 with normal +Z (removes the
+    /// top, z>2); the boundary covers only X∈[0,1] (HALF the cross-section
+    /// in X) over the full Y. The cutter must be bounded to X∈[0,1] —
+    /// proving the strip outside the boundary (X∈[1,2]) is left intact —
+    /// while spanning the host's removed side in Z.
+    #[test]
+    fn bounded_cutter_spans_only_boundary_column() {
+        let (hv, _hi) = cube(Vec3::new(0.0, 0.0, 0.0), Vec3::new(2.0, 1.0, 3.0));
+        let boundary = rect(0.0, 1.0, 0.0, 1.0); // half the X width
+        let (cv, ci) = bounded_halfspace_cutter(
+            &hv,
+            &boundary,
+            Mat4::IDENTITY,
+            Vec3::new(0.0, 0.0, 2.0), // plane point on z = 2
+            Vec3::Z,                  // remove the +Z (z > 2) side
+            ON_PLANE_EPS_BASE_M,
+        )
+        .expect("cutter builds for a host crossing the plane");
+        assert!(!ci.is_empty(), "cutter has triangles");
+
+        // X / Y extents must match the boundary column (0..1, 0..1), NOT
+        // the full host cross-section (X would be 0..2 for a bare-plane
+        // shear). Allow the on-plane eps as slack.
+        let (xlo, xhi) = axis_extent(&cv, 0);
+        let (ylo, yhi) = axis_extent(&cv, 1);
+        let e = 1e-2;
+        assert!(xlo > -e && xlo < e, "cutter X starts at the boundary (0), got {xlo}");
+        assert!((xhi - 1.0).abs() < e, "cutter X ends at the boundary (1), got {xhi}");
+        assert!(ylo > -e && ylo < e, "cutter Y starts at 0, got {ylo}");
+        assert!((yhi - 1.0).abs() < e, "cutter Y ends at 1, got {yhi}");
+
+        // Z must reach from just below the plane (≈2) through the host top
+        // (3), covering the removed side; it must NOT dip to z = 0 (that
+        // would remove host material below the plane).
+        let (zlo, zhi) = axis_extent(&cv, 2);
+        assert!(zlo > 2.0 - 0.05 && zlo < 2.0 + 0.05, "cutter starts at the plane, got {zlo}");
+        assert!(zhi >= 3.0 - 1e-3, "cutter reaches the host top, got {zhi}");
+    }
+
+    /// A boundary entirely on the KEEP side of the plane (the host never
+    /// reaches into the removed half-space) makes no cutter — the faithful
+    /// "bounded column misses the removed region" no-op.
+    #[test]
+    fn bounded_cutter_none_when_host_below_plane() {
+        let (hv, _hi) = cube(Vec3::ZERO, Vec3::ONE); // z ∈ [0,1]
+        let boundary = rect(0.0, 1.0, 0.0, 1.0);
+        let out = bounded_halfspace_cutter(
+            &hv,
+            &boundary,
+            Mat4::IDENTITY,
+            Vec3::new(0.0, 0.0, 2.0), // plane above the whole host
+            Vec3::Z,
+            ON_PLANE_EPS_BASE_M,
+        );
+        assert!(out.is_none(), "no removed-side host → no cutter");
+    }
+
+    /// End-to-end W6 default-build behaviour: subtracting the finite
+    /// bounded cutter from the host removes ONLY the bounded strip, not the
+    /// full removed-side thickness. This is the regression the G55_RIB wall
+    /// exercises (over-removal of the top slab outside the boundary).
+    ///
+    /// Host 2×1×3 (volume 6). Plane z = 2, normal +Z removes z>2. A bare
+    /// plane clip would remove the whole top slab (X∈[0,2]) → 2·1·1 = 2,
+    /// leaving 4. The boundary covers only X∈[0,1], so the bounded cut must
+    /// remove just 1·1·1 = 1, leaving 5. Asserting ~5 (not 4) proves the
+    /// boundary is honoured.
+    #[cfg(feature = "csg")]
+    #[test]
+    fn bounded_subtract_removes_only_the_strip() {
+        let (hv, hi) = cube(Vec3::new(0.0, 0.0, 0.0), Vec3::new(2.0, 1.0, 3.0));
+        let boundary = rect(0.0, 1.0, 0.0, 1.0);
+        let (cv, ci) = bounded_halfspace_cutter(
+            &hv,
+            &boundary,
+            Mat4::IDENTITY,
+            Vec3::new(0.0, 0.0, 2.0),
+            Vec3::Z,
+            ON_PLANE_EPS_BASE_M,
+        )
+        .expect("cutter builds");
+        let (rv, ri) = crate::geom::csg::subtract_many(
+            &hv,
+            &hi,
+            &[(cv.as_slice(), ci.as_slice())],
+        )
+        .expect("subtract succeeds");
+        let vol = signed_volume(&rv, &ri).abs();
+        assert!(
+            (vol - 5.0).abs() < 5e-3,
+            "bounded cut must leave ~5 (host 6 − bounded strip 1), got {vol} \
+             (a bare-plane shear would leave 4)"
         );
     }
 }
