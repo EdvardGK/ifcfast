@@ -470,19 +470,22 @@ pub fn compute(vertices: &[f32], indices: &[u32], unit_scale: f32) -> MeshQto {
     // trust the mesh and route to the prism estimate so the collapse
     // ESCALATES (`volume_reliable = false`) instead of passing silently.
     //
-    // `LOWER_FRAC` is deliberately generous: real non-convex OPEN
-    // elements that reach this prism branch (L-beams, IfcSpaces, sloped
-    // / partially-shelled solids) routinely fill only a fraction of
-    // their prism bound, so the floor sits well below any legitimate
-    // non-convex fill ratio. (Closed RHS / hollow steel tubes are NOT
-    // examples here — a watertight hollow section is a closed manifold
-    // and takes the closed branch, never reaching this tripwire.) Only a
-    // near-total collapse trips it. `MIN_SOLID_PRISM_M3` is the solid-surface guard — a thin
-    // sheet / annotation / degenerate sliver has a tiny prism bound and
-    // a correctly-tiny volume, so we never escalate those; only elements
-    // whose prism bound proves a real 3D solid (≥ this many m³) are
-    // candidates for a collapse alarm.
-    const LOWER_FRAC: f32 = 0.5;
+    // `LOWER_FRAC` MUST stay tight (near-total collapse only). The prism
+    // is only an UPPER bound and can itself be over-inflated — e.g. an
+    // `open_shell` IfcFacetedBrep whose footprint-union over-counts
+    // (G55_RIB slab `0KQH…Msew`: mesh 131.74 m³ vs prism 342 m³). At the
+    // old 0.5 a *correct* mesh against an inflated prism read as a low
+    // fill ratio (0.385) and was wrongly declared "collapsed", emitting
+    // the inflated 342 over the correct 131.74. Only a genuine near-zero
+    // collapse (mesh → 0 vs a real solid prism — the W4 signature, fill
+    // ≈ 0) should trip this. 0.1 sits above zero-collapse yet well below
+    // any legitimate fill, so an over-inflated prism no longer drags a
+    // good mesh into the fallback. `MIN_SOLID_PRISM_M3` is the
+    // solid-surface guard — a thin sheet / annotation / degenerate sliver
+    // has a tiny prism bound and a correctly-tiny volume, so we never
+    // escalate those; only elements whose prism bound proves a real 3D
+    // solid (≥ this many m³) are candidates for a collapse alarm.
+    const LOWER_FRAC: f32 = 0.1;
     const MIN_SOLID_PRISM_M3: f32 = 1e-3; // 1 litre — below this a near-0 volume is plausibly correct
     let (volume_best_m3, volume_method, volume_reliable, volume_prism_bound_m3) =
         if mesh_quality == "closed" {
