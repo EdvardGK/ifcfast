@@ -576,23 +576,28 @@ class Model:
           else — ramps, sloped roofs), ``largest_surface_m2``,
           ``smallest_surface_m2``, ``surface_count``.
 
-          **Volume reliability (GH #60).** ``volume_m3`` is the *best*
-          estimate: the signed-tetra mesh volume when trustworthy, else a
-          ``footprint × height`` prism fallback. ``volume_reliable``
+          **Volume reliability (GH #60, #121).** ``volume_m3`` is the
+          *best* estimate: the signed-tetra mesh volume when trustworthy,
+          else a ``footprint × height`` prism fallback. ``volume_reliable``
           (bool) is the routing flag — ``True`` when ``volume_m3`` is the
           mesh value and it's trustworthy (a closed solid, or an open
-          shell whose volume is still within its tight prism bound — the
-          manifold check over-flags dedup-imperfect meshes that are in
-          fact accurate); ``False`` when the mesh volume was provably too
-          big so ``volume_m3`` is the prism fallback, or the rep is
+          shell whose volume is still within its tight upper bound, the min
+          of the prism and the AABB — the manifold check over-flags
+          dedup-imperfect meshes, and thin glazed doors / windows /
+          railings, that are in fact accurate); ``False`` when the mesh
+          volume was provably too big, collapsed to ~0 against a real
+          solid, so ``volume_m3`` is the prism fallback, or the rep is
           degenerate. Escalate the ``False`` rows to an authoritative
           kernel (see ``examples/hybrid_qto_routing.py``).
-          ``volume_method`` is ``"mesh"`` or ``"prism_fallback"``;
-          ``volume_mesh_m3`` is the raw mesh value regardless of
-          reliability; ``volume_prism_bound_m3`` is the prism bound,
-          computed for every non-closed row (``NaN`` on closed rows —
-          the watertight hot path stays raster-free); ``mesh_quality``
-          is ``"closed"`` / ``"open_shell"`` / ``"degenerate"``.
+          ``volume_method`` is ``"mesh"`` (closed manifold), ``"mesh_open"``
+          (trusted open shell — same trust as ``mesh``, split out so you
+          can filter on watertightness), or ``"prism_fallback"`` (the only
+          ``volume_reliable == False`` method); ``volume_mesh_m3`` is the
+          raw mesh value regardless of reliability; ``volume_prism_bound_m3``
+          is the prism bound, computed for every non-closed row (``NaN`` on
+          closed rows — the watertight hot path stays raster-free);
+          ``mesh_quality`` is ``"closed"`` / ``"open_shell"`` /
+          ``"degenerate"``.
         * ``surfaces_df`` — long-format, one row per distinct planar
           surface per product (sorted by area within a product).
           Columns: ``guid``, ``surface_index``, ``area_m2``, ``nx``,

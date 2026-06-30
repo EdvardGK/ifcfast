@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — open-shell QTO over-count on doors / windows / railings (GH #121)
+
+- **`mesh_qto` now trusts an open shell's mesh volume within its tight
+  upper bound instead of substituting the inflated prism.** The G55_ARK
+  oracle sweep found `volume_m3` over-counting open-shell doors, windows,
+  and railings **40–66×**: their signed-tetra mesh volume already matched
+  the ifcopenshell kernel, but the lower-bound collapse tripwire
+  (`mesh_vol < prism × 0.1`) mistook a legitimately-small volume (1.5–2.5 %
+  of a loose prism bound) for a W4 CSG collapse and emitted the prism. The
+  tripwire is retuned to a near-zero `mesh_vol < min(prism, aabb) × 1e-3`
+  test, so only a genuine mesh → ~0 against a real multi-litre solid
+  escalates; thin glazed shells keep their kernel-matching mesh value.
+- **New `volume_method` value `"mesh_open"`** distinguishes a trusted
+  open-shell mesh volume from a closed-manifold `"mesh"` (same
+  `volume_reliable = true`; filter on `mesh_quality == "closed"` for
+  watertight-only figures). The over-report and degenerate paths still
+  yield `"prism_fallback"`, the only `volume_reliable = false` method.
+- **Cache schema bumped `23` → `24`** — open-shell `volume_m3` /
+  `volume_best_m3` / `volume_method` change; closed-manifold rows are
+  byte-identical, so substrates with open-shell products must be
+  re-extracted.
+
+### Fixed — stale bounded-halfspace default-cut test (GH #114)
+
+- Updated `tight_bounded_halfspace_default_over_cuts` (now
+  `..._default_honors_polygon`) to assert the post-`add0465` default-path
+  behaviour (~0.48 m³, honoring the bounding polygon) instead of the
+  obsolete pre-fix over-cut (~0.20 m³).
+
 ## [0.4.39] - 2026-06-15
 
 Tractable-backlog batch: a single-product mesh getter, a tighter QTO

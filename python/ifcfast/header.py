@@ -507,7 +507,20 @@ def _resolve_step_escapes(s: str) -> str:
 #       `surface_area_m2` (and the stats `volume` / `surface_area`) change
 #       from garbage to correct → such cached substrates must be
 #       re-extracted. centroid_xyz / bbox_*_xyz stay absolute (unchanged).
-_CACHE_SCHEMA_VERSION = 23
+# v24 (GH #121) — open-shell QTO routing. `qto::compute` now trusts an
+#       OPEN shell's signed-tetra volume whenever it sits within the tight
+#       upper bound (min of the three-axis prism and the AABB) and has not
+#       collapsed to ~0, instead of substituting the loose prism. The W4
+#       collapse backstop was retuned from a `< prism * 0.1` fill ratio
+#       (which mis-fired on thin glazed doors / windows / railings whose
+#       true volume is a legitimately-small 1.5–2.5 % of an inflated prism)
+#       to a near-zero `< upper * 1e-3` test. Net effect: open-shell
+#       `volume_m3` / `volume_best_m3` drop from a 40–66× prism over-count
+#       to the kernel-matching mesh value, and `volume_method` carries the
+#       new `"mesh_open"` value for trusted open shells (was `"mesh"`).
+#       Closed-manifold rows are byte-identical; substrates with open-shell
+#       products must be re-extracted.
+_CACHE_SCHEMA_VERSION = 24
 
 _FIELD_RE = re.compile(r"\(\s*(.*?)\s*\)\s*;", re.DOTALL)
 

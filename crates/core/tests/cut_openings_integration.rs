@@ -1160,24 +1160,26 @@ fn manifold_volume_m3(mesh: &ProductMesh) -> f64 {
     m.volume() * 1.0e-9_f64
 }
 
-/// W6 test 1 (DEFAULT build): the infinite-plane clip over-cuts — only
-/// the slab above the plane survives (0.20 m³). This documents the F6 bug
-/// as the default-build behaviour and is the proof the bounded path is
-/// genuinely a different result. Runs on EVERY build (the `apply` default
-/// path is identical with or without `prism-csg-fast`; under
-/// `prism-csg-fast` the carried payload IS tight + reducible, so this
-/// assertion is what the next test contradicts — hence it is itself
-/// gated OFF when the feature is on to avoid contradiction).
+/// W6 test 1 (DEFAULT build): the bounded halfspace now honors its
+/// bounding polygon even on the default cut path (GH #114, commit
+/// `add0465`). Before that fix the default path treated the cutter as an
+/// infinite plane and over-cut to ~0.20 m³ (only the slab above the plane
+/// survived); the default path now removes ONLY the 300×200 boundary
+/// column below the plane → 0.48 m³, matching the `prism-csg-fast`
+/// fast-path (the sibling test below) and the 3D-CSG oracle. The two
+/// builds therefore agree; the historical default-vs-feature divergence
+/// this test used to document is closed.
 #[cfg(not(feature = "prism-csg-fast"))]
 #[test]
-fn tight_bounded_halfspace_default_over_cuts() {
+fn tight_bounded_halfspace_default_honors_polygon() {
     let mut mesh = capture_wall_from(WALL_WITH_TIGHT_BOUNDED_HALFSPACE);
     let outcome = apply(&mut mesh, 1.0);
     assert_eq!(outcome, Outcome::Cut, "bounded halfspace must cut the wall");
     let vol = manifold_volume_m3(&mesh);
     assert!(
-        (vol - 0.20).abs() < 0.02,
-        "default infinite-plane clip should over-cut to ~0.20 m³, got {vol} m³",
+        (vol - 0.48).abs() < 0.02,
+        "default bounded-halfspace cut should honor the polygon → ~0.48 m³ \
+         (0.6 − 0.12 column, GH #114), got {vol} m³",
     );
 }
 

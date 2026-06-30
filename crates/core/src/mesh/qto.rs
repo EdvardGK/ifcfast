@@ -115,12 +115,22 @@ pub struct MeshQto {
     pub volume_reliable: bool,
     /// Which definition `volume_best_m3` carries (always agrees with
     /// `volume_reliable`):
-    /// - `"mesh"`: the signed-tetra mesh volume (reliable rows).
+    /// - `"mesh"`: the signed-tetra mesh volume of a CLOSED manifold
+    ///   (reliable; watertight).
+    /// - `"mesh_open"`: the signed-tetra mesh volume of an OPEN shell that
+    ///   nonetheless sits within its tight upper bound (min of the prism
+    ///   and the AABB) and has not collapsed (GH #121). Reliable — these
+    ///   match the ifcopenshell kernel on G55 even though the edge-pairing
+    ///   classifier flags the shell open (doors, windows, railings,
+    ///   dedup-imperfect breps). Split out from `"mesh"` so an agent that
+    ///   wants ONLY watertight figures can filter on `mesh_quality ==
+    ///   "closed"` while still trusting `volume_reliable` for sums.
     /// - `"prism_fallback"`: the min-over-three-axes prism bound
     ///   (`volume_prism_bound_m3`) — substituted when the mesh volume is
-    ///   provably too big or the rep is degenerate. A tighter bound than
-    ///   the AABB; reproduces the QTO-convention prism value tools like
-    ///   Solibri report for open slabs.
+    ///   provably too big, collapsed to ~0 against a real solid, or the
+    ///   rep is degenerate. A tighter bound than the AABB; reproduces the
+    ///   QTO-convention prism value tools like Solibri report for open
+    ///   slabs. The only `volume_reliable == false` method.
     pub volume_method: &'static str,
     /// The best single volume estimate: the mesh volume when reliable,
     /// else the prism fallback (`volume_prism_bound_m3`). This is what
@@ -457,35 +467,29 @@ pub fn compute(vertices: &[f32], indices: &[u32], unit_scale: f32) -> MeshQto {
     // by integer multiples — far outside the margin (G55: tripwire fires
     // identically for any margin from 1.02 to 1.20).
     const PRISM_TRIPWIRE_MARGIN: f32 = 1.05;
-    // Lower-bound tripwire (closes the one-sided GH #60 gap). The upper
-    // tripwire above catches OVER-report (mesh_vol > prism); it is blind
-    // to COLLAPSE — a mesh volume that has fallen to ~0 sits trivially
-    // *under* the prism bound and would otherwise pass as
-    // `volume_reliable = true`, silently zeroing a real element's QTO. A
-    // future W4-class CSG regression (cut subtracting the whole solid)
-    // has exactly that signature. When the mesh volume is suspiciously
-    // SMALL relative to its own prism bound AND the prism proves the
-    // element is a genuine 3D solid (multi-axis extent → multi-m³ bound,
-    // not a planar sheet whose tiny volume is correct), we refuse to
-    // trust the mesh and route to the prism estimate so the collapse
-    // ESCALATES (`volume_reliable = false`) instead of passing silently.
+    // Near-total-collapse backstop (GH #60 / W4). The upper tripwire
+    // above catches OVER-report (mesh_vol > bound); it is blind to
+    // COLLAPSE — a mesh volume that has fallen to ~0 sits trivially under
+    // any bound and would otherwise pass as `volume_reliable = true`,
+    // silently zeroing a real element's QTO. A W4-class CSG regression
+    // (a cut subtracting the whole solid) has exactly that signature.
     //
-    // `LOWER_FRAC` MUST stay tight (near-total collapse only). The prism
-    // is only an UPPER bound and can itself be over-inflated — e.g. an
-    // `open_shell` IfcFacetedBrep whose footprint-union over-counts
-    // (G55_RIB slab `0KQH…Msew`: mesh 131.74 m³ vs prism 342 m³). At the
-    // old 0.5 a *correct* mesh against an inflated prism read as a low
-    // fill ratio (0.385) and was wrongly declared "collapsed", emitting
-    // the inflated 342 over the correct 131.74. Only a genuine near-zero
-    // collapse (mesh → 0 vs a real solid prism — the W4 signature, fill
-    // ≈ 0) should trip this. 0.1 sits above zero-collapse yet well below
-    // any legitimate fill, so an over-inflated prism no longer drags a
-    // good mesh into the fallback. `MIN_SOLID_PRISM_M3` is the
-    // solid-surface guard — a thin sheet / annotation / degenerate sliver
-    // has a tiny prism bound and a correctly-tiny volume, so we never
-    // escalate those; only elements whose prism bound proves a real 3D
-    // solid (≥ this many m³) are candidates for a collapse alarm.
-    const LOWER_FRAC: f32 = 0.1;
+    // CRITICAL (GH #121): this backstop must key on a *near-zero* volume,
+    // NOT on a low fill ratio against the prism. The prism is only an
+    // UPPER bound and is routinely 40–66× too large for open-shell
+    // products whose true volume is genuinely small — doors, windows, and
+    // railings on G55_ARK are thin glazed/framed shells with large
+    // bounding footprints. Their mesh signed-tetra volume already matches
+    // the ifcopenshell kernel, yet against the inflated prism their fill
+    // ratio is ~0.015–0.025. The previous `< prism * 0.1` collapse test
+    // mistook every one of them for a W4 collapse and substituted the
+    // 40–66× prism, blowing up `SUM(volume_m3)`. `COLLAPSE_FRAC` is now
+    // pinned at near-zero (1e-3) so only a genuine mesh → 0 against a real
+    // solid trips it; a legitimately-thin open shell keeps its mesh value.
+    // `MIN_SOLID_PRISM_M3` + the surface-area floor are the solid-surface
+    // guards — a thin sheet / annotation / degenerate sliver has a tiny
+    // prism and a correctly-tiny volume, so we never escalate those.
+    const COLLAPSE_FRAC: f32 = 1e-3;
     const MIN_SOLID_PRISM_M3: f32 = 1e-3; // 1 litre — below this a near-0 volume is plausibly correct
     let (volume_best_m3, volume_method, volume_reliable, volume_prism_bound_m3) =
         if mesh_quality == "closed" {
@@ -538,17 +542,26 @@ pub fn compute(vertices: &[f32], indices: &[u32], unit_scale: f32) -> MeshQto {
             } else {
                 0.0
             };
-            // Lower-bound collapse guard: a real 3D solid whose mesh
-            // volume has collapsed to a small fraction of its prism bound
-            // is not trustworthy — escalate. Two confirmations that this
-            // is a real solid and not a legitimately-thin element:
-            //   * the prism bound proves multi-litre 3D extent
-            //     (`MIN_SOLID_PRISM_M3`) — a thin sheet / annotation has a
-            //     tiny prism and a correctly-tiny volume; and
-            //   * the surface area is substantial — a true solid boundary
-            //     survives a CSG over-subtraction (the W4 signature:
-            //     volume → 0 but the shell triangles, hence the area,
-            //     remain), whereas an empty / vertex-only mesh has none.
+
+            // Tightest sane upper bound on a real volume: both the prism
+            // (footprint × extent) and the AABB box bound the volume from
+            // above; the smaller is tighter. The over-report tripwire and
+            // the open-shell trust gate both key on this `upper`, so a
+            // wildly-inverted open shell (volume > box) is still caught.
+            let upper = match (prism > 0.0, aabb_volume_m3 > 0.0) {
+                (true, true) => prism.min(aabb_volume_m3),
+                (true, false) => prism,
+                (false, true) => aabb_volume_m3,
+                (false, false) => 0.0,
+            };
+
+            // Near-total-collapse backstop (see the block above). Only a
+            // genuine mesh → ~0 against a prism that proves a real
+            // multi-litre solid AND whose shell triangles survived (the
+            // surface-area floor) is treated as a W4 collapse. A
+            // legitimately-thin open shell (door / window / railing) has a
+            // small-but-nonzero volume well above `upper * COLLAPSE_FRAC`
+            // and is NOT tripped (GH #121).
             let surface_area_m2 = (surface_area_raw * area_scale as f64) as f32;
             // Area threshold scales with the prism bound so it is unit-
             // and size-agnostic: a solid of volume `prism` has surface
@@ -558,16 +571,22 @@ pub fn compute(vertices: &[f32], indices: &[u32], unit_scale: f32) -> MeshQto {
             let solid_area_floor = 0.5 * prism.max(0.0).powf(2.0 / 3.0);
             let collapsed = prism >= MIN_SOLID_PRISM_M3
                 && surface_area_m2 > solid_area_floor
-                && volume_mesh_m3 < prism * LOWER_FRAC;
-            if prism > 0.0 && !collapsed && volume_mesh_m3 <= prism * PRISM_TRIPWIRE_MARGIN {
-                // Mesh volume sits within its tight upper bound (and has
-                // not collapsed) — trust it even though the shell isn't a
-                // perfect manifold.
-                (volume_mesh_m3, "mesh", true, prism)
+                && volume_mesh_m3 < upper * COLLAPSE_FRAC;
+            if upper > 0.0 && volume_mesh_m3 > 0.0 && !collapsed
+                && volume_mesh_m3 <= upper * PRISM_TRIPWIRE_MARGIN
+            {
+                // Open-shell mesh volume sits within its tight upper bound
+                // (min of prism and AABB) and has not collapsed — trust
+                // it. On G55 these match the ifcopenshell kernel even
+                // though the edge-pairing classifier flags the shell open
+                // (GH #121). `mesh_open` distinguishes this from a closed-
+                // manifold `mesh` volume for agents that want only
+                // watertight figures.
+                (volume_mesh_m3, "mesh_open", true, prism)
             } else {
                 // Provably too big, collapsed-to-~0 vs a solid prism, or
                 // degenerate / no usable footprint → fall back to the
-                // prism estimate and flag unreliable.
+                // prism estimate and flag unreliable for kernel escalation.
                 (prism, "prism_fallback", false, prism)
             }
         };
@@ -1284,7 +1303,10 @@ mod tests {
         let q = compute(&v, &i, 1.0);
         assert_eq!(q.mesh_quality, "open_shell");
         assert!(q.volume_reliable, "mesh within its prism bound → trusted");
-        assert_eq!(q.volume_method, "mesh");
+        // GH #121: a trusted OPEN shell carries `mesh_open`, not `mesh`
+        // (which is reserved for closed manifolds). Same value, distinct
+        // label so agents can filter on watertightness.
+        assert_eq!(q.volume_method, "mesh_open");
         assert!(
             (q.volume_best_m3 - q.volume_m3.abs()).abs() < 1e-6,
             "reliable open shell keeps the mesh value"
@@ -1293,6 +1315,65 @@ mod tests {
         // (within margin) upper bound on the kept mesh value.
         assert!(q.volume_prism_bound_m3.is_finite());
         assert!(q.volume_best_m3 <= q.volume_prism_bound_m3 * 1.05 + 1e-6);
+    }
+
+    #[test]
+    fn open_shell_low_fill_keeps_mesh_not_inflated_prism() {
+        // GH #121 regression — the door/window/railing over-count. An open
+        // shell whose true (mesh) volume is a SMALL fraction of its prism
+        // bound (fill ~0.05) must KEEP its mesh value, NOT be mistaken for a
+        // W4 collapse and substituted with the 20× prism. This is precisely
+        // the window the old `LOWER_FRAC = 0.1` tripwire mis-fired on:
+        // fill 0.05 < 0.1 → it collapsed every thin glazed door to the
+        // inflated prism, blowing up `SUM(volume_m3)` 40–66× on G55_ARK.
+        // The new `COLLAPSE_FRAC = 1e-3` only trips a genuine mesh → ~0.
+        //
+        // Construction mirrors the door signature: a large thin pane (full
+        // 2×2 face in the XZ plane at y=0) sets a big XZ footprint but
+        // contributes ~0 divergence volume (it sits on the AABB-min plane),
+        // while a small vertical nub (0.1×0.1 cross-section, 0.5 m tall in
+        // y) gives the y-extent and a small genuine volume. The min-over-
+        // three-axes prism is dominated by the *narrow* X/Z projections
+        // (~0.1 m³), against which the tiny mesh volume reads fill ~0.05.
+        let v: Vec<f32> = vec![
+            // pane (XZ @ y=0), ids 0..4
+            0.0, 0.0, 0.0,   2.0, 0.0, 0.0,   2.0, 0.0, 2.0,   0.0, 0.0, 2.0,
+            // nub bottom ring (y=0), ids 4..8
+            0.0, 0.0, 0.0,   0.1, 0.0, 0.0,   0.1, 0.0, 0.1,   0.0, 0.0, 0.1,
+            // nub top ring (y=0.5), ids 8..12
+            0.0, 0.5, 0.0,   0.1, 0.5, 0.0,   0.1, 0.5, 0.1,   0.0, 0.5, 0.1,
+        ];
+        let i: Vec<u32> = vec![
+            0, 1, 2,   0, 2, 3,            // pane
+            4, 5, 9,   4, 9, 8,            // nub -Z wall
+            5, 6, 10,  5, 10, 9,           // nub +X wall
+            6, 7, 11,  6, 11, 10,          // nub +Z wall
+            7, 4, 8,   7, 8, 11,           // nub -X wall
+        ];
+        let q = compute(&v, &i, 1.0);
+        eprintln!(
+            "[#121] quality={} reliable={} method={} vol={} prism={} fill={:.4}",
+            q.mesh_quality, q.volume_reliable, q.volume_method,
+            q.volume_best_m3, q.volume_prism_bound_m3,
+            q.volume_best_m3 / q.volume_prism_bound_m3,
+        );
+        assert_eq!(q.mesh_quality, "open_shell");
+        assert!(q.volume_reliable, "small-but-nonzero open-shell volume must stay trusted");
+        assert_eq!(q.volume_method, "mesh_open");
+        // The kept value is the mesh volume, NOT the inflated prism.
+        assert!(
+            (q.volume_best_m3 - q.volume_m3.abs()).abs() < 1e-6,
+            "must keep the mesh value, got best={} mesh={}",
+            q.volume_best_m3, q.volume_m3.abs()
+        );
+        // Regression guard: the fill ratio sits in the band (1e-3, 0.1) that
+        // the OLD tripwire wrongly collapsed. If fill ever climbs to ≥0.1
+        // this test stops exercising the fix — keep it in the mis-fire band.
+        assert!(
+            q.volume_best_m3 < q.volume_prism_bound_m3 * 0.1,
+            "test must stay in the old mis-fire band (fill < 0.1): best={} prism={}",
+            q.volume_best_m3, q.volume_prism_bound_m3
+        );
     }
 
     #[test]

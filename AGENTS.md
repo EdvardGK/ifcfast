@@ -215,27 +215,35 @@ describing via `pq.read_schema(...)`):
   bucketed area columns, `largest_surface_m2`, `smallest_surface_m2`,
   `surface_count`, `mesh_quality` (`"closed"` / `"open_shell"` /
   `"degenerate"`).
-- Volume reliability (since cache schema v16, GH #60): `volume_m3` is
-  the **best** estimate (mesh volume when trustworthy, else a
-  min-over-three-axes prism fallback — so `SUM(volume_m3)` no longer
-  mixes open-shell garbage into totals). `volume_reliable` (bool) is the
-  routing flag — `true` when `volume_m3` is the mesh value and it's
-  trustworthy (closed manifold, or a non-manifold whose volume is still
-  within its tight prism upper bound); `false` when the mesh volume is
-  out of bounds either way — provably too big (exceeded the prism bound)
-  **or** collapsed to ~0 against a multi-litre prism bound (a CSG
-  over-subtraction signature) — so `volume_m3` is the prism fallback, or
-  the rep is degenerate. The open-shell classifier first welds
-  coincident fragment-duplicate vertices (brep step_id dedup /
-  CSG-fragment stitching) on a ~0.1 mm grid before flagging, so
-  genuinely-watertight meshes are not demoted on a vertex-dedup
-  technicality. Send `false` rows to an
-  authoritative kernel. `volume_method` is `"mesh"` / `"prism_fallback"`;
-  `volume_mesh_m3` is the raw mesh volume regardless of reliability;
-  `volume_prism_bound_m3` is the prism bound — the min over the three
-  axis projections of `footprint × perpendicular-extent`, tight for
-  beams/columns/slabs alike — computed for every non-closed row (`NaN`
-  on closed rows — the watertight hot path stays raster-free).
+- Volume reliability (since cache schema v16, GH #60; open-shell routing
+  GH #121, cache schema v24): `volume_m3` is the **best** estimate (mesh
+  volume when trustworthy, else a min-over-three-axes prism fallback — so
+  `SUM(volume_m3)` no longer mixes open-shell garbage into totals).
+  `volume_reliable` (bool) is the routing flag — `true` when `volume_m3`
+  is the mesh value and it's trustworthy (closed manifold, **or** an open
+  shell whose volume is still within its tight upper bound, the min of the
+  prism and the AABB); `false` when the mesh volume is out of bounds
+  either way — provably too big (exceeded that bound) **or** collapsed to
+  ~0 against a multi-litre prism (a CSG over-subtraction signature) — so
+  `volume_m3` is the prism fallback, or the rep is degenerate. The
+  open-shell classifier first welds coincident fragment-duplicate vertices
+  (brep step_id dedup / CSG-fragment stitching) on a ~0.1 mm grid before
+  flagging, so genuinely-watertight meshes are not demoted on a
+  vertex-dedup technicality. **GH #121:** a thin glazed door / window /
+  railing is a genuine open shell whose true volume is a legitimately
+  small fraction (~1.5–2.5 %) of an inflated prism bound; its mesh
+  signed-tetra volume matches the ifcopenshell kernel, so it is **trusted,
+  not** replaced by the 40–66× prism — only a near-zero collapse
+  (`< bound × 1e-3`) escalates. Send `false` rows to an authoritative
+  kernel. `volume_method` is `"mesh"` (closed manifold), `"mesh_open"`
+  (trusted open shell — same trust as `mesh`, split out so you can filter
+  on watertightness via `mesh_quality == "closed"`), or `"prism_fallback"`
+  (the only `volume_reliable == false` method); `volume_mesh_m3` is the
+  raw mesh volume regardless of reliability; `volume_prism_bound_m3` is
+  the prism bound — the min over the three axis projections of
+  `footprint × perpendicular-extent`, tight for beams/columns/slabs alike
+  — computed for every non-closed row (`NaN` on closed rows — the
+  watertight hot path stays raster-free).
 - Semantic payload: `materials`, `psets`, `quantities`,
   `classifications` (list-of-struct columns — `UNNEST` in DuckDB).
   Each `psets` and `quantities` struct carries `source`
