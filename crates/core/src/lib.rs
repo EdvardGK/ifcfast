@@ -19,6 +19,7 @@
 //! crate is pure-Rust — used by the standalone `ifcfast-bench` and
 //! `ifcfast-mesh` binaries.
 
+pub mod doc;
 pub mod entity_table;
 pub mod extractors;
 pub mod indexer;

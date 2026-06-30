@@ -209,6 +209,43 @@ where
     }
 }
 
+/// Like [`for_each_record`], but reports each record's absolute byte
+/// span `[start, end)` in `buf` instead of its parsed slices. `start` is
+/// the `#`; `end` is one byte past the terminating `;`. This is the
+/// primitive the `doc` module's serialiser uses to re-emit kept records
+/// verbatim (byte-identical round-trip) — it deliberately exposes the
+/// record boundaries that [`for_each_record`] keeps internal.
+///
+/// Only well-formed `#<id> = TYPE(...)` records invoke the callback;
+/// inter-record whitespace and comments are not reported, so a caller
+/// re-emitting spans should attribute the gap *after* a record to that
+/// record (extend its emit span to the next record's `start`) to
+/// reproduce the original separators.
+pub fn for_each_record_span<F>(buf: &[u8], start: usize, end: usize, mut callback: F)
+where
+    F: FnMut(u64, usize, usize),
+{
+    let mut pos = start;
+    while pos < end {
+        pos = skip_ws_and_comments(buf, pos, end);
+        if pos >= end {
+            break;
+        }
+        if buf[pos] != b'#' {
+            break;
+        }
+        let record_start = pos;
+        let term = match find_record_end(buf, pos, end) {
+            Some(t) => t,
+            None => break,
+        };
+        if let Some(rec) = parse_record(&buf[record_start..term]) {
+            callback(rec.0, record_start, term + 1);
+        }
+        pos = term + 1;
+    }
+}
+
 #[inline]
 fn is_ws(b: u8) -> bool {
     matches!(b, b' ' | b'\t' | b'\r' | b'\n' | 0x0B | 0x0C)
