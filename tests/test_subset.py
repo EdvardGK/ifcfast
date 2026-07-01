@@ -9,6 +9,7 @@ oracle), else falls back to re-parsing with ifcfast.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -82,3 +83,66 @@ def test_subset_reopens_in_ifcopenshell_with_no_dangling(model, tmp_path):
         except Exception:  # noqa: BLE001
             dangling += 1
     assert dangling == 0
+
+
+def _oracle_check(path: Path) -> dict:
+    """Open an emitted subset in ifcopenshell and assert the acceptance
+    gate: parses, zero dangling refs, exactly one rooted IfcProject.
+    Returns a small stats dict for reporting. Raises AssertionError on
+    any violation."""
+    f = ifcopenshell.open(str(path))
+    dangling = 0
+    for inst in f:
+        try:
+            inst.get_info(recursive=False)
+        except Exception:  # noqa: BLE001
+            dangling += 1
+    assert dangling == 0, f"{path.name}: {dangling} instances with unresolved refs"
+    projects = f.by_type("IfcProject")
+    assert len(projects) == 1, f"{path.name}: expected 1 IfcProject, got {len(projects)}"
+    return {
+        "instances": len(list(f)),
+        "sites": len(f.by_type("IfcSite")),
+        "buildings": len(f.by_type("IfcBuilding")),
+        "storeys": len(f.by_type("IfcBuildingStorey")),
+    }
+
+
+def _corpus_paths() -> list[Path]:
+    raw = os.environ.get("IFCFAST_SUBSET_CORPUS", "")
+    return [Path(p) for p in raw.split(":") if p.strip()]
+
+
+@pytest.mark.skipif(
+    not _corpus_paths(),
+    reason="set IFCFAST_SUBSET_CORPUS=/a.ifc:/b.ifc to run the real-file gate",
+)
+@pytest.mark.parametrize("path", _corpus_paths(), ids=lambda p: p.name)
+def test_subset_over_real_corpus_is_ifcopenshell_clean(path, tmp_path):
+    """Durable acceptance gate for GH #124 Phase 2b: drive the Python
+    `Model.subset()` over real, discipline-diverse IFC files and prove
+    each emitted subset reopens in ifcopenshell with zero dangling refs
+    and a single rooted IfcProject. Mirrors the Rust
+    `subset_across_corpus` gate through the agent-facing surface.
+
+        IFCFAST_SUBSET_CORPUS="/G55_ARK.ifc:/G55_RIV.ifc" \\
+            pytest tests/test_subset.py -k real_corpus -s
+    """
+    assert path.exists(), f"corpus file missing: {path}"
+    model = ifcfast.open(path, use_cache=False, write_cache=False)
+
+    guids = [p.guid for p in model if p.guid]
+    assert guids, f"{path.name}: no product GUIDs to seed"
+    step = max(len(guids) // 200, 1)
+    seeds = guids[::step]
+
+    out = tmp_path / f"{path.stem}.subset.ifc"
+    stats = model.subset(seeds, out_path=str(out))
+    assert stats["seeds_present"] == len(seeds)
+
+    info = _oracle_check(out)
+    print(
+        f"OK {path.name}: {len(seeds)} seeds -> {info['instances']} instances, "
+        f"0 dangling, proj=1 site={info['sites']} bldg={info['buildings']} "
+        f"storey={info['storeys']}"
+    )
