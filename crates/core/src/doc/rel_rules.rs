@@ -72,14 +72,27 @@ pub struct RelRule {
 /// The relationship types the subset pass understands, with their field
 /// layouts. Indices verified against IFC2x3/IFC4/IFC4x3 records.
 ///
-/// Not every `IfcRel*` is here: connectivity and constraint rels
-/// (`IfcRelConnects*`, `IfcRelSpaceBoundary`, `IfcRelReferencedInSpatial
-/// Structure`) are intentionally omitted for now — they add cross-links
-/// that would balloon a "minimal" subset. The pass treats an unknown
-/// `IfcRel*` as a plain node: forward-closure keeps it only if something
-/// already kept references it (which, for a rel, never happens), so unknown
-/// rels are simply dropped rather than mis-pruned. Add a rule here (with a
-/// pinning fixture) to bring one into scope.
+/// **Invariant across every active rule:** `pull` is a single ref (the
+/// upstream dependency to add to keep) and `anchor` is the keep-condition
+/// side — a rel is retained iff at least one anchor ref survives, and only
+/// the anchor field (when a SET) is ever rewritten. The subset pass and the
+/// emit splicer both lean on this, so a new rule must fit it.
+///
+/// Not every `IfcRel*` is here:
+/// - Connectivity / constraint rels (`IfcRelConnects*`,
+///   `IfcRelSpaceBoundary`, `IfcRelReferencedInSpatialStructure`) add
+///   cross-links that would balloon a "minimal" subset.
+/// - `IfcRelServicesBuildings` (RelatingSystem@4, RelatedBuildings@5-SET) is
+///   deferred: its concrete-element side is the *building*, which every
+///   subset keeps via the spatial climb, so activating on it would drag
+///   every system serving the building into a one-wall subset. It needs
+///   member-anchoring (keep iff the *system* is kept), which breaks the
+///   single-`pull` invariant above — revisit for MEP-aware subsets.
+///
+/// The pass treats an unknown `IfcRel*` as a plain node: forward-closure
+/// keeps it only if something already kept references it (which, for a rel,
+/// never happens), so unknown rels are simply dropped rather than
+/// mis-pruned. Add a rule here (with a pinning fixture) to bring one in.
 pub const REL_RULES: &[RelRule] = &[
     // Spatial decomposition: RelatingObject(4) aggregates RelatedObjects(5).
     // Anchor = the children (climb toward IfcProject); pull = the parent.
@@ -134,13 +147,6 @@ pub const REL_RULES: &[RelRule] = &[
         anchor: RelField::set(4),
         pull: RelField::single(6),
     },
-    // System serves buildings: RelatingSystem(4) serves RelatedBuildings(5).
-    // Anchor = the served spatial elements; pull = the system.
-    RelRule {
-        type_name: b"IFCRELSERVICESBUILDINGS",
-        anchor: RelField::set(5),
-        pull: RelField::single(4),
-    },
     // Context declares definitions (IFC4+): RelatingContext(4) declares
     // RelatedDefinitions(5). Anchor = the declared types; pull = the
     // project/library context.
@@ -186,6 +192,26 @@ pub fn field_refs(args: &[&[u8]], field: RelField) -> Vec<u64> {
         crate::lexer::Field::List(body) if field.is_set => crate::lexer::parse_ref_list(body),
         _ => Vec::new(),
     }
+}
+
+/// The absolute byte range within `span` of rel field `field`'s value —
+/// the trimmed argument slice, parens included for a SET. `None` if the
+/// span isn't a well-formed record or the field is out of range. Used by
+/// the subset emitter to splice a pruned anchor SET in place while leaving
+/// every other byte of the record verbatim.
+///
+/// The returned range is computed by pointer arithmetic against `span`;
+/// the split arg slices are sub-slices of `span`, so this is sound.
+pub fn field_span(span: &[u8], field: RelField) -> Option<std::ops::Range<usize>> {
+    let (_id, _type_name, args) = crate::lexer::parse_record_span(span)?;
+    let split = crate::lexer::split_top_level_args(args);
+    let raw = split.get(field.index)?;
+    if raw.is_empty() {
+        return None;
+    }
+    let base = span.as_ptr() as usize;
+    let start = (raw.as_ptr() as usize).checked_sub(base)?;
+    Some(start..start + raw.len())
 }
 
 /// Parse a rel record span into its `(rule, anchor_refs, pull_refs)`, or

@@ -48,7 +48,6 @@ fn pins_every_rule_field_index_exactly() {
         (106, &[5011, 5012], &[4006]), // IfcRelAssociatesClassification
         (107, &[5013, 5014], &[4007]), // IfcRelNests
         (108, &[5015, 5016], &[4008]), // IfcRelAssignsToGroup (group @ idx 6)
-        (109, &[5017, 5018], &[4009]), // IfcRelServicesBuildings
         (110, &[5019, 5020], &[4010]), // IfcRelDeclares
         (111, &[5021], &[4011]),       // IfcRelVoidsElement
         (112, &[5022], &[4012]),       // IfcRelFillsElement

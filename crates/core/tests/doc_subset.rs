@@ -10,7 +10,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use _core::doc::{emit, forward_refs, reachable_closure, Doc};
+use _core::doc::{emit, forward_refs, parse_rel, reachable_closure, subset, Doc};
 
 fn fixtures_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures")
@@ -140,6 +140,151 @@ fn corpus_roundtrip_and_closure_across_diverse_files() {
         eprintln!(
             "OK {:?}: {} records, {} bytes, {} seeds checked, subset={} records",
             path.file_name().unwrap(), stats.records_in, out.len(), checked, keep.len()
+        );
+    }
+}
+
+/// Assert `re` has no forward ref to an entity that was present in `orig`
+/// but got dropped — i.e. the subset is self-contained (refs to
+/// never-present ids in an already-broken source don't count).
+fn assert_no_dropped_deps(re: &Doc, orig: &Doc) {
+    let present: HashSet<u64> = re.ids().iter().copied().collect();
+    for &id in &present {
+        for r in forward_refs(re, id) {
+            if !re.contains(r) {
+                assert!(
+                    !orig.contains(r),
+                    "subset dropped in-graph dependency #{} (from #{})",
+                    r, id
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn subset_climbs_spine_pulls_defs_and_prunes_shared_rels() {
+    // Seed one of two walls that share a storey, pset and material. The
+    // subset must climb Storey→Building→Site→Project, pull the pset/material,
+    // and rewrite every shared rel's RelatedObjects SET from (#30,#31) to
+    // (#30) — dropping wall B entirely.
+    let doc = Doc::open_editable(&fixtures_dir().join("subset_prune.ifc")).expect("open");
+    let (bytes, stats) = subset(&doc, &[30]);
+    assert_eq!(stats.seeds_present, 1);
+
+    let re = Doc::from_bytes(bytes);
+
+    // Wall A survives; wall B is gone.
+    assert!(re.contains(30), "seeded wall A must survive");
+    assert!(!re.contains(31), "unseeded wall B must be dropped");
+
+    // Spatial spine to IfcProject.
+    for s in [1u64, 10, 11, 12] {
+        assert!(re.contains(s), "spatial ancestor #{} missing", s);
+    }
+    // Pulled definitions (pset + its props, material).
+    for d in [40u64, 41, 42, 50] {
+        assert!(re.contains(d), "pulled definition #{} missing", d);
+    }
+    // Retained relationships (spine aggregates + attachments + containment).
+    for r in [20u64, 21, 22, 43, 51, 60] {
+        assert!(re.contains(r), "relationship #{} missing", r);
+    }
+
+    // Self-contained: nothing dangling.
+    assert_no_dropped_deps(&re, &doc);
+
+    // The three shared rels had their anchor SET rewritten to just #30.
+    for rel in [43u64, 51, 60] {
+        let span = re.record_bytes(rel).expect("rel present");
+        let (_rule, anchor, _pull) = parse_rel(span).expect("known rel");
+        assert_eq!(anchor, vec![30], "rel #{} anchor not pruned to [30]", rel);
+    }
+    assert_eq!(stats.rels_pruned, 3, "exactly the 3 shared rels prune");
+}
+
+#[test]
+fn subset_of_all_ids_is_byte_identical_to_source() {
+    // The whole-document degenerate case must reproduce the source: closure
+    // of all ids is everything, every rel keeps its full anchor, no override.
+    for name in ["minimal.ifc", "geom_box.ifc", "materials.ifc", "quantities.ifc"] {
+        let doc = Doc::open_editable(&fixtures_dir().join(name)).expect("open");
+        let all: Vec<u64> = doc.ids().to_vec();
+        let (sub_bytes, stats) = subset(&doc, &all);
+        let (full_bytes, _) = emit(&doc, None);
+        assert_eq!(stats.rels_pruned, 0, "no pruning when keeping all ({})", name);
+        assert!(sub_bytes == full_bytes, "subset(all) != source for {}", name);
+    }
+}
+
+#[test]
+fn subset_single_seed_reopens_self_contained() {
+    // Every single-product seed across the fixtures yields a self-contained
+    // subset — no dangling ref, seed present.
+    for path in ifc_fixtures() {
+        let doc = Doc::open_editable(&path).expect("open");
+        for &seed in doc.ids() {
+            let (bytes, _) = subset(&doc, &[seed]);
+            let re = Doc::from_bytes(bytes);
+            assert!(re.contains(seed) || !doc.contains(seed), "seed #{} lost in {:?}", seed, path);
+            assert_no_dropped_deps(&re, &doc);
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires real corpus files via IFCFAST_CORPUS (colon-separated paths)"]
+fn subset_across_corpus_is_self_contained() {
+    // Runs the full subset pass (forward closure + rel activation + anchor
+    // prune) over diverse real files. For each, seeds a spread of ~200
+    // records and asserts the emitted subset re-opens with no dangling ref
+    // to a dropped in-graph entity. If IFCFAST_SUBSET_DIR is set, writes
+    // each subset to <dir>/<name>.subset.ifc for external ifcopenshell
+    // validation (the spatial-tree + zero-dangling acceptance gate).
+    //   IFCFAST_CORPUS="/a.ifc:/b.ifc" IFCFAST_SUBSET_DIR=/tmp/subs \
+    //     cargo test -p ifcfast-core --no-default-features --test doc_subset \
+    //     -- --ignored subset_across_corpus --nocapture
+    let raw = match std::env::var("IFCFAST_CORPUS") {
+        Ok(s) => s,
+        Err(_) => {
+            eprintln!("IFCFAST_CORPUS unset — skipping");
+            return;
+        }
+    };
+    let out_dir = std::env::var("IFCFAST_SUBSET_DIR").ok();
+    let paths: Vec<&str> = raw.split(':').filter(|s| !s.is_empty()).collect();
+    assert!(!paths.is_empty());
+
+    for p in paths {
+        let path = PathBuf::from(p);
+        let doc = Doc::open_editable(&path).expect("open_editable");
+        let ids = doc.ids();
+        let step = (ids.len() / 200).max(1);
+        let seeds: Vec<u64> = ids.iter().copied().step_by(step).collect();
+
+        let (bytes, stats) = subset(&doc, &seeds);
+        let re = Doc::from_bytes(bytes.clone());
+        assert_no_dropped_deps(&re, &doc);
+        assert!(
+            re.len() <= doc.len(),
+            "subset larger than source in {:?}",
+            path
+        );
+
+        if let Some(dir) = &out_dir {
+            let name = path.file_stem().unwrap().to_string_lossy();
+            let out = PathBuf::from(dir).join(format!("{}.subset.ifc", name));
+            fs::write(&out, &bytes).expect("write subset");
+            eprintln!("wrote {:?}", out);
+        }
+        eprintln!(
+            "OK {:?}: {} seeds → {} records ({} rels, {} pruned) of {}",
+            path.file_name().unwrap(),
+            seeds.len(),
+            stats.records_out,
+            stats.rels_kept,
+            stats.rels_pruned,
+            doc.len()
         );
     }
 }

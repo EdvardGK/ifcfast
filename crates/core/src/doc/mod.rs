@@ -27,10 +27,12 @@
 mod emit;
 mod refs;
 mod rel_rules;
+mod subset;
 
-pub use emit::{emit, EmitStats};
+pub use emit::{emit, emit_subset, EmitStats};
 pub use refs::{forward_refs, reachable_closure};
-pub use rel_rules::{field_refs, parse_rel, rule_for, RelField, RelRule, REL_RULES};
+pub use rel_rules::{field_refs, field_span, parse_rel, rule_for, RelField, RelRule, REL_RULES};
+pub use subset::{subset, SubsetStats};
 
 use std::collections::HashMap;
 use std::path::Path;

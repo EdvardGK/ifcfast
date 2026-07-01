@@ -12,7 +12,7 @@
 //! (relationship member-set pruning) will be supplied as `overrides`
 //! once Phase 2 lands; for now `emit` is verbatim-or-skip.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use super::Doc;
 
@@ -54,6 +54,45 @@ pub fn emit(doc: &Doc, keep: Option<&HashSet<u64>>) -> (Vec<u8>, EmitStats) {
 
     // Trailer: ENDSEC; ... END-ISO-10303-21; verbatim.
     out.extend_from_slice(&buf[endsec..]);
+
+    let stats = EmitStats {
+        records_in: doc.len(),
+        records_out,
+        bytes_out: out.len(),
+    };
+    (out, stats)
+}
+
+/// Serialise a subset: emit exactly the records in `emit_ids`, in source
+/// order, substituting `overrides[id]` for a record's verbatim span when
+/// present (used by the rel pass to write a rewritten anchor SET). An
+/// override's bytes are the whole record span — including its trailing
+/// separator — so it drops in place of `record_span` with no reframing.
+///
+/// `emit_ids` must already include every id in `overrides`; an override for
+/// an id not in `emit_ids` is inert (the record is skipped).
+pub fn emit_subset(
+    doc: &Doc,
+    emit_ids: &HashSet<u64>,
+    overrides: &HashMap<u64, Vec<u8>>,
+) -> (Vec<u8>, EmitStats) {
+    let buf = doc.buf();
+    let mut out = Vec::with_capacity(buf.len());
+    out.extend_from_slice(&buf[..doc.prefix_end()]);
+
+    let mut records_out = 0usize;
+    for (id, i) in doc.records() {
+        if !emit_ids.contains(&id) {
+            continue;
+        }
+        match overrides.get(&id) {
+            Some(bytes) => out.extend_from_slice(bytes),
+            None => out.extend_from_slice(&buf[doc.record_span(i)]),
+        }
+        records_out += 1;
+    }
+
+    out.extend_from_slice(&buf[doc.endsec()..]);
 
     let stats = EmitStats {
         records_in: doc.len(),

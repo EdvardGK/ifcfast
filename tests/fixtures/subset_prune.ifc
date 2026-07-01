@@ -1,0 +1,38 @@
+ISO-10303-21;
+HEADER;
+FILE_DESCRIPTION(('ViewDefinition [ReferenceView]'),'2;1');
+FILE_NAME('subset_prune.ifc','2026-07-01T00:00:00',('ifcfast tests'),('Skiplum'),'ifcfast','ifcfast-tests','');
+FILE_SCHEMA(('IFC4'));
+ENDSEC;
+DATA;
+/* GH #124 Phase 2b subset test: two walls (#30, #31) share one storey,
+   one property set (#40) and one material (#50) via multi-participant
+   IfcRel* records. Seeding only wall #30 must (a) climb the spatial spine
+   to IfcProject, (b) pull #40/#50, and (c) rewrite each shared rel's
+   RelatedObjects SET from (#30,#31) down to (#30) — dropping #31. */
+#1=IFCPROJECT('0YvctVUKr0kugbFTf53O9L',$,'Prune Project',$,$,$,$,(#5),#2);
+#2=IFCUNITASSIGNMENT((#3,#4));
+#3=IFCSIUNIT(*,.LENGTHUNIT.,$,.METRE.);
+#4=IFCSIUNIT(*,.PLANEANGLEUNIT.,$,.RADIAN.);
+#5=IFCGEOMETRICREPRESENTATIONCONTEXT($,'Model',3,1.0E-5,#6,$);
+#6=IFCAXIS2PLACEMENT3D(#7,$,$);
+#7=IFCCARTESIANPOINT((0.,0.,0.));
+#10=IFCSITE('1XvctVUKr0kugbFTf53O9L',$,'Site',$,$,#15,$,$,.ELEMENT.,(59,56,0),(10,45,0),0.,$,$);
+#11=IFCBUILDING('2XvctVUKr0kugbFTf53O9L',$,'Building A',$,$,#15,$,$,.ELEMENT.,$,$,$);
+#12=IFCBUILDINGSTOREY('3XvctVUKr0kugbFTf53O9L',$,'Plan 01',$,$,#15,$,'Plan 01',.ELEMENT.,0.0);
+#15=IFCLOCALPLACEMENT($,#6);
+#16=IFCLOCALPLACEMENT(#15,#6);
+#20=IFCRELAGGREGATES('4XvctVUKr0kugbFTf53O9L',$,$,$,#1,(#10));
+#21=IFCRELAGGREGATES('5XvctVUKr0kugbFTf53O9L',$,$,$,#10,(#11));
+#22=IFCRELAGGREGATES('6XvctVUKr0kugbFTf53O9L',$,$,$,#11,(#12));
+#30=IFCWALL('7XvctVUKr0kugbFTf53O9L',$,'Wall-A',$,$,#16,$,'tag-A',.STANDARD.);
+#31=IFCWALL('8XvctVUKr0kugbFTf53O9L',$,'Wall-B',$,$,#16,$,'tag-B',.STANDARD.);
+#40=IFCPROPERTYSET('9XvctVUKr0kugbFTf53O9L',$,'Pset_WallCommon',$,(#41,#42));
+#41=IFCPROPERTYSINGLEVALUE('IsExternal',$,IFCBOOLEAN(.T.),$);
+#42=IFCPROPERTYSINGLEVALUE('LoadBearing',$,IFCBOOLEAN(.F.),$);
+#43=IFCRELDEFINESBYPROPERTIES('ARELDFWUIDgUIDgUIDgUI0',$,$,$,(#30,#31),#40);
+#50=IFCMATERIAL('Concrete',$,'Concrete');
+#51=IFCRELASSOCIATESMATERIAL('DASSC1UIDgUIDgUIDgUID0',$,$,$,(#30,#31),#50);
+#60=IFCRELCONTAINEDINSPATIALSTRUCTURE('8XvctVUKr0kugbFTf53O9L',$,$,$,(#30,#31),#12);
+ENDSEC;
+END-ISO-10303-21;
