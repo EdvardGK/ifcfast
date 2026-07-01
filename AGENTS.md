@@ -145,6 +145,7 @@ releases (additions only, never reorganisations).
 | Sample a labeled point cloud (+ normals) | `m.point_cloud(per_m2=1000)` |
 | Stream a point cloud in bounded-RAM chunks | `m.iter_point_cloud(per_m2=1000, chunk_points=1_000_000)` |
 | One-call viewer export to glTF binary | `m.to_gltf("out.glb")` (cuts on, instancing on, quant on) |
+| Carve a valid standalone IFC of some elements | `m.subset([guid, …])` → STEP `bytes` (or `out_path=` writes a file + returns stats) |
 | Geometric quantities (volume, area) | `m.mesh_qto()` (cut_openings=True by default since v0.4.28) |
 | Placement-vs-mesh sanity check | `m.drift` (SI columns; check `m.world_coordinate_baked` for the file-level signal) |
 | "Which products live under this storey?" | `m.products_in(storey_guid)` |
@@ -906,10 +907,43 @@ model: +6 %…+136 % on Sannergata ARK_E). v0.4.36 restores the source-
 unit guard; metre files are byte-identical across all three versions,
 and mm/imperial `mesh_qto` volumes return to their correct (cut) values.
 
+## Writing: `m.subset(guids)` — the first write primitive
+
+`ifcfast` is read-first, but it can now emit. `m.subset([guid, …])`
+carves a **valid standalone IFC** containing exactly the named elements
+plus everything required to keep them valid:
+
+- their forward dependencies (geometry, placement, profiles, materials,
+  units, representation contexts);
+- the **spatial spine** up to `IfcProject`, so the subset has a
+  well-formed storey → building → site tree (only the ancestors of kept
+  elements are retained);
+- the property / type / material / classification relationships attached
+  to them — each shared relationship's participant list **pruned** to the
+  kept elements. Openings that void a kept wall come along automatically.
+
+Guarantees: the output re-opens (in ifcfast **or** ifcopenshell) with
+**zero dangling references** and a rooted spatial tree. Subsetting *all*
+of a file's elements reproduces the source **byte-for-byte** (the
+lossless-emit invariant the writer is built on).
+
+```python
+walls = [p.guid for p in m.by_type("IfcWall")]
+data  = m.subset(walls)                       # -> STEP bytes
+stats = m.subset(walls, out_path="walls.ifc") # writes file, -> stats dict
+# stats: seeds_present, records_out, rels_kept, rels_pruned, bytes_out, path
+```
+
+Unknown GlobalIds raise `ValueError` (a typo must not silently yield an
+empty subset). Seeds are *element* GlobalIds; you don't seed openings or
+storeys — voids follow their host, and the spine is derived. Full
+in-place mutation / mesh-hotswap is the next step on this axis (GH #124).
+
 ## What `ifcfast` does NOT do (yet)
 
-- Write or modify IFCs. Read-only by construction. (Round-trip
-  editing is the next major milestone — see north-star below.)
+- Mutate IFCs in place / swap geometry. The write axis so far is
+  lossless **subsetting** (`m.subset`, above); surgical edit + emit is
+  the next milestone — see north-star below.
 - True boolean / CSG composition. By design — we surface BOTH
   operands instead, per the reveal-all stance above. If you need
   net geometry, compose the segments downstream.
@@ -924,12 +958,13 @@ and mm/imperial `mesh_qto` volumes return to their correct (cut) values.
 ## North star: surgical modelling via code
 
 The reveal-all stance is the foundation for "read → edit → write"
-round-trips. Today the parser is read-only. The path to editing is:
-preserve per-entity byte offsets, expose a write-back surface that
-mutates the in-memory STEP buffer, and emit a deterministic
-serialiser. Tracked separately — until then, ifcfast is the X-ray
-that tells you exactly what's in the file so you know what to
-change.
+round-trips. The first leg has landed: an owned, round-trippable STEP
+document with a byte-identical serialiser, and `m.subset(guids)` built
+on it (above). The remaining path is surgical mutation: expose a
+write-back surface over the in-memory buffer and a mesh-hotswap that
+re-emits swapped representations deterministically. Tracked in GH #124
+— until then, subset is the write primitive and the parser is the X-ray
+that tells you exactly what's in the file so you know what to change.
 
 If your agent task hits one of these, file an issue with the file
 shape — these are the next-tier extensions.

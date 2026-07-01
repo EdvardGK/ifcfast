@@ -2665,6 +2665,63 @@ mod python {
         })
     }
 
+    // ----- subset_ifc (GH #124 writer axis) ----------------------------
+
+    /// Build a self-contained IFC subset seeded by `seed_guids` (IfcRoot
+    /// GlobalIds) plus everything needed to keep them valid: forward
+    /// dependencies + the spatial spine to `IfcProject` + attached
+    /// pset/type/material/classification rels, each rel's participant SET
+    /// pruned to the survivors.
+    ///
+    /// Unknown GlobalIds raise `ValueError` (fail loud) rather than seeding
+    /// nothing. When `out_path` is given the subset is written there and the
+    /// returned dict carries `path`; otherwise the dict carries the STEP
+    /// `bytes`. Either way it reports `seeds_present`, `records_out`,
+    /// `rels_kept`, `rels_pruned`, `bytes_out`.
+    #[pyfunction]
+    #[pyo3(signature = (path, seed_guids, out_path = None))]
+    pub fn subset_ifc<'py>(
+        py: Python<'py>,
+        path: &str,
+        seed_guids: Vec<String>,
+        out_path: Option<&str>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        catch_panic(|| {
+            let doc = crate::doc::Doc::open_editable(Path::new(path)).map_err(|e| {
+                pyo3::exceptions::PyIOError::new_err(format!("open_editable {path}: {e}"))
+            })?;
+            let (seed_step_ids, missing) = doc.resolve_guids(&seed_guids);
+            if !missing.is_empty() {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "subset: {} unknown GlobalId(s), first few: {:?}",
+                    missing.len(),
+                    &missing[..missing.len().min(5)]
+                )));
+            }
+            let (bytes, stats) =
+                py.detach(|| crate::doc::subset(&doc, &seed_step_ids));
+
+            let out = PyDict::new(py);
+            out.set_item("seeds_present", stats.seeds_present as u64)?;
+            out.set_item("records_out", stats.records_out as u64)?;
+            out.set_item("rels_kept", stats.rels_kept as u64)?;
+            out.set_item("rels_pruned", stats.rels_pruned as u64)?;
+            out.set_item("bytes_out", bytes.len() as u64)?;
+            match out_path {
+                Some(p) => {
+                    std::fs::write(p, &bytes).map_err(|e| {
+                        pyo3::exceptions::PyIOError::new_err(format!("write {p}: {e}"))
+                    })?;
+                    out.set_item("path", p)?;
+                }
+                None => {
+                    out.set_item("bytes", pyo3::types::PyBytes::new(py, &bytes))?;
+                }
+            }
+            Ok(out)
+        })
+    }
+
     #[pymodule]
     fn _core(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add("IfcfastError", _py.get_type::<IfcfastError>())?;
@@ -2694,6 +2751,7 @@ mod python {
         m.add_function(wrap_pyfunction!(bundle, m)?)?;
         #[cfg(feature = "clash")]
         m.add_function(wrap_pyfunction!(clash, m)?)?;
+        m.add_function(wrap_pyfunction!(subset_ifc, m)?)?;
         m.add("__version__", env!("CARGO_PKG_VERSION"))?;
         Ok(())
     }

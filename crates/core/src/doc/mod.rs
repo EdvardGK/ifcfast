@@ -158,4 +158,34 @@ impl Doc {
     pub(crate) fn records(&self) -> impl Iterator<Item = (u64, usize)> + '_ {
         self.order.iter().copied().enumerate().map(|(i, id)| (id, i))
     }
+
+    /// Resolve `IfcRoot` GlobalId strings to their step ids by scanning
+    /// field 0 of every record. Returns `(found_ids, missing_guids)` so the
+    /// caller can fail loudly on an unknown GlobalId rather than silently
+    /// seeding nothing. A GlobalId that appears on multiple records (a
+    /// malformed file) resolves to the first occurrence; records whose
+    /// field 0 is not a string (non-`IfcRoot` entities) are skipped.
+    pub fn resolve_guids(&self, wanted: &[String]) -> (Vec<u64>, Vec<String>) {
+        let mut map: HashMap<String, u64> = HashMap::with_capacity(self.order.len());
+        for (id, i) in self.records() {
+            let span = &self.buf[self.record_span(i)];
+            if let Some((_id, _type, args)) = crate::lexer::parse_record_span(span) {
+                let split = crate::lexer::split_top_level_args(args);
+                if let Some(first) = split.first() {
+                    if let Some(guid) = crate::lexer::decode_string(first) {
+                        map.entry(guid).or_insert(id);
+                    }
+                }
+            }
+        }
+        let mut found = Vec::with_capacity(wanted.len());
+        let mut missing = Vec::new();
+        for g in wanted {
+            match map.get(g) {
+                Some(&id) => found.push(id),
+                None => missing.push(g.clone()),
+            }
+        }
+        (found, missing)
+    }
 }

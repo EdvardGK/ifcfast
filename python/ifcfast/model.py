@@ -915,6 +915,54 @@ class Model:
             bool(cut_openings),
         )
 
+    def subset(self, guids: Iterable[str], *, out_path=None):
+        """Carve a self-contained IFC subset seeded by ``guids``.
+
+        Given a set of element GlobalIds, produce a valid standalone IFC
+        holding exactly those elements plus everything needed to keep them
+        valid: their geometry / placement / material dependencies, the
+        spatial spine up to ``IfcProject`` (so the subset has a well-formed
+        storey→building→site tree), and the property / type / material /
+        classification relationships attached to them — with each shared
+        relationship's participant list pruned to just the kept elements.
+        Openings that void a kept wall come along automatically; unseeded
+        siblings are dropped.
+
+        The result re-opens (in ifcfast or ifcopenshell) with **no dangling
+        reference** and a rooted spatial tree. Seeding *all* the file's
+        elements reproduces the source byte-for-byte.
+
+        Args:
+            guids: element GlobalIds to keep. Unknown GlobalIds raise
+                ``ValueError`` (a typo must not silently yield an empty
+                subset).
+            out_path: when given, the subset is written there and a stats
+                dict is returned (``path``, ``records_out``, ``rels_kept``,
+                ``rels_pruned``, ``seeds_present``, ``bytes_out``). When
+                ``None`` (default), the STEP ``bytes`` are returned directly.
+
+        Returns:
+            ``bytes`` (``out_path is None``) or a stats ``dict``.
+
+        Example::
+
+            >>> walls = [p.guid for p in m.by_type("IfcWall")]
+            >>> data = m.subset(walls)              # bytes
+            >>> stats = m.subset(walls, out_path="walls.ifc")
+            >>> print(stats["records_out"], "records,", stats["rels_pruned"], "rels pruned")
+        """
+        from . import _core
+
+        seeds = list(dict.fromkeys(str(g) for g in guids))  # dedup, keep order
+        if not seeds:
+            raise ValueError("subset: no seed guids given")
+        d = _core.subset_ifc(
+            str(native_path_for(self.header.path)),
+            seeds,
+            str(out_path) if out_path is not None else None,
+        )
+        return d["bytes"] if out_path is None else d
+
     def meshes(
         self,
         unit: str = "m",
