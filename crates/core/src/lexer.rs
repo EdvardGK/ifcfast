@@ -349,6 +349,25 @@ fn skip_quoted_string(buf: &[u8], mut i: usize, end: usize) -> usize {
     end
 }
 
+/// Parse a record *span* — bytes that may include the terminating `;`
+/// and trailing whitespace (as [`crate::doc`] stores them) — into
+/// `(id, type_name, args_body)`. This is the span-tolerant sibling of the
+/// internal `parse_record`, used by the doc rel pass to read specific
+/// positional fields of an `IfcRel*` record.
+///
+/// The record terminator is the last top-level `;`; any `;` inside a
+/// string field precedes it, and only whitespace follows it, so trimming
+/// at the final `;` recovers the `#id = TYPE(...)` shape `parse_record`
+/// expects (it requires a trailing `)`).
+pub fn parse_record_span(span: &[u8]) -> Option<(u64, &[u8], &[u8])> {
+    let end = span
+        .iter()
+        .rposition(|&b| b == b';')
+        .map(|p| p)
+        .unwrap_or(span.len());
+    parse_record(&span[..end])
+}
+
 /// Split a record (`#42 = TYPE ( args ) ;` — the trailing `;` is NOT
 /// in `record`) into id, type, args byte slices.
 fn parse_record(record: &[u8]) -> Option<(u64, &[u8], &[u8])> {

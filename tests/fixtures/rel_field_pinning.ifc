@@ -1,0 +1,29 @@
+ISO-10303-21;
+HEADER;
+FILE_DESCRIPTION(('ViewDefinition [ReferenceView]'),'2;1');
+FILE_NAME('rel_field_pinning.ifc','2026-07-01T00:00:00',('ifcfast tests'),('Skiplum'),'ifcfast','ifcfast-tests','');
+FILE_SCHEMA(('IFC4'));
+ENDSEC;
+DATA;
+/* GH #124 Phase 2b: pins the positional field indices of every IfcRel*
+   the subset pass understands. One record per rule; anchor refs use the
+   #50xx band, pull refs the #40xx band, so tests/doc_rel_rules.rs can
+   assert exact anchor/pull extraction. Field layouts match real records
+   (IfcRelDefinesByType / IfcRelVoidsElement / IfcRelAssignsToGroup were
+   cross-checked against ifc-art + ST28_RIB corpus output). Referenced
+   ids are intentionally dangling: this fixture pins field POSITIONS, not
+   graph validity. */
+#101=IFCRELAGGREGATES('3sOogevgD5l8Blvu6xJn01',$,$,$,#4001,(#5001,#5002));
+#102=IFCRELCONTAINEDINSPATIALSTRUCTURE('3sOogevgD5l8Blvu6xJn02',$,$,$,(#5003,#5004),#4002);
+#103=IFCRELDEFINESBYPROPERTIES('3sOogevgD5l8Blvu6xJn03',$,$,$,(#5005,#5006),#4003);
+#104=IFCRELDEFINESBYTYPE('3sOogevgD5l8Blvu6xJn04',$,$,$,(#5007,#5008),#4004);
+#105=IFCRELASSOCIATESMATERIAL('3sOogevgD5l8Blvu6xJn05',$,$,$,(#5009,#5010),#4005);
+#106=IFCRELASSOCIATESCLASSIFICATION('3sOogevgD5l8Blvu6xJn06',$,$,$,(#5011,#5012),#4006);
+#107=IFCRELNESTS('3sOogevgD5l8Blvu6xJn07',$,$,$,#4007,(#5013,#5014));
+#108=IFCRELASSIGNSTOGROUP('3sOogevgD5l8Blvu6xJn08',$,$,$,(#5015,#5016),$,#4008);
+#109=IFCRELSERVICESBUILDINGS('3sOogevgD5l8Blvu6xJn09',$,$,$,#4009,(#5017,#5018));
+#110=IFCRELDECLARES('3sOogevgD5l8Blvu6xJn10',$,$,$,#4010,(#5019,#5020));
+#111=IFCRELVOIDSELEMENT('3sOogevgD5l8Blvu6xJn11',$,$,$,#5021,#4011);
+#112=IFCRELFILLSELEMENT('3sOogevgD5l8Blvu6xJn12',$,$,$,#4012,#5022);
+ENDSEC;
+END-ISO-10303-21;

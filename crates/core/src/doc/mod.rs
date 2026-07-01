@@ -26,9 +26,11 @@
 
 mod emit;
 mod refs;
+mod rel_rules;
 
 pub use emit::{emit, EmitStats};
 pub use refs::{forward_refs, reachable_closure};
+pub use rel_rules::{field_refs, parse_rel, rule_for, RelField, RelRule, REL_RULES};
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -118,8 +120,9 @@ impl Doc {
 
     /// The full record span bytes (`#id = TYPE(...)` plus its trailing
     /// separator) for `id`, or `None` if absent. Used by the reference
-    /// scanner to extract outbound `#ref` tokens.
-    pub(crate) fn record_bytes(&self, id: u64) -> Option<&[u8]> {
+    /// scanner to extract outbound `#ref` tokens, and by the rel subset
+    /// pass (via [`rel_rules::parse_rel`]) to read positional fields.
+    pub fn record_bytes(&self, id: u64) -> Option<&[u8]> {
         let i = *self.index.get(&id)?;
         Some(&self.buf[self.record_span(i)])
     }
