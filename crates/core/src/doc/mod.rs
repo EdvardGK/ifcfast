@@ -25,8 +25,10 @@
 //! original buffer, byte for byte. See `doc/emit.rs`.
 
 mod emit;
+mod refs;
 
 pub use emit::{emit, EmitStats};
+pub use refs::{forward_refs, reachable_closure};
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -112,6 +114,14 @@ impl Doc {
     /// Whether `id` is present.
     pub fn contains(&self, id: u64) -> bool {
         self.index.contains_key(&id)
+    }
+
+    /// The full record span bytes (`#id = TYPE(...)` plus its trailing
+    /// separator) for `id`, or `None` if absent. Used by the reference
+    /// scanner to extract outbound `#ref` tokens.
+    pub(crate) fn record_bytes(&self, id: u64) -> Option<&[u8]> {
+        let i = *self.index.get(&id)?;
+        Some(&self.buf[self.record_span(i)])
     }
 
     /// The raw bytes of the buffer (header + DATA + trailer).

@@ -246,6 +246,49 @@ where
     }
 }
 
+/// Every `#<digits>` entity-reference token in `bytes`, in order,
+/// skipping single-quoted string literals and `/* */` comments (a `#`
+/// inside `'a #4 name'` or a comment is not a reference). Schema-free:
+/// it doesn't care which attribute position a ref sits in, only that
+/// it's a real reference token — which is all the `doc` module's
+/// reachability graph needs.
+///
+/// NOTE: scanning a whole record span (`#id = TYPE(...)`) yields the
+/// record's OWN id as the first token. Callers wanting only *outbound*
+/// references drop it (see `doc::refs::forward_refs`).
+pub fn scan_ref_tokens(bytes: &[u8]) -> Vec<u64> {
+    let n = bytes.len();
+    let mut out: Vec<u64> = Vec::with_capacity(4);
+    let mut i = 0;
+    while i < n {
+        match bytes[i] {
+            b'\'' => i = skip_quoted_string(bytes, i + 1, n),
+            b'/' if i + 1 < n && bytes[i + 1] == b'*' => {
+                i = skip_block_comment(bytes, i + 2, n)
+            }
+            b'#' => {
+                let s = i + 1;
+                let mut j = s;
+                while j < n && bytes[j].is_ascii_digit() {
+                    j += 1;
+                }
+                if j > s {
+                    let mut id: u64 = 0;
+                    for &b in &bytes[s..j] {
+                        id = id.wrapping_mul(10).wrapping_add((b - b'0') as u64);
+                    }
+                    out.push(id);
+                    i = j;
+                } else {
+                    i += 1;
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    out
+}
+
 #[inline]
 fn is_ws(b: u8) -> bool {
     matches!(b, b' ' | b'\t' | b'\r' | b'\n' | 0x0B | 0x0C)
