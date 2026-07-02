@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — surgical IFC writing: `m.subset()` + `m.hotswap()` (GH #124, #126)
+
+- **`m.subset([guid, …])`** — carve a valid standalone IFC out of a
+  model: forward-reachability closure over the picked elements, the
+  spatial spine up to `IfcProject`, and 13 pruned `IfcRel*` rule types
+  (properties, types, materials, classifications, voids/fillings,
+  coverings, system-service, nests, groups, declares). Output re-opens
+  in ifcfast **and** ifcopenshell with zero dangling references
+  (corpus-gated on all four G55 disciplines). Returns STEP `bytes`, or
+  writes a file + returns a stats dict via `out_path=`.
+- **`m.hotswap(guid, vertices, triangles)`** — swap one element's Body
+  representation for a caller-supplied triangle mesh (e.g. a decimated
+  one), schema-aware: `IfcTriangulatedFaceSet` on IFC4,
+  faceted-brep/surface-model on IFC2x3. Orphaned geometry records are
+  reference-counted and garbage-collected. Coordinates are the
+  element's **local** frame — `m.meshes()` output is world-frame and
+  cannot be fed back directly (GH #127 tracks the bridge).
+- Foundation: an owned round-trippable STEP document with
+  **byte-identical emit** for untouched records.
+
 ### Fixed — open-shell QTO over-count on doors / windows / railings (GH #121)
 
 - **`mesh_qto` now trusts an open shell's mesh volume within its tight

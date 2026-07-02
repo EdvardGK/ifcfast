@@ -425,18 +425,22 @@ contained that we couldn't reveal — never a silent drop.
 
 ## What it doesn't do
 
-- Write or modify IFCs. Read-only by construction. (Round-trip
-  editing is the next major milestone — see AGENTS.md "North star".)
+- General IFC editing. Two surgical write primitives are in:
+  `m.subset(guids)` (valid standalone IFC of chosen elements) and
+  `m.hotswap(guid, verts, tris)` (swap one element's Body mesh) — see
+  AGENTS.md "Writing". General attribute mutation is the next
+  milestone.
 - True boolean / CSG composition. By design — we reveal BOTH
   operands instead.
 - Schema validation. Trusts the file's syntax. Use
   [bsi-validator](https://github.com/buildingSMART/IFC) for conformance.
 - Curved-surface tessellation for `IfcAdvancedBrep` — face loops are
   triangulated as polygons (tagged `advanced_brep_approx`).
-- Property variants beyond `IfcPropertySingleValue` —
-  `IfcPropertyEnumeratedValue`, `IfcPropertyListValue`,
-  `IfcPropertyBoundedValue`, `IfcComplexProperty` are skipped. Covers
-  ~90% of psets seen on Revit / Archicad / Tekla / MagiCAD exports.
+- Exotic `IfcSimpleProperty` leaves. All six property variants
+  (`SingleValue`, `EnumeratedValue`, `ListValue`, `BoundedValue`,
+  `TableValue`, `ComplexProperty`) are extracted since v0.4.29;
+  anything genuinely unparsed surfaces as an `unhandled:` marker,
+  never a silent drop.
 
 ## Layout
 

@@ -187,20 +187,36 @@ numbers exactly where needed. See examples/hybrid_qto_routing.py.
 
 Open and inspect:
     import ifcfast
-    m = ifcfast.open(path)
+    m = ifcfast.open(path)                # strict=True raises on unresolvable units
     m.summary()                           # dict: schema, counts, tables, samples
     m.schemas                             # dict: column-level introspection
     m.preview("psets", n=5)               # sample rows from any table
     m.types()                             # {entity_name: count}
+    m.by_type("IfcWall")                  # rows for a type (+subtypes, case-insensitive)
+    m.unit_scale / m.length_unit          # source-unit → metres factor + unit name
 
 Data layers (long-format pandas, lazy on first access):
     m.psets / m.quantities / m.materials / m.classifications / m.drift
 
 Geometry (no CAD kernel required):
     m.meshes()                  # per-product triangles: (guid, entity, vertices, faces)
+    m.mesh(guid)                # one product's mesh without tessellating the model
+    m.iter_meshes() / m.iter_point_cloud()   # streaming variants (bounded memory)
     m.point_cloud(per_m2=1000)  # area-weighted surface samples + normals
     m.mesh_qto()                # -> (products_df, per_surface_df); volume/area/orientation + planar surfaces
+    m.to_gltf("out.glb")        # viewer-ready glTF (cut_openings=True by default)
     # meshes() / point_cloud() take unit="m"|"mm"|"cm"|"ft"|"in" (default metres)
+
+Writing (surgical, round-trippable):
+    m.subset([guid, ...])                 # valid standalone IFC of those elements -> bytes
+    m.hotswap(guid, vertices, triangles)  # swap one element's Body mesh -> bytes
+    # both take out_path=... to write a file and return a stats dict
+    # hotswap expects LOCAL-frame coords; m.meshes() vertices are WORLD-frame
+
+Substrate + clash (GeoParquet, model-scale analysis):
+    ifcfast.bundle(path, out_dir)         # representations/instances parquet substrate
+    ifcfast.clash(bundle_dir)             # broad+narrow clash pass -> clashes.parquet
+    # mesh_qto volume contract: SUM(volume_m3) only over volume_reliable rows
 
 Spatial-relationship graph:
     m.contained_in / m.aggregates / m.storey_building   # DataFrames
@@ -215,8 +231,11 @@ CLI (all subcommands accept --json for machine output):
     ifcfast demo                  # showcase against the bundled IFC
     ifcfast index FILE            # tier-1 parse + counts
     ifcfast schema FILE           # full schema introspection
+    ifcfast types FILE            # type-first extraction (TypeBank shape)
     ifcfast extract FILE          # data layers
     ifcfast drift FILE            # placement-vs-mesh drift report
+    ifcfast cache DIR             # inspect/clear the parse cache
+    ifcfast bundle FILE OUT_DIR   # write the parquet substrate
 
 For zero-network demos: ifcfast.open(ifcfast.example_path()).
 """

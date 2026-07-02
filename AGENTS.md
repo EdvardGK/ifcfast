@@ -108,7 +108,8 @@ row count, so an incomplete dump is always labelled as such. The
 server's in-process model cache is
 staleness-checked: if the file's size or mtime changes between tool
 calls (re-export from the authoring tool), it is reopened
-transparently — you never query a stale model.
+transparently — you never query a stale model. `list_open()` /
+`close(path)` manage that in-process model cache directly.
 
 ## The 30-second ramp
 
@@ -323,6 +324,10 @@ df = ifcfast.clash(
     "model.bundle/",
     exclude_self_class=["Wall", "Slab"],
 )
+
+# only pairs where at least one side is one of these classes
+# (normalised names — "Pipe", not "IfcPipe")
+df = ifcfast.clash("model.bundle/", include_classes=["Pipe", "Duct"])
 ```
 
 `clashes.parquet` columns:
@@ -923,7 +928,10 @@ plus everything required to keep them valid:
   to them — each shared relationship's participant list **pruned** to the
   kept elements. Openings that void a kept wall come along automatically,
   as do the **coverings** (`IfcRelCoversBldgElements`) on a kept host
-  wall/slab, and a kept system's `IfcRelServicesBuildings` link. Pure
+  wall/slab, and a kept system's `IfcRelServicesBuildings` link.
+  `IfcRelNests` (ports / distribution-part nesting),
+  `IfcRelAssignsToGroup` (system / group membership) and
+  `IfcRelDeclares` (IFC4 project declares) are followed too. Pure
   connectivity relationships (`IfcRelConnectsPathElements` and other
   `IfcRelConnects*`) are intentionally *not* followed — they link peer
   neighbours, so pulling them would chain across the whole model.
@@ -1114,6 +1122,7 @@ hit the palette fallback.
 ifcfast demo                       # works against bundled IFC
 ifcfast index   FILE  --json       # tier-1 summary
 ifcfast schema  FILE  --json       # column-level schema introspection
+ifcfast types   FILE  --json       # type-first extraction (TypeBank shape)
 ifcfast extract FILE  --json       # data-layer extraction
 ifcfast drift   FILE  --json       # placement-vs-mesh report
 ifcfast cache   FILE  --json       # inspect / clear cache
