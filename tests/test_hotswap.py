@@ -5,7 +5,7 @@ Exercises the Python surface: local-frame mesh in, a repointed ``Body``
 representation out, orphan GC of the geometry the old body uniquely owned,
 and fail-loud on bad input. The real proof — that the emitted file reopens
 in ifcopenshell with the element's body now an ``IfcTriangulatedFaceSet`` —
-runs over the discipline-diverse G55 corpus when ``IFCFAST_SUBSET_CORPUS``
+runs over the discipline-diverse G55 corpus when ``IFCFAST_CORPUS``
 is set (same corpus var the subset gate uses).
 """
 
@@ -108,13 +108,15 @@ def test_hotswap_fixture_reopens_clean_in_ifcopenshell(model, tmp_path):
 
 
 def _corpus_paths() -> list[Path]:
-    raw = os.environ.get("IFCFAST_SUBSET_CORPUS", "")
+    raw = os.environ.get("IFCFAST_CORPUS", "") or os.environ.get(
+        "IFCFAST_SUBSET_CORPUS", ""
+    )
     return [Path(p) for p in raw.split(":") if p.strip()]
 
 
 @pytest.mark.skipif(
     not _corpus_paths(),
-    reason="set IFCFAST_SUBSET_CORPUS=/a.ifc:/b.ifc to run the real-file gate",
+    reason="set IFCFAST_CORPUS=/a.ifc:/b.ifc to run the real-file gate",
 )
 @pytest.mark.parametrize("path", _corpus_paths(), ids=lambda p: p.name)
 def test_hotswap_over_real_corpus_is_ifcopenshell_clean(path, tmp_path):

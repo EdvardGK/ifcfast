@@ -120,13 +120,13 @@ fn rel_indices_resolve_across_diverse_corpus() {
     // indices match what Revit/IfcOpenShell/MagiCAD actually write.
     //   IFCFAST_CORPUS="/a.ifc:/b.ifc:..." cargo test -p ifcfast-core \
     //     --no-default-features --test doc_rel_rules -- --ignored --nocapture
-    let raw = match std::env::var("IFCFAST_CORPUS") {
-        Ok(s) => s,
-        Err(_) => {
-            eprintln!("IFCFAST_CORPUS unset — skipping");
-            return;
-        }
-    };
+    let raw = std::env::var("IFCFAST_CORPUS")
+        .or_else(|_| std::env::var("IFCFAST_SUBSET_CORPUS"))
+        .expect(
+            "corpus gate invoked (--ignored) but IFCFAST_CORPUS is unset — \
+             refusing to report green without running: set \
+             IFCFAST_CORPUS=/a.ifc:/b.ifc (IFCFAST_SUBSET_CORPUS also accepted)",
+        );
     let paths: Vec<&str> = raw.split(':').filter(|s| !s.is_empty()).collect();
     assert!(!paths.is_empty());
 

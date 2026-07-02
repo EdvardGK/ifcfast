@@ -109,13 +109,15 @@ def _oracle_check(path: Path) -> dict:
 
 
 def _corpus_paths() -> list[Path]:
-    raw = os.environ.get("IFCFAST_SUBSET_CORPUS", "")
+    raw = os.environ.get("IFCFAST_CORPUS", "") or os.environ.get(
+        "IFCFAST_SUBSET_CORPUS", ""
+    )
     return [Path(p) for p in raw.split(":") if p.strip()]
 
 
 @pytest.mark.skipif(
     not _corpus_paths(),
-    reason="set IFCFAST_SUBSET_CORPUS=/a.ifc:/b.ifc to run the real-file gate",
+    reason="set IFCFAST_CORPUS=/a.ifc:/b.ifc to run the real-file gate",
 )
 @pytest.mark.parametrize("path", _corpus_paths(), ids=lambda p: p.name)
 def test_subset_over_real_corpus_is_ifcopenshell_clean(path, tmp_path):
@@ -125,7 +127,7 @@ def test_subset_over_real_corpus_is_ifcopenshell_clean(path, tmp_path):
     and a single rooted IfcProject. Mirrors the Rust
     `subset_across_corpus` gate through the agent-facing surface.
 
-        IFCFAST_SUBSET_CORPUS="/G55_ARK.ifc:/G55_RIV.ifc" \\
+        IFCFAST_CORPUS="/G55_ARK.ifc:/G55_RIV.ifc" \\
             pytest tests/test_subset.py -k real_corpus -s
     """
     assert path.exists(), f"corpus file missing: {path}"
@@ -150,7 +152,7 @@ def test_subset_over_real_corpus_is_ifcopenshell_clean(path, tmp_path):
 
 @pytest.mark.skipif(
     not _corpus_paths(),
-    reason="set IFCFAST_SUBSET_CORPUS=/a.ifc:/b.ifc to run the real-file gate",
+    reason="set IFCFAST_CORPUS=/a.ifc:/b.ifc to run the real-file gate",
 )
 @pytest.mark.parametrize("path", _corpus_paths(), ids=lambda p: p.name)
 def test_subset_pulls_coverings_when_host_seeded(path, tmp_path):

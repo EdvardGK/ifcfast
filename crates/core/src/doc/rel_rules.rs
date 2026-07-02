@@ -243,11 +243,26 @@ pub fn field_span(span: &[u8], field: RelField) -> Option<std::ops::Range<usize>
 /// `None` if the record isn't a known `IfcRel*` type. The span is the
 /// verbatim record bytes as stored in a [`super::Doc`] (may include the
 /// trailing `;` and whitespace).
+///
+/// The pull set is **every ref outside the anchor field** — not just the
+/// typed pull field. A retained rel is emitted verbatim (anchor splice
+/// aside), so everything else it names must be forward-closed with it:
+/// its OwnerHistory, the pull field whatever its shape (a bare `#ref` or
+/// an inline select aggregate like IFC4's `IfcPropertySetDefinitionSet`
+/// `(#40,#41)`), and any unmodeled field. Dropped anchor participants
+/// are the one thing that must NOT be closed — the anchor rewrite prunes
+/// them from the record instead (GH #129).
 pub fn parse_rel(span: &[u8]) -> Option<(&'static RelRule, Vec<u64>, Vec<u64>)> {
     let (_id, type_name, args) = crate::lexer::parse_record_span(span)?;
     let rule = rule_for(type_name)?;
     let split = crate::lexer::split_top_level_args(args);
     let anchor = field_refs(&split, rule.anchor);
-    let pull = field_refs(&split, rule.pull);
+    let mut pull = Vec::new();
+    for (i, raw) in split.iter().enumerate() {
+        if i == rule.anchor.index {
+            continue;
+        }
+        pull.extend(crate::lexer::scan_ref_tokens(raw));
+    }
     Some((rule, anchor, pull))
 }

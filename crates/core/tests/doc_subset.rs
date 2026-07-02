@@ -72,13 +72,13 @@ fn corpus_roundtrip_and_closure_across_diverse_files() {
     // MagiCAD, 60KB..284MB, ARK/RIV/MEP). Set:
     //   IFCFAST_CORPUS="/a.ifc:/b.ifc:..." cargo test -p ifcfast-core \
     //     --no-default-features --test doc_subset -- --ignored --nocapture
-    let raw = match std::env::var("IFCFAST_CORPUS") {
-        Ok(s) => s,
-        Err(_) => {
-            eprintln!("IFCFAST_CORPUS unset — skipping");
-            return;
-        }
-    };
+    let raw = std::env::var("IFCFAST_CORPUS")
+        .or_else(|_| std::env::var("IFCFAST_SUBSET_CORPUS"))
+        .expect(
+            "corpus gate invoked (--ignored) but IFCFAST_CORPUS is unset — \
+             refusing to report green without running: set \
+             IFCFAST_CORPUS=/a.ifc:/b.ifc (IFCFAST_SUBSET_CORPUS also accepted)",
+        );
     let paths: Vec<&str> = raw.split(':').filter(|s| !s.is_empty()).collect();
     assert!(!paths.is_empty());
 
@@ -244,13 +244,13 @@ fn subset_across_corpus_is_self_contained() {
     //   IFCFAST_CORPUS="/a.ifc:/b.ifc" IFCFAST_SUBSET_DIR=/tmp/subs \
     //     cargo test -p ifcfast-core --no-default-features --test doc_subset \
     //     -- --ignored subset_across_corpus --nocapture
-    let raw = match std::env::var("IFCFAST_CORPUS") {
-        Ok(s) => s,
-        Err(_) => {
-            eprintln!("IFCFAST_CORPUS unset — skipping");
-            return;
-        }
-    };
+    let raw = std::env::var("IFCFAST_CORPUS")
+        .or_else(|_| std::env::var("IFCFAST_SUBSET_CORPUS"))
+        .expect(
+            "corpus gate invoked (--ignored) but IFCFAST_CORPUS is unset — \
+             refusing to report green without running: set \
+             IFCFAST_CORPUS=/a.ifc:/b.ifc (IFCFAST_SUBSET_CORPUS also accepted)",
+        );
     let out_dir = std::env::var("IFCFAST_SUBSET_DIR").ok();
     let paths: Vec<&str> = raw.split(':').filter(|s| !s.is_empty()).collect();
     assert!(!paths.is_empty());
@@ -321,4 +321,31 @@ fn closure_subset_emits_and_reopens_forward_closed() {
             );
         }
     }
+}
+
+#[test]
+fn retained_rel_closes_owner_history_and_inline_pset_set() {
+    // GH #129: rel #43 carries its own OwnerHistory #9 (referenced by
+    // nothing else) and attaches psets through an INLINE IFC4
+    // IfcPropertySetDefinitionSet aggregate (#40,#45) instead of a bare
+    // ref. Retaining the rel must forward-close both — the old pass
+    // closed only the typed pull field and emitted the rel verbatim,
+    // leaving #9/#40/#45 dangling.
+    let doc = Doc::open_editable(&fixtures_dir().join("subset_owner_history.ifc")).expect("open");
+    let (bytes, stats) = subset(&doc, &[30]);
+    assert_eq!(stats.seeds_present, 1);
+
+    let re = Doc::from_bytes(bytes);
+
+    // The rel's own OwnerHistory chain survives.
+    for id in [9u64, 80, 81, 82, 83] {
+        assert!(re.contains(id), "rel OwnerHistory dep #{id} must be pulled");
+    }
+    // Both psets named by the inline IfcPropertySetDefinitionSet survive.
+    for id in [40u64, 41, 45, 46] {
+        assert!(re.contains(id), "inline-set pset dep #{id} must be pulled");
+    }
+
+    // And the reopened subset is fully self-contained.
+    assert_no_dropped_deps(&re, &doc);
 }

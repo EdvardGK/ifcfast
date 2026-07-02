@@ -1,0 +1,42 @@
+ISO-10303-21;
+HEADER;
+FILE_DESCRIPTION(('ViewDefinition [ReferenceView]'),'2;1');
+FILE_NAME('subset_owner_history.ifc','2026-07-02T00:00:00',('ifcfast tests'),('Skiplum'),'ifcfast','ifcfast-tests','');
+FILE_SCHEMA(('IFC4'));
+ENDSEC;
+DATA;
+/* GH #129 regression fixture. Wall #30 carries OwnerHistory #8; the
+   pset rel #43 carries a DIFFERENT OwnerHistory #9 (referenced by
+   nothing else) and attaches its psets through an INLINE IFC4
+   IfcPropertySetDefinitionSet aggregate (#40,#45) rather than a bare
+   ref. Subsetting wall #30 retains rel #43 verbatim — so #9, #40 and
+   #45 must be forward-closed with it or the output dangles. */
+#1=IFCPROJECT('0YvctVUKr0kugbFTf53O9L',$,'OH Project',$,$,$,$,(#5),#2);
+#2=IFCUNITASSIGNMENT((#3));
+#3=IFCSIUNIT(*,.LENGTHUNIT.,$,.METRE.);
+#5=IFCGEOMETRICREPRESENTATIONCONTEXT($,'Model',3,1.0E-5,#6,$);
+#6=IFCAXIS2PLACEMENT3D(#7,$,$);
+#7=IFCCARTESIANPOINT((0.,0.,0.));
+#8=IFCOWNERHISTORY(#80,#81,$,.ADDED.,$,$,$,0);
+#9=IFCOWNERHISTORY(#80,#81,$,.MODIFIED.,$,$,$,1);
+#80=IFCPERSONANDORGANIZATION(#82,#83,$);
+#81=IFCAPPLICATION(#83,'1.0','ifcfast tests','ifcfast');
+#82=IFCPERSON($,'Tester',$,$,$,$,$,$);
+#83=IFCORGANIZATION($,'Skiplum',$,$,$);
+#10=IFCSITE('1YvctVUKr0kugbFTf53O9L',#8,'Site',$,$,#15,$,$,.ELEMENT.,$,$,0.,$,$);
+#11=IFCBUILDING('2YvctVUKr0kugbFTf53O9L',#8,'Building',$,$,#15,$,$,.ELEMENT.,$,$,$);
+#12=IFCBUILDINGSTOREY('3YvctVUKr0kugbFTf53O9L',#8,'Plan 01',$,$,#15,$,'Plan 01',.ELEMENT.,0.0);
+#15=IFCLOCALPLACEMENT($,#6);
+#16=IFCLOCALPLACEMENT(#15,#6);
+#20=IFCRELAGGREGATES('4YvctVUKr0kugbFTf53O9L',#8,$,$,#1,(#10));
+#21=IFCRELAGGREGATES('5YvctVUKr0kugbFTf53O9L',#8,$,$,#10,(#11));
+#22=IFCRELAGGREGATES('6YvctVUKr0kugbFTf53O9L',#8,$,$,#11,(#12));
+#30=IFCWALL('7YvctVUKr0kugbFTf53O9L',#8,'Wall-A',$,$,#16,$,'tag-A',.STANDARD.);
+#40=IFCPROPERTYSET('9YvctVUKr0kugbFTf53O9L',#8,'Pset_WallCommon',$,(#41));
+#41=IFCPROPERTYSINGLEVALUE('IsExternal',$,IFCBOOLEAN(.T.),$);
+#45=IFCPROPERTYSET('AYvctVUKr0kugbFTf53O9L',#8,'Pset_WallExtra',$,(#46));
+#46=IFCPROPERTYSINGLEVALUE('LoadBearing',$,IFCBOOLEAN(.F.),$);
+#43=IFCRELDEFINESBYPROPERTIES('BRELDFWUIDgUIDgUIDgUI0',#9,$,$,(#30),(#40,#45));
+#60=IFCRELCONTAINEDINSPATIALSTRUCTURE('CYvctVUKr0kugbFTf53O9L',#8,$,$,(#30),#12);
+ENDSEC;
+END-ISO-10303-21;

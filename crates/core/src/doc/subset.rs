@@ -19,10 +19,12 @@
 //! A relationship's forward references *include its participants*. If a rel
 //! were placed in the forward-closure keep set, closing it would re-admit
 //! every dropped participant (all the other products in a shared containment
-//! or pset rel), defeating the subset. So rels are never forward-closed:
-//! only their *pull* ref is added to keep. The rel record is emitted
-//! separately, with its anchor SET rewritten to the survivors — see
-//! [`super::rel_rules`] and [`super::emit::emit_subset`].
+//! or pset rel), defeating the subset. So rels are never forward-closed as
+//! records: every ref *outside the anchor field* — OwnerHistory, the pull
+//! field, any unmodeled field — is added to keep (GH #129), while the
+//! anchor participants themselves are only ever *filtered*. The rel record
+//! is emitted separately, with its anchor SET rewritten to the survivors —
+//! see [`super::rel_rules`] and [`super::emit::emit_subset`].
 //!
 //! ## Guarantees
 //!

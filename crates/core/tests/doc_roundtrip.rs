@@ -61,10 +61,10 @@ fn roundtrip_is_byte_identical_on_corpus_file() {
     //     --test doc_roundtrip -- --ignored --nocapture
     let path = match std::env::var("IFCFAST_ROUNDTRIP_FILE") {
         Ok(p) => PathBuf::from(p),
-        Err(_) => {
-            eprintln!("IFCFAST_ROUNDTRIP_FILE unset — skipping");
-            return;
-        }
+        Err(_) => panic!(
+            "roundtrip gate invoked (--ignored) but IFCFAST_ROUNDTRIP_FILE is unset — \
+             refusing to report green without running"
+        ),
     };
     let original = fs::read(&path).expect("read corpus file");
     let doc = Doc::open_editable(&path).expect("open_editable");
