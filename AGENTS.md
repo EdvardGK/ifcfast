@@ -965,9 +965,12 @@ m.hotswap(m0.guid, v, t, out_path="lean.ifc")
 - **Coordinates are element-local.** An `IfcTriangulatedFaceSet`'s coords
   live *before* the element's `ObjectPlacement`. Supply local-frame
   vertices (the frame the original body used), not world coords — the
-  placement is left untouched, so the element stays put. For a
-  decimate-in-place round-trip, extract the element's local mesh,
-  simplify, swap back.
+  placement is left untouched, so the element stays put.
+  ⚠️ **`m.meshes()` returns *world* coords** (placement baked in), so you
+  cannot feed its vertices straight back into `hotswap` — the placement
+  would apply twice. Until a local-frame extractor lands (GH #127), feed
+  `hotswap` a mesh already in the element's local frame (e.g. one you
+  generated, or world verts rebased by the inverse of its placement).
 - **Schema-aware output.** IFC4+ files get a compact
   `IfcTriangulatedFaceSet`; IFC2x3 files (which lack it) get an
   `IfcShellBasedSurfaceModel` — either way the result reopens in
