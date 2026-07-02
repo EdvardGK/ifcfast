@@ -1,0 +1,39 @@
+ISO-10303-21;
+HEADER;
+FILE_DESCRIPTION(('ViewDefinition [ReferenceView]'),'2;1');
+FILE_NAME('hotswap_body_2x3.ifc','2026-07-02T00:00:00',('ifcfast tests'),('Skiplum'),'ifcfast','ifcfast-tests','');
+FILE_SCHEMA(('IFC2X3'));
+ENDSEC;
+DATA;
+/* GH #124 Phase 3: hotswap fixture. Two walls both mapped to a SHARED
+   IfcRepresentationMap (#63). Swapping wall1's body must repoint #41 at a
+   new faceset, GC the mapped item #42 and its unique mapping target #44,
+   but KEEP the shared map #63/#64/#65 (still referenced by wall2's #62)
+   and the shared context #10. Field positions match real IFC2X3 records;
+   geometry is minimal-but-well-formed for syntactic ref scanning. */
+#10=IFCGEOMETRICREPRESENTATIONCONTEXT($,'Model',3,1.E-05,#11,$);
+#11=IFCAXIS2PLACEMENT3D(#12,$,$);
+#12=IFCCARTESIANPOINT((0.,0.,0.));
+/* wall 1 — the swap target, mapped to the shared map #63 */
+#30=IFCWALL('7XvctVUKr0kugbFTf53O9L',$,'Wall-001',$,$,#16,#40,'tag-001',.STANDARD.);
+#16=IFCLOCALPLACEMENT($,#11);
+#40=IFCPRODUCTDEFINITIONSHAPE($,$,(#41));
+#41=IFCSHAPEREPRESENTATION(#10,'Body','MappedRepresentation',(#42));
+#42=IFCMAPPEDITEM(#63,#44);
+#44=IFCCARTESIANTRANSFORMATIONOPERATOR3D($,$,#12,1.,$);
+/* wall 2 — untouched, shares #63 so GC must not reclaim it */
+#50=IFCWALL('1AbCdEfGhIjKlMnOpQrStU',$,'Wall-002',$,$,#51,#60,'tag-002',.STANDARD.);
+#51=IFCLOCALPLACEMENT($,#11);
+#60=IFCPRODUCTDEFINITIONSHAPE($,$,(#61));
+#61=IFCSHAPEREPRESENTATION(#10,'Body','MappedRepresentation',(#62));
+#62=IFCMAPPEDITEM(#63,#66);
+#66=IFCCARTESIANTRANSFORMATIONOPERATOR3D($,$,#12,1.,$);
+/* the shared representation map and its owned geometry */
+#63=IFCREPRESENTATIONMAP(#64,#65);
+#64=IFCAXIS2PLACEMENT3D(#12,$,$);
+#65=IFCSHAPEREPRESENTATION(#10,'Body','SweptSolid',(#67));
+#67=IFCEXTRUDEDAREASOLID(#68,#64,#69,2.5);
+#68=IFCRECTANGLEPROFILEDEF(.AREA.,$,$,1.,0.25);
+#69=IFCDIRECTION((0.,0.,1.));
+ENDSEC;
+END-ISO-10303-21;

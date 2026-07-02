@@ -2722,6 +2722,93 @@ mod python {
         })
     }
 
+    // ----- hotswap_ifc (GH #124 Phase 3 — mesh hotswap) ----------------
+
+    /// Replace the body geometry of the product `guid` with the triangle
+    /// mesh `(vertices, triangles)`. `vertices` is a sequence of `[x,y,z]`
+    /// in the element's **local** representation frame (its ObjectPlacement
+    /// is applied on top — supply local, not world, coords). `triangles` is
+    /// a sequence of 0-based `[i,j,k]` vertex indices.
+    ///
+    /// Repoints the element's `Body` `IfcShapeRepresentation` at a new
+    /// `IfcTriangulatedFaceSet`, flips its type to `Tessellation`, and
+    /// garbage-collects the geometry the old body uniquely owned (a shared
+    /// `IfcRepresentationMap` used by other instances survives). Unknown
+    /// GlobalId, a product with no representation / no `Body` rep, or a bad
+    /// mesh all raise `ValueError`.
+    ///
+    /// The new body geometry is emitted in the file's schema dialect: an
+    /// `IfcTriangulatedFaceSet` on IFC4+, an `IfcShellBasedSurfaceModel` on
+    /// IFC2x3 (where the compact facesets don't exist).
+    ///
+    /// With `out_path` the result is written there and the returned dict
+    /// carries `path`; otherwise it carries the STEP `bytes`. Either way it
+    /// reports `shape_rep`, `new_geometry`, `new_records`, `old_items`,
+    /// `records_gc`, `records_out`, `bytes_out`.
+    #[pyfunction]
+    #[pyo3(signature = (path, guid, vertices, triangles, out_path = None))]
+    pub fn hotswap_ifc<'py>(
+        py: Python<'py>,
+        path: &str,
+        guid: &str,
+        vertices: Vec<Vec<f64>>,
+        triangles: Vec<Vec<u32>>,
+        out_path: Option<&str>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        catch_panic(|| {
+            let mut verts: Vec<[f64; 3]> = Vec::with_capacity(vertices.len());
+            for (i, v) in vertices.iter().enumerate() {
+                if v.len() != 3 {
+                    return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                        "hotswap: vertex {i} has {} coords, expected 3",
+                        v.len()
+                    )));
+                }
+                verts.push([v[0], v[1], v[2]]);
+            }
+            let mut tris: Vec<[u32; 3]> = Vec::with_capacity(triangles.len());
+            for (i, t) in triangles.iter().enumerate() {
+                if t.len() != 3 {
+                    return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                        "hotswap: triangle {i} has {} indices, expected 3",
+                        t.len()
+                    )));
+                }
+                tris.push([t[0], t[1], t[2]]);
+            }
+
+            let doc = crate::doc::Doc::open_editable(Path::new(path)).map_err(|e| {
+                pyo3::exceptions::PyIOError::new_err(format!("open_editable {path}: {e}"))
+            })?;
+
+            let (bytes, stats) = py
+                .detach(|| crate::doc::hotswap(&doc, guid, &verts, &tris))
+                .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("hotswap: {e}")))?;
+
+            let out = PyDict::new(py);
+            out.set_item("product", stats.product)?;
+            out.set_item("shape_rep", stats.shape_rep)?;
+            out.set_item("new_geometry", stats.new_geometry)?;
+            out.set_item("new_records", stats.new_records as u64)?;
+            out.set_item("old_items", stats.old_items as u64)?;
+            out.set_item("records_gc", stats.records_gc as u64)?;
+            out.set_item("records_out", stats.records_out as u64)?;
+            out.set_item("bytes_out", bytes.len() as u64)?;
+            match out_path {
+                Some(p) => {
+                    std::fs::write(p, &bytes).map_err(|e| {
+                        pyo3::exceptions::PyIOError::new_err(format!("write {p}: {e}"))
+                    })?;
+                    out.set_item("path", p)?;
+                }
+                None => {
+                    out.set_item("bytes", pyo3::types::PyBytes::new(py, &bytes))?;
+                }
+            }
+            Ok(out)
+        })
+    }
+
     #[pymodule]
     fn _core(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add("IfcfastError", _py.get_type::<IfcfastError>())?;
@@ -2752,6 +2839,7 @@ mod python {
         #[cfg(feature = "clash")]
         m.add_function(wrap_pyfunction!(clash, m)?)?;
         m.add_function(wrap_pyfunction!(subset_ifc, m)?)?;
+        m.add_function(wrap_pyfunction!(hotswap_ifc, m)?)?;
         m.add("__version__", env!("CARGO_PKG_VERSION"))?;
         Ok(())
     }

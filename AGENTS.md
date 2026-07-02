@@ -146,6 +146,7 @@ releases (additions only, never reorganisations).
 | Stream a point cloud in bounded-RAM chunks | `m.iter_point_cloud(per_m2=1000, chunk_points=1_000_000)` |
 | One-call viewer export to glTF binary | `m.to_gltf("out.glb")` (cuts on, instancing on, quant on) |
 | Carve a valid standalone IFC of some elements | `m.subset([guid, …])` → STEP `bytes` (or `out_path=` writes a file + returns stats) |
+| Swap one element's body mesh (e.g. decimated) | `m.hotswap(guid, vertices, triangles)` → STEP `bytes` (or `out_path=` writes a file + returns stats) |
 | Geometric quantities (volume, area) | `m.mesh_qto()` (cut_openings=True by default since v0.4.28) |
 | Placement-vs-mesh sanity check | `m.drift` (SI columns; check `m.world_coordinate_baked` for the file-level signal) |
 | "Which products live under this storey?" | `m.products_in(storey_guid)` |
@@ -941,14 +942,45 @@ stats = m.subset(walls, out_path="walls.ifc") # writes file, -> stats dict
 
 Unknown GlobalIds raise `ValueError` (a typo must not silently yield an
 empty subset). Seeds are *element* GlobalIds; you don't seed openings or
-storeys — voids follow their host, and the spine is derived. Full
-in-place mutation / mesh-hotswap is the next step on this axis (GH #124).
+storeys — voids follow their host, and the spine is derived.
+
+## Writing: `m.hotswap(guid, vertices, triangles)` — mesh swap
+
+The second write primitive: replace **one element's body geometry** with
+a new triangle mesh — the "swap a heavy mesh for a decimated one" move.
+It repoints that element's `Body` `IfcShapeRepresentation` at freshly
+minted tessellation geometry, and garbage-collects the geometry the old
+body *uniquely* owned (a shared `IfcRepresentationMap` still used by
+other instances survives, so the file only sheds what this element alone
+kept alive).
+
+```python
+m0   = m.meshes()[0]                       # local-frame triangles
+v, t = decimate(m0.vertices, m0.triangles) # your simplifier
+m.hotswap(m0.guid, v, t, out_path="lean.ifc")
+# stats: shape_rep, new_geometry, new_records, old_items, records_gc,
+#        records_out, bytes_out, path
+```
+
+- **Coordinates are element-local.** An `IfcTriangulatedFaceSet`'s coords
+  live *before* the element's `ObjectPlacement`. Supply local-frame
+  vertices (the frame the original body used), not world coords — the
+  placement is left untouched, so the element stays put. For a
+  decimate-in-place round-trip, extract the element's local mesh,
+  simplify, swap back.
+- **Schema-aware output.** IFC4+ files get a compact
+  `IfcTriangulatedFaceSet`; IFC2x3 files (which lack it) get an
+  `IfcShellBasedSurfaceModel` — either way the result reopens in
+  ifcopenshell with zero dangling refs.
+- `triangles` are 0-based `[i,j,k]`; NumPy `(N,3)` arrays are accepted
+  directly. Unknown GlobalId, an element with no `Body` representation,
+  or an empty / out-of-range mesh raise `ValueError`.
 
 ## What `ifcfast` does NOT do (yet)
 
-- Mutate IFCs in place / swap geometry. The write axis so far is
-  lossless **subsetting** (`m.subset`, above); surgical edit + emit is
-  the next milestone — see north-star below.
+- Full in-place property / placement editing. The write axis is lossless
+  **subsetting** (`m.subset`) + **body mesh hotswap** (`m.hotswap`);
+  general attribute mutation is the next milestone — see north-star below.
 - True boolean / CSG composition. By design — we surface BOTH
   operands instead, per the reveal-all stance above. If you need
   net geometry, compose the segments downstream.

@@ -81,6 +81,18 @@ _UNIT_TO_M = {
 }
 
 
+def _as_rows(seq):
+    """Normalise a mesh array to an iterable of row sequences.
+
+    Accepts a NumPy ``(N, 3)`` array (uses ``.tolist()`` for a cheap,
+    Python-native conversion) or any already-iterable of triples.
+    """
+    tolist = getattr(seq, "tolist", None)
+    if callable(tolist):
+        return tolist()
+    return seq
+
+
 def _unit_factor(unit: str) -> float:
     """Multiplier to convert a metres value into ``unit``.
 
@@ -959,6 +971,61 @@ class Model:
         d = _core.subset_ifc(
             str(native_path_for(self.header.path)),
             seeds,
+            str(out_path) if out_path is not None else None,
+        )
+        return d["bytes"] if out_path is None else d
+
+    def hotswap(self, guid, vertices, triangles, *, out_path=None):
+        """Replace one element's body geometry with a new triangle mesh.
+
+        The write-axis payload for "swap a bad mesh for a decimated one":
+        given a product ``guid`` and a ``(vertices, triangles)`` mesh, repoint
+        that element's **Body** ``IfcShapeRepresentation`` at a freshly minted
+        ``IfcTriangulatedFaceSet``, mark it ``Tessellation``, and garbage-
+        collect the geometry the old body uniquely owned. A shared
+        ``IfcRepresentationMap`` still used by other instances is preserved,
+        so the file only sheds what this element alone kept alive.
+
+        **Coordinate frame:** ``vertices`` must be in the element's *local*
+        representation frame — the frame the original body used, before its
+        ``ObjectPlacement``. Supply local coordinates, not world. For a
+        decimate-in-place round-trip, extract the element's local-frame mesh,
+        simplify it, and swap it back; the placement is never touched.
+
+        Args:
+            guid: GlobalId of the element to re-mesh. Unknown GlobalId, an
+                element with no representation or no ``Body`` rep, or an empty
+                / out-of-range mesh all raise ``ValueError``.
+            vertices: sequence of ``[x, y, z]`` (accepts a NumPy ``(N, 3)``
+                array or a list of triples).
+            triangles: sequence of 0-based ``[i, j, k]`` vertex indices
+                (accepts a NumPy ``(M, 3)`` array or a list of triples).
+            out_path: when given, the new IFC is written there and a stats
+                dict is returned (``path``, ``shape_rep``, ``new_geometry``,
+                ``new_records``, ``old_items``, ``records_gc``,
+                ``records_out``, ``bytes_out``). When ``None`` (default), the
+                STEP ``bytes`` are returned directly. The new body is an
+                ``IfcTriangulatedFaceSet`` on IFC4+ files, an
+                ``IfcShellBasedSurfaceModel`` on IFC2x3.
+
+        Returns:
+            ``bytes`` (``out_path is None``) or a stats ``dict``.
+
+        Example::
+
+            >>> m0 = m.meshes()[0]                    # local-frame triangles
+            >>> v, t = decimate(m0.vertices, m0.triangles)
+            >>> m.hotswap(m0.guid, v, t, out_path="lean.ifc")
+        """
+        from . import _core
+
+        verts = [[float(c) for c in row] for row in _as_rows(vertices)]
+        tris = [[int(c) for c in row] for row in _as_rows(triangles)]
+        d = _core.hotswap_ifc(
+            str(native_path_for(self.header.path)),
+            str(guid),
+            verts,
+            tris,
             str(out_path) if out_path is not None else None,
         )
         return d["bytes"] if out_path is None else d

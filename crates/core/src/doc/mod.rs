@@ -25,11 +25,13 @@
 //! original buffer, byte for byte. See `doc/emit.rs`.
 
 mod emit;
+mod hotswap;
 mod refs;
 mod rel_rules;
 mod subset;
 
 pub use emit::{emit, emit_subset, EmitStats};
+pub use hotswap::{hotswap, HotswapError, HotswapStats};
 pub use refs::{forward_refs, reachable_closure};
 pub use rel_rules::{field_refs, field_span, parse_rel, rule_for, RelField, RelRule, REL_RULES};
 pub use subset::{subset, SubsetStats};
