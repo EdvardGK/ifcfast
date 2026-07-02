@@ -141,8 +141,9 @@ releases (additions only, never reorganisations).
 | Tier-1 index (products + storeys) | `m = ifcfast.open(path)`; `m.summary()` |
 | Property sets / quantities / materials | `m.psets` / `m.quantities` / `m.materials` |
 | Classification refs (NS 3451, OmniClass, …) | `m.classifications` |
-| Per-product triangle meshes (verts, faces) | `m.meshes()` (`unit=`, `cut_openings=` opts) |
+| Per-product triangle meshes (verts, faces) | `m.meshes()` (`unit=`, `cut_openings=`, `frame=` opts) |
 | One product's mesh by GlobalId (picking) | `m.mesh(guid, cut_openings=…)` → `Mesh` or `None` |
+| Element-local mesh + placement (hotswap bridge) | `m.mesh(guid, frame="local")` → `LocalMesh(…, placement)` |
 | Sample a labeled point cloud (+ normals) | `m.point_cloud(per_m2=1000)` |
 | Stream a point cloud in bounded-RAM chunks | `m.iter_point_cloud(per_m2=1000, chunk_points=1_000_000)` |
 | One-call viewer export to glTF binary | `m.to_gltf("out.glb")` (cuts on, instancing on, quant on) |
@@ -844,6 +845,21 @@ whole georeferenced model can, so there is no `global_shift` to add
 back. Use `m.meshes()` for batch extraction (shifted `float32` +
 `MeshList.global_shift`); use `m.mesh()` for one element at a time.
 
+**Local frame: `frame="local"` (GH #127).** Both `m.mesh(guid)` and
+`m.meshes()` take `frame=`: `"world"` (default, everything above) or
+`"local"` — the element's **representation-item frame**: the
+coordinates its `Body` items store, *before* `ObjectPlacement`, in the
+file's **native length unit** (no metre scaling, no global shift).
+That is byte-for-byte the `m.hotswap` input frame — see the hotswap
+section for the round-trip. Rows come back as
+`LocalMesh(guid, entity, vertices, faces, placement)` where
+`placement` is the `float64[4, 4]` row-major `world_from_local` matrix
+(native units): `world_native = placement @ [x, y, z, 1]`, times
+`m.unit_scale` for metres. `frame="local"` refuses
+`cut_openings=True` (the cut folds meshes in a shared frame) and a
+non-default `unit=` (native units are the contract) — both raise
+`ValueError`.
+
 **`m.mesh_qto(cut_openings=True)` is the default since v0.4.28** —
 authored `Qto_*Volume` values are net (openings subtracted), and so
 is the new geometric default. Pass `cut_openings=False` if you want
@@ -963,22 +979,23 @@ other instances survives, so the file only sheds what this element alone
 kept alive).
 
 ```python
-m0   = m.meshes()[0]                       # local-frame triangles
-v, t = decimate(m0.vertices, m0.triangles) # your simplifier
-m.hotswap(m0.guid, v, t, out_path="lean.ifc")
+lm   = m.mesh(guid, frame="local")   # element-local frame, native units
+v, t = decimate(lm.vertices, lm.faces)  # your simplifier
+m.hotswap(guid, v, t, out_path="lean.ifc")
 # stats: shape_rep, new_geometry, new_records, old_items, records_gc,
 #        records_out, bytes_out, path
 ```
 
-- **Coordinates are element-local.** An `IfcTriangulatedFaceSet`'s coords
-  live *before* the element's `ObjectPlacement`. Supply local-frame
-  vertices (the frame the original body used), not world coords — the
-  placement is left untouched, so the element stays put.
-  ⚠️ **`m.meshes()` returns *world* coords** (placement baked in), so you
-  cannot feed its vertices straight back into `hotswap` — the placement
-  would apply twice. Until a local-frame extractor lands (GH #127), feed
-  `hotswap` a mesh already in the element's local frame (e.g. one you
-  generated, or world verts rebased by the inverse of its placement).
+- **Coordinates are element-local, native units.** An
+  `IfcTriangulatedFaceSet`'s coords live *before* the element's
+  `ObjectPlacement`, in the file's native length unit. That is exactly
+  what `m.mesh(guid, frame="local")` / `m.meshes(frame="local")` return
+  (GH #127) — extract-local → decimate → `hotswap` round-trips with the
+  placement untouched, so the element stays put. Each `LocalMesh` also
+  carries `placement` (`world_from_local`, 4×4) if you need to move
+  between frames yourself.
+  ⚠️ World-frame vertices — `m.meshes()` / `m.mesh(guid)` *without*
+  `frame="local"` — double-apply the placement when fed back here.
 - **Schema-aware output.** IFC4+ files get a compact
   `IfcTriangulatedFaceSet`; IFC2x3 files (which lack it) get an
   `IfcShellBasedSurfaceModel` — either way the result reopens in

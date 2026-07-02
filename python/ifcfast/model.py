@@ -53,6 +53,19 @@ def _strict_signal(msg: str, strict: bool) -> None:
 #: ``trimesh.Trimesh(mesh.vertices, mesh.faces)``.
 Mesh = namedtuple("Mesh", ["guid", "entity", "vertices", "faces"])
 
+#: One product's triangle mesh in its **local representation frame**, as
+#: returned by :meth:`Model.mesh` / :meth:`Model.meshes` with
+#: ``frame="local"`` (GH #127). ``vertices`` are the coordinates the
+#: element's ``Body`` representation items store — *before* its
+#: ``ObjectPlacement``, in the file's **native length unit** — which is
+#: byte-for-byte the input frame of :meth:`Model.hotswap`. ``placement``
+#: is the ``float64[4, 4]`` row-major ``world_from_local`` matrix
+#: (native units): ``world = placement @ [x, y, z, 1]``; multiply by
+#: ``Model.unit_scale`` for metres.
+LocalMesh = namedtuple(
+    "LocalMesh", ["guid", "entity", "vertices", "faces", "placement"]
+)
+
 
 class MeshList(list):
     """A plain ``list`` of :data:`Mesh` (fully iterable / indexable /
@@ -106,6 +119,28 @@ def _unit_factor(unit: str) -> float:
             f"{sorted(set(_UNIT_TO_M))}"
         )
     return 1.0 / _UNIT_TO_M[key]
+
+
+def _validate_frame(frame: str, unit: str) -> bool:
+    """``True`` when the caller asked for the local representation frame.
+
+    ``frame="local"`` (GH #127) returns coordinates in the file's
+    **native length unit** — the exact :meth:`Model.hotswap` input — so
+    the ``unit=`` conversion does not apply there. A non-default unit
+    combined with ``frame="local"`` is rejected loudly rather than
+    silently mis-scaling a hotswap payload. (``frame="local"`` +
+    ``cut_openings=True`` is rejected by the Rust core for both
+    getters — the cut folds meshes in a shared frame.)
+    """
+    if frame not in ("world", "local"):
+        raise ValueError(f"unknown frame {frame!r}; choose 'world' or 'local'")
+    if frame == "local" and _unit_factor(unit) != 1.0:
+        raise ValueError(
+            "frame='local' returns coordinates in the file's native "
+            "length unit (the m.hotswap contract); the unit= parameter "
+            "does not apply — leave it at its default"
+        )
+    return frame == "local"
 
 
 @dataclass
@@ -988,9 +1023,16 @@ class Model:
 
         **Coordinate frame:** ``vertices`` must be in the element's *local*
         representation frame — the frame the original body used, before its
-        ``ObjectPlacement``. Supply local coordinates, not world. For a
-        decimate-in-place round-trip, extract the element's local-frame mesh,
-        simplify it, and swap it back; the placement is never touched.
+        ``ObjectPlacement``, in the file's **native length unit**. That is
+        exactly what ``m.mesh(guid, frame="local")`` /
+        ``m.meshes(frame="local")`` return (GH #127), so the
+        decimate-in-place round-trip is::
+
+            >>> lm = m.mesh(guid, frame="local")
+            >>> v, t = decimate(lm.vertices, lm.faces)
+            >>> m.hotswap(guid, v, t, out_path="lean.ifc")
+
+        The placement is never touched, so the element stays put.
 
         Args:
             guid: GlobalId of the element to re-mesh. Unknown GlobalId, an
@@ -1015,14 +1057,10 @@ class Model:
         Returns:
             ``bytes`` (``out_path is None``) or a stats ``dict``.
 
-        Example::
-
-            >>> v, t = decimate(local_verts, local_tris)  # LOCAL frame!
-            >>> m.hotswap(guid, v, t, out_path="lean.ifc")
-
-        .. warning:: ``m.meshes()`` vertices are **world**-frame — feeding
-           them straight back double-applies the placement (GH #127 tracks
-           the local-frame bridge).
+        .. warning:: World-frame vertices — ``m.meshes()`` /
+           ``m.mesh(guid)`` *without* ``frame="local"`` — double-apply the
+           placement when fed back here. Always extract with
+           ``frame="local"`` for the round-trip.
         """
         from . import _core
 
@@ -1042,6 +1080,7 @@ class Model:
         unit: str = "m",
         cut_openings: bool = False,
         keep_cutters: bool = False,
+        frame: str = "world",
     ):
         """Raw per-product triangle meshes — the fast drop-in for
         IfcOpenShell tessellation.
@@ -1113,6 +1152,25 @@ class Model:
                 cut pipeline, inspecting cutter placement). Ignored
                 when ``cut_openings=True`` — the cut consumes the
                 cutters entirely.
+            frame: ``"world"`` (default) — the contract above.
+                ``"local"`` (GH #127) — each product's **representation-
+                item frame**: the coordinates its ``Body`` items store,
+                *before* ``ObjectPlacement``, in the file's **native
+                length unit** (no metre scaling, no global shift —
+                ``global_shift`` is ``[0, 0, 0]``). This is byte-for-byte
+                the :meth:`hotswap` input frame, so extract-local →
+                decimate → :meth:`hotswap` round-trips with the placement
+                untouched. Rows become :data:`LocalMesh` (a 5th field,
+                ``placement`` — ``float64[4, 4]`` row-major
+                ``world_from_local``, native units). Incompatible with
+                ``cut_openings=True`` and with a non-default ``unit=``
+                (both raise ``ValueError``).
+
+        Batch decimate → hotswap bridge::
+
+            >>> for lm in m.meshes(frame="local"):
+            ...     v, t = decimate(lm.vertices, lm.faces)
+            ...     data = m.hotswap(lm.guid, v, t)  # frames line up
 
         Drop-in for trimesh:
 
@@ -1140,11 +1198,13 @@ class Model:
         from . import _core
         import numpy as np
 
+        local = _validate_frame(frame, unit)
         factor = _unit_factor(unit)
         d = _core.extract_meshes(
             str(native_path_for(self.header.path)),
             cut_openings=bool(cut_openings),
             keep_cutters=bool(keep_cutters),
+            frame=frame,
         )
         out = MeshList()
         for i in range(len(d["guid"])):
@@ -1153,9 +1213,18 @@ class Model:
                 # Scaled copy (writable). Cast keeps it float32.
                 verts = (verts * np.float32(factor)).astype(np.float32, copy=False)
             faces = np.frombuffer(d["indices"][i], dtype=np.uint32).reshape(-1, 3)
-            out.append(Mesh(d["guid"][i], d["entity"][i], verts, faces))
+            if local:
+                placement = np.asarray(
+                    d["placement"][i], dtype=np.float64
+                ).reshape(4, 4)
+                out.append(
+                    LocalMesh(d["guid"][i], d["entity"][i], verts, faces, placement)
+                )
+            else:
+                out.append(Mesh(d["guid"][i], d["entity"][i], verts, faces))
         # Rust returns the shift in metres; scale to the output unit so
-        # `vertices + global_shift` is consistent.
+        # `vertices + global_shift` is consistent. (frame="local" pins
+        # no shift — the list arrives as [0, 0, 0].)
         gshift = list(d.get("global_shift", [0.0, 0.0, 0.0]))
         out.global_shift = [s * factor for s in gshift] if factor != 1.0 else gshift
         return out
@@ -1165,18 +1234,23 @@ class Model:
         unit: str = "m",
         cut_openings: bool = False,
         keep_cutters: bool = False,
+        frame: str = "world",
     ):
         """Generator form of :meth:`meshes` — yields ``Mesh`` namedtuples
-        one at a time. Identical data; use this when you want to stream
-        through products without materialising the whole list. Note the
-        Rust mesher still runs eagerly (one batch pass), so this trades
-        list-construction memory for iteration ergonomics, not peak RAM.
+        one at a time (``LocalMesh`` when ``frame="local"``). Identical
+        data; use this when you want to stream through products without
+        materialising the whole list. Note the Rust mesher still runs
+        eagerly (one batch pass), so this trades list-construction memory
+        for iteration ergonomics, not peak RAM.
 
-        ``cut_openings`` / ``keep_cutters`` mirror :meth:`meshes` — see
-        that method for the full contract.
+        ``cut_openings`` / ``keep_cutters`` / ``frame`` mirror
+        :meth:`meshes` — see that method for the full contract.
         """
         for mesh in self.meshes(
-            unit=unit, cut_openings=cut_openings, keep_cutters=keep_cutters
+            unit=unit,
+            cut_openings=cut_openings,
+            keep_cutters=keep_cutters,
+            frame=frame,
         ):
             yield mesh
 
@@ -1187,6 +1261,7 @@ class Model:
         unit: str = "m",
         cut_openings: bool = False,
         keep_cutters: bool = False,
+        frame: str = "world",
     ):
         """Tessellate a single product by GlobalId — the interactive-pick
         / per-element analogue of :meth:`meshes`.
@@ -1221,6 +1296,23 @@ class Model:
         ``keep_cutters`` (ignored in cut mode). The cut result is
         identical to the matching product from ``meshes(cut_openings=True)``.
 
+        ``frame="local"`` (GH #127) returns a :data:`LocalMesh` instead:
+        the element's **representation-item frame** — the coordinates its
+        ``Body`` items store, *before* ``ObjectPlacement``, in the file's
+        **native length unit**. That is byte-for-byte the :meth:`hotswap`
+        input, so the per-element decimate round-trip is::
+
+            >>> lm = m.mesh(guid, frame="local")
+            >>> v, t = decimate(lm.vertices, lm.faces)
+            >>> m.hotswap(guid, v, t, out_path="lean.ifc")
+
+        ``lm.placement`` is the ``float64[4, 4]`` row-major
+        ``world_from_local`` matrix (native units):
+        ``world_native = placement @ [x, y, z, 1]``; multiply by
+        :attr:`unit_scale` for metres. ``frame="local"`` is incompatible
+        with ``cut_openings=True`` and with a non-default ``unit=``
+        (both raise ``ValueError``).
+
         Drop-in for trimesh::
 
             >>> tm = trimesh.Trimesh(*m.mesh(guid)[2:], process=False)
@@ -1228,20 +1320,26 @@ class Model:
         from . import _core
         import numpy as np
 
+        local = _validate_frame(frame, unit)
         factor = _unit_factor(unit)
         d = _core.extract_mesh_one(
             str(native_path_for(self.header.path)),
             str(guid),
             cut_openings=bool(cut_openings),
             keep_cutters=bool(keep_cutters),
+            frame=frame,
         )
         if d is None:
             return None
         verts = np.frombuffer(d["vertices"], dtype=np.float64).reshape(-1, 3)
         if factor != 1.0:
-            # Writable scaled copy; stays float64.
+            # Writable scaled copy; stays float64. (Never taken for
+            # frame="local" — _validate_frame pins the default unit.)
             verts = verts * float(factor)
         faces = np.frombuffer(d["indices"], dtype=np.uint32).reshape(-1, 3)
+        if local:
+            placement = np.asarray(d["placement"], dtype=np.float64).reshape(4, 4)
+            return LocalMesh(d["guid"], d["entity"], verts, faces, placement)
         return Mesh(d["guid"], d["entity"], verts, faces)
 
     @property
