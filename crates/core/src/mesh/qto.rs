@@ -572,6 +572,23 @@ pub fn compute(vertices: &[f32], indices: &[u32], unit_scale: f32) -> MeshQto {
             let collapsed = prism >= MIN_SOLID_PRISM_M3
                 && surface_area_m2 > solid_area_floor
                 && volume_mesh_m3 < upper * COLLAPSE_FRAC;
+            // NO winding-coherence gate here — deliberately (GH #131).
+            // Distrusting the divergence sum when triangles disagree on
+            // orientation is the obvious guard against an in-band
+            // UNDER-report, and it was implemented and corpus-refuted on
+            // 2026-07-02: of the 110 in-band open shells it flipped to
+            // `prism_fallback` on G55 ARK+RIB, 104 had mesh volumes at
+            // ifcopenshell parity (median rel err 0.000) while the
+            // substituted prism was off by a median +112 %; the entire
+            // genuine catch was one proxy (0.71 vs 1.48 m³) and a
+            // 2-litre plate. Root cause: the correctness contract is
+            // *oracle parity*, and ifcopenshell computes the same
+            // signed-tetra sum over the same authored geometry — so
+            // authored winding incoherence (double-sided panels, flipped
+            // faces from Revit) cancels identically in the oracle.
+            // Winding predicts divergence from PHYSICAL volume, not from
+            // the oracle. See `winding_gate_tests` below and GH #131 for
+            // the evidence and the measured 6-row residue.
             if upper > 0.0 && volume_mesh_m3 > 0.0 && !collapsed
                 && volume_mesh_m3 <= upper * PRISM_TRIPWIRE_MARGIN
             {
@@ -786,6 +803,48 @@ pub(crate) fn is_closed_manifold(indices: &[u32]) -> bool {
         }
     }
     edges.values().all(|&(unsigned, signed)| unsigned == 2 && signed == 0)
+}
+
+/// Does the shell wind coherently — every undirected edge either a
+/// boundary edge (one incidence) or an interior edge walked once in each
+/// direction? (GH #131)
+///
+/// NOT wired into the trust gate: corpus-refuted as a reliability
+/// predictor on 2026-07-02 (see the comment at the `mesh_open` gate in
+/// [`compute`]). Authored winding incoherence cancels identically in the
+/// ifcopenshell oracle, so this measures divergence from physical truth,
+/// not from the correctness contract. Kept (with its tests) as the
+/// building block for a future discriminator that predicts ORACLE
+/// divergence — e.g. combined with a cancellation-magnitude estimate.
+/// Tolerance: ≤ 2 % bad edges still counts as coherent.
+#[allow(dead_code)]
+pub(crate) fn winding_coherent(indices: &[u32]) -> bool {
+    if indices.len() < 9 || indices.len() % 3 != 0 {
+        return false;
+    }
+    let mut edges: std::collections::HashMap<(u32, u32), (u32, i32)> =
+        std::collections::HashMap::with_capacity(indices.len() / 2);
+    for tri in indices.chunks_exact(3) {
+        let (a, b, c) = (tri[0], tri[1], tri[2]);
+        for &(u, v) in &[(a, b), (b, c), (c, a)] {
+            if u == v {
+                continue; // degenerate edge — same treatment as is_closed_manifold
+            }
+            let (key, sign) = if u < v { ((u, v), 1) } else { ((v, u), -1) };
+            let entry = edges.entry(key).or_insert((0, 0));
+            entry.0 += 1;
+            entry.1 += sign;
+        }
+    }
+    if edges.is_empty() {
+        return false;
+    }
+    let bad = edges
+        .values()
+        .filter(|&&(n, s)| !(n == 1 || (n == 2 && s == 0)))
+        .count();
+    const BAD_EDGE_FRAC: f64 = 0.02;
+    (bad as f64) <= (edges.len() as f64) * BAD_EDGE_FRAC
 }
 
 /// Remap every index to a canonical vertex id keyed by *quantized*
@@ -2000,5 +2059,71 @@ mod tests {
             "L-prism volume ~3 m³, got {}",
             q.volume_best_m3
         );
+    }
+}
+
+#[cfg(test)]
+mod winding_gate_tests {
+    use super::*;
+
+    /// Unit box 0..1 with the top face removed: 5 faces, 10 triangles,
+    /// wound CCW-from-outside. Signed-tetra volume = 2/3 (the origin-
+    /// adjacent faces contribute 0; top contributes 1/3 of the closed 1).
+    fn open_box() -> (Vec<f32>, Vec<u32>) {
+        let v = vec![
+            0.0, 0.0, 0.0,  1.0, 0.0, 0.0,  1.0, 1.0, 0.0,  0.0, 1.0, 0.0,
+            0.0, 0.0, 1.0,  1.0, 0.0, 1.0,  1.0, 1.0, 1.0,  0.0, 1.0, 1.0,
+        ];
+        let i = vec![
+            0, 2, 1,  0, 3, 2, // bottom (-Z)
+            0, 1, 5,  0, 5, 4, // -Y
+            1, 2, 6,  1, 6, 5, // +X
+            2, 3, 7,  2, 7, 6, // +Y
+            3, 0, 4,  3, 4, 7, // -X
+        ];
+        (v, i)
+    }
+
+    #[test]
+    fn coherent_open_shell_is_trusted_mesh_open() {
+        let (v, i) = open_box();
+        let q = compute(&v, &i, 1.0);
+        assert_eq!(q.mesh_quality, "open_shell");
+        assert_eq!(q.volume_method, "mesh_open");
+        assert!(q.volume_reliable);
+        assert!((q.volume_best_m3 - 2.0 / 3.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn incoherent_winding_is_still_trusted_by_design() {
+        // GH #131, DELIBERATE: flip the BOTTOM face only. Its tetra
+        // contributions pass through the origin, so the signed volume
+        // stays 2/3 — identical bounds and collapse margin as the
+        // coherent twin above, but 4 of 17 undirected edges now pair
+        // same-direction. A winding gate here was corpus-refuted
+        // (2026-07-02): 104 of 110 in-band incoherent shells on G55
+        // ARK+RIB sat at ifcopenshell parity because the oracle computes
+        // the same divergence sum over the same authored geometry —
+        // flipping them to the prism regressed them by a median +112 %.
+        // So incoherent-but-in-band stays TRUSTED. If this test starts
+        // failing because someone re-adds a winding gate: bring corpus
+        // evidence first (see GH #131).
+        let (v, mut i) = open_box();
+        i.swap(1, 2); // 0,2,1 -> 0,1,2
+        i.swap(4, 5); // 0,3,2 -> 0,2,3
+        let q = compute(&v, &i, 1.0);
+        assert_eq!(q.mesh_quality, "open_shell");
+        assert_eq!(q.volume_method, "mesh_open");
+        assert!(q.volume_reliable);
+        assert!((q.volume_m3.abs() - 2.0 / 3.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn winding_coherent_direct() {
+        let (_, i) = open_box();
+        assert!(winding_coherent(&i));
+        let mut flipped = i.clone();
+        flipped.swap(1, 2);
+        assert!(!winding_coherent(&flipped)); // 3/17 bad > 2 %
     }
 }
