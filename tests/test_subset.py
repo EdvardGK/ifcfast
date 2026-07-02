@@ -146,3 +146,48 @@ def test_subset_over_real_corpus_is_ifcopenshell_clean(path, tmp_path):
         f"0 dangling, proj=1 site={info['sites']} bldg={info['buildings']} "
         f"storey={info['storeys']}"
     )
+
+
+@pytest.mark.skipif(
+    not _corpus_paths(),
+    reason="set IFCFAST_SUBSET_CORPUS=/a.ifc:/b.ifc to run the real-file gate",
+)
+@pytest.mark.parametrize("path", _corpus_paths(), ids=lambda p: p.name)
+def test_subset_pulls_coverings_when_host_seeded(path, tmp_path):
+    """GH #126 completeness gate: seeding a covered building element must
+    drag its IfcCoverings into the subset. Exercises the new
+    IfcRelCoversBldgElements rule (anchor = host@4, pull = coverings@5-SET)
+    over real Revit/MagiCAD output, using ifcopenshell to discover a
+    genuine covered host and to name the coverings it should pull."""
+    assert path.exists(), f"corpus file missing: {path}"
+    src = ifcopenshell.open(str(path))
+
+    rel = None
+    for r in src.by_type("IfcRelCoversBldgElements"):
+        host = r.RelatingBuildingElement
+        covs = list(r.RelatedCoverings or [])
+        if (
+            host is not None
+            and getattr(host, "GlobalId", None)
+            and covs
+            and all(getattr(c, "GlobalId", None) for c in covs)
+        ):
+            rel = r
+            break
+    if rel is None:
+        pytest.skip(f"{path.name}: no IfcRelCoversBldgElements with GUIDs")
+
+    host_guid = rel.RelatingBuildingElement.GlobalId
+    cov_guids = {c.GlobalId for c in rel.RelatedCoverings}
+
+    model = ifcfast.open(path, use_cache=False, write_cache=False)
+    out = tmp_path / f"{path.stem}.covers.ifc"
+    model.subset([host_guid], out_path=str(out))
+
+    re = ifcfast.open(out, use_cache=False, write_cache=False)
+    guids = {p.guid for p in re}
+    assert host_guid in guids, f"{path.name}: seeded host {host_guid} missing"
+    missing = cov_guids - guids
+    assert not missing, f"{path.name}: coverings not pulled: {missing}"
+    _oracle_check(out)  # still ifcopenshell-clean with the coverings pulled
+    print(f"OK {path.name}: host {host_guid} pulled {len(cov_guids)} coverings")

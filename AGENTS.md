@@ -920,7 +920,12 @@ plus everything required to keep them valid:
   elements are retained);
 - the property / type / material / classification relationships attached
   to them — each shared relationship's participant list **pruned** to the
-  kept elements. Openings that void a kept wall come along automatically.
+  kept elements. Openings that void a kept wall come along automatically,
+  as do the **coverings** (`IfcRelCoversBldgElements`) on a kept host
+  wall/slab, and a kept system's `IfcRelServicesBuildings` link. Pure
+  connectivity relationships (`IfcRelConnectsPathElements` and other
+  `IfcRelConnects*`) are intentionally *not* followed — they link peer
+  neighbours, so pulling them would chain across the whole model.
 
 Guarantees: the output re-opens (in ifcfast **or** ifcopenshell) with
 **zero dangling references** and a rooted spatial tree. Subsetting *all*
@@ -949,11 +954,11 @@ in-place mutation / mesh-hotswap is the next step on this axis (GH #124).
   net geometry, compose the segments downstream.
 - Curved-surface tessellation for `IfcAdvancedBrep` — the face
   loops are triangulated as polygons, marked `advanced_brep_approx`.
-- `IfcRelConnectsElements` and other non-spatial / non-aggregation
-  relationships beyond the four already extracted
-  (`IfcRelContainedInSpatialStructure`, `IfcRelAggregates`,
-  `IfcRelVoidsElement`, `IfcRelDefinesByType`). File an issue with the
-  relation name + a sample if you need another one.
+- Follow *connectivity* relationships in a subset (`IfcRelConnects*`,
+  `IfcRelSpaceBoundary`). The subset pass understands spatial,
+  definition, void/fill, covering, and system-service rels (see
+  `m.subset` above); pure peer-to-peer links are dropped by design. File
+  an issue with the relation name + a sample if you need another one.
 
 ## North star: surgical modelling via code
 

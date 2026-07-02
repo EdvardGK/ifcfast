@@ -51,6 +51,8 @@ fn pins_every_rule_field_index_exactly() {
         (110, &[5019, 5020], &[4010]), // IfcRelDeclares
         (111, &[5021], &[4011]),       // IfcRelVoidsElement
         (112, &[5022], &[4012]),       // IfcRelFillsElement
+        (113, &[5023], &[4013, 4014]), // IfcRelCoversBldgElements (SET pull)
+        (114, &[5024], &[4015, 4016]), // IfcRelServicesBuildings (SET pull)
     ];
 
     for &(id, want_anchor, want_pull) in expected {

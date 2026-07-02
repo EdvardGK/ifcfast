@@ -72,22 +72,25 @@ pub struct RelRule {
 /// The relationship types the subset pass understands, with their field
 /// layouts. Indices verified against IFC2x3/IFC4/IFC4x3 records.
 ///
-/// **Invariant across every active rule:** `pull` is a single ref (the
-/// upstream dependency to add to keep) and `anchor` is the keep-condition
+/// **Invariant across every active rule:** `anchor` is the keep-condition
 /// side — a rel is retained iff at least one anchor ref survives, and only
-/// the anchor field (when a SET) is ever rewritten. The subset pass and the
-/// emit splicer both lean on this, so a new rule must fit it.
+/// the anchor field (when a SET) is ever rewritten. `pull` names the upstream
+/// dependencies added to keep when the rel activates; it may be a single ref
+/// *or* a SET. A SET pull is safe because pull refs are only ever *added* to
+/// keep (never rewritten) and the emitted rel names them verbatim, so every
+/// pull member is present — no dangling. The subset pass iterates `pull` as a
+/// list and the emit splicer only ever touches `anchor`, so both sides of the
+/// classification are honoured whether `pull` is single or set.
 ///
 /// Not every `IfcRel*` is here:
 /// - Connectivity / constraint rels (`IfcRelConnects*`,
 ///   `IfcRelSpaceBoundary`, `IfcRelReferencedInSpatialStructure`) add
-///   cross-links that would balloon a "minimal" subset.
-/// - `IfcRelServicesBuildings` (RelatingSystem@4, RelatedBuildings@5-SET) is
-///   deferred: its concrete-element side is the *building*, which every
-///   subset keeps via the spatial climb, so activating on it would drag
-///   every system serving the building into a one-wall subset. It needs
-///   member-anchoring (keep iff the *system* is kept), which breaks the
-///   single-`pull` invariant above — revisit for MEP-aware subsets.
+///   cross-links that would balloon a "minimal" subset. `IfcRelConnectsPath-
+///   Elements` (1951 in G55_ARK) is deliberately dropped for this reason:
+///   its two sides are peer neighbours (wall-to-wall joins), not a
+///   dependency, so pulling the connected element would chain across the
+///   whole model. A subset stays valid without it — connectivity is
+///   advisory, not structural.
 ///
 /// The pass treats an unknown `IfcRel*` as a plain node: forward-closure
 /// keeps it only if something already kept references it (which, for a rel,
@@ -170,6 +173,28 @@ pub const REL_RULES: &[RelRule] = &[
         type_name: b"IFCRELFILLSELEMENT",
         anchor: RelField::single(5),
         pull: RelField::single(4),
+    },
+    // Coverings: RelatingBuildingElement(4) is covered by RelatedCoverings(5,
+    // SET of IfcCovering). Anchor = the host wall/slab (single); pull = its
+    // coverings (set). Parallel to Voids: if the host survives, keep the
+    // finishes attached to it. Anchoring on the specific host (not the
+    // coverings) means seeding one wall pulls only *that* wall's coverings —
+    // no ballooning. First rule to use a SET pull. (GH #126)
+    RelRule {
+        type_name: b"IFCRELCOVERSBLDGELEMENTS",
+        anchor: RelField::single(4),
+        pull: RelField::set(5),
+    },
+    // System service: RelatingSystem(4, single) serves RelatedBuildings(5,
+    // SET of IfcSpatialElement). Anchor = the system (activates only when a
+    // system is deliberately seeded, so a one-wall subset never drags it in);
+    // pull = the served buildings, which the spatial climb already keeps, so
+    // the pull is near-free and just anchors the service link itself. This is
+    // the member-anchoring the old deferral note called for. (GH #126)
+    RelRule {
+        type_name: b"IFCRELSERVICESBUILDINGS",
+        anchor: RelField::single(4),
+        pull: RelField::set(5),
     },
 ];
 
