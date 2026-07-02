@@ -161,13 +161,15 @@ def test_local_frame_rejects_unit_conversion(model):
 
 
 def _corpus_paths() -> list[Path]:
-    raw = os.environ.get("IFCFAST_SUBSET_CORPUS", "")
+    raw = os.environ.get("IFCFAST_CORPUS", "") or os.environ.get(
+        "IFCFAST_SUBSET_CORPUS", ""
+    )
     return [Path(p) for p in raw.split(":") if p.strip()]
 
 
 @pytest.mark.skipif(
     not _corpus_paths(),
-    reason="set IFCFAST_SUBSET_CORPUS=/a.ifc:/b.ifc to run the real-file gate",
+    reason="set IFCFAST_CORPUS=/a.ifc:/b.ifc to run the real-file gate",
 )
 @pytest.mark.parametrize("path", _corpus_paths(), ids=lambda p: p.name)
 def test_local_roundtrip_over_real_corpus(path, tmp_path):
