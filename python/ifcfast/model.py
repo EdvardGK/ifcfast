@@ -995,15 +995,19 @@ class Model:
         Args:
             guid: GlobalId of the element to re-mesh. Unknown GlobalId, an
                 element with no representation or no ``Body`` rep, or an empty
-                / out-of-range mesh all raise ``ValueError``.
+                / out-of-range mesh all raise ``ValueError``. (A negative or
+                > 2**32-1 triangle index surfaces as ``OverflowError``, and a
+                flat 1-D array as ``TypeError`` — both from the binding
+                layer.)
             vertices: sequence of ``[x, y, z]`` (accepts a NumPy ``(N, 3)``
                 array or a list of triples).
             triangles: sequence of 0-based ``[i, j, k]`` vertex indices
                 (accepts a NumPy ``(M, 3)`` array or a list of triples).
             out_path: when given, the new IFC is written there and a stats
-                dict is returned (``path``, ``shape_rep``, ``new_geometry``,
-                ``new_records``, ``old_items``, ``records_gc``,
-                ``records_out``, ``bytes_out``). When ``None`` (default), the
+                dict is returned (``path``, ``product``, ``shape_rep``,
+                ``new_geometry``, ``new_records``, ``old_items``,
+                ``records_gc``, ``records_out``, ``bytes_out``). When
+                ``None`` (default), the
                 STEP ``bytes`` are returned directly. The new body is an
                 ``IfcTriangulatedFaceSet`` on IFC4+ files, an
                 ``IfcShellBasedSurfaceModel`` on IFC2x3.
@@ -1013,9 +1017,12 @@ class Model:
 
         Example::
 
-            >>> m0 = m.meshes()[0]                    # local-frame triangles
-            >>> v, t = decimate(m0.vertices, m0.triangles)
-            >>> m.hotswap(m0.guid, v, t, out_path="lean.ifc")
+            >>> v, t = decimate(local_verts, local_tris)  # LOCAL frame!
+            >>> m.hotswap(guid, v, t, out_path="lean.ifc")
+
+        .. warning:: ``m.meshes()`` vertices are **world**-frame — feeding
+           them straight back double-applies the placement (GH #127 tracks
+           the local-frame bridge).
         """
         from . import _core
 
