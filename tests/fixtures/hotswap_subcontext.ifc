@@ -1,0 +1,34 @@
+ISO-10303-21;
+HEADER;
+FILE_DESCRIPTION(('ViewDefinition [ReferenceView]'),'2;1');
+FILE_NAME('hotswap_subcontext.ifc','2026-07-02T00:00:00',('ifcfast tests'),('Skiplum'),'ifcfast','ifcfast-tests','');
+FILE_SCHEMA(('IFC4'));
+ENDSEC;
+DATA;
+/* GH #130 regression fixture. ONE wall whose Body is a uniquely-owned
+   MappedRepresentation, and a Body SUBCONTEXT #13 referenced ONLY by
+   shape representations (#41 + the map's source rep #65) — the parent
+   context #10 is held by IfcProject, the subcontext is not. Swapping
+   the wall's body GCs the map chain (#42,#44,#63,#64,#65,#67,#68,#69),
+   but the swapped rep #41 still references #13: the GC refcount must
+   count #41's surviving ContextOfItems edge or #13 (and #10 behind it)
+   is deleted out from under the emitted file. */
+#1=IFCPROJECT('0GH130ProjectGuid00001',$,'P',$,$,$,$,(#10),$);
+#10=IFCGEOMETRICREPRESENTATIONCONTEXT($,'Model',3,1.E-05,#11,$);
+#11=IFCAXIS2PLACEMENT3D(#12,$,$);
+#12=IFCCARTESIANPOINT((0.,0.,0.));
+#13=IFCGEOMETRICREPRESENTATIONSUBCONTEXT('Body','Model',*,*,*,*,#10,$,.MODEL_VIEW.,$);
+#30=IFCWALL('7XvctVUKr0kugbFTf53O9L',$,'Wall-001',$,$,#16,#40,'tag-001',.STANDARD.);
+#16=IFCLOCALPLACEMENT($,#11);
+#40=IFCPRODUCTDEFINITIONSHAPE($,$,(#41));
+#41=IFCSHAPEREPRESENTATION(#13,'Body','MappedRepresentation',(#42));
+#42=IFCMAPPEDITEM(#63,#44);
+#44=IFCCARTESIANTRANSFORMATIONOPERATOR3D($,$,#12,1.,$);
+#63=IFCREPRESENTATIONMAP(#64,#65);
+#64=IFCAXIS2PLACEMENT3D(#12,$,$);
+#65=IFCSHAPEREPRESENTATION(#13,'Body','SweptSolid',(#67));
+#67=IFCEXTRUDEDAREASOLID(#68,#64,#69,2.5);
+#68=IFCRECTANGLEPROFILEDEF(.AREA.,$,$,1.,0.25);
+#69=IFCDIRECTION((0.,0.,1.));
+ENDSEC;
+END-ISO-10303-21;

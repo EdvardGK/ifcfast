@@ -128,6 +128,14 @@ pub fn hotswap(
     if tris.is_empty() {
         return Err(HotswapError::BadMesh("no triangles".into()));
     }
+    for (i, v) in verts.iter().enumerate() {
+        if !v.iter().all(|c| c.is_finite()) {
+            return Err(HotswapError::BadMesh(format!(
+                "vertex {i} has a non-finite coordinate ({:?},{:?},{:?})",
+                v[0], v[1], v[2]
+            )));
+        }
+    }
     let nv = verts.len() as u32;
     for (t, tri) in tris.iter().enumerate() {
         for &v in tri {
@@ -304,15 +312,18 @@ fn gc_orphans(doc: &Doc, shape_rep: u64, old_items: &[u64]) -> HashSet<u64> {
     let closure = reachable_closure(doc, old_items);
 
     // Inbound refcount over the post-swap graph.
+    let old_set: HashSet<u64> = old_items.iter().copied().collect();
     let mut refcount: HashMap<u64, usize> = HashMap::new();
     for &id in doc.ids() {
-        if id == shape_rep {
-            // Post-swap the body rep references only the new geometry (not
-            // yet in the doc) plus its context; neither is an old item, so
-            // it contributes nothing to the closure's counts.
-            continue;
-        }
         for r in forward_refs(doc, id) {
+            // Post-swap the body rep's Items are the new geometry (not yet
+            // in the doc), so its old-item edges vanish — but every OTHER
+            // field it carries (notably ContextOfItems) survives the swap
+            // and must keep its target alive, e.g. a subcontext whose only
+            // referrers are shape representations (GH #130).
+            if id == shape_rep && old_set.contains(&r) {
+                continue;
+            }
             if closure.contains(&r) {
                 *refcount.entry(r).or_insert(0) += 1;
             }
@@ -442,11 +453,21 @@ fn fmt_tuple(v: &[f64; 3]) -> String {
     format!("({},{},{})", fmt_real(v[0]), fmt_real(v[1]), fmt_real(v[2]))
 }
 
-/// Format an `f64` as a STEP REAL — always carrying a decimal point (or an
-/// exponent), never a bare integer token. `{:?}` gives the shortest
-/// round-tripping form and guarantees a `.` for whole values (`1.0`).
+/// Format an `f64` as a STEP REAL. `{:?}` gives the shortest
+/// round-tripping form and a `.` for whole values (`1.0`), but drops the
+/// point in exponent form (`5e-5`) — the ISO-10303-21 REAL grammar requires
+/// a decimal point even with an exponent, so re-insert it. Non-finite
+/// values must be rejected upstream (`hotswap` validates); debug-assert
+/// here as the backstop.
 fn fmt_real(x: f64) -> String {
-    format!("{x:?}")
+    debug_assert!(x.is_finite(), "fmt_real: non-finite {x}");
+    let s = format!("{x:?}");
+    match s.find(['e', 'E']) {
+        Some(epos) if !s[..epos].contains('.') => {
+            format!("{}.0{}", &s[..epos], &s[epos..])
+        }
+        _ => s,
+    }
 }
 
 /// Emit the mutated document: header + every record (skipping `removed`,

@@ -169,3 +169,63 @@ fn bad_mesh_is_loud() {
         Err(HotswapError::BadMesh(_))
     ));
 }
+
+#[test]
+fn gc_keeps_the_subcontext_the_swapped_rep_still_references() {
+    // GH #130: `hotswap_subcontext.ifc` has ONE wall whose Body is a
+    // uniquely-owned MappedRepresentation, and a Body subcontext #13
+    // referenced only by shape representations (#41 + the map's source
+    // rep #65). The map chain is fully GC'd — but the swapped rep #41
+    // still references #13, so #13 (and #10 behind it) must survive.
+    let doc = Doc::open_editable(&fixtures_dir().join("hotswap_subcontext.ifc")).expect("open");
+    let (verts, tris) = unit_cube();
+
+    let (bytes, stats) = hotswap(&doc, WALL1, &verts, &tris).expect("hotswap ok");
+    let re = Doc::from_bytes(bytes);
+
+    // The uniquely-owned map chain is reclaimed…
+    for gone in [42, 44, 63, 64, 65, 67, 68, 69] {
+        assert!(!re.contains(gone), "#{gone} is uniquely owned, should be GC'd");
+    }
+    assert_eq!(stats.records_gc, 8);
+
+    // …but the contexts the swapped rep still references survive.
+    for kept in [13, 10, 11, 12, 1] {
+        assert!(re.contains(kept), "#{kept} must survive the swap");
+    }
+
+    // Zero dangling references in the reopened document.
+    for &id in re.ids() {
+        for r in forward_refs(&re, id) {
+            assert!(re.contains(r), "dangling #{r} referenced by #{id}");
+        }
+    }
+}
+
+#[test]
+fn non_finite_vertices_are_loud() {
+    // GH #128: NaN / inf must be rejected, never serialised.
+    let doc = Doc::open_editable(&fixtures_dir().join("hotswap_body.ifc")).expect("open");
+    let tris = vec![[0u32, 1, 2]];
+    for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        let verts = vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, bad, 0.0]];
+        assert!(
+            matches!(hotswap(&doc, WALL1, &verts, &tris), Err(HotswapError::BadMesh(_))),
+            "coordinate {bad} must be rejected"
+        );
+    }
+}
+
+#[test]
+fn tiny_coordinates_keep_a_decimal_point() {
+    // GH #128: Rust's shortest {:?} form drops the decimal point in
+    // exponent notation (`1e-5`) — invalid as an ISO-10303-21 REAL. The
+    // emitted token must carry a point (`1.0e-5`).
+    let doc = Doc::open_editable(&fixtures_dir().join("hotswap_body.ifc")).expect("open");
+    let verts = vec![[1e-5, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]];
+    let tris = vec![[0u32, 1, 2]];
+    let (bytes, _stats) = hotswap(&doc, WALL1, &verts, &tris).expect("hotswap ok");
+    let text = String::from_utf8(bytes).expect("utf8");
+    assert!(text.contains("1.0e-5"), "exponent REAL must keep a decimal point");
+    assert!(!text.contains("(1e-5"), "bare 1e-5 token must not be emitted");
+}
