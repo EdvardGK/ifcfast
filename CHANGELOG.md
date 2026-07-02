@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — local-frame mesh extraction + placement matrix (GH #127)
+
+- **`m.mesh(guid, frame="local")` / `m.meshes(frame="local")`** — the
+  hotswap round-trip bridge. Returns each element's
+  **representation-item frame**: the coordinates its `Body` items
+  store, *before* `ObjectPlacement`, in the file's **native length
+  unit** — byte-for-byte the `m.hotswap` input, so
+  extract-local → decimate → `m.hotswap` no longer double-applies the
+  placement. Rows come back as `LocalMesh(guid, entity, vertices,
+  faces, placement)` where `placement` is the `float64[4, 4]`
+  row-major `world_from_local` matrix (native units); world-frame
+  `_core.extract_meshes` / `_core.extract_mesh_one` output carries the
+  per-product `placement` too. `frame="local"` rejects
+  `cut_openings=True` and a non-default `unit=` loudly. Rust core: new
+  `BakeFrame::ItemLocal` (drops the placement chain entirely; keeps
+  the `IfcMappedItem` composition + `rep_origin` rebase through the
+  f64 anchor). Round-trip gated on fixture (translation + rotation +
+  mapped-item placements) and, via `IFCFAST_SUBSET_CORPUS`, on the
+  real-file corpus.
+
 ### Added — surgical IFC writing: `m.subset()` + `m.hotswap()` (GH #124, #126)
 
 - **`m.subset([guid, …])`** — carve a valid standalone IFC out of a
@@ -22,8 +42,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   one), schema-aware: `IfcTriangulatedFaceSet` on IFC4,
   faceted-brep/surface-model on IFC2x3. Orphaned geometry records are
   reference-counted and garbage-collected. Coordinates are the
-  element's **local** frame — `m.meshes()` output is world-frame and
-  cannot be fed back directly (GH #127 tracks the bridge).
+  element's **local** frame — extract it with
+  `m.mesh(guid, frame="local")` (the GH #127 bridge above); default
+  world-frame `m.meshes()` output cannot be fed back directly.
 - Foundation: an owned round-trippable STEP document with
   **byte-identical emit** for untouched records.
 

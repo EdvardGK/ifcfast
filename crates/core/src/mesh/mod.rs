@@ -460,10 +460,24 @@ pub fn mesh_ifc(buf: &[u8]) -> (Vec<ProductMesh>, MeshStats) {
 ///   `ProductMesh.placement_origin`, so position is never lost — and
 ///   the GUID keeps the link to the spatial graph for relative-
 ///   placement queries.
+/// - `ItemLocal`: vertices are in the product's **representation-item
+///   frame** — the coordinates the `Body` representation items
+///   themselves store, *before* the product's `ObjectPlacement` is
+///   applied (GH #127). Only the per-instance `IfcMappedItem`
+///   composition (`instance_transform`) and the item's own
+///   `rep_origin` rebase are re-applied; the placement chain is
+///   dropped entirely. This is exactly the frame `doc::hotswap`
+///   re-emits into, so an `ItemLocal` extract → `hotswap` round-trip
+///   reproduces the original world geometry once any consumer applies
+///   the (untouched) placement on top. Note this differs from `Local`:
+///   `Local` keeps the placement's rotation and drops only the large
+///   translation (a QTO precision device); `ItemLocal` drops the whole
+///   placement (a coordinate contract).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BakeFrame {
     World,
     Local,
+    ItemLocal,
 }
 
 /// World-frame streaming mesh — the back-compatible entry point.
@@ -862,38 +876,53 @@ fn tessellate_one(
                     );
                     let precise_anchor_f64 = effective_f64.transform_point3(rep_origin_f64);
                     let _ = mesh_anchor_f64.get_or_insert(precise_anchor_f64);
-                    let anchor_f32 = Vec3::new(
-                        precise_anchor_f64.x as f32,
-                        precise_anchor_f64.y as f32,
-                        precise_anchor_f64.z as f32,
-                    );
-                    match frame {
+                    // Per-frame affine bake map. Every frame bakes as
+                    // `v = bake_linear.transform_vector3(p) + bake_translation`
+                    // — the frames differ only in which linear part and
+                    // which (f64-derived) translation they use. The same
+                    // pair is applied to the bounded-halfspace payload
+                    // below so cutter params always share the vertex frame.
+                    let (bake_linear, bake_translation) = match frame {
                         BakeFrame::World => {
-                            for chunk in local.vertices.chunks_exact(3) {
-                                let p = Vec3::new(chunk[0], chunk[1], chunk[2]);
-                                let w = effective.transform_vector3(p) + anchor_f32;
-                                combined_v.push(w.x);
-                                combined_v.push(w.y);
-                                combined_v.push(w.z);
-                            }
+                            let anchor_f32 = Vec3::new(
+                                precise_anchor_f64.x as f32,
+                                precise_anchor_f64.y as f32,
+                                precise_anchor_f64.z as f32,
+                            );
+                            (effective, anchor_f32)
                         }
                         BakeFrame::Local => {
                             let anchor = mesh_anchor_f64
-                                .expect("pinned above for both bake frames");
+                                .expect("pinned above for all bake frames");
                             let frag_off_f64 = precise_anchor_f64 - anchor;
                             let frag_off = Vec3::new(
                                 frag_off_f64.x as f32,
                                 frag_off_f64.y as f32,
                                 frag_off_f64.z as f32,
                             );
-                            for chunk in local.vertices.chunks_exact(3) {
-                                let p = Vec3::new(chunk[0], chunk[1], chunk[2]);
-                                let v = effective.transform_vector3(p) + frag_off;
-                                combined_v.push(v.x);
-                                combined_v.push(v.y);
-                                combined_v.push(v.z);
-                            }
+                            (effective, frag_off)
                         }
+                        BakeFrame::ItemLocal => {
+                            // Representation-item frame (GH #127): drop the
+                            // placement chain entirely; re-apply only the
+                            // instance composition + the item's rep_origin
+                            // rebase, anchored in f64 like the world bake.
+                            let local_anchor_f64 =
+                                instance_f64.transform_point3(rep_origin_f64);
+                            let local_anchor = Vec3::new(
+                                local_anchor_f64.x as f32,
+                                local_anchor_f64.y as f32,
+                                local_anchor_f64.z as f32,
+                            );
+                            (instance_transform, local_anchor)
+                        }
+                    };
+                    for chunk in local.vertices.chunks_exact(3) {
+                        let p = Vec3::new(chunk[0], chunk[1], chunk[2]);
+                        let v = bake_linear.transform_vector3(p) + bake_translation;
+                        combined_v.push(v.x);
+                        combined_v.push(v.y);
+                        combined_v.push(v.z);
                     }
                     for &idx in &local.indices {
                         combined_i.push(base + idx);
@@ -902,9 +931,9 @@ fn tessellate_one(
                     // W6: bake the bounded-halfspace payload into the SAME
                     // frame as this fragment's vertices so `cut_openings`
                     // can use it against the baked mesh. The fragment's
-                    // bake map is affine: linear = `effective` (rotation +
-                    // any instance scale), translation = `anchor_f32`
-                    // (World) or the per-fragment offset (Local). Apply
+                    // bake map is affine — the shared per-frame pair:
+                    // linear = `bake_linear`, translation =
+                    // `bake_translation` (see the match above). Apply
                     // that exact map to the payload's points + xform and
                     // the linear part to its normal.
                     // Consumed in ALL builds since the W6 default-path fix:
@@ -912,17 +941,8 @@ fn tessellate_one(
                     // clip only the boundary column; the `prism-csg-fast`
                     // fast-path uses it for 2D region decomposition.
                     if let Some(p) = bounded_halfspace {
-                        let bake_translation = match frame {
-                            BakeFrame::World => anchor_f32,
-                            BakeFrame::Local => {
-                                let anchor = mesh_anchor_f64
-                                    .expect("pinned above for both bake frames");
-                                let off = precise_anchor_f64 - anchor;
-                                Vec3::new(off.x as f32, off.y as f32, off.z as f32)
-                            }
-                        };
                         let bake = {
-                            let mut m = effective;
+                            let mut m = bake_linear;
                             m.w_axis = Vec4::new(
                                 bake_translation.x,
                                 bake_translation.y,
@@ -938,7 +958,7 @@ fn tessellate_one(
                         // flipping it (GH #64 #6). For a pure rotation
                         // (R⁻¹)ᵀ = R, identical to the linear part.
                         let normal_xform =
-                            glam::Mat3::from_mat4(effective).inverse().transpose();
+                            glam::Mat3::from_mat4(bake_linear).inverse().transpose();
                         bounded_halfspaces.push(BoundedHalfspacePayload {
                             boundary: p.boundary,
                             boundary_xform: bake * p.boundary_xform,

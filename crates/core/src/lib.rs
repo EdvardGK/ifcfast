@@ -1227,6 +1227,58 @@ mod python {
         }
     }
 
+    /// The product's `world_from_local` placement matrix as a flat
+    /// **row-major** 16-float list (numpy: `np.array(p).reshape(4, 4)`),
+    /// in the file's native length unit (GH #127).
+    ///
+    /// Assembled from `ProductMesh.world_transform` (f32, col-major —
+    /// exact for the unit-magnitude rotation part) with the translation
+    /// column replaced by the f64 `world_origin` (the same point,
+    /// resolved through the f64 placement chain), so georeferenced
+    /// translations keep full precision instead of the f32 quantum.
+    #[cfg(feature = "mesh")]
+    fn placement_row_major(world_transform: &[f32; 16], world_origin: &[f64; 3]) -> [f64; 16] {
+        let mut m = [0.0_f64; 16];
+        for r in 0..4 {
+            for c in 0..4 {
+                // col-major source: element (r, c) sits at c*4 + r.
+                m[r * 4 + c] = world_transform[c * 4 + r] as f64;
+            }
+        }
+        m[3] = world_origin[0];
+        m[7] = world_origin[1];
+        m[11] = world_origin[2];
+        m
+    }
+
+    /// Parse a Python-facing `frame=` argument ("world" / "local") into
+    /// "is the item-local frame requested", failing loud on anything
+    /// else. `local` (GH #127) additionally rejects `cut_openings` —
+    /// the cut folds host + opening meshes in a shared frame, while the
+    /// item-local frame is each element's own representation frame, so
+    /// the fold's operands would not be commensurable.
+    #[cfg(feature = "mesh")]
+    fn parse_mesh_frame(frame: &str, cut_openings: bool) -> PyResult<bool> {
+        let local = match frame {
+            "world" => false,
+            "local" => true,
+            other => {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "unknown frame {other:?}; choose \"world\" or \"local\""
+                )))
+            }
+        };
+        if local && cut_openings {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "frame=\"local\" is incompatible with cut_openings=True: the cut \
+                 folds host and opening meshes in a shared frame, but frame=\"local\" \
+                 is each element's own representation frame. Extract the uncut \
+                 local mesh for the hotswap round-trip.",
+            ));
+        }
+        Ok(local)
+    }
+
     // ----- sample_point_cloud ------------------------------------------
 
     /// Sample `per_m2` points per square metre of surface on every
@@ -1811,17 +1863,32 @@ mod python {
     /// Geometryless products (no body) are omitted — they have no
     /// triangles to return. Use the substrate bundle or `m.products_df`
     /// if you need those rows.
+    ///
+    /// `frame` (GH #127): `"world"` (default) keeps the contract above.
+    /// `"local"` returns each product's **representation-item** frame —
+    /// the coordinates its `Body` items store, before `ObjectPlacement`,
+    /// in the file's **native length unit** (no metre scaling, no global
+    /// shift — `global_shift` is `[0,0,0]`). That is byte-for-byte the
+    /// input frame of `hotswap_ifc`. Incompatible with
+    /// `cut_openings=True`. Both frames also return `placement[i]` — a
+    /// flat row-major 16-f64 `world_from_local` matrix in native units.
     #[cfg(feature = "mesh")]
     #[pyfunction]
-    #[pyo3(signature = (path, cut_openings = false, keep_cutters = false))]
+    #[pyo3(signature = (path, cut_openings = false, keep_cutters = false, frame = "world"))]
     pub fn extract_meshes<'py>(
         py: Python<'py>,
         path: &str,
         cut_openings: bool,
         keep_cutters: bool,
+        frame: &str,
     ) -> PyResult<Bound<'py, PyDict>> {
         catch_panic(|| {
         use crate::mesh::{BakeFrame, ProductMesh, ProductSink};
+
+        // frame="local" (GH #127): per-element representation-item
+        // coordinates in native units — the m.hotswap input frame.
+        // Incompatible with cut_openings (validated here).
+        let local_frame = parse_mesh_frame(frame, cut_openings)?;
 
         // cut_openings requires the `csg` feature — surface a clear
         // error rather than silently ignoring the flag.
@@ -1847,6 +1914,11 @@ mod python {
         struct MeshSink {
             unit_scale: f32,
             cut_openings: bool,
+            // GH #127: emit representation-item-frame vertices verbatim
+            // (native units, no shift, no metre scaling) instead of the
+            // shifted world-metres encode. `global_shift` stays [0,0,0]
+            // because `shift` is never pinned on this path.
+            local_frame: bool,
             // Reveal-all opt-in (GH #66): keep the synthetic half-space
             // visualisation slabs in the no-cut output. Default `false`
             // — they are tool geometry with foreign extent (±20 000
@@ -1865,6 +1937,9 @@ mod python {
             triangle_count: Vec<u32>,
             vertices_le: Vec<Vec<u8>>,
             indices_le: Vec<Vec<u8>>,
+            // Per-product `world_from_local` placement, flat row-major
+            // 16 f64 in native units (GH #127) — both frames carry it.
+            placement: Vec<[f64; 16]>,
             cut_stats: crate::mesh::cut_stats::CutOpeningsStats,
             // Cross-product IfcRelVoidsElement buffer. Some(_) only
             // when cut_openings && the file has at least one void
@@ -1882,31 +1957,43 @@ mod python {
             /// columns. Shared between the streaming `on_product`
             /// path and the post-stream cross-product flush.
             fn encode(&mut self, mesh: ProductMesh) {
-                let shift = *self
-                    .shift
-                    .get_or_insert_with(|| global_shift_for(&mesh.mesh_anchor, self.unit_scale));
-                let off = [
-                    mesh.mesh_anchor[0] - shift[0],
-                    mesh.mesh_anchor[1] - shift[1],
-                    mesh.mesh_anchor[2] - shift[2],
-                ];
-                // Reposition local-frame shape to `local + off` (f64),
-                // scale native-unit → metres. Far-from-origin geometry
-                // stays precise: shape near origin, off small.
-                let us = self.unit_scale as f64;
                 let mut vbytes = Vec::with_capacity(mesh.vertices.len() * 4);
-                for chunk in mesh.vertices.chunks_exact(3) {
-                    let x = ((chunk[0] as f64 + off[0]) * us) as f32;
-                    let y = ((chunk[1] as f64 + off[1]) * us) as f32;
-                    let z = ((chunk[2] as f64 + off[2]) * us) as f32;
-                    vbytes.extend_from_slice(&x.to_le_bytes());
-                    vbytes.extend_from_slice(&y.to_le_bytes());
-                    vbytes.extend_from_slice(&z.to_le_bytes());
+                if self.local_frame {
+                    // Representation-item frame (GH #127): the bake
+                    // already produced the item's own coordinates in
+                    // native units — the exact m.hotswap input. Copy
+                    // through verbatim: no shift, no metre scaling.
+                    for v in &mesh.vertices {
+                        vbytes.extend_from_slice(&v.to_le_bytes());
+                    }
+                } else {
+                    let shift = *self
+                        .shift
+                        .get_or_insert_with(|| global_shift_for(&mesh.mesh_anchor, self.unit_scale));
+                    let off = [
+                        mesh.mesh_anchor[0] - shift[0],
+                        mesh.mesh_anchor[1] - shift[1],
+                        mesh.mesh_anchor[2] - shift[2],
+                    ];
+                    // Reposition local-frame shape to `local + off` (f64),
+                    // scale native-unit → metres. Far-from-origin geometry
+                    // stays precise: shape near origin, off small.
+                    let us = self.unit_scale as f64;
+                    for chunk in mesh.vertices.chunks_exact(3) {
+                        let x = ((chunk[0] as f64 + off[0]) * us) as f32;
+                        let y = ((chunk[1] as f64 + off[1]) * us) as f32;
+                        let z = ((chunk[2] as f64 + off[2]) * us) as f32;
+                        vbytes.extend_from_slice(&x.to_le_bytes());
+                        vbytes.extend_from_slice(&y.to_le_bytes());
+                        vbytes.extend_from_slice(&z.to_le_bytes());
+                    }
                 }
                 let mut ibytes = Vec::with_capacity(mesh.indices.len() * 4);
                 for i in &mesh.indices {
                     ibytes.extend_from_slice(&i.to_le_bytes());
                 }
+                self.placement
+                    .push(placement_row_major(&mesh.world_transform, &mesh.world_origin));
                 self.guid.push(mesh.guid);
                 self.entity.push(mesh.entity);
                 self.vertex_count.push((mesh.vertices.len() / 3) as u32);
@@ -1986,6 +2073,7 @@ mod python {
         let mut sink = MeshSink {
             unit_scale,
             cut_openings,
+            local_frame,
             keep_cutters,
             cutters_stripped: 0,
             shift: None,
@@ -1995,14 +2083,18 @@ mod python {
             triangle_count: Vec::new(),
             vertices_le: Vec::new(),
             indices_le: Vec::new(),
+            placement: Vec::new(),
             cut_stats: crate::mesh::cut_stats::CutOpeningsStats::default(),
             #[cfg(feature = "csg")]
             cross,
         };
         let t_mesh = Instant::now();
-        // Local frame + per-product f64 shift — see sample_point_cloud.
+        // World output: Local (QTO) bake + per-product f64 shift — see
+        // sample_point_cloud. Local output: ItemLocal bake, encoded
+        // verbatim (GH #127).
+        let bake = if local_frame { BakeFrame::ItemLocal } else { BakeFrame::Local };
         let mesh_stats = py.detach(|| {
-            crate::mesh::mesh_ifc_streaming_framed(&mmap, &mut sink, BakeFrame::Local)
+            crate::mesh::mesh_ifc_streaming_framed(&mmap, &mut sink, bake)
         });
 
         // Cross-product flush. After the streaming pass, fold every
@@ -2039,6 +2131,15 @@ mod python {
             .collect();
         out.set_item("vertices", PyList::new(py, verts)?)?;
         out.set_item("indices", PyList::new(py, inds)?)?;
+        // Per-product world_from_local placement: flat row-major 16 f64,
+        // native units (GH #127). `np.array(p).reshape(4, 4)` Python-side.
+        let placements: Vec<Bound<'py, PyList>> = sink
+            .placement
+            .iter()
+            .map(|p| PyList::new(py, p))
+            .collect::<PyResult<Vec<_>>>()?;
+        out.set_item("placement", PyList::new(py, placements)?)?;
+        out.set_item("frame", frame)?;
         // Global shift in METRES — add back to vertices for absolute
         // world coords. `[0, 0, 0]` for near-origin or empty models.
         let gs = sink.shift.unwrap_or([0.0, 0.0, 0.0]);
@@ -2107,18 +2208,34 @@ mod python {
     /// (cross-product `IfcRelVoidsElement` folding via the same
     /// `CrossProductCut`; synthetic half-space cutter slabs stripped
     /// unless `keep_cutters`, ignored in cut mode).
+    ///
+    /// `frame` (GH #127): `"world"` (default) keeps the contract above.
+    /// `"local"` returns the element's **representation-item** frame —
+    /// the coordinates its `Body` items store, before `ObjectPlacement`,
+    /// in the file's **native length unit** (f64 upcast of the f32 bake).
+    /// That is byte-for-byte the input frame of `hotswap_ifc`, so
+    /// extract-local → `hotswap_ifc` round-trips without touching the
+    /// placement. Incompatible with `cut_openings=True`. Both frames
+    /// also return `placement` — a flat row-major 16-f64
+    /// `world_from_local` matrix in native units.
     #[cfg(feature = "mesh")]
     #[pyfunction]
-    #[pyo3(signature = (path, guid, cut_openings = false, keep_cutters = false))]
+    #[pyo3(signature = (path, guid, cut_openings = false, keep_cutters = false, frame = "world"))]
     pub fn extract_mesh_one<'py>(
         py: Python<'py>,
         path: &str,
         guid: &str,
         cut_openings: bool,
         keep_cutters: bool,
+        frame: &str,
     ) -> PyResult<Option<Bound<'py, PyDict>>> {
         catch_panic(|| {
         use crate::mesh::{BakeFrame, ProductMesh};
+
+        // frame="local" (GH #127): the element's representation-item
+        // coordinates in native units — the hotswap_ifc input frame.
+        // Incompatible with cut_openings (validated here).
+        let local_frame = parse_mesh_frame(frame, cut_openings)?;
 
         // cut_openings requires the `csg` feature — same contract as
         // extract_meshes: surface a clear error rather than silently
@@ -2167,8 +2284,11 @@ mod python {
             }
         }
 
+        // World output: Local (QTO) bake + f64 anchor reposition below.
+        // Local output: ItemLocal bake, emitted verbatim (GH #127).
+        let bake = if local_frame { BakeFrame::ItemLocal } else { BakeFrame::Local };
         let meshes = py.detach(|| {
-            crate::mesh::mesh_products_by_step(&mmap, &step_ids, BakeFrame::Local)
+            crate::mesh::mesh_products_by_step(&mmap, &step_ids, bake)
         });
 
         // Resolve the final target mesh, applying cuts when requested by
@@ -2227,31 +2347,46 @@ mod python {
             _ => return Ok(None), // geometryless, or cut consumed the host
         };
 
-        // Encode absolute world coords in metres as f64 (full precision —
-        // no global shift). Absolute = (local + mesh_anchor) * unit_scale,
-        // the same identity extract_meshes' shifted-frame encode reduces
-        // to when its model-wide shift is added back.
-        let us = unit_scale as f64;
-        let anchor = mesh.mesh_anchor;
         let mut vbytes = Vec::with_capacity(mesh.vertices.len() * 8);
-        for chunk in mesh.vertices.chunks_exact(3) {
-            let x = (chunk[0] as f64 + anchor[0]) * us;
-            let y = (chunk[1] as f64 + anchor[1]) * us;
-            let z = (chunk[2] as f64 + anchor[2]) * us;
-            vbytes.extend_from_slice(&x.to_le_bytes());
-            vbytes.extend_from_slice(&y.to_le_bytes());
-            vbytes.extend_from_slice(&z.to_le_bytes());
+        if local_frame {
+            // Representation-item frame (GH #127): the ItemLocal bake
+            // already produced the item's own coordinates in native
+            // units — the exact hotswap_ifc input. Upcast to f64 and
+            // emit verbatim: no anchor, no metre scaling.
+            for v in &mesh.vertices {
+                vbytes.extend_from_slice(&(*v as f64).to_le_bytes());
+            }
+        } else {
+            // Encode absolute world coords in metres as f64 (full precision —
+            // no global shift). Absolute = (local + mesh_anchor) * unit_scale,
+            // the same identity extract_meshes' shifted-frame encode reduces
+            // to when its model-wide shift is added back.
+            let us = unit_scale as f64;
+            let anchor = mesh.mesh_anchor;
+            for chunk in mesh.vertices.chunks_exact(3) {
+                let x = (chunk[0] as f64 + anchor[0]) * us;
+                let y = (chunk[1] as f64 + anchor[1]) * us;
+                let z = (chunk[2] as f64 + anchor[2]) * us;
+                vbytes.extend_from_slice(&x.to_le_bytes());
+                vbytes.extend_from_slice(&y.to_le_bytes());
+                vbytes.extend_from_slice(&z.to_le_bytes());
+            }
         }
         let mut ibytes = Vec::with_capacity(mesh.indices.len() * 4);
         for i in &mesh.indices {
             ibytes.extend_from_slice(&i.to_le_bytes());
         }
 
+        let placement = placement_row_major(&mesh.world_transform, &mesh.world_origin);
+
         let out = PyDict::new(py);
         out.set_item("guid", &mesh.guid)?;
         out.set_item("entity", &mesh.entity)?;
         out.set_item("vertices", PyBytes::new(py, &vbytes))?;
         out.set_item("indices", PyBytes::new(py, &ibytes))?;
+        // world_from_local, flat row-major 16 f64, native units (GH #127).
+        out.set_item("placement", PyList::new(py, placement)?)?;
+        out.set_item("frame", frame)?;
         Ok(Some(out))
         })
     }
