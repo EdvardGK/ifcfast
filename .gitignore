@@ -38,3 +38,10 @@ Thumbs.db
 !tests/fixtures/*.ifc
 !python/ifcfast/data/*.ifc
 .vercel
+
+# Session dirs + dead npm experiment
+/scratch/
+/.claude/
+node_modules/
+/package.json
+/package-lock.json
