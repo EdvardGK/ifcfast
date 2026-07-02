@@ -27,6 +27,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Foundation: an owned round-trippable STEP document with
   **byte-identical emit** for untouched records.
 
+### Fixed — write-axis hardening from the 2026-07-02 deep review
+
+- **`m.hotswap` rejects non-finite coordinates** (`NaN`/`±inf` →
+  `ValueError`) and always emits STEP REALs with a decimal point —
+  Rust's shortest float form (`1e-5`) is not a valid ISO-10303-21
+  REAL token (GH #128).
+- **`m.subset` forward-closes everything a retained relationship
+  names outside its anchor field** — a rel's own `IfcOwnerHistory`
+  and IFC4's inline `IfcPropertySetDefinitionSet` aggregate could
+  previously dangle in the output (GH #129).
+- **`m.hotswap`'s orphan-GC counts the swapped rep's surviving
+  references** — a uniquely-owned mapped body could previously
+  cascade-delete the `IfcGeometricRepresentationSubContext` the
+  swapped representation still points at (GH #130).
+- **Corpus gates unified on `IFCFAST_CORPUS`** (legacy
+  `IFCFAST_SUBSET_CORPUS` still accepted) and the Rust gates now
+  fail loudly when invoked with `--ignored` but no corpus, instead
+  of reporting green with zero assertions (GH #132).
+
 ### Fixed — open-shell QTO over-count on doors / windows / railings (GH #121)
 
 - **`mesh_qto` now trusts an open shell's mesh volume within its tight
