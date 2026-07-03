@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.41] - 2026-07-03
+
+### Fixed — QTO / mesh geometry (GH #62, #138)
+
+- **Profile winding normalisation (GH #62)** — `profile::extract` now
+  enforces the `Polygon2D` invariant (outer CCW, holes CW) by signed
+  area before extrusion. Revit authors `IfcPolyline` profile voids
+  clockwise; the previous blind `reverse()` inverted every hole-wall
+  normal on swept solids with voids, so the divergence-theorem volume
+  ADDED the void instead of subtracting it (G55_ARK: all 208 windows,
+  mesh volume 8× the kernel → classified `open_shell` →
+  `prism_fallback` → the +482% window residue). Post-fix all 208 ARK
+  windows and doors sit at exact oracle parity. Cache schema 24 → 25.
+- **Negative-direction extrusion winding (GH #138)** — `extrude_polygon`
+  built cap/wall winding assuming the extrusion runs up the profile
+  normal (+Z). An `IfcExtrudedAreaSolid` authored along
+  `IFCDIRECTION((0.,0.,-1.))` therefore meshed inside-out: negative
+  signed-tetra volume that CANCELLED against sibling solids in a
+  multi-item Body (G55_ARK covering −14.2 %) and corrupted CSG
+  difference subtractors (4 slabs +5–15 %). Winding now flips when the
+  direction runs against the profile normal, so those solids add /
+  subtract correctly. Oracle-gated: IfcSlab 1.0212 → 1.0000, IfcCovering
+  0.9934 → 0.9999, all other classes byte-identical. Cache schema
+  25 → 26. Substrates with such profiles re-extract via the cache key.
+
 ### Fixed / Changed — write-axis hardening (GH #132 items 2–8)
 
 - **Subsets now carry authored colours and CAD layers**: `IfcStyledItem`
