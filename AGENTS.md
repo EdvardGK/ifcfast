@@ -220,6 +220,19 @@ describing via `pq.read_schema(...)`):
   bucketed area columns, `largest_surface_m2`, `smallest_surface_m2`,
   `surface_count`, `mesh_quality` (`"closed"` / `"open_shell"` /
   `"degenerate"`).
+- **Coverage boundary (GH #122).** The meshable-product substrate emits
+  building elements plus `IfcSpace`. Two categories are intentionally
+  absent, so a differential against a raw `ifcopenshell.geom` iterator
+  (which meshes *every* product with a representation) shows them as
+  "missing": (1) **subtractive void features** (`IfcOpeningElement` and
+  the rest of `IfcFeatureElementSubtraction`) — under the default
+  `mesh_qto(cut_openings=True)` these are folded into their host's volume
+  and get no standalone row (use `cut_openings=False` to see them as
+  reveal-all operands); (2) **spatial containers**
+  (`IfcSite` / `IfcBuilding` / `IfcBuildingStorey`) — structure, not
+  building-element geometry, so their representations are not quantified.
+  Everything else ifcopenshell meshes, ifcfast meshes too (G55_ARK:
+  identical product set once these two categories are aligned).
 - Volume reliability (since cache schema v16, GH #60; open-shell routing
   GH #121, cache schema v24): `volume_m3` is the **best** estimate (mesh
   volume when trustworthy, else a min-over-three-axes prism fallback — so

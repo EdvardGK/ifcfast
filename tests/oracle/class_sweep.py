@@ -24,6 +24,11 @@ corpora), one ``ifcopenshell.geom.iterator`` pass, signed-tetra
 ``abs()/6`` volume, per-element try/except so one bad product never
 aborts the sweep. ifcfast side is ``mesh_qto(cut_openings=True)`` and
 uses ``volume_m3`` (the routed best estimate — the number agents consume).
+
+Because the ifcfast side folds openings into their hosts (cut_openings),
+the ios side drops the whole ``IfcFeatureElementSubtraction`` hierarchy
+(GH #122) so the coverage differential compares emitted products, not the
+subtractive void solids ifcopenshell's iterator meshes standalone.
 """
 
 from __future__ import annotations
@@ -60,6 +65,16 @@ def ios_volumes(ifc_path: Path) -> dict[str, dict]:
 
     f = ifcopenshell.open(str(ifc_path))
     entity_of = {e.GlobalId: e.is_a() for e in f.by_type("IfcProduct")}
+    # Apples-to-apples with the ifcfast side (GH #122). The ifcfast side is
+    # `mesh_qto(cut_openings=True)`, which folds every subtractive void
+    # feature into its host (via IfcRelVoidsElement) and emits NO standalone
+    # row for it. ifcopenshell's iterator, by contrast, meshes each opening's
+    # raw void solid as its own shape — on G55_ARK that is 1304 phantom
+    # "missing_in_ours" rows (all IfcOpeningElement). Exclude the whole
+    # IfcFeatureElementSubtraction hierarchy (IfcOpeningElement,
+    # IfcVoidingFeature, …) here so the coverage differential compares the
+    # products both kernels actually emit, not the cuts one side consumed.
+    subtractive = {e.GlobalId for e in f.by_type("IfcFeatureElementSubtraction")}
     settings = ifcopenshell.geom.settings()  # DEFAULT — no use-world-coords
     it = ifcopenshell.geom.iterator(settings, f)
     out: dict[str, dict] = {}
@@ -67,6 +82,10 @@ def ios_volumes(ifc_path: Path) -> dict[str, dict]:
         return out
     while True:
         shape = it.get()
+        if shape.guid in subtractive:
+            if not it.next():
+                break
+            continue
         try:
             geom = shape.geometry
             verts = list(geom.verts)
