@@ -263,9 +263,7 @@ pub fn scan_ref_tokens(bytes: &[u8]) -> Vec<u64> {
     while i < n {
         match bytes[i] {
             b'\'' => i = skip_quoted_string(bytes, i + 1, n),
-            b'/' if i + 1 < n && bytes[i + 1] == b'*' => {
-                i = skip_block_comment(bytes, i + 2, n)
-            }
+            b'/' if i + 1 < n && bytes[i + 1] == b'*' => i = skip_block_comment(bytes, i + 2, n),
             b'#' => {
                 let s = i + 1;
                 let mut j = s;
@@ -355,16 +353,14 @@ fn skip_quoted_string(buf: &[u8], mut i: usize, end: usize) -> usize {
 /// internal `parse_record`, used by the doc rel pass to read specific
 /// positional fields of an `IfcRel*` record.
 ///
-/// The record terminator is the last top-level `;`; any `;` inside a
-/// string field precedes it, and only whitespace follows it, so trimming
-/// at the final `;` recovers the `#id = TYPE(...)` shape `parse_record`
-/// expects (it requires a trailing `)`).
+/// The record terminator is the FIRST top-level `;` — found by the same
+/// string- and comment-aware scan the record framer uses. Trimming at
+/// the *last* `;` (the old behaviour) broke on a trailing inter-record
+/// comment containing a `;` (`#5=FOO(#1); /* a;b */`): the "record" then
+/// ended inside the comment, `parse_record` saw no trailing `)`, and the
+/// record silently vanished from rel/guid resolution (GH #132 item 2).
 pub fn parse_record_span(span: &[u8]) -> Option<(u64, &[u8], &[u8])> {
-    let end = span
-        .iter()
-        .rposition(|&b| b == b';')
-        .map(|p| p)
-        .unwrap_or(span.len());
+    let end = find_record_end(span, 0, span.len()).unwrap_or(span.len());
     parse_record(&span[..end])
 }
 
@@ -407,9 +403,7 @@ fn parse_record(record: &[u8]) -> Option<(u64, &[u8], &[u8])> {
     }
     // Read type token: alphanumeric / underscore.
     let type_start = i;
-    while i < record.len()
-        && (record[i].is_ascii_alphanumeric() || record[i] == b'_')
-    {
+    while i < record.len() && (record[i].is_ascii_alphanumeric() || record[i] == b'_') {
         i += 1;
     }
     if i == type_start {
@@ -735,7 +729,10 @@ pub fn parse_field(raw: &[u8]) -> Field<'_> {
         },
         b'#' => {
             let digits = &raw[1..];
-            match std::str::from_utf8(digits).ok().and_then(|s| s.parse().ok()) {
+            match std::str::from_utf8(digits)
+                .ok()
+                .and_then(|s| s.parse().ok())
+            {
                 Some(n) => Field::Ref(n),
                 None => Field::Other(raw),
             }
@@ -781,7 +778,29 @@ pub fn parse_ref_list(body: &[u8]) -> Vec<u64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{data_section_start, decode_string, endsec_position, for_each_record};
+    use super::{
+        data_section_start, decode_string, endsec_position, for_each_record, parse_record_span,
+    };
+
+    /// GH #132 item 2: a trailing inter-record comment containing `;`
+    /// made the span parser trim inside the comment (last-`;` scan), so
+    /// the record silently vanished from rel/guid resolution. The
+    /// terminator is the FIRST top-level `;` — string- and comment-aware.
+    #[test]
+    fn record_span_survives_trailing_comment_with_semicolon() {
+        let span = b"#5=IFCWALL('g',$,$,$); /* a;b */\n";
+        let (id, ty, _args) = parse_record_span(span).expect("must parse");
+        assert_eq!(id, 5);
+        assert_eq!(ty, b"IFCWALL");
+        // A `;` inside a string field still doesn't terminate early.
+        let span = b"#6=IFCWALL('a;b',$,$,$);\n";
+        let (id, _ty, args) = parse_record_span(span).expect("must parse");
+        assert_eq!(id, 6);
+        assert_eq!(
+            decode_string(super::split_top_level_args(args)[0]).as_deref(),
+            Some("a;b")
+        );
+    }
 
     fn dec(quoted: &[u8]) -> String {
         decode_string(quoted).expect("decode_string returned None")
@@ -797,16 +816,12 @@ mod tests {
         let end = endsec_position(buf, start);
         let mut out = Vec::new();
         for_each_record(buf, start, end, |rec| {
-            out.push((
-                rec.id,
-                String::from_utf8_lossy(rec.type_name).into_owned(),
-            ));
+            out.push((rec.id, String::from_utf8_lossy(rec.type_name).into_owned()));
         });
         out
     }
 
-    const HEADER: &str =
-        "ISO-10303-21;\nHEADER;\nFILE_DESCRIPTION((''),'2;1');\nENDSEC;\n";
+    const HEADER: &str = "ISO-10303-21;\nHEADER;\nFILE_DESCRIPTION((''),'2;1');\nENDSEC;\n";
 
     #[test]
     fn framing_normal_file_no_regression() {
@@ -859,7 +874,11 @@ mod tests {
              ENDSEC;\n"
         );
         let recs = collect(&src);
-        assert_eq!(recs.len(), 2, "comment with ; and ' must not split the record");
+        assert_eq!(
+            recs.len(),
+            2,
+            "comment with ; and ' must not split the record"
+        );
         assert_eq!(recs[0].0, 1);
         assert_eq!(recs[1].0, 2);
     }
@@ -1054,8 +1073,14 @@ mod tests {
         // dropping the valid `0041` ('A') too. Lossy decode keeps 'A' and
         // substitutes U+FFFD for the bad unit.
         let out = dec(br"'\X2\0041D800\X0\Z'");
-        assert!(out.starts_with('A'), "valid leading unit must survive: {out:?}");
-        assert!(out.ends_with('Z'), "trailing text after \\X0\\ must survive: {out:?}");
+        assert!(
+            out.starts_with('A'),
+            "valid leading unit must survive: {out:?}"
+        );
+        assert!(
+            out.ends_with('Z'),
+            "trailing text after \\X0\\ must survive: {out:?}"
+        );
         assert!(out.contains('\u{FFFD}'), "bad surrogate -> U+FFFD: {out:?}");
         // A well-formed surrogate pair still decodes to the astral char.
         assert_eq!(dec(br"'\X2\D83DDE00\X0\'"), "😀");

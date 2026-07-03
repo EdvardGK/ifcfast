@@ -947,11 +947,16 @@ plus everything required to keep them valid:
   as do the **coverings** (`IfcRelCoversBldgElements`) on a kept host
   wall/slab, and a kept system's `IfcRelServicesBuildings` link.
   `IfcRelNests` (ports / distribution-part nesting),
-  `IfcRelAssignsToGroup` (system / group membership) and
-  `IfcRelDeclares` (IFC4 project declares) are followed too. Pure
-  connectivity relationships (`IfcRelConnectsPathElements` and other
-  `IfcRelConnects*`) are intentionally *not* followed — they link peer
-  neighbours, so pulling them would chain across the whole model.
+  `IfcRelAssignsToGroup` (+ `…ByFactor`, zone weighting) and
+  `IfcRelDeclares` (IFC4 project declares) are followed too;
+- authored **colours and CAD layers**: the `IfcStyledItem` of every kept
+  geometry item rides along with its surface-style chain, and
+  `IfcPresentationLayerAssignment` / `…WithStyle` are kept with their
+  member lists pruned to the surviving items.
+
+  Pure connectivity relationships (`IfcRelConnectsPathElements` and
+  other `IfcRelConnects*`) are intentionally *not* followed — they link
+  peer neighbours, so pulling them would chain across the whole model.
 
 Guarantees: the output re-opens (in ifcfast **or** ifcopenshell) with
 **zero dangling references** and a rooted spatial tree. Subsetting *all*
@@ -977,15 +982,22 @@ It repoints that element's `Body` `IfcShapeRepresentation` at freshly
 minted tessellation geometry, and garbage-collects the geometry the old
 body *uniquely* owned (a shared `IfcRepresentationMap` still used by
 other instances survives, so the file only sheds what this element alone
-kept alive).
+kept alive). An `IfcStyledItem` on the old geometry is removed with it
+(a decoration doesn't keep dead geometry alive), and layer assignments
+are pruned to the surviving items.
 
 ```python
 lm   = m.mesh(guid, frame="local")   # element-local frame, native units
 v, t = decimate(lm.vertices, lm.faces)  # your simplifier
 m.hotswap(guid, v, t, out_path="lean.ifc")
 # stats: shape_rep, new_geometry, new_records, old_items, records_gc,
-#        records_out, bytes_out, path
+#        records_out, pds_shared_with, body_reps, bytes_out, path
 ```
+
+Check `pds_shared_with` in the stats: when nonzero, other products share
+this element's `IfcProductDefinitionShape` and the swap changed their
+visible geometry too (legal IFC — decide if that's what you meant).
+`body_reps > 1` means only the first `Body` representation was swapped.
 
 - **Coordinates are element-local, native units.** An
   `IfcTriangulatedFaceSet`'s coords live *before* the element's

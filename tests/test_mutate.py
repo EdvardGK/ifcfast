@@ -321,3 +321,18 @@ def _get_info_ok(inst) -> bool:
         return True
     except Exception:  # noqa: BLE001
         return False
+
+
+def test_ifczip_out_path_writes_real_zip(model, tmp_path):
+    """GH #132 item 7: an .ifczip out_path must be a real ZIP archive
+    (magic-byte dispatch reopens it), not raw STEP in a lying filename."""
+    out = tmp_path / "mutated.ifczip"
+    stats = model.mutate(
+        [{"op": "rename", "guid": WALL_A, "name": "zipped"}],
+        out_path=str(out),
+    )
+    assert stats["path"] == str(out)
+    raw = out.read_bytes()
+    assert raw[:2] == b"PK", "must be a ZIP archive, got raw STEP"
+    m2 = ifcfast.open(out, use_cache=False, write_cache=False)
+    assert len(m2.products) == 3

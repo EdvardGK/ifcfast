@@ -45,7 +45,10 @@ fn closure_is_forward_closed_for_every_single_seed() {
                         assert!(
                             keep.contains(&r),
                             "dangling ref #{} from #{} (seed #{}) in {:?}",
-                            r, id, seed, path
+                            r,
+                            id,
+                            seed,
+                            path
                         );
                     }
                 }
@@ -60,7 +63,12 @@ fn closure_of_all_ids_is_everything() {
         let doc = Doc::open_editable(&path).expect("open");
         let all: Vec<u64> = doc.ids().to_vec();
         let keep = reachable_closure(&doc, &all);
-        assert_eq!(keep.len(), all.len(), "closure(all) must equal all in {:?}", path);
+        assert_eq!(
+            keep.len(),
+            all.len(),
+            "closure(all) must equal all in {:?}",
+            path
+        );
     }
 }
 
@@ -93,7 +101,8 @@ fn corpus_roundtrip_and_closure_across_diverse_files() {
         assert!(
             out == original,
             "round-trip NOT byte-identical: {:?} ({} records)",
-            path, stats.records_in
+            path,
+            stats.records_in
         );
 
         // (2) forward-closed closure invariant, on ~300 seeds spread
@@ -110,7 +119,10 @@ fn corpus_roundtrip_and_closure_across_diverse_files() {
                         assert!(
                             keep.contains(&r),
                             "dangling ref #{} from #{} (seed #{}) in {:?}",
-                            r, id, seed, path
+                            r,
+                            id,
+                            seed,
+                            path
                         );
                     }
                 }
@@ -131,7 +143,9 @@ fn corpus_roundtrip_and_closure_across_diverse_files() {
                     assert!(
                         !doc.contains(r),
                         "reopened subset dropped in-graph dep #{} (from #{}) in {:?}",
-                        r, id, path
+                        r,
+                        id,
+                        path
                     );
                 }
             }
@@ -139,7 +153,11 @@ fn corpus_roundtrip_and_closure_across_diverse_files() {
 
         eprintln!(
             "OK {:?}: {} records, {} bytes, {} seeds checked, subset={} records",
-            path.file_name().unwrap(), stats.records_in, out.len(), checked, keep.len()
+            path.file_name().unwrap(),
+            stats.records_in,
+            out.len(),
+            checked,
+            keep.len()
         );
     }
 }
@@ -155,7 +173,8 @@ fn assert_no_dropped_deps(re: &Doc, orig: &Doc) {
                 assert!(
                     !orig.contains(r),
                     "subset dropped in-graph dependency #{} (from #{})",
-                    r, id
+                    r,
+                    id
                 );
             }
         }
@@ -207,13 +226,26 @@ fn subset_climbs_spine_pulls_defs_and_prunes_shared_rels() {
 fn subset_of_all_ids_is_byte_identical_to_source() {
     // The whole-document degenerate case must reproduce the source: closure
     // of all ids is everything, every rel keeps its full anchor, no override.
-    for name in ["minimal.ifc", "geom_box.ifc", "materials.ifc", "quantities.ifc"] {
+    for name in [
+        "minimal.ifc",
+        "geom_box.ifc",
+        "materials.ifc",
+        "quantities.ifc",
+    ] {
         let doc = Doc::open_editable(&fixtures_dir().join(name)).expect("open");
         let all: Vec<u64> = doc.ids().to_vec();
         let (sub_bytes, stats) = subset(&doc, &all);
         let (full_bytes, _) = emit(&doc, None);
-        assert_eq!(stats.rels_pruned, 0, "no pruning when keeping all ({})", name);
-        assert!(sub_bytes == full_bytes, "subset(all) != source for {}", name);
+        assert_eq!(
+            stats.rels_pruned, 0,
+            "no pruning when keeping all ({})",
+            name
+        );
+        assert!(
+            sub_bytes == full_bytes,
+            "subset(all) != source for {}",
+            name
+        );
     }
 }
 
@@ -226,7 +258,12 @@ fn subset_single_seed_reopens_self_contained() {
         for &seed in doc.ids() {
             let (bytes, _) = subset(&doc, &[seed]);
             let re = Doc::from_bytes(bytes);
-            assert!(re.contains(seed) || !doc.contains(seed), "seed #{} lost in {:?}", seed, path);
+            assert!(
+                re.contains(seed) || !doc.contains(seed),
+                "seed #{} lost in {:?}",
+                seed,
+                path
+            );
             assert_no_dropped_deps(&re, &doc);
         }
     }
@@ -317,7 +354,8 @@ fn closure_subset_emits_and_reopens_forward_closed() {
             assert!(
                 !doc.contains(r),
                 "reopened subset dropped an in-graph dependency #{} (from #{})",
-                r, id
+                r,
+                id
             );
         }
     }
@@ -348,4 +386,59 @@ fn retained_rel_closes_owner_history_and_inline_pset_set() {
 
     // And the reopened subset is fully self-contained.
     assert_no_dropped_deps(&re, &doc);
+}
+
+#[test]
+fn subset_carries_styles_and_prunes_layer_assignments() {
+    // GH #132 item 5: IfcStyledItem / IfcPresentationLayerAssignment used
+    // to be silently dropped from subsets — authored colours and CAD
+    // layers lost. They follow the anchor/pull model: the styled item of
+    // a kept geometry item comes along (pulling its style chain), and a
+    // layer assignment is pruned to the surviving members.
+    let doc = Doc::open_editable(&fixtures_dir().join("hotswap_styled.ifc")).expect("open");
+    let (bytes, _stats) = subset(&doc, &[40]); // wall 1 only
+    let out = Doc::from_bytes(bytes);
+
+    // Styled item + full style chain present.
+    for id in [46u64, 49, 50, 51] {
+        assert!(out.contains(id), "#{id} (style chain) must ride along");
+    }
+    // Layer assignment kept, pruned to wall 1's item only (#45, not #65).
+    assert!(out.contains(70), "layer assignment must be kept");
+    assert_eq!(
+        forward_refs(&out, 70),
+        vec![45],
+        "layer pruned to kept items"
+    );
+    // Wall 2 and its item are gone.
+    assert!(!out.contains(60));
+    assert!(!out.contains(65));
+
+    // No dangling refs.
+    for &id in out.ids() {
+        for r in forward_refs(&out, id) {
+            assert!(out.contains(r), "dangling #{r} from #{id}");
+        }
+    }
+}
+
+#[test]
+fn group_by_factor_membership_is_kept() {
+    // GH #132 item 3: exact-name rule matching dropped the
+    // IfcRelAssignsToGroupByFactor subtype — group membership lost.
+    let src = concat!(
+        "ISO-10303-21;\nHEADER;\nFILE_DESCRIPTION((''),'2;1');\n",
+        "FILE_NAME('t','',(''),(''),'','','');\nFILE_SCHEMA(('IFC4'));\n",
+        "ENDSEC;\nDATA;\n",
+        "#1=IFCWALL('WallGuid0000000000001',$,'W',$,$,$,$,$,$);\n",
+        "#2=IFCZONE('ZoneGuid0000000000002',$,'Zone',$,$);\n",
+        "#3=IFCRELASSIGNSTOGROUPBYFACTOR('RelGuid00000000000003',$,$,$,(#1),$,#2,0.5);\n",
+        "ENDSEC;\nEND-ISO-10303-21;\n"
+    );
+    let doc = Doc::from_bytes(src.as_bytes().to_vec());
+    let (bytes, stats) = subset(&doc, &[1]);
+    let out = Doc::from_bytes(bytes);
+    assert!(out.contains(3), "group-by-factor rel must be kept");
+    assert!(out.contains(2), "the group must be pulled in");
+    assert!(stats.rels_kept >= 1);
 }

@@ -99,7 +99,14 @@ impl Doc {
             }
         });
 
-        Doc { buf, order, starts, endsec, index, max_id }
+        Doc {
+            buf,
+            order,
+            starts,
+            endsec,
+            index,
+            max_id,
+        }
     }
 
     /// Number of DATA-section records.
@@ -162,21 +169,30 @@ impl Doc {
 
     /// Iterate `(id, position)` in source order.
     pub(crate) fn records(&self) -> impl Iterator<Item = (u64, usize)> + '_ {
-        self.order.iter().copied().enumerate().map(|(i, id)| (id, i))
+        self.order
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(i, id)| (id, i))
     }
 
     /// Resolve `IfcRoot` GlobalId strings to their step ids by scanning
     /// field 0 of every record. Returns `(found_ids, missing_guids)` so the
     /// caller can fail loudly on an unknown GlobalId rather than silently
     /// seeding nothing. A GlobalId that appears on multiple records (a
-    /// malformed file) resolves to the first occurrence; records whose
-    /// field 0 is not a string (non-`IfcRoot` entities) are skipped.
+    /// malformed file) resolves to the first occurrence; records that
+    /// don't pass [`looks_rooted`] are skipped — matching ANY field-0
+    /// string let a mistyped seed hit e.g. `IFCMATERIAL('Concrete')`
+    /// instead of failing loud (GH #132 item 4).
     pub fn resolve_guids(&self, wanted: &[String]) -> (Vec<u64>, Vec<String>) {
         let mut map: HashMap<String, u64> = HashMap::with_capacity(self.order.len());
         for (id, i) in self.records() {
             let span = &self.buf[self.record_span(i)];
             if let Some((_id, _type, args)) = crate::lexer::parse_record_span(span) {
                 let split = crate::lexer::split_top_level_args(args);
+                if !looks_rooted(&split) {
+                    continue;
+                }
                 if let Some(first) = split.first() {
                     if let Some(guid) = crate::lexer::decode_string(first) {
                         map.entry(guid).or_insert(id);
@@ -194,4 +210,27 @@ impl Doc {
         }
         (found, missing)
     }
+}
+
+/// Whether a split argument list has the `IfcRoot` shape — schema-free,
+/// so guid resolution doesn't need a type table:
+/// `(GlobalId: String, OwnerHistory: #ref|$, Name: String|$,
+/// Description: String|$, …)` with at least the four rooted positions.
+/// Rejects the classic false positives: `IFCMATERIAL('Concrete')` (too
+/// few args), `IFCPROPERTYSINGLEVALUE('Name',$,IFCLABEL(…),$)` (typed
+/// value at position 2), `IFCQUANTITYLENGTH('Length',$,$,4.)` (number at
+/// position 3).
+pub(crate) fn looks_rooted(args: &[&[u8]]) -> bool {
+    use crate::lexer::{parse_field, Field};
+    if args.len() < 4 {
+        return false;
+    }
+    if !matches!(parse_field(args[0]), Field::String(_)) {
+        return false;
+    }
+    if !matches!(parse_field(args[1]), Field::Ref(_) | Field::Null) {
+        return false;
+    }
+    matches!(parse_field(args[2]), Field::String(_) | Field::Null)
+        && matches!(parse_field(args[3]), Field::String(_) | Field::Null)
 }

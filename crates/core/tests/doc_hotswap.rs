@@ -22,13 +22,28 @@ const WALL1: &str = "7XvctVUKr0kugbFTf53O9L";
 /// A unit cube (8 verts, 12 tris) — a plausible decimated body.
 fn unit_cube() -> (Vec<[f64; 3]>, Vec<[u32; 3]>) {
     let v = vec![
-        [0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 1.0, 0.0], [0.0, 1.0, 0.0],
-        [0.0, 0.0, 1.0], [1.0, 0.0, 1.0], [1.0, 1.0, 1.0], [0.0, 1.0, 1.0],
+        [0.0, 0.0, 0.0],
+        [1.0, 0.0, 0.0],
+        [1.0, 1.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [0.0, 0.0, 1.0],
+        [1.0, 0.0, 1.0],
+        [1.0, 1.0, 1.0],
+        [0.0, 1.0, 1.0],
     ];
     let t = vec![
-        [0, 2, 1], [0, 3, 2], [4, 5, 6], [4, 6, 7],
-        [0, 1, 5], [0, 5, 4], [1, 2, 6], [1, 6, 5],
-        [2, 3, 7], [2, 7, 6], [3, 0, 4], [3, 4, 7],
+        [0, 2, 1],
+        [0, 3, 2],
+        [4, 5, 6],
+        [4, 6, 7],
+        [0, 1, 5],
+        [0, 5, 4],
+        [1, 2, 6],
+        [1, 6, 5],
+        [2, 3, 7],
+        [2, 7, 6],
+        [3, 0, 4],
+        [3, 4, 7],
     ];
     (v, t)
 }
@@ -54,14 +69,21 @@ fn swaps_body_gcs_unique_items_keeps_shared_map() {
     assert_eq!(stats.new_geometry, max_id + 2, "faceset above point list");
     assert_eq!(stats.new_records, 2, "point list + faceset");
     // Wall1 uniquely owned #42 (mapped item) + #44 (its mapping target).
-    assert_eq!(stats.records_gc, 2, "should reclaim exactly the unique items");
+    assert_eq!(
+        stats.records_gc, 2,
+        "should reclaim exactly the unique items"
+    );
 
     let re = Doc::from_bytes(bytes);
 
     // The body rep now points at the new faceset and is a Tessellation.
     assert_eq!(field_str(&re, 41, 2).as_deref(), Some("Tessellation"));
     let items = forward_refs(&re, 41);
-    assert_eq!(items, vec![10, stats.new_geometry], "context + new faceset only");
+    assert_eq!(
+        items,
+        vec![10, stats.new_geometry],
+        "context + new faceset only"
+    );
 
     // New geometry present; the faceset backs onto the new point list (max+1).
     assert!(re.contains(stats.new_geometry));
@@ -185,7 +207,10 @@ fn gc_keeps_the_subcontext_the_swapped_rep_still_references() {
 
     // The uniquely-owned map chain is reclaimed…
     for gone in [42, 44, 63, 64, 65, 67, 68, 69] {
-        assert!(!re.contains(gone), "#{gone} is uniquely owned, should be GC'd");
+        assert!(
+            !re.contains(gone),
+            "#{gone} is uniquely owned, should be GC'd"
+        );
     }
     assert_eq!(stats.records_gc, 8);
 
@@ -210,7 +235,10 @@ fn non_finite_vertices_are_loud() {
     for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
         let verts = vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, bad, 0.0]];
         assert!(
-            matches!(hotswap(&doc, WALL1, &verts, &tris), Err(HotswapError::BadMesh(_))),
+            matches!(
+                hotswap(&doc, WALL1, &verts, &tris),
+                Err(HotswapError::BadMesh(_))
+            ),
             "coordinate {bad} must be rejected"
         );
     }
@@ -226,6 +254,57 @@ fn tiny_coordinates_keep_a_decimal_point() {
     let tris = vec![[0u32, 1, 2]];
     let (bytes, _stats) = hotswap(&doc, WALL1, &verts, &tris).expect("hotswap ok");
     let text = String::from_utf8(bytes).expect("utf8");
-    assert!(text.contains("1.0e-5"), "exponent REAL must keep a decimal point");
-    assert!(!text.contains("(1e-5"), "bare 1e-5 token must not be emitted");
+    assert!(
+        text.contains("1.0e-5"),
+        "exponent REAL must keep a decimal point"
+    );
+    assert!(
+        !text.contains("(1e-5"),
+        "bare 1e-5 token must not be emitted"
+    );
+}
+
+#[test]
+fn styled_item_is_weak_and_layer_assignment_is_pruned() {
+    // GH #132 item 5: an IfcStyledItem's inbound edge used to count as
+    // ownership, keeping every styled element's dead body alive — hotswap
+    // never shrank real (Revit-coloured) files. The styled item must be
+    // cascade-removed with its item, and a layer assignment naming the
+    // removed item must be pruned to the survivors.
+    let doc = Doc::open_editable(&fixtures_dir().join("hotswap_styled.ifc")).expect("open");
+    let (verts, tris) = unit_cube();
+
+    let (bytes, stats) = hotswap(&doc, "Wall1Styled000000000A", &verts, &tris).expect("swap");
+
+    // Old solid #45 AND its styled item #46 are reclaimed.
+    assert_eq!(stats.records_gc, 2, "old solid + styled item");
+    let re = Doc::from_bytes(bytes);
+    assert!(
+        !re.contains(45),
+        "old solid must be GC'd despite the styled item"
+    );
+    assert!(
+        !re.contains(46),
+        "orphaned styled item must go with its item"
+    );
+
+    // Shared profile/direction survive (wall 2 still uses them), and the
+    // style chain is conservatively kept (outside the removal universe).
+    for kept in [44, 48, 49, 50, 51, 65] {
+        assert!(re.contains(kept), "#{kept} must survive");
+    }
+
+    // The layer assignment now names only the surviving item.
+    assert_eq!(forward_refs(&re, 70), vec![65], "layer pruned to survivors");
+
+    // Sharing telemetry: wall 1's PDS is unshared, single body rep.
+    assert_eq!(stats.pds_shared_with, 0);
+    assert_eq!(stats.body_reps, 1);
+
+    // Zero dangling refs in the reopened document.
+    for &id in re.ids() {
+        for r in forward_refs(&re, id) {
+            assert!(re.contains(r), "dangling #{r} referenced by #{id}");
+        }
+    }
 }

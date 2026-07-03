@@ -67,10 +67,20 @@ fn pins_every_rule_field_index_exactly() {
     for &(id, _, _) in expected {
         let (anchor, pull) = extract(&doc, id);
         for r in anchor {
-            assert!((5000..6000).contains(&r), "anchor #{} out of band on #{}", r, id);
+            assert!(
+                (5000..6000).contains(&r),
+                "anchor #{} out of band on #{}",
+                r,
+                id
+            );
         }
         for r in pull {
-            assert!((4000..5000).contains(&r), "pull #{} out of band on #{}", r, id);
+            assert!(
+                (4000..5000).contains(&r),
+                "pull #{} out of band on #{}",
+                r,
+                id
+            );
         }
     }
 }
@@ -91,8 +101,18 @@ fn extracted_refs_resolve_in_a_real_graph() {
         };
         seen_types.insert(String::from_utf8_lossy(rule.type_name).into_owned());
 
-        assert!(!anchor.is_empty(), "empty anchor on #{} ({:?})", id, rule.type_name);
-        assert!(!pull.is_empty(), "empty pull on #{} ({:?})", id, rule.type_name);
+        assert!(
+            !anchor.is_empty(),
+            "empty anchor on #{} ({:?})",
+            id,
+            rule.type_name
+        );
+        assert!(
+            !pull.is_empty(),
+            "empty pull on #{} ({:?})",
+            id,
+            rule.type_name
+        );
         for r in anchor.iter().chain(pull.iter()) {
             assert!(doc.contains(*r), "unresolved ref #{} on #{}", r, id);
         }
@@ -100,13 +120,22 @@ fn extracted_refs_resolve_in_a_real_graph() {
         // (nothing invented).
         let fwd: HashSet<u64> = forward_refs(&doc, id).into_iter().collect();
         for r in anchor.iter().chain(pull.iter()) {
-            assert!(fwd.contains(r), "extracted #{} not a forward ref of #{}", r, id);
+            assert!(
+                fwd.contains(r),
+                "extracted #{} not a forward ref of #{}",
+                r,
+                id
+            );
         }
     }
 
-    for t in ["IFCRELAGGREGATES", "IFCRELCONTAINEDINSPATIALSTRUCTURE",
-              "IFCRELDEFINESBYPROPERTIES", "IFCRELASSOCIATESMATERIAL",
-              "IFCRELASSOCIATESCLASSIFICATION"] {
+    for t in [
+        "IFCRELAGGREGATES",
+        "IFCRELCONTAINEDINSPATIALSTRUCTURE",
+        "IFCRELDEFINESBYPROPERTIES",
+        "IFCRELASSOCIATESMATERIAL",
+        "IFCRELASSOCIATESCLASSIFICATION",
+    ] {
         assert!(seen_types.contains(t), "fixture drifted: no {} record", t);
     }
 }
@@ -144,16 +173,53 @@ fn rel_indices_resolve_across_diverse_corpus() {
             let tname = String::from_utf8_lossy(rule.type_name).into_owned();
             *counts.entry(tname.clone()).or_default() += 1;
 
-            assert!(!anchor.is_empty(), "empty anchor on #{} ({}) in {:?}", id, tname, path);
-            assert!(!pull.is_empty(), "empty pull on #{} ({}) in {:?}", id, tname, path);
+            // IfcStyledItem legitimately carries `$` for Item in the
+            // IFC2x3 material-styles idiom (styled rep chains) — an empty
+            // anchor there just means "never activates"; the record still
+            // rides in via forward closure from its styled representation.
+            // Every actual relationship must have a non-empty anchor.
+            if tname != "IFCSTYLEDITEM" {
+                assert!(
+                    !anchor.is_empty(),
+                    "empty anchor on #{} ({}) in {:?}",
+                    id,
+                    tname,
+                    path
+                );
+            }
+            // Plain layer assignments (`IfcPresentationLayerAssignment`
+            // without styles) have no refs outside the anchor — Name /
+            // Description / Identifier are strings — so an empty pull is
+            // the norm there, and a style-less IfcStyledItem parallels it.
+            if !matches!(
+                tname.as_str(),
+                "IFCPRESENTATIONLAYERASSIGNMENT"
+                    | "IFCPRESENTATIONLAYERWITHSTYLE"
+                    | "IFCSTYLEDITEM"
+            ) {
+                assert!(
+                    !pull.is_empty(),
+                    "empty pull on #{} ({}) in {:?}",
+                    id,
+                    tname,
+                    path
+                );
+            }
             for r in anchor.iter().chain(pull.iter()) {
                 assert!(
                     doc.contains(*r),
                     "unresolved rel ref #{} on #{} ({}) in {:?}",
-                    r, id, tname, path
+                    r,
+                    id,
+                    tname,
+                    path
                 );
             }
         }
-        eprintln!("OK {:?}: rel counts {:?}", path.file_name().unwrap(), counts);
+        eprintln!(
+            "OK {:?}: rel counts {:?}",
+            path.file_name().unwrap(),
+            counts
+        );
     }
 }

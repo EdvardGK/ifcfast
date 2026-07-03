@@ -2801,6 +2801,30 @@ mod python {
         })
     }
 
+    // ----- write-axis output helper -------------------------------------
+
+    /// Write STEP output honouring the target extension: an `.ifczip`
+    /// `out_path` gets a single-member ZIP archive (GH #132 item 7 — the
+    /// write axis used to emit raw STEP bytes into a `.ifczip`-named file,
+    /// which no consumer could then open), anything else raw STEP.
+    fn write_step_output(p: &str, bytes: &[u8]) -> PyResult<()> {
+        let data: std::borrow::Cow<'_, [u8]> = if p.to_ascii_lowercase().ends_with(".ifczip") {
+            let stem = Path::new(p)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("model");
+            std::borrow::Cow::Owned(
+                crate::source::compress_ifczip(bytes, &format!("{stem}.ifc")).map_err(|e| {
+                    pyo3::exceptions::PyIOError::new_err(format!("compress {p}: {e}"))
+                })?,
+            )
+        } else {
+            std::borrow::Cow::Borrowed(bytes)
+        };
+        std::fs::write(p, &data)
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("write {p}: {e}")))
+    }
+
     // ----- subset_ifc (GH #124 writer axis) ----------------------------
 
     /// Build a self-contained IFC subset seeded by `seed_guids` (IfcRoot
@@ -2845,9 +2869,7 @@ mod python {
             out.set_item("bytes_out", bytes.len() as u64)?;
             match out_path {
                 Some(p) => {
-                    std::fs::write(p, &bytes).map_err(|e| {
-                        pyo3::exceptions::PyIOError::new_err(format!("write {p}: {e}"))
-                    })?;
+                    write_step_output(p, &bytes)?;
                     out.set_item("path", p)?;
                 }
                 None => {
@@ -2887,11 +2909,25 @@ mod python {
         py: Python<'py>,
         path: &str,
         guid: &str,
-        vertices: Vec<Vec<f64>>,
-        triangles: Vec<Vec<u32>>,
+        vertices: Bound<'py, pyo3::types::PyAny>,
+        triangles: Bound<'py, pyo3::types::PyAny>,
         out_path: Option<&str>,
     ) -> PyResult<Bound<'py, PyDict>> {
         catch_panic(|| {
+            // Extract by hand so every malformed input surfaces as
+            // ValueError — extraction via typed signature params leaked
+            // OverflowError (negative / > u32::MAX index) and TypeError
+            // (flat 1-D array) instead (GH #132 item 8).
+            let vertices: Vec<Vec<f64>> = vertices.extract().map_err(|_| {
+                pyo3::exceptions::PyValueError::new_err(
+                    "hotswap: vertices must be a sequence of [x, y, z] rows",
+                )
+            })?;
+            let triangles: Vec<Vec<i64>> = triangles.extract().map_err(|_| {
+                pyo3::exceptions::PyValueError::new_err(
+                    "hotswap: triangles must be a sequence of [i, j, k] index rows",
+                )
+            })?;
             let mut verts: Vec<[f64; 3]> = Vec::with_capacity(vertices.len());
             for (i, v) in vertices.iter().enumerate() {
                 if v.len() != 3 {
@@ -2910,7 +2946,15 @@ mod python {
                         t.len()
                     )));
                 }
-                tris.push([t[0], t[1], t[2]]);
+                let mut row = [0u32; 3];
+                for (k, &idx) in t.iter().enumerate() {
+                    row[k] = u32::try_from(idx).map_err(|_| {
+                        pyo3::exceptions::PyValueError::new_err(format!(
+                            "hotswap: triangle {i} index {idx} out of range (0..2^32)"
+                        ))
+                    })?;
+                }
+                tris.push(row);
             }
 
             let doc = crate::doc::Doc::open_editable(Path::new(path)).map_err(|e| {
@@ -2929,12 +2973,12 @@ mod python {
             out.set_item("old_items", stats.old_items as u64)?;
             out.set_item("records_gc", stats.records_gc as u64)?;
             out.set_item("records_out", stats.records_out as u64)?;
+            out.set_item("pds_shared_with", stats.pds_shared_with as u64)?;
+            out.set_item("body_reps", stats.body_reps as u64)?;
             out.set_item("bytes_out", bytes.len() as u64)?;
             match out_path {
                 Some(p) => {
-                    std::fs::write(p, &bytes).map_err(|e| {
-                        pyo3::exceptions::PyIOError::new_err(format!("write {p}: {e}"))
-                    })?;
+                    write_step_output(p, &bytes)?;
                     out.set_item("path", p)?;
                 }
                 None => {
@@ -3095,9 +3139,7 @@ mod python {
             out.set_item("bytes_out", bytes.len() as u64)?;
             match out_path {
                 Some(p) => {
-                    std::fs::write(p, &bytes).map_err(|e| {
-                        pyo3::exceptions::PyIOError::new_err(format!("write {p}: {e}"))
-                    })?;
+                    write_step_output(p, &bytes)?;
                     out.set_item("path", p)?;
                 }
                 None => {

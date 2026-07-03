@@ -48,10 +48,16 @@ pub struct RelField {
 
 impl RelField {
     const fn single(index: usize) -> RelField {
-        RelField { index, is_set: false }
+        RelField {
+            index,
+            is_set: false,
+        }
     }
     const fn set(index: usize) -> RelField {
-        RelField { index, is_set: true }
+        RelField {
+            index,
+            is_set: true,
+        }
     }
 }
 
@@ -150,6 +156,15 @@ pub const REL_RULES: &[RelRule] = &[
         anchor: RelField::set(4),
         pull: RelField::single(6),
     },
+    // Weighted group membership (zone factors): same layout as its
+    // supertype with a trailing Factor(7) REAL that carries no refs.
+    // Exact-name matching means the subtype needs its own row — it was
+    // silently dropped before this one existed (GH #132 item 3).
+    RelRule {
+        type_name: b"IFCRELASSIGNSTOGROUPBYFACTOR",
+        anchor: RelField::set(4),
+        pull: RelField::single(6),
+    },
     // Context declares definitions (IFC4+): RelatingContext(4) declares
     // RelatedDefinitions(5). Anchor = the declared types; pull = the
     // project/library context.
@@ -195,6 +210,36 @@ pub const REL_RULES: &[RelRule] = &[
         type_name: b"IFCRELSERVICESBUILDINGS",
         anchor: RelField::single(4),
         pull: RelField::set(5),
+    },
+    // ---- non-IfcRel "decoration" records (GH #132 item 5) --------------
+    // These aren't relationships, but they have the identical shape the
+    // pass models: nothing references THEM, they point AT kept things,
+    // and dropping them loses information (authored colours / layers).
+    //
+    // Surface style attachment: Item(0, single geometric item — may be
+    // `$` in the IFC2x3 material-styles idiom, which yields an empty
+    // anchor and simply never activates; such styled items ride in via
+    // forward closure from their IfcStyledRepresentation instead).
+    // Pull = Styles(1): the style select chain the item needs.
+    RelRule {
+        type_name: b"IFCSTYLEDITEM",
+        anchor: RelField::single(0),
+        pull: RelField::set(1),
+    },
+    // CAD layer assignment: AssignedItems(2, SET of items/representations)
+    // pruned to survivors like any anchor set; Name/Description/Identifier
+    // carry no refs, so pull is the (empty-of-refs) Name field — parse_rel
+    // pulls every non-anchor ref regardless, which also covers the
+    // LayerStyles(4) set of the IfcPresentationLayerWithStyle subtype.
+    RelRule {
+        type_name: b"IFCPRESENTATIONLAYERASSIGNMENT",
+        anchor: RelField::set(2),
+        pull: RelField::single(0),
+    },
+    RelRule {
+        type_name: b"IFCPRESENTATIONLAYERWITHSTYLE",
+        anchor: RelField::set(2),
+        pull: RelField::single(0),
     },
 ];
 

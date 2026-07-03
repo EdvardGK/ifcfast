@@ -51,36 +51,45 @@ fn roundtrip_is_byte_identical_keeping_everything() {
 }
 
 #[test]
-#[ignore = "requires a real corpus file via IFCFAST_ROUNDTRIP_FILE (not committed — RAM/licence)"]
+#[ignore = "requires real corpus files via IFCFAST_CORPUS (not committed — RAM/licence)"]
 fn roundtrip_is_byte_identical_on_corpus_file() {
     // Synthetic fixtures don't exercise multi-line records, inter-record
     // comments, far-origin coordinates, or exporter whitespace quirks.
-    // Point this at a real model to prove byte-identity at scale:
-    //   IFCFAST_ROUNDTRIP_FILE=/path/to/G55_ARK.ifc \
+    // Point this at real models to prove byte-identity at scale:
+    //   IFCFAST_CORPUS="/a.ifc:/b.ifc" \
     //     cargo test -p ifcfast-core --no-default-features \
     //     --test doc_roundtrip -- --ignored --nocapture
-    let path = match std::env::var("IFCFAST_ROUNDTRIP_FILE") {
-        Ok(p) => PathBuf::from(p),
-        Err(_) => panic!(
-            "roundtrip gate invoked (--ignored) but IFCFAST_ROUNDTRIP_FILE is unset — \
-             refusing to report green without running"
-        ),
-    };
-    let original = fs::read(&path).expect("read corpus file");
-    let doc = Doc::open_editable(&path).expect("open_editable");
-    let (out, stats) = emit(&doc, None);
-    eprintln!(
-        "corpus {:?}: {} records, {} bytes",
-        path, stats.records_in, stats.bytes_out
-    );
-    assert_eq!(stats.records_in, stats.records_out);
-    assert_eq!(
-        out.len(),
-        original.len(),
-        "length mismatch on {:?}",
-        path
-    );
-    assert!(out == original, "round-trip not byte-identical on {:?}", path);
+    // (The unified corpus var — GH #132 item 1. Legacy
+    // IFCFAST_ROUNDTRIP_FILE still accepted.)
+    let raw = std::env::var("IFCFAST_CORPUS")
+        .or_else(|_| std::env::var("IFCFAST_ROUNDTRIP_FILE"))
+        .expect(
+            "roundtrip gate invoked (--ignored) but IFCFAST_CORPUS is unset — \
+             refusing to report green without running: set \
+             IFCFAST_CORPUS=/a.ifc:/b.ifc (IFCFAST_ROUNDTRIP_FILE also accepted)",
+        );
+    let paths: Vec<PathBuf> = raw
+        .split(':')
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .collect();
+    assert!(!paths.is_empty());
+    for path in paths {
+        let original = fs::read(&path).expect("read corpus file");
+        let doc = Doc::open_editable(&path).expect("open_editable");
+        let (out, stats) = emit(&doc, None);
+        eprintln!(
+            "corpus {:?}: {} records, {} bytes",
+            path, stats.records_in, stats.bytes_out
+        );
+        assert_eq!(stats.records_in, stats.records_out);
+        assert_eq!(out.len(), original.len(), "length mismatch on {:?}", path);
+        assert!(
+            out == original,
+            "round-trip not byte-identical on {:?}",
+            path
+        );
+    }
 }
 
 #[test]
@@ -93,7 +102,11 @@ fn subset_keeping_all_ids_equals_keep_none() {
         let all: HashSet<u64> = doc.ids().iter().copied().collect();
         let (none_out, _) = emit(&doc, None);
         let (all_out, _) = emit(&doc, Some(&all));
-        assert_eq!(none_out, all_out, "keep-all set != keep-none for {:?}", path);
+        assert_eq!(
+            none_out, all_out,
+            "keep-all set != keep-none for {:?}",
+            path
+        );
     }
 }
 
@@ -114,7 +127,10 @@ fn subset_drops_only_requested_records() {
     let (full, _) = emit(&doc, None);
     let (subset, stats) = emit(&doc, Some(&keep));
 
-    assert!(subset.len() < full.len(), "dropping a record must shrink output");
+    assert!(
+        subset.len() < full.len(),
+        "dropping a record must shrink output"
+    );
     assert_eq!(stats.records_out, ids.len() - 1);
     // The dropped record's `#<id>=` token must be gone from the output.
     let needle = format!("#{}=", drop);

@@ -16,8 +16,7 @@
 
 /// The IFC base-64 alphabet (differs from RFC 4648: `_` and `$` in the
 /// last two slots).
-const ALPHABET: &[u8; 64] =
-    b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz_$";
+const ALPHABET: &[u8; 64] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz_$";
 
 /// Encode a 128-bit value as a 22-char IFC compressed GUID.
 pub fn encode_guid(v: u128) -> String {
@@ -118,7 +117,12 @@ mod tests {
 
     #[test]
     fn encode_decode_roundtrip() {
-        for v in [0u128, 1, u128::MAX, 0x1234_5678_9ABC_DEF0_1234_5678_9ABC_DEF0] {
+        for v in [
+            0u128,
+            1,
+            u128::MAX,
+            0x1234_5678_9ABC_DEF0_1234_5678_9ABC_DEF0,
+        ] {
             assert_eq!(decode_guid(&encode_guid(v)), Some(v));
         }
     }

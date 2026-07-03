@@ -985,7 +985,8 @@ class Model:
                 subset).
             out_path: when given, the subset is written there and a stats
                 dict is returned (``path``, ``records_out``, ``rels_kept``,
-                ``rels_pruned``, ``seeds_present``, ``bytes_out``). When
+                ``rels_pruned``, ``seeds_present``, ``bytes_out``); an
+                ``.ifczip`` path is written as a real ZIP archive. When
                 ``None`` (default), the STEP ``bytes`` are returned directly.
 
         Returns:
@@ -1036,11 +1037,9 @@ class Model:
 
         Args:
             guid: GlobalId of the element to re-mesh. Unknown GlobalId, an
-                element with no representation or no ``Body`` rep, or an empty
-                / out-of-range mesh all raise ``ValueError``. (A negative or
-                > 2**32-1 triangle index surfaces as ``OverflowError``, and a
-                flat 1-D array as ``TypeError`` — both from the binding
-                layer.)
+                element with no representation or no ``Body`` rep, an empty
+                / out-of-range mesh, a negative or > 2**32-1 triangle
+                index, or a flat 1-D array all raise ``ValueError``.
             vertices: sequence of ``[x, y, z]`` (accepts a NumPy ``(N, 3)``
                 array or a list of triples).
             triangles: sequence of 0-based ``[i, j, k]`` vertex indices
@@ -1048,8 +1047,14 @@ class Model:
             out_path: when given, the new IFC is written there and a stats
                 dict is returned (``path``, ``product``, ``shape_rep``,
                 ``new_geometry``, ``new_records``, ``old_items``,
-                ``records_gc``, ``records_out``, ``bytes_out``). When
-                ``None`` (default), the
+                ``records_gc``, ``records_out``, ``pds_shared_with``,
+                ``body_reps``, ``bytes_out``). ``pds_shared_with`` > 0
+                means other products share this element's
+                ``IfcProductDefinitionShape`` — the swap changed THEIR
+                visible geometry too; ``body_reps`` > 1 means only the
+                first ``Body`` representation was swapped. An
+                ``.ifczip`` ``out_path`` is written as a real ZIP
+                archive. When ``None`` (default), the
                 STEP ``bytes`` are returned directly. The new body is an
                 ``IfcTriangulatedFaceSet`` on IFC4+ files, an
                 ``IfcShellBasedSurfaceModel`` on IFC2x3.
@@ -1064,8 +1069,16 @@ class Model:
         """
         from . import _core
 
-        verts = [[float(c) for c in row] for row in _as_rows(vertices)]
-        tris = [[int(c) for c in row] for row in _as_rows(triangles)]
+        try:
+            verts = [[float(c) for c in row] for row in _as_rows(vertices)]
+            tris = [[int(c) for c in row] for row in _as_rows(triangles)]
+        except TypeError as e:
+            # A flat 1-D array ('float' object is not iterable) must
+            # surface as ValueError like every other bad-mesh input.
+            raise ValueError(
+                "hotswap: vertices/triangles must be sequences of "
+                "[x, y, z] / [i, j, k] rows"
+            ) from e
         d = _core.hotswap_ifc(
             str(native_path_for(self.header.path)),
             str(guid),
@@ -1130,7 +1143,8 @@ class Model:
                 ``renamed``, ``props_set``, ``props_added``,
                 ``psets_cloned``, ``rels_cloned``, ``placements_cloned``,
                 ``translated``, ``rotated``, ``records_minted``,
-                ``records_gc``, ``records_out``, ``bytes_out``). When
+                ``records_gc``, ``records_out``, ``bytes_out``); an
+                ``.ifczip`` path is written as a real ZIP archive. When
                 ``None`` (default), the STEP ``bytes`` are returned.
             seed: makes minted GlobalIds reproducible (testing only) —
                 leave unset in production so two independent runs can

@@ -58,9 +58,7 @@ fn fixture() -> String {
     s.push_str("#66=IFCRELDEFINESBYPROPERTIES('RelSoGuid000000000000',$,$,$,(#40),#65);\n");
     // A quantity set with a colliding-style name: the type guard target.
     s.push_str("#70=IFCQUANTITYLENGTH('Length',$,$,4.);\n");
-    s.push_str(
-        "#71=IFCELEMENTQUANTITY('QtoGuid00000000000000',$,'Qto_WallBase',$,$,(#70));\n",
-    );
+    s.push_str("#71=IFCELEMENTQUANTITY('QtoGuid00000000000000',$,'Qto_WallBase',$,$,(#70));\n");
     s.push_str("#72=IFCRELDEFINESBYPROPERTIES('RelQtGuid000000000000',$,$,$,(#40),#71);\n");
     s.push_str("ENDSEC;\nEND-ISO-10303-21;\n");
     s
@@ -417,8 +415,10 @@ fn rotate_composes_axes_about_own_location() {
             _ => panic!("ratio"),
         })
         .collect();
-    assert!(vals[0].abs() < 1e-12 && (vals[1] - 1.0).abs() < 1e-12 && vals[2].abs() < 1e-12,
-        "refdir after 90° about z must be (0,1,0), got {vals:?}");
+    assert!(
+        vals[0].abs() < 1e-12 && (vals[1] - 1.0).abs() < 1e-12 && vals[2].abs() < 1e-12,
+        "refdir after 90° about z must be (0,1,0), got {vals:?}"
+    );
 }
 
 #[test]
@@ -517,7 +517,12 @@ fn output_reopens_and_all_guids_unique() {
     assert_no_dangling(&out);
     // Only rooted types carry a GlobalId at field 0 — a property's
     // field 0 is its Name and legitimately repeats across records.
-    let rooted = ["IFCWALL", "IFCPROPERTYSET", "IFCRELDEFINESBYPROPERTIES", "IFCELEMENTQUANTITY"];
+    let rooted = [
+        "IFCWALL",
+        "IFCPROPERTYSET",
+        "IFCRELDEFINESBYPROPERTIES",
+        "IFCELEMENTQUANTITY",
+    ];
     let mut seen: HashSet<String> = HashSet::new();
     for &id in out.ids() {
         if !rooted.contains(&type_of(&out, id).as_str()) {
@@ -528,4 +533,23 @@ fn output_reopens_and_all_guids_unique() {
             assert!(seen.insert(g.clone()), "duplicate GlobalId {g} on #{id}");
         }
     }
+}
+
+#[test]
+fn property_names_do_not_resolve_as_guids() {
+    // GH #132 item 4: any field-0 string used to resolve as a GlobalId —
+    // a mistyped seed could silently hit a property Name or a material.
+    // The rooted-shape guard must reject them.
+    let doc = open();
+    let ops = [MutateOp::Rename {
+        guid: "FireRating".to_string(), // an IfcPropertySingleValue Name
+        name: Some("x".to_string()),
+        description: None,
+    }];
+    let err = mutate(&doc, &ops, Some(1)).expect_err("property name must not resolve");
+    assert!(err.failures[0].1.contains("unknown GlobalId"));
+    // resolve_guids agrees.
+    let (found, missing) = doc.resolve_guids(&["FireRating".to_string()]);
+    assert!(found.is_empty());
+    assert_eq!(missing, vec!["FireRating".to_string()]);
 }

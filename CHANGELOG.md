@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed / Changed — write-axis hardening (GH #132 items 2–8)
+
+- **Subsets now carry authored colours and CAD layers**: `IfcStyledItem`
+  rides along with every kept geometry item (pulling its surface-style
+  chain) and `IfcPresentationLayerAssignment` / `…WithStyle` are kept
+  with member lists pruned to survivors. On G55 this recovers 10.5k–36k
+  styled items per model that were silently dropped before.
+  `IfcRelAssignsToGroupByFactor` (zone weighting) is followed too.
+- **Hotswap actually shrinks styled files**: an `IfcStyledItem`'s
+  inbound edge no longer counts as ownership in orphan GC — it used to
+  keep every styled (Revit-coloured) element's dead body alive. Orphaned
+  styled items are cascade-removed with their item; layer assignments
+  are pruned (or dropped when emptied). New stats: `pds_shared_with`
+  (other products sharing the swapped `IfcProductDefinitionShape` — the
+  swap changed their geometry too) and `body_reps` (only the first
+  `Body` rep is swapped).
+- **Lexer**: `parse_record_span` now finds the FIRST top-level `;`
+  (string- and comment-aware) instead of the last `;` in the span — a
+  trailing inter-record comment containing `;` made the record invisible
+  to rel/guid resolution.
+- **GlobalId resolution is shape-guarded**: only records with the
+  `IfcRoot` argument shape resolve; a mistyped seed can no longer
+  silently match `IFCMATERIAL('Concrete')` or a property `Name`.
+- **`.ifczip` out_path is honoured**: `subset` / `hotswap` / `mutate`
+  write a real single-member ZIP archive when the target ends in
+  `.ifczip` (previously raw STEP under a lying extension).
+- **Error normalisation**: every bad hotswap mesh input — negative or
+  > 2³²−1 triangle index, flat 1-D array — raises `ValueError`
+  (previously `OverflowError` / `TypeError` leaked from the binding).
+- Corpus gates: `doc_roundtrip` now reads the unified `IFCFAST_CORPUS`
+  (multi-path) like every other gate; legacy `IFCFAST_ROUNDTRIP_FILE`
+  still accepted.
+
 ### Added — attribute mutation: `m.mutate(ops)` (GH #133)
 
 - **`m.mutate(ops, out_path=None, seed=None)`** — the last write axis:

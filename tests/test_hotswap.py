@@ -174,3 +174,23 @@ def test_hotswap_over_real_corpus_is_ifcopenshell_clean(path, tmp_path):
         f"OK {path.name}: swapped {prod.is_a()} {guid}, "
         f"GC'd {stats['records_gc']} records, {stats['records_out']} out"
     )
+
+
+def test_bad_indices_and_shapes_raise_value_error(model):
+    """GH #132 item 8: a negative / oversized triangle index used to leak
+    OverflowError and a flat 1-D array TypeError; both are ValueError now."""
+    v, t = _unit_cube()
+    with pytest.raises(ValueError):
+        model.hotswap(WALL1, v, [[0, 1, -2]])
+    with pytest.raises(ValueError):
+        model.hotswap(WALL1, v, [[0, 1, 2**33]])
+    with pytest.raises(ValueError):
+        model.hotswap(WALL1, [0.0, 1.0, 2.0], t)  # flat, not rows
+
+
+def test_sharing_telemetry_in_stats(model, tmp_path):
+    """GH #132 item 6: pds_shared_with / body_reps surface in stats."""
+    v, t = _unit_cube()
+    stats = model.hotswap(WALL1, v, t, out_path=str(tmp_path / "s.ifc"))
+    assert stats["pds_shared_with"] == 0
+    assert stats["body_reps"] == 1

@@ -253,7 +253,14 @@ impl<'d> Editor<'d> {
             }
             out_refs.insert(id, refs);
             if let Some((_id, _ty, args)) = parse_record_span(span) {
-                if let Some(first) = split_top_level_args(args).first() {
+                let split = split_top_level_args(args);
+                // Same rooted-shape guard as Doc::resolve_guids (GH #132
+                // item 4): a property Name or a material must not resolve
+                // as a GlobalId.
+                if !super::looks_rooted(&split) {
+                    continue;
+                }
+                if let Some(first) = split.first() {
                     if let Some(g) = crate::lexer::decode_string(first) {
                         guid_to_id.entry(g.clone()).or_insert(id);
                         taken_guids.insert(g);
@@ -334,8 +341,14 @@ impl<'d> Editor<'d> {
         let span = self
             .current_bytes(id)
             .ok_or_else(|| format!("#{id} absent"))?;
-        let range = field_span(span, RelField { index, is_set: false })
-            .ok_or_else(|| format!("#{id} has no field @{index}"))?;
+        let range = field_span(
+            span,
+            RelField {
+                index,
+                is_set: false,
+            },
+        )
+        .ok_or_else(|| format!("#{id} has no field @{index}"))?;
         let mut out = span.to_vec();
         out.splice(range, repl.iter().copied());
         self.set_bytes(id, out);
@@ -528,8 +541,7 @@ impl<'d> Editor<'d> {
 
             if anchor_multi {
                 // Splice the element out of the shared rel's anchor…
-                let survivors: Vec<u64> =
-                    anchor.iter().copied().filter(|a| *a != elem).collect();
+                let survivors: Vec<u64> = anchor.iter().copied().filter(|a| *a != elem).collect();
                 let mut list = String::from("(");
                 for (i, s) in survivors.iter().enumerate() {
                     if i > 0 {
@@ -1080,7 +1092,12 @@ fn build_nominal(
 fn wrapper_is_integer(wrapper: &str) -> bool {
     matches!(
         wrapper,
-        "IFCINTEGER" | "IFCCOUNTMEASURE" | "IFCTIMESTAMP" | "IFCDAYINMONTHNUMBER"
-            | "IFCDAYINWEEKNUMBER" | "IFCMONTHINYEARNUMBER" | "IFCINTEGERCOUNTRATEMEASURE"
+        "IFCINTEGER"
+            | "IFCCOUNTMEASURE"
+            | "IFCTIMESTAMP"
+            | "IFCDAYINMONTHNUMBER"
+            | "IFCDAYINWEEKNUMBER"
+            | "IFCMONTHINYEARNUMBER"
+            | "IFCINTEGERCOUNTRATEMEASURE"
     )
 }

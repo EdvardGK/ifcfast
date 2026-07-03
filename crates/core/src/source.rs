@@ -212,6 +212,29 @@ pub fn decompress_ifczip(zip_bytes: &[u8]) -> io::Result<Vec<u8>> {
     Ok(buf)
 }
 
+/// Compress STEP bytes into a single-member `.ifczip` (ZIP/deflate)
+/// archive — the inverse of [`decompress_ifczip`], used by the write
+/// axis when a caller's `out_path` ends in `.ifczip` (GH #132 item 7).
+/// `inner_name` is the archive member name (conventionally
+/// `<stem>.ifc`).
+pub fn compress_ifczip(step_bytes: &[u8], inner_name: &str) -> io::Result<Vec<u8>> {
+    use std::io::Write;
+    let mut buf = Vec::with_capacity(step_bytes.len() / 4);
+    {
+        let cursor = std::io::Cursor::new(&mut buf);
+        let mut zw = zip::ZipWriter::new(cursor);
+        let opts: zip::write::SimpleFileOptions = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated)
+            .large_file(step_bytes.len() as u64 >= 0xFFFF_FFFF);
+        zw.start_file(inner_name, opts)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!(".ifczip: {e}")))?;
+        zw.write_all(step_bytes)?;
+        zw.finish()
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!(".ifczip: {e}")))?;
+    }
+    Ok(buf)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
