@@ -383,10 +383,143 @@ fn curve_to_polyline(table: &EntityTable, curve_id: u64) -> Option<Vec<Vec2>> {
         // mesh — the annular-pipe empty-mesh failure mode.
         return circle_curve_2d(table, &fields);
     }
-    // IfcTrimmedCurve / IfcEllipse arcs — not yet sampled. Returning None
-    // here makes the parent profile resolve to None (empty mesh). Tracked
-    // as a follow-on; full circles (the common pipe case) are handled above.
+    if type_name.eq_ignore_ascii_case(b"IFCTRIMMEDCURVE") {
+        // (BasisCurve, Trim1, Trim2, SenseAgreement, MasterRepresentation).
+        // A circular arc segment inside an IfcCompositeCurve — the profile
+        // curve of thin *curved* walls (Revit "15mm flis" etc.). Before this
+        // the arc returned None and the composite walk `continue`d past it,
+        // so a two-arc profile collapsed to its two straight end-cap lines:
+        // a ~0-area sliver → open tube mesh → prism_fallback 8-9x over-count
+        // (GH #123). Only circular basis curves are sampled; ellipse/line
+        // arcs still fall through to None.
+        return trimmed_curve_2d(table, &fields);
+    }
+    // IfcEllipse arcs — not yet sampled. Returning None here makes the
+    // parent profile resolve to None (empty mesh). Tracked as a follow-on.
     None
+}
+
+/// Sample an `IfcTrimmedCurve` on an `IfcCircle` basis into a polyline arc.
+///
+/// Trim parameters (`Trim1` / `Trim2`) are read as angles in DEGREES when
+/// authored as `IfcParameterValue` — the Revit / ArchiCAD convention for
+/// IFC2x3 / IFC4 conic trims (a semicircle trims 180 → 0, unambiguously
+/// degrees) — or as points (angle via `atan2` in the circle's local frame)
+/// for CARTESIAN trims. Orientation follows `SenseAgreement` (arg 3): `T`
+/// runs the arc in the circle's natural CCW / increasing-angle direction
+/// from `Trim1` to `Trim2`, `F` clockwise. The composite-curve caller then
+/// applies the per-segment `SameSense` reversal on top. Endpoints are
+/// inclusive so the arc joins its neighbours in the composite walk. Only
+/// circular basis curves are handled; ellipse / line bases return `None`.
+fn trimmed_curve_2d(table: &EntityTable, fields: &[&[u8]]) -> Option<Vec<Vec2>> {
+    let basis_id = match parse_field(fields.first()?) {
+        Field::Ref(id) => id,
+        _ => return None,
+    };
+    let (basis_type, basis_args) = table.get(basis_id)?;
+    if !basis_type.eq_ignore_ascii_case(b"IFCCIRCLE") {
+        return None;
+    }
+    let basis_fields = split_top_level_args(basis_args);
+    let radius = number_at(&basis_fields, 1)? as f32;
+    if !(radius.is_finite() && radius > 0.0) {
+        return None;
+    }
+    let (center, ref_dir) = match basis_fields.first().copied().map(parse_field) {
+        Some(Field::Ref(pid)) => placement2d_origin_dir(table, pid),
+        _ => (Vec2::ZERO, Vec2::X),
+    };
+    let a1 = trim_angle(table, fields.get(1).copied(), center, ref_dir)?;
+    let a2 = trim_angle(table, fields.get(2).copied(), center, ref_dir)?;
+    let sense = matches!(
+        fields.get(3).copied().map(parse_field),
+        Some(Field::Enum(b"T"))
+    );
+    let (start, end) = arc_span(a1, a2, sense);
+    let sweep = (end - start).abs();
+    let n = ((CURVE_SAMPLES as f32) * sweep / std::f32::consts::TAU)
+        .ceil()
+        .max(2.0) as usize;
+    let (cos, sin) = (ref_dir.x, ref_dir.y);
+    let pts = (0..=n)
+        .map(|i| {
+            let t = start + (end - start) * (i as f32 / n as f32);
+            let lx = radius * t.cos();
+            let ly = radius * t.sin();
+            Vec2::new(center.x + cos * lx - sin * ly, center.y + sin * lx + cos * ly)
+        })
+        .collect();
+    Some(pts)
+}
+
+/// Resolve one `IfcTrimmingSelect` (a 1-2 element SET) to an angle in the
+/// circle's local frame (radians). Prefers a CARTESIAN point (unambiguous
+/// via `atan2`); otherwise reads an `IfcParameterValue` as degrees.
+fn trim_angle(
+    table: &EntityTable,
+    field: Option<&[u8]>,
+    center: Vec2,
+    ref_dir: Vec2,
+) -> Option<f32> {
+    let body = match parse_field(field?) {
+        Field::List(b) => b,
+        _ => return None,
+    };
+    let mut param_deg: Option<f64> = None;
+    for sel in split_top_level_args(body) {
+        match parse_field(sel) {
+            Field::Ref(pid) => {
+                if let Some(p) = cartesian_point_2d(table, pid) {
+                    // Un-rotate the world point into the circle's local frame.
+                    let d = p - center;
+                    let (cos, sin) = (ref_dir.x, ref_dir.y);
+                    let lx = cos * d.x + sin * d.y;
+                    let ly = -sin * d.x + cos * d.y;
+                    return Some(ly.atan2(lx));
+                }
+            }
+            _ => {
+                if param_deg.is_none() {
+                    param_deg = parameter_value(sel);
+                }
+            }
+        }
+    }
+    param_deg.map(|deg| (deg as f32).to_radians())
+}
+
+/// Extract the scalar from an `IfcParameterValue(x)` / `IfcReal(x)` wrapper
+/// (or a bare number).
+fn parameter_value(raw: &[u8]) -> Option<f64> {
+    if let Field::Number(n) = parse_field(raw) {
+        return Some(n);
+    }
+    let open = raw.iter().position(|&b| b == b'(')?;
+    let close = raw.iter().rposition(|&b| b == b')')?;
+    if close <= open + 1 {
+        return None;
+    }
+    std::str::from_utf8(&raw[open + 1..close]).ok()?.trim().parse().ok()
+}
+
+/// Directed angular span `[start, end]` from `a1` to `a2`. `sense == true`
+/// sweeps CCW (increasing angle), `false` CW; a1 == a2 yields a full turn.
+fn arc_span(a1: f32, a2: f32, sense: bool) -> (f32, f32) {
+    use std::f32::consts::TAU;
+    const EPS: f32 = 1e-6;
+    if sense {
+        let mut e = a2;
+        while e <= a1 + EPS {
+            e += TAU;
+        }
+        (a1, e)
+    } else {
+        let mut e = a2;
+        while e >= a1 - EPS {
+            e -= TAU;
+        }
+        (a1, e)
+    }
 }
 
 /// Sample an `IfcCircle` into a closed CCW polyline of `CURVE_SAMPLES`

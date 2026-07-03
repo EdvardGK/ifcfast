@@ -544,7 +544,18 @@ def _resolve_step_escapes(s: str) -> str:
 #       dir.z < 0, so those solids add/subtract correctly. `volume_m3` /
 #       `volume_best_m3` change on every product with a -Z extrusion item;
 #       substrates from such files must be re-extracted.
-_CACHE_SCHEMA_VERSION = 26
+# v27 (GH #123) — circular-arc segments in composite-curve profiles.
+#       `profile::extract` now samples `IfcTrimmedCurve` arcs on an
+#       `IfcCircle` basis inside an `IfcCompositeCurve` (thin curved walls,
+#       Revit "15mm flis"). Before, the arcs were skipped and the profile
+#       collapsed to its straight end-cap lines — a zero-area sliver whose
+#       extruded mesh was an open tube (volume ~0 → `prism_fallback`
+#       over-counting the AABB ~8-9×; G55_ARK: 0.1749 vs ios 0.0182). The
+#       curved band now tessellates, so those products' `mesh_quality`,
+#       `volume_m3` / `volume_mesh_m3` / `volume_best_m3`, surface areas and
+#       vertex/triangle counts change on re-extraction. Substrates from
+#       files with arc-profile geometry must be re-extracted.
+_CACHE_SCHEMA_VERSION = 27
 
 _FIELD_RE = re.compile(r"\(\s*(.*?)\s*\)\s*;", re.DOTALL)
 
