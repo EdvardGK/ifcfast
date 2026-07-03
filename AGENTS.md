@@ -257,7 +257,13 @@ describing via `pq.read_schema(...)`):
   `"prism_fallback"` → `"mesh"`, and `volume_m3` drops from a prism
   over-count to the exact mesh volume (G55 windows: an ~8× over-count
   went to kernel parity). Substrates cached under v24 or earlier
-  re-extract automatically via the cache key.
+  re-extract automatically via the cache key. **GH #138 (cache schema
+  v26):** extrusions authored along a negative direction
+  (`IFCDIRECTION((0.,0.,-1.))`) previously meshed inside-out and their
+  negative signed volume cancelled against sibling solids in a
+  multi-item Body (or corrupted a CSG subtractor); the winding is now
+  flipped when the direction runs against the profile normal, so those
+  products' `volume_m3` / `volume_best_m3` correct on re-extraction.
 - Semantic payload: `materials`, `psets`, `quantities`,
   `classifications` (list-of-struct columns — `UNNEST` in DuckDB).
   Each `psets` and `quantities` struct carries `source`

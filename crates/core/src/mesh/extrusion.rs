@@ -170,13 +170,30 @@ pub fn extrude_polygon(polygon: &Polygon2D, dir: Vec3, depth: f32, local_xform: 
     let bot_base = mesh.push_vertices(&bottom);
     let top_base = mesh.push_vertices(&top);
 
+    // The profile is triangulated with a +Z (CCW) normal (profile::extract
+    // normalises outer CCW / holes CW, GH #62). The cap and wall winding
+    // below is built assuming the extrusion runs *up* that normal. When the
+    // direction points against it (dir·(+Z) = dir.z < 0 — e.g. an
+    // `IFCDIRECTION((0.,0.,-1.))` extrusion) the emitted solid is inside-out:
+    // its signed-tetra volume is negative and it CANCELS against the other
+    // solids in a multi-item Body instead of adding (GH #138). Flip every
+    // cap/wall triangle so the solid is consistently outward-oriented
+    // regardless of the extrusion sign.
+    let flip = dir.z < 0.0;
+
     // 3. Cap triangles. Bottom flipped (CW so normal points -dir).
     for tri in tris.chunks_exact(3) {
         let (a, b, c) = (tri[0] as u32, tri[1] as u32, tri[2] as u32);
-        // Top cap (CCW for +dir normal).
-        mesh.push_triangle(top_base + a, top_base + b, top_base + c);
-        // Bottom cap (flipped winding).
-        mesh.push_triangle(bot_base + a, bot_base + c, bot_base + b);
+        if flip {
+            // Reversed extrusion: swap each cap's winding.
+            mesh.push_triangle(top_base + a, top_base + c, top_base + b);
+            mesh.push_triangle(bot_base + a, bot_base + b, bot_base + c);
+        } else {
+            // Top cap (CCW for +dir normal).
+            mesh.push_triangle(top_base + a, top_base + b, top_base + c);
+            // Bottom cap (flipped winding).
+            mesh.push_triangle(bot_base + a, bot_base + c, bot_base + b);
+        }
     }
 
     // 4. Side strip — one quad per polygon edge (outer + each hole).
@@ -199,9 +216,15 @@ pub fn extrude_polygon(polygon: &Polygon2D, dir: Vec3, depth: f32, local_xform: 
             let b1 = bot_base + i1 as u32;
             let t0 = top_base + i0 as u32;
             let t1 = top_base + i1 as u32;
-            // Quad as two tris (b0, b1, t1) + (b0, t1, t0)
-            mesh.push_triangle(b0, b1, t1);
-            mesh.push_triangle(b0, t1, t0);
+            // Quad as two tris (b0, b1, t1) + (b0, t1, t0), reversed when
+            // the extrusion runs against the profile normal (GH #138).
+            if flip {
+                mesh.push_triangle(b0, t1, b1);
+                mesh.push_triangle(b0, t0, t1);
+            } else {
+                mesh.push_triangle(b0, b1, t1);
+                mesh.push_triangle(b0, t1, t0);
+            }
         }
     }
 
@@ -257,4 +280,89 @@ fn triangulate(polygon: &Polygon2D) -> Vec<usize> {
         acc += h.len();
     }
     earcutr::earcut(&coords, &hole_starts, 2).unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use glam::Vec2;
+
+    /// Signed-tetra divergence volume (f64) over the whole mesh. Positive
+    /// for an outward-oriented closed solid, negative for an inside-out one.
+    fn signed_volume(m: &LocalMesh) -> f64 {
+        let mut acc = 0.0_f64;
+        for tri in m.indices.chunks_exact(3) {
+            let p = |i: u32| {
+                let b = i as usize * 3;
+                (
+                    m.vertices[b] as f64,
+                    m.vertices[b + 1] as f64,
+                    m.vertices[b + 2] as f64,
+                )
+            };
+            let (ax, ay, az) = p(tri[0]);
+            let (bx, by, bz) = p(tri[1]);
+            let (cx, cy, cz) = p(tri[2]);
+            acc += ax * (by * cz - bz * cy) - ay * (bx * cz - bz * cx)
+                + az * (bx * cy - by * cx);
+        }
+        acc / 6.0
+    }
+
+    /// A unit square profile, CCW (the `profile::extract` invariant).
+    fn unit_square() -> Polygon2D {
+        Polygon2D {
+            outer: vec![
+                Vec2::new(0.0, 0.0),
+                Vec2::new(1.0, 0.0),
+                Vec2::new(1.0, 1.0),
+                Vec2::new(0.0, 1.0),
+            ],
+            holes: vec![],
+        }
+    }
+
+    /// GH #138: an extrusion along -Z must produce a *positive* (outward)
+    /// signed volume, identical in magnitude to the +Z extrusion. Before
+    /// the winding-sign fix the -Z solid came out inside-out (negative
+    /// volume) and cancelled against sibling solids in a multi-item Body.
+    #[test]
+    fn negative_z_extrusion_stays_outward_oriented() {
+        let sq = unit_square();
+        let up = extrude_polygon(&sq, Vec3::Z, 1.0, Mat4::IDENTITY);
+        let down = extrude_polygon(&sq, Vec3::NEG_Z, 1.0, Mat4::IDENTITY);
+
+        let v_up = signed_volume(&up);
+        let v_down = signed_volume(&down);
+
+        assert!(
+            v_up > 0.0,
+            "+Z extrusion should have positive signed volume, got {v_up}"
+        );
+        assert!(
+            v_down > 0.0,
+            "-Z extrusion should have positive signed volume (GH #138), got {v_down}"
+        );
+        assert!(
+            (v_up.abs() - 1.0).abs() < 1e-5 && (v_down.abs() - 1.0).abs() < 1e-5,
+            "both unit extrusions should have |volume| 1.0, got up={v_up} down={v_down}"
+        );
+    }
+
+    /// The corpus mechanism directly: a Body of two solids where the second
+    /// is extruded along -Z should ADD (total 2.0), not cancel (0.0).
+    #[test]
+    fn multi_item_body_with_negative_z_solid_adds() {
+        let sq = unit_square();
+        let a = extrude_polygon(&sq, Vec3::Z, 1.0, Mat4::IDENTITY);
+        // Second solid offset in +X so it doesn't overlap, extruded -Z.
+        let offset = Mat4::from_translation(Vec3::new(5.0, 0.0, 0.0));
+        let b = extrude_polygon(&sq, Vec3::NEG_Z, 1.0, offset);
+
+        let total = signed_volume(&a) + signed_volume(&b);
+        assert!(
+            (total - 2.0).abs() < 1e-5,
+            "two unit solids (one -Z) should sum to 2.0, got {total} — -Z solid cancelled (GH #138)"
+        );
+    }
 }

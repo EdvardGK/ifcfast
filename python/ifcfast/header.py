@@ -534,7 +534,17 @@ def _resolve_step_escapes(s: str) -> str:
 #       value; CW-authored OUTER loops additionally get their cap/wall
 #       normals un-inverted (affects area_top/bottom classification).
 #       Substrates from files with such profiles must be re-extracted.
-_CACHE_SCHEMA_VERSION = 25
+# v26 (GH #138) — negative-direction extrusion winding. `extrude_polygon`
+#       built cap/wall winding assuming the extrusion runs up the profile
+#       normal (+Z). An `IfcExtrudedAreaSolid` authored along
+#       `IFCDIRECTION((0.,0.,-1.))` therefore came out inside-out: negative
+#       signed-tetra volume that CANCELLED against sibling solids in a
+#       multi-item Body (G55_ARK covering 28Yq… −14.2 %) and corrupted CSG
+#       difference subtractors (4 slabs +5–15 %). The winding now flips when
+#       dir.z < 0, so those solids add/subtract correctly. `volume_m3` /
+#       `volume_best_m3` change on every product with a -Z extrusion item;
+#       substrates from such files must be re-extracted.
+_CACHE_SCHEMA_VERSION = 26
 
 _FIELD_RE = re.compile(r"\(\s*(.*?)\s*\)\s*;", re.DOTALL)
 
