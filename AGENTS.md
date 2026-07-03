@@ -248,7 +248,16 @@ describing via `pq.read_schema(...)`):
   the prism bound — the min over the three axis projections of
   `footprint × perpendicular-extent`, tight for beams/columns/slabs alike
   — computed for every non-closed row (`NaN` on closed rows — the
-  watertight hot path stays raster-free).
+  watertight hot path stays raster-free). **GH #62 (cache schema v25):**
+  profile winding is now normalised (outer CCW, holes CW) before
+  extrusion, so swept solids whose void curves were authored clockwise
+  (Revit's habit) mesh as closed manifolds instead of inverted-hole
+  open shells. On such files re-extraction flips those rows'
+  `mesh_quality` `"open_shell"` → `"closed"` and `volume_method`
+  `"prism_fallback"` → `"mesh"`, and `volume_m3` drops from a prism
+  over-count to the exact mesh volume (G55 windows: an ~8× over-count
+  went to kernel parity). Substrates cached under v24 or earlier
+  re-extract automatically via the cache key.
 - Semantic payload: `materials`, `psets`, `quantities`,
   `classifications` (list-of-struct columns — `UNNEST` in DuckDB).
   Each `psets` and `quantities` struct carries `source`

@@ -72,7 +72,46 @@ pub fn extract(table: &EntityTable, id: u64) -> Option<Polygon2D> {
     } else {
         apply_profile_position(table, &fields, polygon)
     };
-    Some(positioned)
+    Some(normalize_winding(positioned))
+}
+
+/// Twice the shoelace signed area of a 2D loop, accumulated in f64 so
+/// far-origin mm-scale coordinates don't lose the sign to f32 cancellation.
+/// Positive = counter-clockwise.
+fn signed_area_2(pts: &[Vec2]) -> f64 {
+    let n = pts.len();
+    let mut acc = 0.0_f64;
+    for i in 0..n {
+        let a = pts[i];
+        let b = pts[(i + 1) % n];
+        acc += a.x as f64 * b.y as f64 - b.x as f64 * a.y as f64;
+    }
+    acc
+}
+
+/// Enforce the `Polygon2D` winding invariant every consumer assumes:
+/// **outer CCW, holes CW**. IFC does not mandate a winding for profile
+/// curves and Revit routinely authors both `IfcPolyline` outers and voids
+/// clockwise. Downstream that assumption is load-bearing twice over —
+/// `extrude_polygon` derives cap normals from earcut output (which follows
+/// the outer ring's winding) and winds wall quads per loop, so a
+/// wrong-winding hole inverts its wall normals: the divergence-theorem
+/// volume then *adds* the void instead of subtracting it and edge-pairing
+/// flags the mesh `open_shell` (G55_ARK: all 208 windows, mesh volume
+/// 8× the kernel, GH #62/#121 window residue). Normalising by signed area
+/// at the single exit point makes every authored winding safe; loops that
+/// already comply are untouched. Zero-area (degenerate) loops keep their
+/// order — reversing them is meaningless either way.
+fn normalize_winding(mut polygon: Polygon2D) -> Polygon2D {
+    if signed_area_2(&polygon.outer) < 0.0 {
+        polygon.outer.reverse();
+    }
+    for hole in &mut polygon.holes {
+        if signed_area_2(hole) > 0.0 {
+            hole.reverse();
+        }
+    }
+    polygon
 }
 
 // ----------------------------------------------------------------------
@@ -267,13 +306,15 @@ fn arbitrary_with_voids(table: &EntityTable, fields: &[&[u8]]) -> Option<Polygon
         Field::List(b) => b,
         _ => return Some(Polygon2D { outer, holes: vec![] }),
     };
+    // Holes are pushed as authored — `normalize_winding` at the `extract`
+    // exit forces them CW by signed area. (A blind `reverse()` here was
+    // the GH #62 window bug: Revit authors voids CW already, so reversing
+    // made them CCW and inverted every hole-wall normal downstream.)
     let mut holes: Vec<Vec<Vec2>> = Vec::new();
     for hole_field in split_top_level_args(body) {
         if let Field::Ref(hid) = parse_field(hole_field) {
             if let Some(hole) = curve_to_polyline(table, hid) {
-                let mut h = hole;
-                h.reverse(); // CW for inner
-                holes.push(h);
+                holes.push(hole);
             }
         }
     }

@@ -520,7 +520,21 @@ def _resolve_step_escapes(s: str) -> str:
 #       new `"mesh_open"` value for trusted open shells (was `"mesh"`).
 #       Closed-manifold rows are byte-identical; substrates with open-shell
 #       products must be re-extracted.
-_CACHE_SCHEMA_VERSION = 24
+# v25 (GH #62) — profile winding normalisation. `profile::extract` now
+#       enforces the Polygon2D invariant (outer CCW, holes CW) by signed
+#       area instead of blindly reversing InnerCurves. Revit authors
+#       IfcPolyline profile voids CW, so the blind reverse inverted every
+#       hole-wall normal on swept solids with voids: the divergence-theorem
+#       volume ADDED the void instead of subtracting it (G55_ARK: all 208
+#       windows, mesh volume 8× the kernel, classified open_shell →
+#       prism_fallback → the #121 window +482% residue). Meshes of
+#       CW-authored-void extrusions change (hole-wall triangle winding),
+#       flipping their `mesh_quality` open_shell → closed and
+#       `volume_m3` / `volume_best_m3` / `volume_method` to the exact mesh
+#       value; CW-authored OUTER loops additionally get their cap/wall
+#       normals un-inverted (affects area_top/bottom classification).
+#       Substrates from files with such profiles must be re-extracted.
+_CACHE_SCHEMA_VERSION = 25
 
 _FIELD_RE = re.compile(r"\(\s*(.*?)\s*\)\s*;", re.DOTALL)
 
