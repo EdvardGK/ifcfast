@@ -41,7 +41,8 @@ Thumbs.db
 
 # Session dirs + dead npm experiment
 /scratch/
-/.claude/
+/.claude/*
+!/.claude/skills/
 node_modules/
 /package.json
 /package-lock.json

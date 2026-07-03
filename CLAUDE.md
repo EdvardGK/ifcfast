@@ -7,12 +7,21 @@ obvious from the code or from `AGENTS.md`.
 ## Orchestration
 
 Follow the global multi-agent framework (~/.claude/CLAUDE.md): the
-session model is the central coordinator; it may spawn best-model
-sub-coordinators (one level down) for substantial work-streams, and
-opus/sonnet/haiku workers for everything else. ifcfast-specific:
-corpus gates, oracle sweeps, and pytest runs are ideal worker tasks
-once the `.so` is built; cargo/maturin builds stay serialized at the
-coordinator (Omarchy OOMs on concurrent builds).
+session model coordinates and assigns each agent a model fitted to the
+task (fable sub-coordinators max one level down when on fable; on opus,
+opus freely where it's the best fit, sonnet/haiku when they do the job).
+ifcfast-specific: corpus sweeps, pytest runs, and diff reviews are ideal
+agent tasks once the `.so` is built; cargo/maturin builds stay
+serialized at the coordinator (Omarchy OOMs on concurrent builds;
+`env -u CONDA_PREFIX maturin develop`).
+
+## Ship gate for geometry/QTO changes
+
+Any change that can move mesh or QTO output runs the `/oracle-gate`
+skill before commit: Rust suite → rebuild .so → pytest (corpus env) →
+per-class oracle sweep vs local baselines
+(`python -m tests.oracle.class_sweep … --baseline scratch/g55/baselines/<MODEL>.json`)
+→ diff review. Unattributed drift = not ready to ship.
 
 ## Keep AGENTS.md current — it's a public contract
 
