@@ -26,14 +26,18 @@
 
 mod emit;
 mod hotswap;
+mod mutate;
 mod refs;
 mod rel_rules;
+mod step_fmt;
 mod subset;
 
 pub use emit::{emit, emit_subset, EmitStats};
 pub use hotswap::{hotswap, HotswapError, HotswapStats};
-pub use refs::{forward_refs, reachable_closure};
+pub use mutate::{mutate, MutateError, MutateOp, MutateStats, PropValue};
+pub use refs::{forward_refs, reachable_closure, RecordSource};
 pub use rel_rules::{field_refs, field_span, parse_rel, rule_for, RelField, RelRule, REL_RULES};
+pub use step_fmt::{encode_string, fmt_real, fmt_tuple};
 pub use subset::{subset, SubsetStats};
 
 use std::collections::HashMap;

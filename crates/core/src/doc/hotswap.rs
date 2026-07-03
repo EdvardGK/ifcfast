@@ -45,6 +45,7 @@ use std::collections::{HashMap, HashSet};
 
 use super::rel_rules::{field_refs, field_span, RelField};
 use super::refs::{forward_refs, reachable_closure};
+use super::step_fmt::fmt_tuple;
 use super::Doc;
 
 /// Summary of a hotswap.
@@ -444,30 +445,6 @@ fn build_surface_model(
 
     let n_records = verts.len() + tris.len() * 3 + 2;
     (s.into_bytes(), sbsm, "SurfaceModel", n_records)
-}
-
-/// A STEP coordinate tuple `(x,y,z)` with STEP-real formatting — the shared
-/// inner list for both an `IfcCartesianPointList3D` item and an
-/// `IfcCartesianPoint`'s `Coordinates`.
-fn fmt_tuple(v: &[f64; 3]) -> String {
-    format!("({},{},{})", fmt_real(v[0]), fmt_real(v[1]), fmt_real(v[2]))
-}
-
-/// Format an `f64` as a STEP REAL. `{:?}` gives the shortest
-/// round-tripping form and a `.` for whole values (`1.0`), but drops the
-/// point in exponent form (`5e-5`) — the ISO-10303-21 REAL grammar requires
-/// a decimal point even with an exponent, so re-insert it. Non-finite
-/// values must be rejected upstream (`hotswap` validates); debug-assert
-/// here as the backstop.
-fn fmt_real(x: f64) -> String {
-    debug_assert!(x.is_finite(), "fmt_real: non-finite {x}");
-    let s = format!("{x:?}");
-    match s.find(['e', 'E']) {
-        Some(epos) if !s[..epos].contains('.') => {
-            format!("{}.0{}", &s[..epos], &s[epos..])
-        }
-        _ => s,
-    }
 }
 
 /// Emit the mutated document: header + every record (skipping `removed`,

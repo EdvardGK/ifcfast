@@ -149,6 +149,7 @@ releases (additions only, never reorganisations).
 | One-call viewer export to glTF binary | `m.to_gltf("out.glb")` (cuts on, instancing on, quant on) |
 | Carve a valid standalone IFC of some elements | `m.subset([guid, …])` → STEP `bytes` (or `out_path=` writes a file + returns stats) |
 | Swap one element's body mesh (e.g. decimated) | `m.hotswap(guid, vertices, triangles)` → STEP `bytes` (or `out_path=` writes a file + returns stats) |
+| Edit pset values / names / placements | `m.mutate([{"op": "set_property", ...}, ...])` → STEP `bytes` (or `out_path=` writes a file + returns stats) |
 | Geometric quantities (volume, area) | `m.mesh_qto()` (cut_openings=True by default since v0.4.28) |
 | Placement-vs-mesh sanity check | `m.drift` (SI columns; check `m.world_coordinate_baked` for the file-level signal) |
 | "Which products live under this storey?" | `m.products_in(storey_guid)` |
@@ -1004,11 +1005,56 @@ m.hotswap(guid, v, t, out_path="lean.ifc")
   directly. Unknown GlobalId, an element with no `Body` representation,
   or an empty / out-of-range mesh raise `ValueError`.
 
+## Writing: `m.mutate(ops)` — attribute mutation
+
+The third write primitive: batch-edit **pset values, names, and
+placements** on the owned document. One call, one emit; everything an
+op doesn't touch is byte-identical. Ops apply in list order (each sees
+the previous ops' effects).
+
+```python
+data = m.mutate([                                      # -> STEP bytes
+    {"op": "set_property", "guid": g, "pset": "Pset_WallCommon",
+     "name": "FireRating", "value": "REI 60"},
+    {"op": "rename", "guid": g, "name": "Vegg 12", "description": "sør"},
+    {"op": "translate", "guid": g, "delta": [0, 0, 150.0]},
+    {"op": "rotate", "guid": g, "degrees": 90},        # axis defaults [0,0,1]
+], )
+stats = m.mutate(ops, out_path="fixed.ifc")            # writes file, -> stats
+# stats: ops_applied, renamed, props_set, props_added, props_retyped,
+#        psets_cloned, rels_cloned, placements_cloned, translated,
+#        rotated, records_minted, records_gc, records_out, bytes_out
+```
+
+Decision rules:
+
+- **`set_property`** targets an `IfcPropertySingleValue` on the named
+  pset. `value` is `str | float | int | bool | None` (`None` unsets to
+  `$`). Replacing preserves the authored wrapper type; pass
+  `"ifc_type": "IFCTEXT"` etc. to retype. **Adding** a property that
+  doesn't exist REQUIRES `"ifc_type"` (a Python float can't disambiguate
+  `IFCREAL` vs `IFCLENGTHMEASURE` — fail loud beats guessing).
+  `Qto_*` quantity sets (`IfcElementQuantity`) are refused, never
+  silently corrupted.
+- **Shared data is copy-on-write.** Ops are per-element intent: if the
+  pset applies to several elements, the target element gets a cloned
+  pset (fresh GlobalId) and siblings keep their original values —
+  `psets_cloned` in stats tells you it happened. Same for a
+  `IfcLocalPlacement` shared by several products.
+- **`translate` delta** is in the placement-parent's frame, native
+  length units (same contract as hotswap's local frame). `rotate` spins
+  the element about its own location, composing with any existing tilt.
+- **Atomic.** Any failure aborts the whole batch and the `ValueError`
+  lists EVERY failing op as `[op N] reason` — fix a big batch in one
+  round trip, nothing is half-written.
+
 ## What `ifcfast` does NOT do (yet)
 
-- Full in-place property / placement editing. The write axis is lossless
-  **subsetting** (`m.subset`) + **body mesh hotswap** (`m.hotswap`);
-  general attribute mutation is the next milestone — see north-star below.
+- Mutate quantity values (`IfcElementQuantity`), enumerated / bounded /
+  list properties, or type-level psets; `m.mutate` covers
+  `IfcPropertySingleValue`, Name/Description, and `IfcLocalPlacement`
+  translate/rotate. File an issue with the record shape if you need
+  more.
 - True boolean / CSG composition. By design — we surface BOTH
   operands instead, per the reveal-all stance above. If you need
   net geometry, compose the segments downstream.
@@ -1023,13 +1069,13 @@ m.hotswap(guid, v, t, out_path="lean.ifc")
 ## North star: surgical modelling via code
 
 The reveal-all stance is the foundation for "read → edit → write"
-round-trips. The first leg has landed: an owned, round-trippable STEP
-document with a byte-identical serialiser, and `m.subset(guids)` built
-on it (above). The remaining path is surgical mutation: expose a
-write-back surface over the in-memory buffer and a mesh-hotswap that
-re-emits swapped representations deterministically. Tracked in GH #124
-— until then, subset is the write primitive and the parser is the X-ray
-that tells you exactly what's in the file so you know what to change.
+round-trips, and the write axis now has all three legs: an owned,
+round-trippable STEP document with a byte-identical serialiser,
+`m.subset(guids)` carving valid standalone models, `m.hotswap(...)`
+swapping body meshes, and `m.mutate(ops)` editing attributes — each
+emitting everything it didn't touch byte-for-byte. The parser is the
+X-ray that tells you exactly what's in the file; the write primitives
+are the scalpel. Umbrella: GH #124 (shipped) / #133.
 
 If your agent task hits one of these, file an issue with the file
 shape — these are the next-tier extensions.

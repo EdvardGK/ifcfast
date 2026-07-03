@@ -21,6 +21,7 @@
 
 pub mod doc;
 pub mod entity_table;
+pub mod guid;
 pub mod extractors;
 pub mod indexer;
 pub mod lexer;
@@ -2944,6 +2945,169 @@ mod python {
         })
     }
 
+    // ----- mutate_ifc (GH #133 — attribute mutation) -------------------
+
+    /// Parse one Python op dict into a [`crate::doc::MutateOp`].
+    fn parse_op(op: &Bound<'_, PyDict>, i: usize) -> PyResult<crate::doc::MutateOp> {
+        use crate::doc::{MutateOp, PropValue};
+        let bad = |msg: String| {
+            pyo3::exceptions::PyValueError::new_err(format!("mutate: op {i}: {msg}"))
+        };
+        let get_str = |key: &str| -> PyResult<Option<String>> {
+            match op.get_item(key)? {
+                Some(v) if !v.is_none() => Ok(Some(v.extract::<String>().map_err(|_| {
+                    bad(format!("'{key}' must be a string"))
+                })?)),
+                _ => Ok(None),
+            }
+        };
+        let require_str = |key: &str| -> PyResult<String> {
+            get_str(key)?.ok_or_else(|| bad(format!("missing required key '{key}'")))
+        };
+        let get_xyz = |key: &str| -> PyResult<[f64; 3]> {
+            let v = op
+                .get_item(key)?
+                .ok_or_else(|| bad(format!("missing required key '{key}'")))?;
+            let l: Vec<f64> = v
+                .extract()
+                .map_err(|_| bad(format!("'{key}' must be [x, y, z]")))?;
+            if l.len() != 3 {
+                return Err(bad(format!("'{key}' must have 3 components, got {}", l.len())));
+            }
+            Ok([l[0], l[1], l[2]])
+        };
+
+        let verb = require_str("op")?;
+        let guid = require_str("guid")?;
+        match verb.as_str() {
+            "rename" => {
+                let name = get_str("name")?;
+                let description = get_str("description")?;
+                if name.is_none() && description.is_none() {
+                    return Err(bad("rename needs 'name' and/or 'description'".into()));
+                }
+                Ok(MutateOp::Rename { guid, name, description })
+            }
+            "set_property" => {
+                let pset = require_str("pset")?;
+                let prop = require_str("name")?;
+                let ifc_type = get_str("ifc_type")?;
+                let value = match op.get_item("value")? {
+                    None => return Err(bad("missing required key 'value'".into())),
+                    Some(v) if v.is_none() => PropValue::Null,
+                    Some(v) => {
+                        // bool first: Python bool is an int subclass.
+                        if let Ok(b) = v.cast::<pyo3::types::PyBool>() {
+                            PropValue::Bool(b.is_true())
+                        } else if let Ok(n) = v.extract::<i64>() {
+                            PropValue::Int(n)
+                        } else if let Ok(f) = v.extract::<f64>() {
+                            PropValue::Real(f)
+                        } else if let Ok(s) = v.extract::<String>() {
+                            PropValue::Str(s)
+                        } else {
+                            return Err(bad("'value' must be str, int, float, bool or None".into()));
+                        }
+                    }
+                };
+                Ok(MutateOp::SetProperty { guid, pset, prop, value, ifc_type })
+            }
+            "translate" => Ok(MutateOp::Translate { guid, delta: get_xyz("delta")? }),
+            "rotate" => {
+                let degrees = match op.get_item("degrees")? {
+                    Some(v) => v
+                        .extract::<f64>()
+                        .map_err(|_| bad("'degrees' must be a number".into()))?,
+                    None => return Err(bad("missing required key 'degrees'".into())),
+                };
+                let axis = match op.get_item("axis")? {
+                    Some(v) if !v.is_none() => {
+                        let l: Vec<f64> = v
+                            .extract()
+                            .map_err(|_| bad("'axis' must be [x, y, z]".into()))?;
+                        if l.len() != 3 {
+                            return Err(bad("'axis' must have 3 components".into()));
+                        }
+                        [l[0], l[1], l[2]]
+                    }
+                    _ => [0.0, 0.0, 1.0],
+                };
+                Ok(MutateOp::Rotate { guid, axis, degrees })
+            }
+            other => Err(bad(format!(
+                "unknown op '{other}' (expected rename / set_property / translate / rotate)"
+            ))),
+        }
+    }
+
+    /// Apply a batch of attribute mutations to an IFC file — the GH #133
+    /// write axis: pset values, names/descriptions, placements. Ops apply
+    /// in list order against one owned document; everything untouched is
+    /// emitted byte-identical. Atomic: any op failure raises `ValueError`
+    /// listing EVERY failing op (index + reason) and nothing is written.
+    ///
+    /// Shared substructure is never edited in place: a pset applying to
+    /// several elements is cloned copy-on-write (fresh GlobalId) for the
+    /// target element; placements always get freshly minted geometry with
+    /// the old records reclaimed only when nothing else references them.
+    ///
+    /// With `out_path` the result is written there and the returned dict
+    /// carries `path`; otherwise it carries the STEP `bytes`. `seed` makes
+    /// minted GlobalIds reproducible (testing) — leave unset in production
+    /// so independent runs can never collide.
+    #[pyfunction]
+    #[pyo3(signature = (path, ops, out_path = None, seed = None))]
+    pub fn mutate_ifc<'py>(
+        py: Python<'py>,
+        path: &str,
+        ops: Vec<Bound<'py, PyDict>>,
+        out_path: Option<&str>,
+        seed: Option<u64>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        catch_panic(|| {
+            let mut parsed: Vec<crate::doc::MutateOp> = Vec::with_capacity(ops.len());
+            for (i, op) in ops.iter().enumerate() {
+                parsed.push(parse_op(op, i)?);
+            }
+
+            let doc = crate::doc::Doc::open_editable(Path::new(path)).map_err(|e| {
+                pyo3::exceptions::PyIOError::new_err(format!("open_editable {path}: {e}"))
+            })?;
+
+            let (bytes, stats) = py
+                .detach(|| crate::doc::mutate(&doc, &parsed, seed))
+                .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("mutate: {e}")))?;
+
+            let out = PyDict::new(py);
+            out.set_item("ops_applied", stats.ops_applied as u64)?;
+            out.set_item("renamed", stats.renamed as u64)?;
+            out.set_item("props_set", stats.props_set as u64)?;
+            out.set_item("props_added", stats.props_added as u64)?;
+            out.set_item("props_retyped", stats.props_retyped as u64)?;
+            out.set_item("psets_cloned", stats.psets_cloned as u64)?;
+            out.set_item("rels_cloned", stats.rels_cloned as u64)?;
+            out.set_item("placements_cloned", stats.placements_cloned as u64)?;
+            out.set_item("translated", stats.translated as u64)?;
+            out.set_item("rotated", stats.rotated as u64)?;
+            out.set_item("records_minted", stats.records_minted as u64)?;
+            out.set_item("records_gc", stats.records_gc as u64)?;
+            out.set_item("records_out", stats.records_out as u64)?;
+            out.set_item("bytes_out", bytes.len() as u64)?;
+            match out_path {
+                Some(p) => {
+                    std::fs::write(p, &bytes).map_err(|e| {
+                        pyo3::exceptions::PyIOError::new_err(format!("write {p}: {e}"))
+                    })?;
+                    out.set_item("path", p)?;
+                }
+                None => {
+                    out.set_item("bytes", pyo3::types::PyBytes::new(py, &bytes))?;
+                }
+            }
+            Ok(out)
+        })
+    }
+
     #[pymodule]
     fn _core(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add("IfcfastError", _py.get_type::<IfcfastError>())?;
@@ -2975,6 +3139,7 @@ mod python {
         m.add_function(wrap_pyfunction!(clash, m)?)?;
         m.add_function(wrap_pyfunction!(subset_ifc, m)?)?;
         m.add_function(wrap_pyfunction!(hotswap_ifc, m)?)?;
+        m.add_function(wrap_pyfunction!(mutate_ifc, m)?)?;
         m.add("__version__", env!("CARGO_PKG_VERSION"))?;
         Ok(())
     }

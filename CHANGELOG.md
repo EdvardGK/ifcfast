@@ -5,6 +5,40 @@ All notable changes to ifcfast will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added — attribute mutation: `m.mutate(ops)` (GH #133)
+
+- **`m.mutate(ops, out_path=None, seed=None)`** — the last write axis:
+  batch attribute mutation on the owned STEP document with the same
+  byte-identical-elsewhere guarantee as `subset`/`hotswap`. Op
+  vocabulary: `set_property` (replace or add an
+  `IfcPropertySingleValue`; authored wrapper type preserved, explicit
+  `ifc_type` to retype, REQUIRED when adding — a Python float can't
+  disambiguate `IFCREAL` vs `IFCLENGTHMEASURE`), `rename`
+  (Name/Description on any rooted entity, raw-UTF-8 STEP string
+  encoding so æøå survive), `translate` (parent-frame delta, native
+  units) and `rotate` (axis-angle about the element's own location,
+  composing with existing tilt). **Copy-on-write on shared data**: a
+  pset applying to several elements is cloned (fresh GlobalId, valid
+  22-char IFC compressed form) for the target element and siblings keep
+  their values; placement points/directions are never edited in place —
+  new records are minted and orphan GC (refcount fixpoint over the
+  live, editor-aware graph) reclaims only what the element uniquely
+  owned. **Atomic batches**: any failure aborts with a `ValueError`
+  listing every failing op (`[op N] reason`), nothing half-written.
+  Quantity sets (`IfcElementQuantity`) are type-guarded and refused —
+  same-named pset/qto can't corrupt an `IfcQuantityLength`. Gated on
+  the 4-discipline G55 corpus via the ifcopenshell oracle (property
+  read-back, exact placement delta, zero dangling refs).
+- Rust core: `doc::mutate` (editor overlay with maintained ref graph),
+  `doc::step_fmt` (shared STEP REAL/string encoders — `encode_string`
+  is the true inverse of the lexer's `decode_string`), `guid` (IFC
+  compressed-GUID mint; 2-bit first char; ambient-entropy salt by
+  default, opt-in `seed` for reproducible output),
+  `doc::refs::RecordSource` (pluggable bytes resolution so subset /
+  hotswap / mutate share one closure engine).
+
 ## [0.4.40] - 2026-07-02
 
 ### Added — local-frame mesh extraction + placement matrix (GH #127)

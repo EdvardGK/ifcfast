@@ -1075,6 +1075,97 @@ class Model:
         )
         return d["bytes"] if out_path is None else d
 
+    def mutate(self, ops, *, out_path=None, seed=None):
+        """Apply a batch of attribute mutations — the write axis for data.
+
+        Batch-first: one call opens the document once, applies every op in
+        list order (each op sees the previous ops' effects), and emits
+        once. Everything an op doesn't touch is emitted **byte-identical**
+        to the source, same as :meth:`subset` / :meth:`hotswap`.
+
+        Each op is a dict. The vocabulary:
+
+        * ``{"op": "rename", "guid": G, "name": ..., "description": ...}``
+          — set ``Name`` and/or ``Description`` on any rooted entity
+          (element, pset, storey...). At least one of the two required.
+        * ``{"op": "set_property", "guid": G, "pset": P, "name": N,
+          "value": V}`` — set (or add) a property on the element's pset
+          ``P``. ``V`` may be ``str`` / ``float`` / ``int`` / ``bool`` /
+          ``None`` (``None`` unsets to ``$``). Replacing an existing
+          ``IfcPropertySingleValue`` preserves the authored wrapper type
+          (``IFCLABEL`` stays ``IFCLABEL``); pass ``"ifc_type"`` (e.g.
+          ``"IFCTEXT"``, ``"IFCLENGTHMEASURE"``) to retype explicitly.
+          **Adding** a property that doesn't exist requires ``"ifc_type"``
+          — guessing a measure type from a Python float would be lossy,
+          so it fails loud instead. Quantity sets (``IfcElementQuantity``)
+          are guarded and refused, never silently corrupted.
+        * ``{"op": "translate", "guid": G, "delta": [dx, dy, dz]}`` —
+          move the element. The delta is in the placement-parent's frame
+          in the file's **native length unit** (same contract as
+          :meth:`hotswap`'s local-frame mesh). For the usual
+          storey-parented, unrotated case this coincides with world axes.
+        * ``{"op": "rotate", "guid": G, "degrees": D, "axis": [x, y, z]}``
+          — rotate the element about its **own location** by ``D`` degrees
+          around ``axis`` (parent frame; default ``[0, 0, 1]``). Composes
+          with the existing orientation, so a pre-tilted element stays
+          tilted.
+
+        **Shared data is never edited in place.** Mutations are
+        per-element intent: if the target pset applies to several elements
+        (one rel anchoring many objects, or several rels sharing the pset
+        record), the element gets a copy-on-write clone with a fresh
+        GlobalId and the siblings keep the original values. Placement
+        geometry (points/directions — the most-shared records in real
+        files) is always freshly minted, with the old records
+        garbage-collected only when nothing else references them.
+
+        **Atomic.** Any failing op aborts the whole batch: ``ValueError``
+        lists *every* failing op (index + reason), and nothing is written
+        — fix a 300-op batch in one round trip.
+
+        Args:
+            ops: list of op dicts (see vocabulary above).
+            out_path: when given, the mutated IFC is written there and a
+                stats dict is returned (``path``, ``ops_applied``,
+                ``renamed``, ``props_set``, ``props_added``,
+                ``psets_cloned``, ``rels_cloned``, ``placements_cloned``,
+                ``translated``, ``rotated``, ``records_minted``,
+                ``records_gc``, ``records_out``, ``bytes_out``). When
+                ``None`` (default), the STEP ``bytes`` are returned.
+            seed: makes minted GlobalIds reproducible (testing only) —
+                leave unset in production so two independent runs can
+                never mint colliding ids.
+
+        Returns:
+            ``bytes`` (``out_path is None``) or a stats ``dict``.
+
+        Example::
+
+            >>> stats = m.mutate([
+            ...     {"op": "set_property", "guid": g, "pset": "Pset_WallCommon",
+            ...      "name": "FireRating", "value": "REI 60"},
+            ...     {"op": "rename", "guid": g, "name": "Vegg Ø-akse 12"},
+            ...     {"op": "translate", "guid": g, "delta": [0, 0, 150.0]},
+            ... ], out_path="fixed.ifc")
+            >>> stats["props_set"], stats["psets_cloned"]
+            (1, 1)
+        """
+        from . import _core
+
+        ops = list(ops)
+        if not ops:
+            raise ValueError("mutate: empty op list")
+        for i, op in enumerate(ops):
+            if not isinstance(op, dict):
+                raise ValueError(f"mutate: op {i} is not a dict")
+        d = _core.mutate_ifc(
+            str(native_path_for(self.header.path)),
+            ops,
+            str(out_path) if out_path is not None else None,
+            seed,
+        )
+        return d["bytes"] if out_path is None else d
+
     def meshes(
         self,
         unit: str = "m",
