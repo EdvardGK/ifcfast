@@ -4,6 +4,16 @@ This file is loaded automatically by Claude Code sessions opened in
 this repo. Keep it short and focused on conventions that aren't
 obvious from the code or from `AGENTS.md`.
 
+## Orchestration
+
+Follow the global multi-agent framework (~/.claude/CLAUDE.md): the
+session model is the central coordinator; it may spawn best-model
+sub-coordinators (one level down) for substantial work-streams, and
+opus/sonnet/haiku workers for everything else. ifcfast-specific:
+corpus gates, oracle sweeps, and pytest runs are ideal worker tasks
+once the `.so` is built; cargo/maturin builds stay serialized at the
+coordinator (Omarchy OOMs on concurrent builds).
+
 ## Keep AGENTS.md current — it's a public contract
 
 `AGENTS.md` at the repo root is the canonical guide for LLMs and
