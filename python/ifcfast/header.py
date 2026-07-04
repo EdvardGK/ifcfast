@@ -555,7 +555,21 @@ def _resolve_step_escapes(s: str) -> str:
 #       `volume_m3` / `volume_mesh_m3` / `volume_best_m3`, surface areas and
 #       vertex/triangle counts change on re-extraction. Substrates from
 #       files with arc-profile geometry must be re-extracted.
-_CACHE_SCHEMA_VERSION = 27
+# v28 (GH #139) — arc-profile sampling extended beyond the circular /
+#       degree-authored case of v27. `trimmed_curve_2d` now samples
+#       `IfcTrimmedCurve` arcs on an `IfcEllipse` (SemiAxis1/SemiAxis2) and
+#       `IfcLine` (Pnt + u·Magnitude·dir) basis too, and conic PARAMETER
+#       trims are scaled by the model's declared `PLANEANGLEUNIT` instead of
+#       assuming degrees (a radian-authored semicircle was misread as a
+#       ~3.14° sliver → the v27 collapse signature). Files whose curved-wall
+#       profiles use an ellipse/line basis or radian-authored conic trims
+#       previously collapsed to a sliver (open tube, volume ~0); they now
+#       tessellate the true curved band, so those products' `mesh_quality`,
+#       `volume_*`, surface areas and vertex/triangle counts change on
+#       re-extraction. Circular + degree-authored profiles (the entire G55
+#       corpus) are byte-identical; only files with the ellipse/line/radian
+#       constructs must be re-extracted.
+_CACHE_SCHEMA_VERSION = 28
 
 _FIELD_RE = re.compile(r"\(\s*(.*?)\s*\)\s*;", re.DOTALL)
 

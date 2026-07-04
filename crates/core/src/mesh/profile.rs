@@ -11,7 +11,7 @@
 use glam::{Mat3, Vec2, Vec3};
 
 use crate::entity_table::EntityTable;
-use crate::lexer::{parse_field, split_top_level_args, Field};
+use crate::lexer::{parse_field, parse_ref_list, split_top_level_args, Field};
 
 pub const CURVE_SAMPLES: usize = 32;
 
@@ -385,52 +385,89 @@ fn curve_to_polyline(table: &EntityTable, curve_id: u64) -> Option<Vec<Vec2>> {
     }
     if type_name.eq_ignore_ascii_case(b"IFCTRIMMEDCURVE") {
         // (BasisCurve, Trim1, Trim2, SenseAgreement, MasterRepresentation).
-        // A circular arc segment inside an IfcCompositeCurve — the profile
-        // curve of thin *curved* walls (Revit "15mm flis" etc.). Before this
-        // the arc returned None and the composite walk `continue`d past it,
-        // so a two-arc profile collapsed to its two straight end-cap lines:
-        // a ~0-area sliver → open tube mesh → prism_fallback 8-9x over-count
-        // (GH #123). Only circular basis curves are sampled; ellipse/line
-        // arcs still fall through to None.
+        // An arc segment inside an IfcCompositeCurve — the profile curve of
+        // thin *curved* walls (Revit "15mm flis" etc.). Before GH #123 the
+        // arc returned None and the composite walk `continue`d past it, so a
+        // two-arc profile collapsed to its two straight end-cap lines: a
+        // ~0-area sliver → open tube mesh → prism_fallback 8-9x over-count.
+        // Circle, ellipse and line basis curves are all sampled; conic trim
+        // parameters honour the model's PLANEANGLEUNIT (GH #139).
         return trimmed_curve_2d(table, &fields);
     }
-    // IfcEllipse arcs — not yet sampled. Returning None here makes the
-    // parent profile resolve to None (empty mesh). Tracked as a follow-on.
+    // A bare IfcEllipse / IfcLine as a *direct* composite-curve parent (not
+    // wrapped in an IfcTrimmedCurve) is a full conic / infinite line — not a
+    // closed profile boundary on its own; resolving to None is correct.
     None
 }
 
-/// Sample an `IfcTrimmedCurve` on an `IfcCircle` basis into a polyline arc.
+/// Sample an `IfcTrimmedCurve` into a polyline arc, dispatching on the basis
+/// curve type:
+/// - `IfcCircle` — circular arc (`a == b == Radius`).
+/// - `IfcEllipse` — elliptical arc (`a = SemiAxis1`, `b = SemiAxis2`).
+/// - `IfcLine` — a straight segment between the two trim points (lengths
+///   along the line, not angles).
 ///
-/// Trim parameters (`Trim1` / `Trim2`) are read as angles in DEGREES when
-/// authored as `IfcParameterValue` — the Revit / ArchiCAD convention for
-/// IFC2x3 / IFC4 conic trims (a semicircle trims 180 → 0, unambiguously
-/// degrees) — or as points (angle via `atan2` in the circle's local frame)
-/// for CARTESIAN trims. Orientation follows `SenseAgreement` (arg 3): `T`
-/// runs the arc in the circle's natural CCW / increasing-angle direction
-/// from `Trim1` to `Trim2`, `F` clockwise. The composite-curve caller then
-/// applies the per-segment `SameSense` reversal on top. Endpoints are
-/// inclusive so the arc joins its neighbours in the composite walk. Only
-/// circular basis curves are handled; ellipse / line bases return `None`.
+/// Conic (circle / ellipse) trim parameters authored as `IfcParameterValue`
+/// are angles scaled by the model's `PLANEANGLEUNIT`
+/// ([`resolve_plane_angle_scale`]); CARTESIAN trims are points resolved via
+/// `atan2` in the conic's local frame (unit-safe). Orientation follows
+/// `SenseAgreement` (arg 3): `T` runs the arc in the natural
+/// CCW / increasing-parameter direction from `Trim1` to `Trim2`, `F` the
+/// reverse; the composite-curve caller applies its own per-segment
+/// `SameSense` reversal on top. Endpoints are inclusive so the arc joins its
+/// neighbours in the composite walk.
 fn trimmed_curve_2d(table: &EntityTable, fields: &[&[u8]]) -> Option<Vec<Vec2>> {
     let basis_id = match parse_field(fields.first()?) {
         Field::Ref(id) => id,
         _ => return None,
     };
     let (basis_type, basis_args) = table.get(basis_id)?;
-    if !basis_type.eq_ignore_ascii_case(b"IFCCIRCLE") {
-        return None;
-    }
     let basis_fields = split_top_level_args(basis_args);
-    let radius = number_at(&basis_fields, 1)? as f32;
-    if !(radius.is_finite() && radius > 0.0) {
-        return None;
+    if basis_type.eq_ignore_ascii_case(b"IFCCIRCLE") {
+        // (Position, Radius)
+        let radius = number_at(&basis_fields, 1)? as f32;
+        if !(radius.is_finite() && radius > 0.0) {
+            return None;
+        }
+        conic_arc(table, fields, &basis_fields, radius, radius)
+    } else if basis_type.eq_ignore_ascii_case(b"IFCELLIPSE") {
+        // (Position, SemiAxis1, SemiAxis2)
+        let a = number_at(&basis_fields, 1)? as f32;
+        let b = number_at(&basis_fields, 2)? as f32;
+        if !(a.is_finite() && a > 0.0 && b.is_finite() && b > 0.0) {
+            return None;
+        }
+        conic_arc(table, fields, &basis_fields, a, b)
+    } else if basis_type.eq_ignore_ascii_case(b"IFCLINE") {
+        // (Pnt, Dir: IfcVector)
+        trimmed_line_2d(table, fields, &basis_fields)
+    } else {
+        None
     }
+}
+
+/// Sample a trimmed circle / ellipse arc. `a` / `b` are the local semi-axes
+/// (equal for a circle); the trim parameters are angles in the conic's local
+/// frame. Shared by the circle and ellipse basis paths of
+/// [`trimmed_curve_2d`].
+fn conic_arc(
+    table: &EntityTable,
+    fields: &[&[u8]],
+    basis_fields: &[&[u8]],
+    a: f32,
+    b: f32,
+) -> Option<Vec<Vec2>> {
     let (center, ref_dir) = match basis_fields.first().copied().map(parse_field) {
         Some(Field::Ref(pid)) => placement2d_origin_dir(table, pid),
         _ => (Vec2::ZERO, Vec2::X),
     };
-    let a1 = trim_angle(table, fields.get(1).copied(), center, ref_dir)?;
-    let a2 = trim_angle(table, fields.get(2).copied(), center, ref_dir)?;
+    // Radians per authored PARAMETER trim unit. Resolved once per arc — only
+    // trimmed conic profiles (a rare curved-wall case) pay for the unit walk;
+    // the thousands of ordinary products never reach here.
+    let pa = resolve_plane_angle_scale(table);
+    let semi = Vec2::new(a, b);
+    let a1 = trim_angle(table, fields.get(1).copied(), center, ref_dir, semi, pa)?;
+    let a2 = trim_angle(table, fields.get(2).copied(), center, ref_dir, semi, pa)?;
     let sense = matches!(
         fields.get(3).copied().map(parse_field),
         Some(Field::Enum(b"T"))
@@ -444,48 +481,123 @@ fn trimmed_curve_2d(table: &EntityTable, fields: &[&[u8]]) -> Option<Vec<Vec2>> 
     let pts = (0..=n)
         .map(|i| {
             let t = start + (end - start) * (i as f32 / n as f32);
-            let lx = radius * t.cos();
-            let ly = radius * t.sin();
+            let lx = a * t.cos();
+            let ly = b * t.sin();
             Vec2::new(center.x + cos * lx - sin * ly, center.y + sin * lx + cos * ly)
         })
         .collect();
     Some(pts)
 }
 
+/// Sample an `IfcTrimmedCurve` on an `IfcLine` basis into a 2-vertex segment.
+/// Line trims are lengths along the line (`P(u) = Pnt + u·Magnitude·dir`),
+/// NOT angles — the `PLANEANGLEUNIT` scaling does not apply. PARAMETER trims
+/// give `u` directly; CARTESIAN trims are points projected onto the line.
+/// Straight composite segments are usually authored as `IfcPolyline`, so this
+/// basis is uncommon — but handling it removes the last basis that could
+/// collapse a profile to `None`.
+fn trimmed_line_2d(
+    table: &EntityTable,
+    fields: &[&[u8]],
+    basis_fields: &[&[u8]],
+) -> Option<Vec<Vec2>> {
+    let pnt = match basis_fields.first().copied().map(parse_field) {
+        Some(Field::Ref(pid)) => cartesian_point_2d(table, pid)?,
+        _ => return None,
+    };
+    let (dir, mag) = match basis_fields.get(1).copied().map(parse_field) {
+        Some(Field::Ref(vid)) => vector_2d(table, vid)?,
+        _ => return None,
+    };
+    let u1 = trim_line_param(table, fields.get(1).copied(), pnt, dir, mag)?;
+    let u2 = trim_line_param(table, fields.get(2).copied(), pnt, dir, mag)?;
+    let p1 = pnt + dir * (u1 * mag);
+    let p2 = pnt + dir * (u2 * mag);
+    // SenseAgreement `F` runs the segment Trim2 -> Trim1.
+    let sense = matches!(
+        fields.get(3).copied().map(parse_field),
+        Some(Field::Enum(b"T"))
+    );
+    let (start, end) = if sense { (p1, p2) } else { (p2, p1) };
+    if (start - end).length_squared() < 1e-12 {
+        return None;
+    }
+    Some(vec![start, end])
+}
+
 /// Resolve one `IfcTrimmingSelect` (a 1-2 element SET) to an angle in the
-/// circle's local frame (radians). Prefers a CARTESIAN point (unambiguous
-/// via `atan2`); otherwise reads an `IfcParameterValue` as degrees.
+/// conic's local frame (radians). Prefers a CARTESIAN point (unambiguous via
+/// `atan2`, with the ellipse semi-axes divided out so the parameter `t` is
+/// recovered — a no-op for a circle where `semi.x == semi.y`); otherwise
+/// reads an `IfcParameterValue` and scales it by `pa` (radians per authored
+/// plane-angle unit, from [`resolve_plane_angle_scale`]).
 fn trim_angle(
     table: &EntityTable,
     field: Option<&[u8]>,
     center: Vec2,
     ref_dir: Vec2,
+    semi: Vec2,
+    pa: f32,
 ) -> Option<f32> {
     let body = match parse_field(field?) {
         Field::List(b) => b,
         _ => return None,
     };
-    let mut param_deg: Option<f64> = None;
+    let mut param: Option<f64> = None;
     for sel in split_top_level_args(body) {
         match parse_field(sel) {
             Field::Ref(pid) => {
                 if let Some(p) = cartesian_point_2d(table, pid) {
-                    // Un-rotate the world point into the circle's local frame.
+                    // Un-rotate the world point into the conic's local frame,
+                    // then divide out the semi-axes so an ellipse recovers its
+                    // parameter t (identity for a circle).
                     let d = p - center;
                     let (cos, sin) = (ref_dir.x, ref_dir.y);
                     let lx = cos * d.x + sin * d.y;
                     let ly = -sin * d.x + cos * d.y;
-                    return Some(ly.atan2(lx));
+                    return Some((ly / semi.y).atan2(lx / semi.x));
                 }
             }
             _ => {
-                if param_deg.is_none() {
-                    param_deg = parameter_value(sel);
+                if param.is_none() {
+                    param = parameter_value(sel);
                 }
             }
         }
     }
-    param_deg.map(|deg| (deg as f32).to_radians())
+    param.map(|v| (v as f32) * pa)
+}
+
+/// Resolve one `IfcTrimmingSelect` to a line parameter `u` (a dimensionless
+/// multiple of the basis `IfcVector`). CARTESIAN trims project the point onto
+/// the line; PARAMETER trims are used directly.
+fn trim_line_param(
+    table: &EntityTable,
+    field: Option<&[u8]>,
+    pnt: Vec2,
+    dir: Vec2,
+    mag: f32,
+) -> Option<f32> {
+    let body = match parse_field(field?) {
+        Field::List(b) => b,
+        _ => return None,
+    };
+    let mut param: Option<f64> = None;
+    for sel in split_top_level_args(body) {
+        match parse_field(sel) {
+            Field::Ref(pid) => {
+                if let Some(q) = cartesian_point_2d(table, pid) {
+                    return Some((q - pnt).dot(dir) / mag);
+                }
+            }
+            _ => {
+                if param.is_none() {
+                    param = parameter_value(sel);
+                }
+            }
+        }
+    }
+    param.map(|v| v as f32)
 }
 
 /// Extract the scalar from an `IfcParameterValue(x)` / `IfcReal(x)` wrapper
@@ -500,6 +612,83 @@ fn parameter_value(raw: &[u8]) -> Option<f64> {
         return None;
     }
     std::str::from_utf8(&raw[open + 1..close]).ok()?.trim().parse().ok()
+}
+
+/// Radians per authored plane-angle unit, for scaling `IfcParameterValue`
+/// conic trim parameters. Walks the `IfcUnitAssignment.Units` for a
+/// PLANEANGLEUNIT:
+/// - `IfcSIUnit(*,.PLANEANGLEUNIT.,$,.RADIAN.)` → `1.0` (already radians).
+/// - `IfcConversionBasedUnit(_,.PLANEANGLEUNIT.,'DEGREE',#f)` where
+///   `#f = IfcMeasureWithUnit(IfcPlaneAngleMeasure(v), _)` → `v`
+///   (`0.017453… = π/180` for DEGREE, read straight off the measure).
+///
+/// Default when no PLANEANGLEUNIT resolves: **π/180 (degrees)** — a
+/// deliberate deviation from IFC's spec default of RADIAN. Revit / ArchiCAD
+/// author conic trims in degrees (a semicircle trims `180.0`) and routinely
+/// omit the plane-angle declaration; defaulting to radians would turn every
+/// undeclared `180` into a ~28-turn sweep. Files that *do* declare RADIAN get
+/// `1.0` and parse correctly. Resolves strictly through the assignment's
+/// Units, so a stray RADIAN `IfcSIUnit` not referenced by the assignment
+/// (both G55 files carry one) is ignored.
+fn resolve_plane_angle_scale(table: &EntityTable) -> f32 {
+    const DEGREE: f32 = std::f32::consts::PI / 180.0;
+    // The unit assignment can be the last entity in a multi-million-entry
+    // file (G55_ARK: penultimate of ~2.8M), so use the table's memoized
+    // lookup — one scan per model — rather than re-scanning per arc.
+    let unit_refs = table
+        .unit_assignment_id()
+        .and_then(|id| table.get(id))
+        .map(|(_, args)| {
+            let fields = split_top_level_args(args);
+            match fields.first().copied().map(parse_field) {
+                Some(Field::List(b)) => parse_ref_list(b),
+                _ => Vec::new(),
+            }
+        })
+        .unwrap_or_default();
+    for uref in unit_refs {
+        let (utype, uargs) = match table.get(uref) {
+            Some(x) => x,
+            None => continue,
+        };
+        let uf = split_top_level_args(uargs);
+        // UnitType is arg[1] on both IfcSIUnit and IfcConversionBasedUnit.
+        let is_plane_angle = matches!(
+            uf.get(1).copied().map(parse_field),
+            Some(Field::Enum(b"PLANEANGLEUNIT"))
+        );
+        if !is_plane_angle {
+            continue;
+        }
+        if utype.eq_ignore_ascii_case(b"IFCSIUNIT") {
+            // (Dimensions, UnitType, Prefix, Name) — RADIAN is the only SI
+            // plane-angle name.
+            if matches!(
+                uf.get(3).copied().map(parse_field),
+                Some(Field::Enum(b"RADIAN"))
+            ) {
+                return 1.0;
+            }
+        } else if utype.eq_ignore_ascii_case(b"IFCCONVERSIONBASEDUNIT") {
+            // (Dimensions, UnitType, Name, ConversionFactor) → follow the
+            // factor to IfcMeasureWithUnit and read its radians-per-unit value.
+            let factor_ref = match uf.get(3).copied().map(parse_field) {
+                Some(Field::Ref(id)) => id,
+                _ => continue,
+            };
+            if let Some((mtype, margs)) = table.get(factor_ref) {
+                if mtype.eq_ignore_ascii_case(b"IFCMEASUREWITHUNIT") {
+                    let mf = split_top_level_args(margs);
+                    if let Some(v) = mf.first().copied().and_then(parameter_value) {
+                        if v.is_finite() && v > 0.0 {
+                            return v as f32;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    DEGREE
 }
 
 /// Directed angular span `[start, end]` from `a1` to `a2`. `sense == true`
@@ -782,6 +971,31 @@ fn direction_2d(table: &EntityTable, id: u64) -> Option<Vec2> {
     let x = *ratios.first().unwrap_or(&1.0);
     let y = *ratios.get(1).unwrap_or(&0.0);
     Some(Vec2::new(x, y).normalize_or_zero())
+}
+
+/// Resolve an `IfcVector(Orientation: IfcDirection, Magnitude)` to a
+/// normalized 2D direction and its magnitude. Used by the `IfcLine` basis of
+/// [`trimmed_line_2d`].
+fn vector_2d(table: &EntityTable, id: u64) -> Option<(Vec2, f32)> {
+    let (type_name, args) = table.get(id)?;
+    if !type_name.eq_ignore_ascii_case(b"IFCVECTOR") {
+        return None;
+    }
+    let fields = split_top_level_args(args);
+    let dir = match fields.first().copied().map(parse_field) {
+        Some(Field::Ref(did)) => direction_2d(table, did)?,
+        _ => return None,
+    };
+    let mag = number_at(&fields, 1)? as f32;
+    if !(mag.is_finite() && mag > 0.0) {
+        return None;
+    }
+    // direction_2d already normalizes; a zero direction collapses to zero and
+    // would make the line degenerate — reject it.
+    if dir.length_squared() < 1e-12 {
+        return None;
+    }
+    Some((dir, mag))
 }
 
 // ----------------------------------------------------------------------

@@ -13,6 +13,7 @@
 //! parsing happens lazily per-lookup.
 
 use std::collections::HashMap;
+use std::sync::OnceLock;
 
 use crate::lexer::{data_section_start, endsec_position, for_each_record};
 
@@ -43,6 +44,14 @@ pub struct EntityTable<'a> {
     buf: &'a [u8],
     entries: HashMap<u64, EntityRefs>,
     order: Vec<u64>,
+    /// Memoized id of the first `IfcUnitAssignment` (or `None` if absent).
+    /// Finding it is an O(n) `iter()` scan and the assignment can sit at the
+    /// very end of the DATA section (G55_ARK: penultimate entity of ~2.8M),
+    /// so callers that need it per-item (e.g. profile conic-trim unit
+    /// resolution) would otherwise re-scan the whole table repeatedly. Filled
+    /// on first request via `unit_assignment_id`, tied to this table's
+    /// lifetime so it can never go stale across models.
+    unit_assignment: OnceLock<Option<u64>>,
 }
 
 impl<'a> EntityTable<'a> {
@@ -82,7 +91,24 @@ impl<'a> EntityTable<'a> {
             }
         });
 
-        Self { buf, entries, order }
+        Self {
+            buf,
+            entries,
+            order,
+            unit_assignment: OnceLock::new(),
+        }
+    }
+
+    /// Id of the first `IfcUnitAssignment` in the DATA section, memoized so
+    /// the O(n) scan runs at most once per table. Returns `None` when the
+    /// file declares no unit assignment. Used by profile conic-trim unit
+    /// resolution, which would otherwise re-scan the whole table per arc.
+    pub fn unit_assignment_id(&self) -> Option<u64> {
+        *self.unit_assignment.get_or_init(|| {
+            self.iter()
+                .find(|(_, t, _)| t.eq_ignore_ascii_case(b"IFCUNITASSIGNMENT"))
+                .map(|(id, _, _)| id)
+        })
     }
 
     /// Look up an entity by STEP id. Returns `(type_name, args)` byte slices
