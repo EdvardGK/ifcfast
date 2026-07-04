@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.42] - 2026-07-03
+
+### Fixed — mesh geometry: composite-curve arc profiles (GH #123, #139)
+
+- **Circular arc segments in composite-curve profiles (GH #123)** —
+  `profile::extract` now samples `IfcTrimmedCurve` arcs on an `IfcCircle`
+  basis inside an `IfcCompositeCurve` (thin curved walls, Revit "15mm
+  flis"). Before, the arcs were skipped and the profile collapsed to its
+  two straight end-cap lines — a zero-area sliver whose extruded mesh was
+  an open tube (volume ~0 → `prism_fallback` over-counting the AABB
+  ~8-9×; G55_ARK: 0.1749 vs ios 0.0182). The curved band now tessellates.
+  Cache schema 26 → 27.
+- **Ellipse / line basis + radian conic trims (GH #139)** — the arc
+  sampling above is extended beyond the circular / degree-authored case.
+  `IfcEllipse` (SemiAxis1 / SemiAxis2) and `IfcLine`
+  (`Pnt + u·Magnitude·dir`) basis curves are now sampled (both previously
+  returned `None` and could collapse a profile to the same sliver), and
+  conic `IfcParameterValue` trims are scaled by the model's declared
+  `PLANEANGLEUNIT` instead of assuming degrees — a radian-authored
+  semicircle (0 → π) was misread as a ~3.14° sliver. The degree default
+  is preserved for files that omit the declaration (Revit / ArchiCAD
+  convention), so the circular + degree corpus path is arithmetically
+  identical (G55 oracle sweep: zero drift on ARK + RIB). The
+  `IfcUnitAssignment` lookup is memoized on `EntityTable` (one scan per
+  model, not per arc — the assignment is the penultimate entity in
+  G55_ARK's ~2.8M-entity table). Cache schema 27 → 28.
+
 ## [0.4.41] - 2026-07-03
 
 ### Fixed — QTO / mesh geometry (GH #62, #138)

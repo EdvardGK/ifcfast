@@ -277,6 +277,18 @@ describing via `pq.read_schema(...)`):
   multi-item Body (or corrupted a CSG subtractor); the winding is now
   flipped when the direction runs against the profile normal, so those
   products' `volume_m3` / `volume_best_m3` correct on re-extraction.
+  **GH #123 (cache schema v27):** `IfcTrimmedCurve` arc segments on an
+  `IfcCircle` basis inside an `IfcCompositeCurve` (thin curved walls,
+  Revit "15mm flis") are now sampled; before, the arcs were skipped and
+  the profile collapsed to a zero-area sliver whose extruded mesh was an
+  open tube (`prism_fallback` over-counting the AABB ~8-9×). Such
+  products re-extract to the true curved band. **GH #139 (cache schema
+  v28):** the same arc sampling now covers `IfcEllipse` and `IfcLine`
+  bases, and conic PARAMETER trims scale by the model's declared
+  `PLANEANGLEUNIT` (a radian-authored semicircle was previously misread
+  as a ~3.14° sliver) rather than assuming degrees. Circular +
+  degree-authored profiles are byte-identical; only files with an
+  ellipse/line basis or radian-authored trims re-extract.
 - Semantic payload: `materials`, `psets`, `quantities`,
   `classifications` (list-of-struct columns — `UNNEST` in DuckDB).
   Each `psets` and `quantities` struct carries `source`
