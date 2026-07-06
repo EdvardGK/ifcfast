@@ -42,7 +42,58 @@ def test_mutate_returns_bytes_by_default(model):
         [{"op": "rename", "guid": WALL_A, "name": "Vegg Æblåbær"}]
     )
     assert isinstance(data, (bytes, bytearray))
-    assert "Vegg Æblåbær".encode() in data
+    # GH #142: minted strings use canonical ISO-10303-21 escapes, never
+    # raw UTF-8 bytes (strict readers silently drop those).
+    assert "Vegg Æblåbær".encode() not in data
+    assert rb"'Vegg \X2\00C6\X0\bl\X2\00E5\X0\b\X2\00E6\X0\r'" in data
+
+
+def test_mutate_non_ascii_is_step_escaped(model, tmp_path):
+    """GH #142 regression: raw UTF-8 in minted strings = silent æøå loss.
+
+    The tester's repro verbatim: rename to a Norwegian string, then prove
+    the emitted literal stays inside the STEP basic alphabet and both a
+    lenient (ifcfast) and a strict (ifcopenshell) reader see it intact.
+    """
+    new_name = "Vegg-Ø-æøå"
+    new_desc = "Beskrivelse-æøå"
+    out = tmp_path / "escaped.ifc"
+    model.mutate(
+        [
+            {"op": "rename", "guid": WALL_A, "name": new_name,
+             "description": new_desc},
+            {"op": "set_property", "guid": WALL_A, "pset": "Pset_WallCommon",
+             "name": "Rom", "value": "Kjøkken-æøå", "ifc_type": "IFCLABEL"},
+        ],
+        out_path=str(out),
+    )
+    raw = out.read_bytes()
+    assert new_name.encode("utf-8") not in raw
+    assert b"\\X2\\" in raw
+    # Every emitted string literal stays within 0x20..=0x7E: strip the
+    # data section down to quoted literals and scan for high bytes.
+    in_string = False
+    for b in raw:
+        if b == 0x27:  # "'" — toggles are naive but doubled quotes cancel out
+            in_string = not in_string
+        elif in_string:
+            assert 0x20 <= b <= 0x7E, f"raw byte 0x{b:02X} inside string literal"
+
+    reread = ifcfast.open(out, use_cache=False, write_cache=False)
+    row = next(p for p in reread.products if p.guid == WALL_A)
+    assert row.name == new_name
+
+    if ifcopenshell is not None:
+        el = ifcopenshell.open(str(out)).by_guid(WALL_A)
+        assert el.Name == new_name, "strict reader dropped non-ASCII (GH #142)"
+        assert el.Description == new_desc
+
+
+def test_mutate_non_bmp_uses_x4(model):
+    data = model.mutate(
+        [{"op": "rename", "guid": WALL_B, "name": "Merk 😀"}]
+    )
+    assert rb"'Merk \X4\0001F600\X0\'" in data
 
 
 def test_mutate_out_path_returns_stats(model, tmp_path):
