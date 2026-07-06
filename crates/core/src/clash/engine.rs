@@ -260,61 +260,101 @@ pub fn run(
 
     let candidate_pairs = geom::pairs_overlapping(&boxes, options.tolerance_m);
 
-    // Materialise world-coord TriMeshes lazily — once per instance that
-    // shows up in at least one candidate pair. Many models have most
-    // instances disjoint, so building a mesh for every one upfront
-    // would be wasted. We bake-world per instance rather than sharing
-    // per-rep BVHs across instances — see module docs for the rationale.
-    // Arc keeps the cache borrow checker happy when we need both a and
-    // b out simultaneously; cloning the Arc is constant-time.
-    let mut mesh_cache: HashMap<u32, Option<Arc<parry3d::shape::TriMesh>>> = HashMap::new();
+    // Class filters are cheap string checks — apply them before any
+    // geometry work so filtered candidates never cost a mesh build.
+    let candidate_pairs: Vec<(u32, u32)> = candidate_pairs
+        .into_iter()
+        .filter(|&(a, b)| {
+            class_filter_ok(&instances[a as usize], &instances[b as usize], options)
+        })
+        .collect();
+
+    // Materialise world-coord TriMeshes once per instance that shows up
+    // in at least one surviving candidate pair — built in parallel, the
+    // narrow phase's fixed cost. We bake-world per instance rather than
+    // sharing per-rep BVHs across instances — see module docs for the
+    // rationale. Arc so both sides of a pair borrow concurrently.
+    use rayon::prelude::*;
+    let mut ids: Vec<u32> = candidate_pairs
+        .iter()
+        .flat_map(|&(a, b)| [a, b])
+        .collect();
+    ids.sort_unstable();
+    ids.dedup();
+    let mesh_cache: HashMap<u32, Option<Arc<parry3d::shape::TriMesh>>> = ids
+        .par_iter()
+        .map(|&idx| {
+            (
+                idx,
+                build_world_trimesh(&instances[idx as usize], reps).map(Arc::new),
+            )
+        })
+        .collect();
+
+    // Narrow phase, in parallel over candidate pairs (order-preserving
+    // collect keeps the output deterministic). `intersection_test`
+    // early-outs on first BVH contact; the exhaustive `distance` query
+    // is only paid for non-intersecting pairs when a clearance band
+    // actually asks for it (federation-scale runs at tolerance 0 were
+    // spending hours in global distance traversals — GH #141 finding).
+    enum Outcome {
+        Pair(ClashPair),
+        Residual,
+        Skip,
+    }
+    let outcomes: Vec<Result<Outcome, ClashError>> = candidate_pairs
+        .par_iter()
+        .map(|&(id_a, id_b)| {
+            let (mesh_a, mesh_b) = match (
+                mesh_cache.get(&id_a).and_then(|m| m.as_ref()),
+                mesh_cache.get(&id_b).and_then(|m| m.as_ref()),
+            ) {
+                (Some(a), Some(b)) => (a, b),
+                _ => return Ok(Outcome::Residual),
+            };
+
+            let distance = if geom::intersects(mesh_a, mesh_b)? {
+                0.0
+            } else if options.tolerance_m > 0.0 {
+                geom::min_distance(mesh_a, mesh_b)?
+            } else {
+                return Ok(Outcome::Skip);
+            };
+
+            let kind = if distance == 0.0 {
+                ClashKind::Hard
+            } else if distance <= options.tolerance_m {
+                ClashKind::Clearance
+            } else {
+                // Broad phase admitted them via expanded AABBs but the
+                // actual mesh distance is outside the tolerance band.
+                return Ok(Outcome::Skip);
+            };
+
+            let a = &instances[id_a as usize];
+            let b = &instances[id_b as usize];
+            Ok(Outcome::Pair(ClashPair {
+                ifc_id_a: a.ifc_id,
+                ifc_id_b: b.ifc_id,
+                guid_a: a.guid.clone(),
+                guid_b: b.guid.clone(),
+                class_a: a.class.clone(),
+                class_b: b.class.clone(),
+                kind,
+                category: categorise(&a.class, &b.class),
+                min_distance_m: distance,
+            }))
+        })
+        .collect();
+
     let mut narrow_phase_residuals = 0usize;
     let mut pairs: Vec<ClashPair> = Vec::new();
-
-    for (id_a, id_b) in candidate_pairs {
-        if !class_filter_ok(&instances[id_a as usize], &instances[id_b as usize], options) {
-            continue;
+    for outcome in outcomes {
+        match outcome? {
+            Outcome::Pair(p) => pairs.push(p),
+            Outcome::Residual => narrow_phase_residuals += 1,
+            Outcome::Skip => {}
         }
-
-        let mesh_a = ensure_mesh(&mut mesh_cache, instances, reps, id_a);
-        let mesh_b = ensure_mesh(&mut mesh_cache, instances, reps, id_b);
-
-        let (mesh_a, mesh_b) = match (mesh_a, mesh_b) {
-            (Some(a), Some(b)) => (a, b),
-            _ => {
-                narrow_phase_residuals += 1;
-                continue;
-            }
-        };
-
-        // Distance subsumes intersection: 0.0 == hard clash, positive
-        // == clearance. One parry call, both facts.
-        let distance = geom::min_distance(&mesh_a, &mesh_b)?;
-
-        let kind = if distance == 0.0 {
-            ClashKind::Hard
-        } else if distance <= options.tolerance_m {
-            ClashKind::Clearance
-        } else {
-            // Broad phase admitted them via expanded AABBs but the
-            // actual mesh distance is outside the tolerance band.
-            continue;
-        };
-
-        let a = &instances[id_a as usize];
-        let b = &instances[id_b as usize];
-        let category = categorise(&a.class, &b.class);
-        pairs.push(ClashPair {
-            ifc_id_a: a.ifc_id,
-            ifc_id_b: b.ifc_id,
-            guid_a: a.guid.clone(),
-            guid_b: b.guid.clone(),
-            class_a: a.class.clone(),
-            class_b: b.class.clone(),
-            kind,
-            category,
-            min_distance_m: distance,
-        });
     }
 
     Ok(ClashReport {
@@ -337,22 +377,9 @@ fn class_filter_ok(a: &InstanceRow, b: &InstanceRow, options: &ClashOptions) -> 
     true
 }
 
-/// Build (and cache) the world-coord `TriMesh` for `instances[idx]`.
-/// Returns `None` if the rep is missing from the representations map
-/// or if the mesh failed to build — caller treats both as residuals.
-fn ensure_mesh(
-    cache: &mut HashMap<u32, Option<Arc<parry3d::shape::TriMesh>>>,
-    instances: &[InstanceRow],
-    reps: &HashMap<u64, RepresentationRow>,
-    idx: u32,
-) -> Option<Arc<parry3d::shape::TriMesh>> {
-    if !cache.contains_key(&idx) {
-        let built = build_world_trimesh(&instances[idx as usize], reps).map(Arc::new);
-        cache.insert(idx, built);
-    }
-    cache.get(&idx).and_then(|m| m.clone())
-}
-
+/// Build the world-coord `TriMesh` for one instance. Returns `None` if
+/// the rep is missing from the representations map or if the mesh
+/// failed to build — caller treats both as residuals.
 fn build_world_trimesh(
     inst: &InstanceRow,
     reps: &HashMap<u64, RepresentationRow>,
