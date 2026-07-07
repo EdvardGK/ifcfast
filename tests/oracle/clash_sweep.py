@@ -18,10 +18,28 @@ Usage (repo root, venv active)::
         --ifc scratch/g55/solibri/models_tmk13/G55_RIE.ifc \
         --ifc scratch/g55/solibri/models_tmk13/G55_RIV.ifc \
         [--cache-dir DIR]        # bundle cache; skip re-bundling
-        [--tolerance-m 0.0]      # clearance band passed to clash()
+        [--tolerance-m 0.0]      # base clearance band passed to clash()
+        [--rule-tol 'RULE=M']    # per-rule tolerance override (repeatable)
         [--baseline FILE]        # prior sweep JSON to diff against
         [--write-baseline FILE]  # save this sweep as a new baseline
         [--report FILE]          # full per-pair detail JSON
+
+Per-rule tolerance (``--rule-tol``): Solibri rules differ in semantics —
+a clash rule implies geometric contact (tolerance 0), a clearance rule a
+band (e.g. rule 10.1 RIE–RIVv flags pairs ~54 mm apart). Each truth pair
+is judged against ITS OWN rule's tolerance: matched iff the engine finds
+it with ``min_distance_m <= tol(rule)``. ``RULE`` matches the topic's
+rule tag exactly, or as a prefix when it ends with ``*``. Rules without
+an override use ``--tolerance-m``. The engine runs once at the base
+tolerance (full-set context, regression parity) plus at most ONE
+supplemental run at the max rule tolerance on a **selection-scoped
+mini-bundle** (only the guids of tolerance-band topics): every judged
+pair has both endpoints inside the BCF selections and the narrow phase
+is pure pairwise, so the mini-run distances are bit-identical for judged
+pairs at a fraction of the cost (91 s vs 10.5 h measured, TMK13
+3-model set at 0.1 m).
+Rule tolerances are provisional until the full Solibri checking report
+(rule parameters) is exported; the baseline locks them once chosen.
 
 Baselines live OUTSIDE the repo (client data), convention
 ``scratch/<corpus>/baselines/clash_<round>.json``. Exit 1 when a pair that
@@ -69,11 +87,79 @@ def run_clash(bundle_dir: Path, tolerance_m: float):
 
     df = ifcfast.clash(str(bundle_dir), tolerance_m=tolerance_m, write_parquet=False)
     print(
-        f"clash: {len(df)} pairs at tolerance {tolerance_m} m "
+        f"clash [{bundle_dir.name}]: {len(df)} pairs at tolerance {tolerance_m} m "
         f"({df.attrs.get('clash_ms', 0):.0f} ms, "
         f"{df.attrs.get('geometryless_skipped', 0)} geometryless skipped)"
     )
     return df
+
+
+def parse_rule_tol(spec: str) -> tuple[str, float]:
+    """``'10.1. RIE - RIVv=0.1'`` -> ``('10.1. RIE - RIVv', 0.1)``."""
+    rule, sep, val = spec.rpartition("=")
+    if not sep or not rule:
+        raise argparse.ArgumentTypeError(
+            f"--rule-tol needs 'RULE=METRES', got {spec!r}"
+        )
+    return rule, float(val)
+
+
+def make_tol_for_rule(rule_tols: list[tuple[str, float]], base: float):
+    """Effective tolerance for a Solibri rule tag: exact match first,
+    then ``prefix*`` patterns in given order, else the base tolerance."""
+
+    exact = {r: t for r, t in rule_tols if not r.endswith("*")}
+    prefixes = [(r[:-1], t) for r, t in rule_tols if r.endswith("*")]
+
+    def tol_for_rule(rule: str) -> float:
+        if rule in exact:
+            return exact[rule]
+        for pre, t in prefixes:
+            if rule.startswith(pre):
+                return t
+        return base
+
+    return tol_for_rule
+
+
+_EPS = 1e-6  # f32 min_distance_m vs f64 tolerance
+
+
+def pair_matches(pair_meta: dict, pair, tolerance_m: float) -> bool:
+    """A truth pair matches iff the engine found it within ``tolerance_m``."""
+    meta = pair_meta.get(pair)
+    return meta is not None and meta[2] <= tolerance_m + _EPS
+
+
+def write_selection_bundle(fed_dir: Path, guids: set[str], out_dir: Path) -> int:
+    """Filter a federated bundle down to ``guids`` (+ their reps).
+
+    Every pair the sweep judges has BOTH endpoints inside the BCF topic
+    selections, and the narrow phase is pure pairwise — so a clash run on
+    this mini-bundle returns bit-identical ``min_distance_m`` for every
+    judged pair at a fraction of the full-set cost (measured: 91 s vs
+    10.5 h on TMK13 RIE+RIV+ARK at tolerance 0.1 m). ``pq.write_table``
+    preserves the arrow schema + ``ifcfast.*`` metadata the strict Rust
+    reader requires. Returns the instance row count.
+    """
+    import pyarrow as pa
+    import pyarrow.compute as pc
+    import pyarrow.parquet as pq
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    inst = pq.read_table(fed_dir / "instances.parquet")
+    mini = inst.filter(pc.is_in(inst.column("guid"), value_set=pa.array(sorted(guids))))
+    rep_ids = sorted({r for r in mini.column("rep_id").to_pylist() if r is not None})
+    reps = pq.read_table(fed_dir / "representations.parquet")
+    mreps = reps.filter(
+        pc.is_in(
+            reps.column("rep_id"),
+            value_set=pa.array(rep_ids, type=reps.schema.field("rep_id").type),
+        )
+    )
+    pq.write_table(mini, out_dir / "instances.parquet")
+    pq.write_table(mreps, out_dir / "representations.parquet")
+    return mini.num_rows
 
 
 def load_instance_index(bundle_dir: Path, unit_scale: float) -> dict[str, dict]:
@@ -138,6 +224,15 @@ def main() -> int:
     ap.add_argument("--ifc", type=Path, action="append", required=True)
     ap.add_argument("--cache-dir", type=Path, default=Path("scratch/clash_oracle_cache"))
     ap.add_argument("--tolerance-m", type=float, default=0.0)
+    ap.add_argument(
+        "--rule-tol",
+        type=parse_rule_tol,
+        action="append",
+        default=[],
+        metavar="RULE=METRES",
+        help="per-rule tolerance override; RULE matches the topic rule tag "
+        "exactly, or as a prefix when it ends with '*' (repeatable)",
+    )
     ap.add_argument("--baseline", type=Path, default=None)
     ap.add_argument("--write-baseline", type=Path, default=None)
     ap.add_argument("--report", type=Path, default=None)
@@ -171,6 +266,9 @@ def main() -> int:
         print(f"WARNING: {len(sidecar['guid_collisions'])} guid collisions across sources")
     unit_scale = float(sidecar["unit_scale"])
 
+    index = load_instance_index(fed_dir, unit_scale)
+    tol_for_rule = make_tol_for_rule(args.rule_tol, args.tolerance_m)
+
     df = run_clash(fed_dir, args.tolerance_m)
     found_pairs = {frozenset((a, b)) for a, b in zip(df["guid_a"], df["guid_b"])}
     pair_meta = {
@@ -178,17 +276,52 @@ def main() -> int:
         for r in df.itertuples()
     }
 
+    # --- supplemental scoped run for tolerance-band rules ----------------
+    band_topics = [t for t in topics if tol_for_rule(t.rule) > args.tolerance_m]
+    supp_tol = max((tol_for_rule(t.rule) for t in band_topics), default=0.0)
+    if band_topics:
+        band_guids = {
+            g for t in band_topics for g in t.selection_guids if g in index
+        }
+        if not band_guids:
+            print("WARNING: no band-topic guid resolves in the bundle; "
+                  "skipping supplemental run")
+        else:
+            mini_dir = args.cache_dir / "selection_scope" / fed_dir.name
+            n = write_selection_bundle(fed_dir, band_guids, mini_dir)
+            print(
+                f"supplemental run for {len(band_topics)} tolerance-band topics "
+                f"(rules: {sorted({t.rule for t in band_topics})}) — "
+                f"selection-scoped mini-bundle, {n} instances"
+            )
+            df_supp = run_clash(mini_dir, supp_tol)
+            for r in df_supp.itertuples():
+                p = frozenset((r.guid_a, r.guid_b))
+                prev = pair_meta.get(p)
+                if prev is None or float(r.min_distance_m) < prev[2]:
+                    pair_meta[p] = (r.category, r.kind, float(r.min_distance_m))
+
+    def pair_within(pair, rule: str) -> bool:
+        return pair_matches(pair_meta, pair, tol_for_rule(rule))
+
     # --- reconcile -------------------------------------------------------
-    matched = {p for p in truth_pairs if p in found_pairs}
+    matched = {p for p in truth_pairs if pair_within(p, pair_rule.get(p, ""))}
     missed = truth_pairs - matched
-    index = load_instance_index(fed_dir, unit_scale)
-    diagnoses = [diagnose_miss(p, index) for p in sorted(missed, key=sorted)]
+    diagnoses = []
+    for p in sorted(missed, key=sorted):
+        d = diagnose_miss(p, index)
+        meta = pair_meta.get(p)
+        if meta is not None:  # engine found it, but beyond the rule's band
+            d["reason"] = "outside_rule_tolerance"
+            d["engine_min_distance_m"] = round(meta[2], 4)
+            d["rule_tolerance_m"] = tol_for_rule(pair_rule.get(p, ""))
+        diagnoses.append(d)
 
     topic_hits = 0
     topic_misses = []
     for t in topics:
         cands = t.all_candidate_pairs()
-        if cands and (cands & found_pairs):
+        if cands and any(pair_within(p, t.rule) for p in cands):
             topic_hits += 1
         elif cands:
             topic_misses.append(t)
@@ -223,7 +356,22 @@ def main() -> int:
             rule_stats[r][1] += 1
     print("\n--- clean-pair recall per Solibri rule ---")
     for r, (n, m) in sorted(rule_stats.items()):
-        print(f"  {r or '<no rule>':<32} {m}/{n}")
+        print(f"  {r or '<no rule>':<32} {m}/{n}  @ tol {tol_for_rule(r)} m")
+
+    if topic_misses:
+        print("\n--- missed topics (no candidate pair within rule tolerance) ---")
+        for t in topic_misses:
+            gaps = [
+                aabb_gap_m(index[a], index[b])
+                for p in t.all_candidate_pairs()
+                for a, b in [sorted(p)]
+                if a in index and b in index
+                and index[a]["has_geom"] and index[b]["has_geom"]
+            ]
+            gap_s = f"min AABB gap {min(gaps):.3f} m" if gaps else "no resolvable pair"
+            print(f"  {t.topic_guid}  rule={t.rule!r}  "
+                  f"{len(t.selection_guids)} guids, {len(t.all_candidate_pairs())} pairs, "
+                  f"{gap_s}  title={t.title[:60]!r}")
 
     if diagnoses:
         print("\n--- missed truth pairs ---")
@@ -242,6 +390,7 @@ def main() -> int:
 
     result = {
         "tolerance_m": args.tolerance_m,
+        "rule_tolerances": {r: t for r, t in args.rule_tol},
         "bcf": [str(p) for p in args.bcf],
         "ifc": [str(p) for p in args.ifc],
         "n_truth_pairs": len(truth_pairs),
@@ -252,7 +401,10 @@ def main() -> int:
         "topic_recall": topic_recall,
         "n_found_pairs": len(found_pairs),
         "n_cross_model_pairs": len(cross),
-        "rules": {r: {"n": n, "matched": m} for r, (n, m) in sorted(rule_stats.items())},
+        "rules": {
+            r: {"n": n, "matched": m, "tolerance_m": tol_for_rule(r)}
+            for r, (n, m) in sorted(rule_stats.items())
+        },
         "matched": sorted("|".join(sorted(p)) for p in matched),
         "missed": sorted("|".join(sorted(p)) for p in missed),
     }
@@ -261,6 +413,16 @@ def main() -> int:
         args.report.parent.mkdir(parents=True, exist_ok=True)
         detail = dict(result)
         detail["miss_diagnoses"] = diagnoses
+        detail["topic_misses"] = [
+            {
+                "topic_guid": t.topic_guid,
+                "title": t.title,
+                "rule": t.rule,
+                "n_selection_guids": len(t.selection_guids),
+                "n_candidate_pairs": len(t.all_candidate_pairs()),
+            }
+            for t in topic_misses
+        ]
         detail["extra_class_pairs"] = {
             f"{ca}|{cb}": n for (ca, cb), n in extra_classes.most_common()
         }
