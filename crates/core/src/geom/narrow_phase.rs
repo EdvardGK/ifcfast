@@ -64,6 +64,40 @@ pub fn min_distance(a: &TriMesh, b: &TriMesh) -> Result<f32, NarrowPhaseError> {
     query::distance(&pos, a, &pos, b).map_err(|_| NarrowPhaseError::Unsupported)
 }
 
+/// Band probe: `Some(d)` with some mesh-mesh distance `d <= cap` when
+/// the meshes lie within `cap` of each other, else `None`. The
+/// best-first traversal is seeded with `cap` as its initial pruning
+/// bound instead of infinity, so subtrees whose AABB lower bound
+/// already exceeds the band are never descended — in clearance sweeps
+/// most candidate pairs lie beyond the band, and each of those rejects
+/// near the BVH root instead of paying an exhaustive exact-distance
+/// traversal (GH #143).
+///
+/// REJECT-ONLY: do not report the returned value. Seeding changes the
+/// traversal schedule, and parry's composite distance is only
+/// schedule-deterministic — near-tied leaf pairs resolve differently
+/// (measured ~1e-6 m flips on G55; `query::distance(a,b)` vs `(b,a)`
+/// differ the same way, and node lower bounds computed in world-scale
+/// f32 can round above a leaf's true value). Callers that emit a
+/// distance must confirm with [`min_distance`] and re-test the band —
+/// and pad `cap` by more than the bound-arithmetic rounding slack so
+/// a `None` here can never contradict the exact query's band verdict.
+pub fn min_distance_within(a: &TriMesh, b: &TriMesh, cap: f32) -> Option<f32> {
+    use parry3d::query::details::CompositeShapeAgainstAnyDistanceVisitor;
+    use parry3d::query::DefaultQueryDispatcher;
+
+    let pos = Isometry::identity();
+    let mut visitor =
+        CompositeShapeAgainstAnyDistanceVisitor::new(&DefaultQueryDispatcher, &pos, a, b);
+    // Seed with `cap.next_up()`, not `cap`: the traversal records a
+    // leaf only when its distance is STRICTLY below the running bound,
+    // and callers band-test with `d <= cap` — a pair at exactly `cap`
+    // must not be lost.
+    a.qbvh()
+        .traverse_best_first_node(&mut visitor, 0, cap.next_up())
+        .map(|(_, (_, d))| d)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -134,6 +168,42 @@ mod tests {
         assert!(!intersects(&a, &b).unwrap());
         let d = min_distance(&a, &b).unwrap();
         assert!((d - 1.0).abs() < 1e-4, "expected ~1.0 m clearance, got {d}");
+    }
+
+    #[test]
+    fn capped_distance_within_band_matches_exact() {
+        let a = cube([0.0, 0.0, 0.0]);
+        let b = cube([2.0, 0.0, 0.0]); // ~1 m clearance
+        let exact = min_distance(&a, &b).unwrap();
+        // Comfortably inside the band. On well-conditioned fixtures
+        // like these cubes the probe and the exact query agree
+        // exactly; on real meshes the probe's VALUE may differ at the
+        // last ulps (see the fn docs) — only Some/None is contractual.
+        assert_eq!(min_distance_within(&a, &b, 1.5), Some(exact));
+    }
+
+    #[test]
+    fn capped_distance_beyond_band_rejects() {
+        let a = cube([0.0, 0.0, 0.0]);
+        let b = cube([2.0, 0.0, 0.0]); // ~1 m clearance
+        assert_eq!(min_distance_within(&a, &b, 0.5), None);
+    }
+
+    #[test]
+    fn capped_distance_at_exact_band_edge_is_kept() {
+        // Callers band-test with `d <= cap`, so a pair at exactly the
+        // cap must survive — this pins the `cap.next_up()` seeding.
+        let a = cube([0.0, 0.0, 0.0]);
+        let b = cube([2.0, 0.0, 0.0]);
+        let exact = min_distance(&a, &b).unwrap();
+        assert_eq!(min_distance_within(&a, &b, exact), Some(exact));
+    }
+
+    #[test]
+    fn capped_distance_intersecting_is_zero() {
+        let a = cube([0.0, 0.0, 0.0]);
+        let b = cube([0.5, 0.5, 0.5]);
+        assert_eq!(min_distance_within(&a, &b, 0.1), Some(0.0));
     }
 
     #[test]

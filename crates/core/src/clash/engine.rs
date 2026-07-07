@@ -296,12 +296,13 @@ pub fn run(
     // `intersection_test` early-outs on first BVH contact and no
     // distance traversal is ever paid (federation-scale runs were
     // spending hours in global distance traversals — GH #141 finding).
-    // At tolerance > 0 a single `distance` query answers both
-    // questions: parry's best-first visitor ExitEarly-returns exactly
-    // 0.0 on the first touching leaf pair, so intersecting pairs still
-    // early-out while non-intersecting pairs (the dominant band cost)
-    // no longer pay a redundant full `intersection_test` traversal
-    // before the distance query (GH #143 Step 1).
+    // At tolerance > 0, a band-capped probe rejects beyond-band pairs
+    // (the dominant band cost) near the BVH root; survivors pay the
+    // exhaustive `distance` query, whose value is what we report —
+    // the probe's value is schedule-dependent at the last ulps and is
+    // never emitted (GH #143, see `min_distance_within` docs). The
+    // probe cap is padded so its `None` provably agrees with the
+    // exact query's band verdict despite that jitter.
     enum Outcome {
         Pair(ClashPair),
         Residual,
@@ -319,6 +320,15 @@ pub fn run(
             };
 
             let distance = if options.tolerance_m > 0.0 {
+                // 5 mm absolute / 5 % relative pad — orders of
+                // magnitude above the f32 bound-rounding slack at
+                // building-scale coords, negligible extra pass-through.
+                let pad = (options.tolerance_m * 0.05).max(0.005);
+                if geom::min_distance_within(mesh_a, mesh_b, options.tolerance_m + pad)
+                    .is_none()
+                {
+                    return Ok(Outcome::Skip);
+                }
                 geom::min_distance(mesh_a, mesh_b)?
             } else if geom::intersects(mesh_a, mesh_b)? {
                 0.0

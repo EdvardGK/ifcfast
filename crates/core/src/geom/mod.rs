@@ -37,7 +37,7 @@ pub mod csg;
 
 pub use broad_phase::{pairs_overlapping, AabbF32};
 pub use mesh::{build_trimesh, MeshBuildError};
-pub use narrow_phase::{intersects, min_distance, NarrowPhaseError};
+pub use narrow_phase::{intersects, min_distance, min_distance_within, NarrowPhaseError};
 
 #[cfg(feature = "csg")]
 pub use csg::{build_manifold, manifold_to_buffers, subtract, subtract_many, CsgKernelError};
