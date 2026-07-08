@@ -24,6 +24,11 @@ pub struct InstanceRow {
     pub ifc_id: u64,
     pub guid: String,
     pub class: String,
+    /// Model identity from the substrate's `source_model` column
+    /// (GH #50): the source IFC's stem, re-stamped per constituent
+    /// bundle by federation. Empty string for pre-v29 bundles that
+    /// don't carry the column.
+    pub source_model: String,
     /// `None` for geometryless products — broad-phase skips them.
     pub rep_id: Option<u64>,
     /// Column-major 4×4. For `composite` reps this is identity (rep is
@@ -128,6 +133,7 @@ pub fn read_instances(path: &Path) -> Result<Vec<InstanceRow>, SubstrateReadErro
         let ifc_id = column_u64(&batch, "ifc_id")?;
         let guid = column_string(&batch, "guid")?;
         let class = column_string(&batch, "class")?;
+        let source_model = column_string_or_empty(&batch, "source_model")?;
         let rep_id = column_u64_opt(&batch, "rep_id")?;
         let transform = column_fixed_f32(&batch, "transform", 16)?;
         let bbox_min = column_fixed_f32(&batch, "bbox_min_xyz", 3)?;
@@ -157,6 +163,7 @@ pub fn read_instances(path: &Path) -> Result<Vec<InstanceRow>, SubstrateReadErro
                 ifc_id: ifc_id[i],
                 guid: guid[i].clone(),
                 class: class[i].clone(),
+                source_model: source_model[i].clone(),
                 rep_id: rep_id[i],
                 transform: t,
                 bbox_min: bmin,
@@ -281,6 +288,26 @@ fn column_string(
         .downcast_ref::<StringArray>()
         .ok_or(SubstrateReadError::UnexpectedColumnType(name))?;
     Ok((0..arr.len()).map(|i| arr.value(i).to_string()).collect())
+}
+
+/// Like [`column_string`], but a MISSING column yields empty strings
+/// for every row instead of erroring — for columns added to the
+/// substrate after bundles in the wild were written (`source_model`,
+/// cache schema v29). A present-but-mistyped column still errors.
+fn column_string_or_empty(
+    batch: &arrow::record_batch::RecordBatch,
+    name: &'static str,
+) -> Result<Vec<String>, SubstrateReadError> {
+    match batch.column_by_name(name) {
+        None => Ok(vec![String::new(); batch.num_rows()]),
+        Some(arr) => {
+            let arr = arr
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or(SubstrateReadError::UnexpectedColumnType(name))?;
+            Ok((0..arr.len()).map(|i| arr.value(i).to_string()).collect())
+        }
+    }
 }
 
 fn column_binary<'a>(

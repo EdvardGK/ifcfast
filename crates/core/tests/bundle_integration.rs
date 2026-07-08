@@ -79,7 +79,7 @@ fn bundle_to_parquet(buf: &[u8]) -> (Bundle, std::path::PathBuf) {
     fs::create_dir_all(&out_dir).unwrap();
 
     let bundle = Bundle::build(buf);
-    let mut sink = ParquetSink::create_in_dir(&out_dir, &bundle)
+    let mut sink = ParquetSink::create_in_dir(&out_dir, &bundle, "fixture_model")
         .expect("ParquetSink::create_in_dir");
     let _stats = mesh_ifc_streaming(buf, &mut sink);
     sink.finish().expect("sink finish");

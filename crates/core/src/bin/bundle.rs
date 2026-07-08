@@ -100,7 +100,13 @@ fn main() -> ExitCode {
     eprintln!("[ifcfast-bundle]   quantity rows:       {}", sem.quantity_rows);
     eprintln!("[ifcfast-bundle]   classification rows: {}", sem.classification_rows);
 
-    let mut sink = match ParquetSink::create_in_dir(&out_dir, &bundle) {
+    // Model identity stamped on every instance row (GH #50): the
+    // source IFC's file stem, mirroring the PyO3 `bundle()` path.
+    let source_model = in_path
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let mut sink = match ParquetSink::create_in_dir(&out_dir, &bundle, &source_model) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("create sink in {}: {e}", out_dir.display());

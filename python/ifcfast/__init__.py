@@ -57,6 +57,9 @@ Public API:
 * :func:`header` — parse only the STEP header (no full index).
 * :func:`example_path` — path to the bundled minimal IFC fixture.
 * :func:`system_prompt` — paste-into-agent description of the library.
+* :func:`bundle` — write the parquet substrate for one IFC.
+* :func:`federate` — merge N substrate bundles into one clash-able bundle.
+* :func:`clash` — clash detection against a bundle (or a list of them).
 * :class:`Model` — parsed index, lazy data layers, spatial-graph helpers.
 * :class:`ProductRow`, :class:`StoreyRow` — row dataclasses.
 * :mod:`ifcfast.classify` — element-mode policy.
@@ -71,6 +74,7 @@ from .header import IFCHeader, header
 from .model import Model, ProductRow, StoreyRow, open_ifc as open
 from .bundle import bundle
 from .clash import clash
+from .federate import federate
 from . import cache, classify
 
 # Re-export the Rust-side IfcfastError so callers can
@@ -97,6 +101,7 @@ __all__ = [
     "classify",
     "clash",
     "example_path",
+    "federate",
     "header",
     "open",
     "system_prompt",
@@ -216,6 +221,10 @@ Writing (surgical, round-trippable):
 Substrate + clash (GeoParquet, model-scale analysis):
     ifcfast.bundle(path, out_dir)         # representations/instances parquet substrate
     ifcfast.clash(bundle_dir)             # broad+narrow clash pass -> clashes.parquet
+    ifcfast.clash([ark_dir, rib_dir])     # federates the bundles, then clashes them as one
+    ifcfast.federate(dirs, out_dir)       # explicit N-bundle merge (+ federation.json)
+    # cross-model pairs: df[df.source_model_a != df.source_model_b]
+    # federated substrate join key: (guid, source_model) — bare guid/ifc_id may collide
     # mesh_qto volume contract: SUM(volume_m3) only over volume_reliable rows
 
 Spatial-relationship graph:

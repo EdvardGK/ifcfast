@@ -113,7 +113,7 @@ fn bundle_to_parquet(buf: &[u8]) -> PathBuf {
     ));
     fs::create_dir_all(&out_dir).unwrap();
     let bundle = Bundle::build(buf);
-    let mut sink = ParquetSink::create_in_dir(&out_dir, &bundle).unwrap();
+    let mut sink = ParquetSink::create_in_dir(&out_dir, &bundle, "fixture_model").unwrap();
     let _ = mesh_ifc_streaming(buf, &mut sink);
     sink.finish().unwrap();
     out_dir

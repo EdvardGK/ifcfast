@@ -164,6 +164,10 @@ releases (additions only, never reorganisations).
 | Count of products (matches `m.products`) | `len(m)` |
 | Same data as a pandas DataFrame | `m.products_df` |
 | What changed between v1 and v2? | `m.diff(other_path)` |
+| Parquet substrate for pipelines / DuckDB | `ifcfast.bundle(path)` → `model.bundle/` |
+| Clash detection within one model | `ifcfast.clash("model.bundle/")` |
+| Cross-discipline clash (N models) | `ifcfast.clash(["ark.bundle/", "rib.bundle/"])` — federates, then clashes |
+| Merge N bundles into one substrate | `ifcfast.federate([a, b, …], out_dir)` |
 
 ## Substrate output (DuckDB-queryable parquet)
 
@@ -211,6 +215,12 @@ describing via `pq.read_schema(...)`):
   schema v19, GH #69) — Revit emits those base classes for types with
   no schema-specific `*Type` subtype (e.g. roof/stair/ramp types on
   IFC2X3). They were silently dropped before v19.
+  `source_model` (Utf8, non-null; GH #50, cache schema v29) — model
+  identity: the source IFC's file stem, re-stamped with the
+  constituent bundle dir's name by `ifcfast.federate()`. In a
+  federated bundle `guid` and `ifc_id` may collide across constituent
+  models — the canonical join keys there are `(guid, source_model)` /
+  `(ifc_id, source_model)`.
 - Placement / world: `transform` (4×4 col-major), `placement_xyz`.
 - World-AABB: `bbox_min_xyz`, `bbox_max_xyz`.
 - **Geometric fingerprint** (since v0.4.19, cache schema v5):
@@ -316,6 +326,11 @@ JOIN 'rib/instances.parquet' b
      / NULLIF(a.aabb_volume_m3, 0) < 0.05;                 -- ±5% volume
 ```
 
+With a federated bundle (see below) the same query becomes a
+self-join on one file, split by `source_model`:
+`… FROM 'federated/instances.parquet' a JOIN 'federated/instances.parquet' b
+ON a.source_model < b.source_model AND …`.
+
 **Cache schema version** is at `_CACHE_SCHEMA_VERSION` in
 `python/ifcfast/header.py` — when it bumps, the column set changed.
 Old caches become orphaned automatically.
@@ -344,6 +359,59 @@ is `None` on those builds — check it before aggregating. A standalone
 `ifcfast extract` (no drift requested) does **not** set the flag, so a
 later drift-wanting reader still cold-parses drift.
 
+### Federation (`ifcfast.federate()`)
+
+Cross-discipline work needs N discipline bundles as ONE substrate.
+`federate` is a materializing columnar merge — no re-parse, no
+geometry work:
+
+```python
+import ifcfast
+
+sidecar = ifcfast.federate(
+    ["ark.bundle/", "rib.bundle/", "riv.bundle/"],
+    "federated/",
+    on_collision="warn",       # or "fail" / "dedup"
+    reference_only=(),         # recorded here, ENFORCED by clash()
+)
+```
+
+What it does, precisely:
+
+- `rep_id` is per-bundle numbering — each source after the first has
+  its rep_ids offset (in BOTH tables) so geometry never cross-links.
+- Arrow schemas must match exactly across sources (mixed ifcfast
+  versions → `ValueError`: re-bundle). `ifcfast.unit_scale` must agree
+  (mixed-unit merges would silently misplace geometry → `ValueError`).
+- Every instance row's `source_model` is re-stamped with its
+  constituent bundle DIRECTORY name (dir names must be unique). After
+  federation, `guid` / `ifc_id` alone are NOT unique keys — join on
+  `(guid, source_model)` / `(ifc_id, source_model)`.
+- guid collisions across sources (same element exported into two
+  models — it would self-clash as noise) follow `on_collision`:
+  `"warn"` keeps everything and warns, `"fail"` raises, `"dedup"`
+  keeps the first source's row and drops later duplicates.
+- Output: merged `instances.parquet` + `representations.parquet`, a
+  copy of `view.sql`, and a `federation.json` sidecar
+  (`sources`, `rep_id_offsets`, `guid_source` — guid → source stem,
+  first wins — `guid_collisions`, `unit_scale`, `reference_only`).
+
+Naming note: `ifcfast.federate` (bundle merge, this section) is
+unrelated to `ifcfast.federated_floors` (storey clustering across
+models opened in memory).
+
+You rarely need to call it yourself — passing a LIST to
+`ifcfast.clash()` federates into a content-keyed cache dir
+(`cache_root()/federated/<key>`, reused while the constituent
+parquets are unchanged) and runs the single-substrate engine:
+
+```python
+df = ifcfast.clash(["ark.bundle/", "rib.bundle/"])
+cross = df[df.source_model_a != df.source_model_b]   # cross-model pairs
+df.attrs["federated_dir"]   # where the merged substrate (and clashes.parquet) live
+df.attrs["federation"]      # the federation.json sidecar dict
+```
+
 ### Narrow-phase clash (`ifcfast.clash()`)
 
 True mesh-mesh intersection runs against the same substrate. The
@@ -370,18 +438,32 @@ df = ifcfast.clash(
 # only pairs where at least one side is one of these classes
 # (normalised names — "Pipe", not "IfcPipe")
 df = ifcfast.clash("model.bundle/", include_classes=["Pipe", "Duct"])
+
+# cross-discipline: a LIST federates first (see Federation above)
+df = ifcfast.clash(["ark.bundle/", "rib.bundle/"], tolerance_m=0.05)
+
+# reference geometry: pairs with BOTH sides in a reference model are
+# dropped before narrow-phase (reference vs active still clashes).
+# Names are source_model values — bundle dir names for a federation.
+df = ifcfast.clash(["ark.bundle/", "rib.bundle/"],
+                   reference_only=["ark.bundle"])
 ```
 
 `clashes.parquet` columns:
 
-| column           | type    | meaning                                                  |
-|------------------|---------|----------------------------------------------------------|
-| `ifc_id_a/b`     | UInt64  | STEP entity ids — join back to `instances.parquet`       |
-| `guid_a/b`       | Utf8    | IFC GUIDs                                                |
-| `class_a/b`      | Utf8    | normalised classes (`"Pipe"`, not `"IfcPipe"`)           |
-| `kind`           | Utf8    | `"hard"` (meshes intersect) or `"clearance"` (within tol)|
-| `category`       | Utf8    | semantic bucket (`"clash"` / `"insulation"` / `"connection"` / `"non_physical"`) — see below |
-| `min_distance_m` | Float32 | minimum mesh-to-mesh distance, metres; `0.0` for hard    |
+| column             | type    | meaning                                                  |
+|--------------------|---------|----------------------------------------------------------|
+| `ifc_id_a/b`       | UInt64  | STEP entity ids — join back to `instances.parquet`       |
+| `guid_a/b`         | Utf8    | IFC GUIDs                                                |
+| `class_a/b`        | Utf8    | normalised classes (`"Pipe"`, not `"IfcPipe"`)           |
+| `source_model_a/b` | Utf8    | each side's substrate `source_model` (GH #50, since cache schema v29; `""` on older bundles). Cross-model split: `source_model_a != source_model_b` |
+| `kind`             | Utf8    | `"hard"` (meshes intersect) or `"clearance"` (within tol)|
+| `category`         | Utf8    | semantic bucket (`"clash"` / `"insulation"` / `"connection"` / `"non_physical"`) — see below |
+| `min_distance_m`   | Float32 | minimum mesh-to-mesh distance, metres; `0.0` for hard    |
+
+On a FEDERATED substrate, join back to `instances.parquet` on
+`(ifc_id, source_model)` / `(guid, source_model)` — bare `ifc_id` /
+`guid` can collide across constituent models.
 
 The engine is just the *fact* layer — does this pair touch, by how
 much, and which semantic bucket it falls in. **Policy** (BCF emit,

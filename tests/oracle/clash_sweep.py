@@ -67,12 +67,16 @@ def ensure_bundle(ifc: Path, cache_dir: Path) -> Path:
     out = cache_dir / "bundles" / ifc.stem
     inst = out / "instances.parquet"
     if inst.is_file():
-        meta = pq.read_schema(inst).metadata or {}
+        schema = pq.read_schema(inst)
+        meta = schema.metadata or {}
         cached = (meta.get(b"ifcfast.version") or b"").decode()
-        if cached == ifcfast.__version__:
+        # Version alone misses same-version schema changes on a dev
+        # tree (GH #50 landed source_model within 0.4.42) — also
+        # require the current column set's marker column.
+        if cached == ifcfast.__version__ and "source_model" in schema.names:
             print(f"bundle cache hit: {out} (v{cached})")
             return out
-        print(f"bundle cache stale ({cached} != {ifcfast.__version__}): {out}")
+        print(f"bundle cache stale ({cached} != {ifcfast.__version__} or pre-v29 schema): {out}")
     print(f"bundling {ifc.name} ...", flush=True)
     info = ifcfast.bundle(str(ifc), out_dir=str(out))
     print(

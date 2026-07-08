@@ -569,7 +569,17 @@ def _resolve_step_escapes(s: str) -> str:
 #       re-extraction. Circular + degree-authored profiles (the entire G55
 #       corpus) are byte-identical; only files with the ellipse/line/radian
 #       constructs must be re-extracted.
-_CACHE_SCHEMA_VERSION = 28
+# v29 (GH #50) — first-class federation. `instances.parquet` gains a
+#       `source_model` column (Utf8, non-null): the source IFC's file stem,
+#       re-stamped with the constituent bundle dir's name by
+#       `ifcfast.federate()`. In a federated bundle `ifc_id` / `guid` may
+#       collide across constituent models, so the canonical join keys become
+#       `(guid, source_model)` / `(ifc_id, source_model)`; `clashes.parquet`
+#       correspondingly gains `source_model_a` / `source_model_b`. Geometry,
+#       QTO and all other columns are byte-identical — the bump exists
+#       because the column set changed and because federation caches
+#       (`cache_root()/federated/<key>`) key on it.
+_CACHE_SCHEMA_VERSION = 29
 
 _FIELD_RE = re.compile(r"\(\s*(.*?)\s*\)\s*;", re.DOTALL)
 

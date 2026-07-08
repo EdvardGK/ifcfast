@@ -16,6 +16,8 @@
 //! | `guid_b`           | Utf8    | IFC GUID of side B                          |
 //! | `class_a`          | Utf8    | normalised class of side A (e.g. "Pipe")    |
 //! | `class_b`          | Utf8    | normalised class of side B                  |
+//! | `source_model_a`   | Utf8    | substrate `source_model` of side A (GH #50); "" on pre-v29 bundles. In a federated bundle join back to instances on `(ifc_id, source_model)` — bare `ifc_id`/`guid` can collide across constituent models |
+//! | `source_model_b`   | Utf8    | substrate `source_model` of side B          |
 //! | `kind`             | Utf8    | "hard" or "clearance"                       |
 //! | `category`         | Utf8    | "clash", "insulation", "connection", "non_physical" — see [`super::engine::categorise`] for the rules |
 //! | `min_distance_m`   | Float32 | 0.0 for hard clash, positive for clearance  |
@@ -40,6 +42,8 @@ fn build_clash_schema() -> Schema {
         Field::new("guid_b", DataType::Utf8, false),
         Field::new("class_a", DataType::Utf8, false),
         Field::new("class_b", DataType::Utf8, false),
+        Field::new("source_model_a", DataType::Utf8, false),
+        Field::new("source_model_b", DataType::Utf8, false),
         Field::new("kind", DataType::Utf8, false),
         Field::new("category", DataType::Utf8, false),
         Field::new("min_distance_m", DataType::Float32, false),
@@ -81,6 +85,8 @@ fn build_batch(schema: &SchemaRef, pairs: &[ClashPair]) -> parquet::errors::Resu
     let mut guid_b = StringBuilder::with_capacity(n, n * 22);
     let mut class_a = StringBuilder::with_capacity(n, n * 10);
     let mut class_b = StringBuilder::with_capacity(n, n * 10);
+    let mut source_model_a = StringBuilder::with_capacity(n, n * 12);
+    let mut source_model_b = StringBuilder::with_capacity(n, n * 12);
     let mut kind = StringBuilder::with_capacity(n, n * 8);
     let mut category = StringBuilder::with_capacity(n, n * 12);
     let mut distance = Float32Builder::with_capacity(n);
@@ -92,6 +98,8 @@ fn build_batch(schema: &SchemaRef, pairs: &[ClashPair]) -> parquet::errors::Resu
         guid_b.append_value(&p.guid_b);
         class_a.append_value(&p.class_a);
         class_b.append_value(&p.class_b);
+        source_model_a.append_value(&p.source_model_a);
+        source_model_b.append_value(&p.source_model_b);
         kind.append_value(p.kind.as_str());
         category.append_value(p.category.as_str());
         distance.append_value(p.min_distance_m);
@@ -104,6 +112,8 @@ fn build_batch(schema: &SchemaRef, pairs: &[ClashPair]) -> parquet::errors::Resu
         Arc::new(guid_b.finish()),
         Arc::new(class_a.finish()),
         Arc::new(class_b.finish()),
+        Arc::new(source_model_a.finish()),
+        Arc::new(source_model_b.finish()),
         Arc::new(kind.finish()),
         Arc::new(category.finish()),
         Arc::new(distance.finish()),

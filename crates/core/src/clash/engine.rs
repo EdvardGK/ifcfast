@@ -137,7 +137,10 @@ pub fn categorise(class_a: &str, class_b: &str) -> ClashCategory {
 
 /// One clash fact between two instances. Identity is by `ifc_id` and
 /// the substrate `guid` — agents join this back to `instances.parquet`
-/// for storey / type / pset enrichment.
+/// for storey / type / pset enrichment. In a FEDERATED bundle (GH #50)
+/// bare `ifc_id` / `guid` can collide across constituent models; the
+/// unique join key there is `(ifc_id, source_model)` /
+/// `(guid, source_model)`.
 #[derive(Debug, Clone)]
 pub struct ClashPair {
     pub ifc_id_a: u64,
@@ -146,6 +149,11 @@ pub struct ClashPair {
     pub guid_b: String,
     pub class_a: String,
     pub class_b: String,
+    /// `source_model` of each side (empty string on pre-v29 bundles).
+    /// `source_model_a != source_model_b` is the cross-model clash
+    /// predicate on a federated substrate.
+    pub source_model_a: String,
+    pub source_model_b: String,
     pub kind: ClashKind,
     pub category: ClashCategory,
     pub min_distance_m: f32,
@@ -166,6 +174,13 @@ pub struct ClashOptions {
     /// suppressing "wall-vs-wall" noise where the user only cares about
     /// cross-discipline clashes. Empty = no self-class filter.
     pub exclude_self_class: Vec<String>,
+    /// `source_model` values acting as pure REFERENCE geometry (GH #50):
+    /// pairs where BOTH sides' `source_model` is in this set are
+    /// dropped before narrow-phase — reference models clash against
+    /// active models, never among themselves. Enforced here rather
+    /// than at federation time so one federated bundle serves every
+    /// reference-set choice. Empty = no reference filter.
+    pub reference_only: Vec<String>,
 }
 
 impl Default for ClashOptions {
@@ -174,6 +189,7 @@ impl Default for ClashOptions {
             tolerance_m: 0.0,
             include_classes: Vec::new(),
             exclude_self_class: Vec::new(),
+            reference_only: Vec::new(),
         }
     }
 }
@@ -355,6 +371,8 @@ pub fn run(
                 guid_b: b.guid.clone(),
                 class_a: a.class.clone(),
                 class_b: b.class.clone(),
+                source_model_a: a.source_model.clone(),
+                source_model_b: b.source_model.clone(),
                 kind,
                 category: categorise(&a.class, &b.class),
                 min_distance_m: distance,
@@ -387,6 +405,12 @@ fn class_filter_ok(a: &InstanceRow, b: &InstanceRow, options: &ClashOptions) -> 
         }
     }
     if a.class == b.class && options.exclude_self_class.iter().any(|c| c == &a.class) {
+        return false;
+    }
+    if !options.reference_only.is_empty()
+        && options.reference_only.iter().any(|m| m == &a.source_model)
+        && options.reference_only.iter().any(|m| m == &b.source_model)
+    {
         return false;
     }
     true
@@ -487,6 +511,7 @@ mod tests {
             ifc_id: idx,
             guid: format!("g{idx}"),
             class: "Wall".to_string(),
+            source_model: String::new(),
             rep_id: Some(rep_id),
             transform,
             bbox_min: bbox_origin,
@@ -785,5 +810,49 @@ mod tests {
         )
         .unwrap();
         assert!(report.pairs.is_empty());
+    }
+
+    #[test]
+    fn reference_only_drops_pairs_only_when_both_sides_are_reference() {
+        let (v, i) = unit_cube_local();
+        let rep = RepresentationRow {
+            rep_id: 100,
+            source_kind: "shared_or_direct".to_string(),
+            vertices: v,
+            indices: i,
+        };
+        let mut reps = HashMap::new();
+        reps.insert(100u64, rep);
+
+        // Three overlapping instances: two from a reference model, one
+        // from an active model. ref-vs-ref is dropped; ref-vs-active
+        // pairs survive.
+        let mut r1 = make_instance(1, 100, identity(), [0.0, 0.0, 0.0]);
+        r1.source_model = "REF".to_string();
+        let mut r2 = make_instance(2, 100, translate(0.25, 0.0, 0.0), [0.25, 0.0, 0.0]);
+        r2.source_model = "REF".to_string();
+        let mut act = make_instance(3, 100, translate(0.5, 0.0, 0.0), [0.5, 0.0, 0.0]);
+        act.source_model = "ACT".to_string();
+        let instances = vec![r1, r2, act];
+
+        let unfiltered = run(&instances, &reps, &ClashOptions::default()).unwrap();
+        assert_eq!(unfiltered.pairs.len(), 3);
+
+        let report = run(
+            &instances,
+            &reps,
+            &ClashOptions {
+                reference_only: vec!["REF".to_string()],
+                ..ClashOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(report.pairs.len(), 2, "ref-vs-ref pair must be dropped");
+        for p in &report.pairs {
+            assert!(
+                p.source_model_a == "ACT" || p.source_model_b == "ACT",
+                "surviving pairs must involve the active model"
+            );
+        }
     }
 }

@@ -23,9 +23,12 @@ Additional guards:
 ``ifc_id`` (STEP entity id) is NOT remapped: it is per-source and only
 used for reporting; ``guid`` is the cross-source key. The returned sidecar
 maps guid -> source stem so callers can split intra- from cross-model
-pairs. This module stays in tests/ as the oracle's scaffolding until #50
-ships first-class federation — at which point the harness gates parity
-between the two.
+pairs. #50 has shipped first-class federation (``ifcfast.federate``);
+this module stays frozen as the differential spec —
+``tests/test_federate_parity.py`` gates table-level equality between
+the two. Only post-#50 change: instance rows are re-stamped with
+``source_model`` = bundle dir name (cache schema v29), exactly as the
+product does, so the schemas stay comparable.
 """
 
 from __future__ import annotations
@@ -64,6 +67,19 @@ def _offset_rep_id(t: pa.Table, offset: int) -> pa.Table:
     return t.set_column(idx, t.schema.field(idx), col.cast(pa.uint64()))
 
 
+def _stamp_source_model(t: pa.Table, stem: str) -> pa.Table:
+    """Re-stamp ``source_model`` = bundle dir name (cache schema v29),
+    mirroring ``ifcfast.federate``. Pre-v29 bundles lack the column —
+    append it at the end, where the v29 writer puts it."""
+    col = pa.array([stem] * t.num_rows, pa.string())
+    idx = t.schema.get_field_index("source_model")
+    if idx == -1:
+        return t.append_column(
+            pa.field("source_model", pa.string(), nullable=False), col
+        )
+    return t.set_column(idx, t.schema.field(idx), col)
+
+
 def federate_bundles(bundle_dirs: list[Path | str], out_dir: Path | str) -> dict:
     """Merge N substrate bundles into one clash-able bundle at ``out_dir``.
 
@@ -100,7 +116,7 @@ def federate_bundles(bundle_dirs: list[Path | str], out_dir: Path | str) -> dict
                 "re-bundle all sources with the same ifcfast version"
             )
         offsets[stem] = next_offset
-        inst_parts.append(_offset_rep_id(inst, next_offset))
+        inst_parts.append(_stamp_source_model(_offset_rep_id(inst, next_offset), stem))
         rep_parts.append(_offset_rep_id(rep, next_offset))
         max_rep = pc.max(rep.column("rep_id")).as_py()
         next_offset += (max_rep if max_rep is not None else 0) + 1

@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — first-class federation (GH #50)
+
+- **`ifcfast.federate(bundles, out_dir, *, on_collision, reference_only)`** —
+  materializing merge of N substrate bundles into one clash-able bundle
+  (+ `federation.json` sidecar + `view.sql`), promoted from the clash
+  oracle's hand-merge (`tests/oracle/federate.py`, which stays frozen as
+  the differential spec — `tests/test_federate_parity.py` gates bitwise
+  table parity between the two). Per-source `rep_id` offsetting, strict
+  schema and `unit_scale` agreement, guid-collision policies
+  (`warn` / `fail` / `dedup`).
+- **`ifcfast.clash([a, b, …])`** — a list of bundle dirs federates into
+  a content-keyed cache dir (`cache_root()/federated/<key>`) and runs
+  the single-substrate engine; `df.attrs` carries `federated_dir` +
+  the `federation` sidecar.
+- **`source_model` column on `instances.parquet`** (Utf8, non-null):
+  the source IFC's file stem, re-stamped with the constituent bundle
+  dir's name by `federate()`. In a federated bundle the canonical join
+  keys are `(guid, source_model)` / `(ifc_id, source_model)` — bare
+  `guid` / `ifc_id` may collide across constituent models. Cache
+  schema 28 → 29.
+- **`source_model_a` / `source_model_b` on `clashes.parquet`** (empty
+  string for pre-v29 bundles) — cross-model attribution without the
+  sidecar dance: `df[df.source_model_a != df.source_model_b]`.
+- **`reference_only` on `ifcfast.clash()`** — pairs whose BOTH sides
+  come from reference models are dropped before narrow-phase
+  (reference-vs-active still clashes). Enforced engine-side so
+  `clashes.parquet` and the DataFrame agree, and one cached federation
+  serves every reference-set choice.
+
 ## [0.4.42] - 2026-07-03
 
 ### Fixed — mesh geometry: composite-curve arc profiles (GH #123, #139)

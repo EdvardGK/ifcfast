@@ -45,6 +45,11 @@ const DEFAULT_ROW_GROUP_SIZE: usize = 1024;
 /// so the standard `mesh_ifc_streaming` pipeline drives it directly.
 pub struct ParquetSink<'a> {
     bundle: &'a Bundle,
+    /// Model identity stamped on every instance row (`source_model`
+    /// column). `bundle()` passes the source IFC's file stem; the
+    /// federation layer re-stamps rows with the constituent bundle
+    /// dir's name when merging (GH #50) — see `python/ifcfast/federate.py`.
+    source_model: String,
     rep_schema: SchemaRef,
     inst_schema: SchemaRef,
     rep_writer: ArrowWriter<File>,
@@ -73,9 +78,13 @@ impl<'a> ParquetSink<'a> {
     /// Open both Parquet files in `out_dir` for streaming write.
     /// Layout: `{out_dir}/representations.parquet` +
     /// `{out_dir}/instances.parquet`. The directory must already exist.
+    /// `source_model` is stamped on every instance row — callers pass
+    /// the source IFC's file stem (the `Bundle` itself is built from a
+    /// byte buffer and cannot derive it).
     pub fn create_in_dir<P: AsRef<Path>>(
         out_dir: P,
         bundle: &'a Bundle,
+        source_model: &str,
     ) -> parquet::errors::Result<Self> {
         let rep_path = out_dir.as_ref().join("representations.parquet");
         let inst_path = out_dir.as_ref().join("instances.parquet");
@@ -123,6 +132,7 @@ impl<'a> ParquetSink<'a> {
 
         Ok(Self {
             bundle,
+            source_model: source_model.to_string(),
             rep_schema,
             inst_schema,
             rep_writer,
@@ -192,9 +202,10 @@ impl<'a> ParquetSink<'a> {
     }
 
     fn flush_insts(&mut self) -> parquet::errors::Result<()> {
-        let batch = build_instance_batch(&self.inst_schema, &self.pending_insts).map_err(|e| {
-            parquet::errors::ParquetError::General(format!("build instance batch: {e}"))
-        })?;
+        let batch = build_instance_batch(&self.inst_schema, &self.pending_insts, &self.source_model)
+            .map_err(|e| {
+                parquet::errors::ParquetError::General(format!("build instance batch: {e}"))
+            })?;
         self.inst_writer.write(&batch)?;
         self.pending_insts.clear();
         Ok(())
@@ -465,6 +476,12 @@ fn build_instance_schema() -> Schema {
             ))),
             false,
         ),
+        // Model identity (GH #50, cache schema v29). Constant per
+        // bundle (the source IFC's file stem); federation re-stamps it
+        // per constituent bundle so `(guid, source_model)` — and
+        // `(ifc_id, source_model)` — stay unique join keys in a merged
+        // substrate where bare `guid` / `ifc_id` may collide.
+        Field::new("source_model", DataType::Utf8, false),
     ])
 }
 
@@ -537,6 +554,7 @@ fn build_rep_batch(
 fn build_instance_batch(
     schema: &SchemaRef,
     records: &[InstanceRecord],
+    source_model_value: &str,
 ) -> arrow::error::Result<RecordBatch> {
     let n = records.len();
 
@@ -598,6 +616,8 @@ fn build_instance_batch(
     let mut volume_prism_bound_m3 = Float32Builder::with_capacity(n);
     let mut volume_reliable = BooleanBuilder::with_capacity(n);
     let mut volume_method = StringBuilder::with_capacity(n, n * 8);
+    let mut source_model =
+        StringBuilder::with_capacity(n, n * source_model_value.len().max(1));
 
     for r in records {
         ifc_id.append_value(r.ifc_id);
@@ -747,6 +767,7 @@ fn build_instance_batch(
         volume_prism_bound_m3.append_value(r.volume_prism_bound_m3);
         volume_reliable.append_value(r.volume_reliable);
         volume_method.append_value(r.volume_method);
+        source_model.append_value(source_model_value);
 
         // Per-surface list — one row per distinct planar face.
         {
@@ -804,6 +825,7 @@ fn build_instance_batch(
         Arc::new(volume_reliable.finish()),
         Arc::new(volume_method.finish()),
         Arc::new(surfaces.finish()),
+        Arc::new(source_model.finish()),
     ];
 
     RecordBatch::try_new(schema.clone(), arrays)

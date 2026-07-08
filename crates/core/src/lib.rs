@@ -2648,7 +2648,15 @@ mod python {
         let bundle_ms = t_bundle.elapsed().as_secs_f64() * 1000.0;
         let sem = bundle.semantic_stats();
 
-        let mut sink = ParquetSink::create_in_dir(&out_dir_path, &bundle).map_err(|e| {
+        // `source_model` = the source IFC's file stem — the model
+        // identity carried on every instance row (GH #50). Federation
+        // re-stamps it per constituent bundle dir when merging.
+        let source_model = in_path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let mut sink = ParquetSink::create_in_dir(&out_dir_path, &bundle, &source_model)
+            .map_err(|e| {
             pyo3::exceptions::PyIOError::new_err(format!(
                 "create sink in {}: {e}",
                 out_dir_path.display()
@@ -2715,6 +2723,7 @@ mod python {
         write_parquet = true,
         include_classes = Vec::<String>::new(),
         exclude_self_class = Vec::<String>::new(),
+        reference_only = Vec::<String>::new(),
     ))]
     fn clash<'py>(
         py: Python<'py>,
@@ -2723,6 +2732,7 @@ mod python {
         write_parquet: bool,
         include_classes: Vec<String>,
         exclude_self_class: Vec<String>,
+        reference_only: Vec<String>,
     ) -> PyResult<Bound<'py, PyDict>> {
         catch_panic(|| {
         use crate::clash::{
@@ -2733,6 +2743,7 @@ mod python {
             tolerance_m,
             include_classes,
             exclude_self_class,
+            reference_only,
         };
 
         let t = Instant::now();
@@ -2761,6 +2772,8 @@ mod python {
         let mut guid_b: Vec<String> = Vec::with_capacity(n);
         let mut class_a: Vec<String> = Vec::with_capacity(n);
         let mut class_b: Vec<String> = Vec::with_capacity(n);
+        let mut source_model_a: Vec<String> = Vec::with_capacity(n);
+        let mut source_model_b: Vec<String> = Vec::with_capacity(n);
         let mut kind: Vec<&'static str> = Vec::with_capacity(n);
         let mut category: Vec<&'static str> = Vec::with_capacity(n);
         let mut min_distance_m: Vec<f32> = Vec::with_capacity(n);
@@ -2771,6 +2784,8 @@ mod python {
             guid_b.push(p.guid_b.clone());
             class_a.push(p.class_a.clone());
             class_b.push(p.class_b.clone());
+            source_model_a.push(p.source_model_a.clone());
+            source_model_b.push(p.source_model_b.clone());
             kind.push(match p.kind {
                 ClashKind::Hard => "hard",
                 ClashKind::Clearance => "clearance",
@@ -2786,6 +2801,8 @@ mod python {
         out.set_item("guid_b", PyList::new(py, &guid_b)?)?;
         out.set_item("class_a", PyList::new(py, &class_a)?)?;
         out.set_item("class_b", PyList::new(py, &class_b)?)?;
+        out.set_item("source_model_a", PyList::new(py, &source_model_a)?)?;
+        out.set_item("source_model_b", PyList::new(py, &source_model_b)?)?;
         out.set_item("kind", PyList::new(py, &kind)?)?;
         out.set_item("category", PyList::new(py, &category)?)?;
         out.set_item("min_distance_m", PyList::new(py, &min_distance_m)?)?;
