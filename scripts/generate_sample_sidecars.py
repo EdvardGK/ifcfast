@@ -534,6 +534,7 @@ def main():
     else:
         model.to_gltf(str(glb_path))
     print(f"wrote {glb_path}  ({glb_path.stat().st_size / 1024:.1f} KB)")
+    _split_materials_per_product(glb_path)
 
     # ---- type gallery: one representative instance per type_name,
     # carved with subset() and exported as a mini-glb + manifest.
