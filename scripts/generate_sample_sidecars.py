@@ -37,6 +37,7 @@ import argparse
 import json
 import math
 import sys
+import tempfile
 from pathlib import Path
 
 # Ensure we use the in-tree ifcfast (not whatever's pip-installed)
@@ -526,7 +527,6 @@ def main():
     df = model.products_df
     keep = df.loc[df.entity != "IfcSpace", "guid"].tolist()
     if len(keep) < len(df):
-        import tempfile
         with tempfile.TemporaryDirectory() as td:
             nospace = Path(td) / "nospaces.ifc"
             model.subset(keep, out_path=str(nospace))
@@ -534,6 +534,43 @@ def main():
     else:
         model.to_gltf(str(glb_path))
     print(f"wrote {glb_path}  ({glb_path.stat().st_size / 1024:.1f} KB)")
+
+    # ---- type gallery: one representative instance per type_name,
+    # carved with subset() and exported as a mini-glb + manifest.
+    # Feeds the site's specimen-wall gallery.
+    import re as _re
+
+    def _slug(text: str) -> str:
+        out = _re.sub(r"[^a-zA-Z0-9]+", "-", text.lower()).strip("-")
+        return out[:48] or "type"
+
+    gallery_dir = args.out / "types"
+    gallery_dir.mkdir(exist_ok=True)
+    tdf = df[df.type_name.notna() & (df.entity != "IfcSpace")]
+    entries, seen = [], set()
+    groups = sorted(tdf.groupby("type_name"), key=lambda kv: (-len(kv[1]), kv[0]))
+    for type_name, grp in groups:
+        slug = _slug(f"{grp.entity.iloc[0][3:]}-{type_name}")
+        while slug in seen:
+            slug += "-x"
+        seen.add(slug)
+        mini = gallery_dir / f"{slug}.glb"
+        with tempfile.TemporaryDirectory() as td:
+            one = Path(td) / "one.ifc"
+            model.subset([grp.guid.iloc[0]], out_path=str(one))
+            ifcfast.open(str(one)).to_gltf(str(mini))
+        entries.append({
+            "slug": slug, "type_name": type_name,
+            "entity": grp.entity.iloc[0], "count": int(len(grp)),
+            "guid": grp.guid.iloc[0],
+            "glb": f"/sample/types/{slug}.glb",
+            "bytes": mini.stat().st_size,
+        })
+    (gallery_dir / "manifest.json").write_text(json.dumps({
+        "source": args.ifc.name, "generated_with": ifcfast.__version__,
+        "types": entries,
+    }, indent=1))
+    print(f"type gallery: {len(entries)} types -> {gallery_dir}")
     print(f"Done — outputs in {args.out}")
 
 
