@@ -161,8 +161,11 @@ def _qto_aggregates(per_product):
             row["products_without_mesh"] += 1
             continue
         row["products_with_mesh"] += 1
-        sa = ms.get("surface_area")
-        vol = ms.get("volume_abs")
+        # drift measure columns are unit-suffixed (surface_area_m2 /
+        # volume_abs_m3 / max_extent_m); the pre-rename names .get() to
+        # None and silently zero every aggregate.
+        sa = ms.get("surface_area_m2")
+        vol = ms.get("volume_abs_m3")
         if isinstance(sa, (int, float)) and math.isfinite(sa):
             row["area_m2"] += sa
         if isinstance(vol, (int, float)) and math.isfinite(vol):
@@ -265,9 +268,9 @@ def _build_graph(model, spaces, containers, mesh_stats_by_guid, pset_attrs_by_gu
         attrs = pset_attrs_by_guid.get(guid) or {}
         # Direct mesh stats — null when ifcfast-mesh produced no
         # geometry for this product itself.
-        m3_direct = ms.get("volume_abs") if ms else None
-        m2_direct = ms.get("surface_area") if ms else None
-        lm_direct = ms.get("max_extent") if ms else None
+        m3_direct = ms.get("volume_abs_m3") if ms else None
+        m2_direct = ms.get("surface_area_m2") if ms else None
+        lm_direct = ms.get("max_extent_m") if ms else None
         # Effective m3/m2/lm shown in the UI: direct when present,
         # rollup (from aggregated descendants) otherwise. `m_source`
         # tells the consumer which one this row is using so
@@ -316,9 +319,13 @@ def _build_graph(model, spaces, containers, mesh_stats_by_guid, pset_attrs_by_gu
         for s in model.storeys
     ]
 
+    # contained_in is keyed container_guid/container_kind (spaces can
+    # be containers too). The sidecar keeps the legacy storey_guid key
+    # and storey containers only, rather than silently mis-keying.
     contained_in = [
-        {"product_guid": r["product_guid"], "storey_guid": r["storey_guid"]}
+        {"product_guid": r["product_guid"], "storey_guid": r["container_guid"]}
         for r in _df_to_records(model.contained_in)
+        if r.get("container_kind", "storey") == "storey"
     ]
     aggregates = [
         {"child_guid": r["child_guid"], "parent_guid": r["parent_guid"],
@@ -470,7 +477,7 @@ def main():
         for d in descs:
             ms = mesh_stats_by_guid.get(d)
             if not ms: continue
-            v = ms.get("volume_abs"); a = ms.get("surface_area"); l = ms.get("max_extent")
+            v = ms.get("volume_abs_m3"); a = ms.get("surface_area_m2"); l = ms.get("max_extent_m")
             if isinstance(v, (int, float)) and v == v: m3 += v; m3c += 1
             if isinstance(a, (int, float)) and a == a: m2 += a; m2c += 1
             if isinstance(l, (int, float)) and l == l: lm += l; lmc += 1
@@ -510,6 +517,23 @@ def main():
     )
 
     print(f"\nLegacy sidecars regenerated alongside bundle.")
+
+    # ---- viewer glb. Spaces are excluded: translucent IfcSpace
+    # volumes envelop the building and read as clutter in the demo
+    # viewer; the subset -> to_gltf hop keeps the exclusion in valid
+    # IFC land instead of post-processing the glb.
+    glb_path = args.out / f"{args.prefix}.glb"
+    df = model.products_df
+    keep = df.loc[df.entity != "IfcSpace", "guid"].tolist()
+    if len(keep) < len(df):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            nospace = Path(td) / "nospaces.ifc"
+            model.subset(keep, out_path=str(nospace))
+            ifcfast.open(str(nospace)).to_gltf(str(glb_path))
+    else:
+        model.to_gltf(str(glb_path))
+    print(f"wrote {glb_path}  ({glb_path.stat().st_size / 1024:.1f} KB)")
     print(f"Done — outputs in {args.out}")
 
 
