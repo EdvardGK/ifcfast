@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed — federation accepts mixed units (GH #169)
+
+`ifcfast.federate()` no longer refuses constituents authored in
+different length units — the normal case on real projects, where
+disciplines come from different tools and template years (the
+buildingSMART Medical-Dental Clinic sample is Architectural /
+Structural / Electrical in metres, HVAC / Plumbing in millimetres).
+It used to raise `ValueError: unit_scale differs across bundles`,
+which made cross-discipline `ifcfast.clash([...])` impossible on such
+a set.
+
+- Target unit = the **finest** constituent (smallest
+  `ifcfast.unit_scale`); coarser sources are multiplied by
+  `unit_scale_src / unit_scale_target` (metres → mm is ×1000). Scaling
+  up preserves f32 relative precision; scaling down to metres would
+  quantise far-from-origin site coordinates at centimetre level.
+- Rescaled columns: `representations.vertices_le`,
+  `local_bbox_min_xyz`, `local_bbox_max_xyz`; `instances.bbox_min_xyz`,
+  `bbox_max_xyz`, `centroid_xyz`, `placement_xyz`, and `transform`'s
+  translation slots (12/13/14) only. QTO columns (m² / m³),
+  `materials[].thickness_mm`, `indices_le`, `segments` and
+  `quantities[].value` are unit-independent or raw and stay untouched.
+  Arrow dtypes and fixed-size-list shapes are preserved exactly.
+- The merged parquets are stamped with the target `ifcfast.unit_scale`,
+  so the clash engine converts to metres with no caller action.
+  `federation.json` gains `unit_scales` (`{stem: raw}`) and
+  `unit_factors` (`{stem: float}`); `unit_scale` is now the target.
+- Fails loudly still: a missing / non-numeric / non-positive
+  `unit_scale`, or a bundle whose own two parquets disagree.
+- A single-unit federation is **byte-identical** to the previous
+  output — the rescale pass is not entered. The federated cache key
+  gains a `_FEDERATION_VERSION` salt so a pre-#169 cached merge is
+  never served.
+- Measured on the Clinic sample (5 disciplines, 3 m + 2 mm): federate
+  0.95 s, clash 1.77 s, 61 485 pairs of which 36 425 cross-model.
+
 ### 2026-09-06 review sweep (GH #147–#165)
 
 A full-codebase review filed nineteen issues and this sweep closes

@@ -75,7 +75,7 @@ def two_box_bundles(tmp_path: Path) -> tuple[Path, Path]:
 def disjoint_bundles(tmp_path: Path) -> tuple[Path, Path]:
     """Two different fixtures — disjoint guids, the clean-merge path.
     Both metre-scale (hotswap_roundtrip.ifc is mm-authored and feeds
-    the mixed-unit failure test instead)."""
+    the GH #169 mixed-unit rescale test instead)."""
     a = _bundle_fixture("geom_box.ifc", tmp_path / "box.bundle")
     b = _bundle_fixture("hotswap_body.ifc", tmp_path / "body.bundle")
     return a, b
@@ -302,11 +302,21 @@ def test_federate_rejects_unknown_reference_only(disjoint_bundles, tmp_path):
         ifcfast.federate([a, b], tmp_path / "fed", reference_only=("nope",))
 
 
-def test_federate_rejects_mixed_unit_scale(disjoint_bundles, tmp_path):
+def test_federate_rescales_mixed_unit_scale(disjoint_bundles, tmp_path):
+    """GH #169: mixed units are converted, not refused. The oracle spec
+    predates the rule and still raises, so this case is deliberately
+    OUTSIDE the parity gate — the full contract lives in
+    ``tests/test_federate_mixed_units.py``."""
     a, _ = disjoint_bundles  # metre-scale
     mm = _bundle_fixture("hotswap_roundtrip.ifc", tmp_path / "mm.bundle")
-    with pytest.raises(ValueError, match="unit_scale"):
-        ifcfast.federate([a, mm], tmp_path / "fed")
+    fed = tmp_path / "fed"
+    sidecar = ifcfast.federate([a, mm], fed)
+    assert sidecar["unit_scale"] == "0.001", "target is the FINEST unit"
+    assert sidecar["unit_factors"] == {a.name: 1000.0, "mm.bundle": 1.0}
+    assert (
+        pq.read_schema(fed / "instances.parquet").metadata[b"ifcfast.unit_scale"]
+        == b"0.001"
+    )
 
 
 def test_federate_rejects_non_bundle_dir(disjoint_bundles, tmp_path):

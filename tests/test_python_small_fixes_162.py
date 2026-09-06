@@ -104,7 +104,10 @@ def test_unit_scale_compared_numerically(two_bundles, tmp_path):
     assert float(sidecar["unit_scale"]) == 1.0
 
 
-def test_unit_scale_still_rejects_genuinely_mixed_units(two_bundles, tmp_path):
+def test_genuinely_mixed_units_are_rescaled_not_rejected(two_bundles, tmp_path):
+    """GH #169 supersedes the #162 rejection: a real unit difference is
+    converted to the finest constituent's unit. Full contract in
+    ``tests/test_federate_mixed_units.py``."""
     a, b = two_bundles
     for table in ("instances", "representations"):
         f = b / f"{table}.parquet"
@@ -113,8 +116,9 @@ def test_unit_scale_still_rejects_genuinely_mixed_units(two_bundles, tmp_path):
         meta[b"ifcfast.unit_scale"] = b"0.001"
         pq.write_table(t.replace_schema_metadata(meta), f)
 
-    with pytest.raises(ValueError, match="unit_scale differs"):
-        ifcfast.federate([a, b], tmp_path / "fed")
+    sidecar = ifcfast.federate([a, b], tmp_path / "fed")
+    assert sidecar["unit_scale"] == "0.001"
+    assert sidecar["unit_factors"] == {a.name: 1000.0, b.name: 1.0}
 
 
 # ----------------------------------------------------------------------

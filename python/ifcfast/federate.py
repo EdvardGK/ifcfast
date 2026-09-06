@@ -7,7 +7,7 @@ oracle reference ``tests/oracle/federate.py``, which stays frozen in
 ``tests/`` as the differential spec (``tests/test_federate_parity.py``
 gates table-level equality between the two).
 
-The merge is pure columnar surgery, and two edges are load-bearing:
+The merge is pure columnar surgery, and three edges are load-bearing:
 
 1. ``rep_id`` is numbered per bundle — every source after the first has
    its rep_ids offset by the running maximum, in BOTH ``instances`` and
@@ -16,6 +16,11 @@ The merge is pure columnar surgery, and two edges are load-bearing:
    merged with pyarrow preserving the EXACT source schema (a pandas
    round-trip silently widens ``string`` to ``large_string`` and gets
    rejected).
+3. Constituents may be authored in DIFFERENT length units (GH #169) —
+   the normal case across disciplines. The merge converts every
+   source-unit length into the FINEST constituent's unit rather than
+   refusing; see :func:`federate` and :data:`_LENGTH_FSL_COLUMNS` for
+   exactly which columns move and which are unit-independent.
 
 Identity in a federated bundle: ``ifc_id`` (STEP entity id) and even
 ``guid`` may collide across sources (the same element exported into two
@@ -39,6 +44,7 @@ from os import PathLike
 from pathlib import Path
 from typing import Iterable, Literal
 
+import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
@@ -46,6 +52,42 @@ import pyarrow.parquet as pq
 _TABLES = ("instances", "representations")
 
 _SOURCE_MODEL_FIELD = pa.field("source_model", pa.string(), nullable=False)
+
+#: Bumped when the merge ALGORITHM changes in a way that would make a
+#: cached federated substrate wrong even though the constituent bytes
+#: are unchanged. v2 = GH #169 mixed-unit rescale (a federation of the
+#: same bundles now produces a rescaled, single-unit substrate where it
+#: previously raised — and, for a cache written by a pre-#169 build, a
+#: same-unit merge is unaffected but the key must still move so the two
+#: code paths never share a directory).
+_FEDERATION_VERSION = 2
+
+#: Every substrate column that is a LENGTH in source units, per table.
+#: Enumerated from ``build_representation_schema`` /
+#: ``build_instance_schema`` in ``crates/core/src/bundle/parquet_sink.rs``.
+#:
+#: NOT scaled, deliberately:
+#:   * QTO columns (``volume_m3``, ``*_m2``, ``surfaces[].area_m2``,
+#:     ``aabb_volume_m3``, ``volume_mesh_m3``, ``volume_prism_bound_m3``)
+#:     — already m² / m³, unit-independent by construction.
+#:   * ``materials[].thickness_mm`` — the extractor normalises it to
+#:     millimetres at parse time (``t * unit_scale * 1000.0``).
+#:   * ``representations.indices_le``, ``segments`` (source /
+#:     index_start / triangle_count) — topology, no lengths.
+#:   * ``quantities[].value`` — raw authored strings, kept verbatim in
+#:     the authoring model's own units (they carry ``unit_step_id``).
+_LENGTH_FSL_COLUMNS = {
+    "instances": (
+        "bbox_min_xyz",
+        "bbox_max_xyz",
+        "centroid_xyz",
+        "placement_xyz",
+    ),
+    "representations": ("local_bbox_min_xyz", "local_bbox_max_xyz"),
+}
+
+#: 4x4 column-major transform: only the translation column scales.
+_TRANSFORM_TRANSLATION_SLOTS = (12, 13, 14)
 
 
 def _read(bundle_dir: Path, table: str) -> pa.Table:
@@ -57,16 +99,21 @@ def _read(bundle_dir: Path, table: str) -> pa.Table:
     return pq.read_table(f)
 
 
-def _unit_scale(t: pa.Table) -> tuple[float, str]:
+def _unit_scale(t: pa.Table | pa.Schema) -> tuple[float, str]:
     """``(value, raw)`` for the bundle's ``ifcfast.unit_scale`` metadata.
 
     The raw string is what the sidecar records; the float is what the
-    mixed-unit check compares. Comparing the STRINGS (pre-GH #162)
+    rescale factor is computed from. Comparing the STRINGS (pre-GH #162)
     rejected ``"0.001"`` against ``"1e-3"`` — the same millimetre
     substrate, written by two ifcfast versions with different float
     formatting — as "mixed units".
+
+    Accepts a table or a bare schema so the pre-pass that picks the
+    federation's target unit can read metadata without materialising
+    the parquet.
     """
-    meta = t.schema.metadata or {}
+    schema = t if isinstance(t, pa.Schema) else t.schema
+    meta = schema.metadata or {}
     scale = meta.get(b"ifcfast.unit_scale")
     if scale is None:
         raise ValueError("bundle parquet missing ifcfast.unit_scale metadata")
@@ -79,6 +126,137 @@ def _unit_scale(t: pa.Table) -> tuple[float, str]:
             f"metadata value {raw!r}"
         ) from None
     return value, raw
+
+
+def _scaled_f32(values: np.ndarray, factor: float) -> np.ndarray:
+    """Multiply f32 data by ``factor`` with f64 intermediate rounding.
+
+    ``vertices * np.float32(1000.0)`` rounds twice (once into the f32
+    product, once nowhere); promoting to f64 for the multiply and
+    rounding ONCE back to f32 gives the correctly-rounded f32 result —
+    the same number a re-bundle of the file in the target unit would
+    produce, modulo the source's own quantisation.
+    """
+    return (values.astype(np.float64) * factor).astype(np.float32)
+
+
+def _rescale_fsl_chunk(chunk: pa.Array, factor: float, slots) -> pa.Array:
+    """Scale a ``FixedSizeList<float32>[k]`` chunk.
+
+    ``slots`` is ``None`` to scale every component (xyz columns) or a
+    tuple of component indices (the transform's translation column).
+    The output is cast back to the input type so the item field's name
+    and nullability — which the strict Rust substrate reader checks —
+    survive untouched.
+    """
+    size = chunk.type.list_size
+    flat = chunk.flatten().to_numpy(zero_copy_only=False)
+    if slots is None:
+        flat = _scaled_f32(flat, factor)
+    else:
+        flat = flat.copy().reshape(-1, size)
+        flat[:, list(slots)] = _scaled_f32(flat[:, list(slots)], factor)
+        flat = flat.reshape(-1)
+    out = pa.FixedSizeListArray.from_arrays(
+        pa.array(flat, pa.float32()), size
+    )
+    return out.cast(chunk.type)
+
+
+def _rescale_binary_f32_chunk(chunk: pa.Array, factor: float) -> pa.Array:
+    """Scale a ``Binary`` chunk whose values are packed LE f32 blobs.
+
+    ``vertices_le`` is xyz triples; every float in the blob is a length,
+    so the whole concatenated data buffer can be scaled in one numpy
+    pass and the offsets reused verbatim (byte lengths do not change).
+    """
+    if chunk.null_count or chunk.offset:
+        # Defensive: bundle() never writes nulls into vertices_le and
+        # parquet chunks arrive unsliced, but a rescale that silently
+        # dropped a null would be a geometry bug.
+        out = []
+        for blob in chunk.to_pylist():
+            if blob is None:
+                out.append(None)
+            else:
+                v = np.frombuffer(blob, dtype="<f4")
+                out.append(_scaled_f32(v, factor).astype("<f4").tobytes())
+        return pa.array(out, type=chunk.type)
+
+    _, offsets_buf, data_buf = chunk.buffers()
+    n = len(chunk)
+    offsets = np.frombuffer(offsets_buf, dtype=np.int32, count=n + 1)
+    start, end = int(offsets[0]), int(offsets[n])
+    raw = np.frombuffer(data_buf, dtype=np.uint8)[start:end].copy()
+    if raw.nbytes % 4:
+        raise ValueError(
+            "vertices_le blob is not a whole number of float32 values; "
+            "refusing to rescale a malformed substrate"
+        )
+    scaled = _scaled_f32(raw.view("<f4"), factor).astype("<f4")
+    new_offsets = (offsets - start).astype(np.int32)
+    return pa.Array.from_buffers(
+        chunk.type,
+        n,
+        [None, pa.py_buffer(new_offsets.tobytes()), pa.py_buffer(scaled.tobytes())],
+        null_count=0,
+    )
+
+
+def _rescale_column(col: pa.ChunkedArray, fn) -> pa.ChunkedArray:
+    if col.num_chunks == 0:
+        return col
+    return pa.chunked_array([fn(c) for c in col.chunks], col.type)
+
+
+def _rescale_table(t: pa.Table, table: str, factor: float) -> pa.Table:
+    """Convert every source-unit length in ``t`` by ``factor``.
+
+    Dtypes and field metadata are preserved exactly: f32 stays f32,
+    fixed-size-list shapes are unchanged, and only the columns
+    enumerated in :data:`_LENGTH_FSL_COLUMNS` (plus ``transform``'s
+    translation and ``vertices_le``) are touched.
+    """
+    for name in _LENGTH_FSL_COLUMNS[table]:
+        idx = t.schema.get_field_index(name)
+        if idx == -1:
+            raise ValueError(
+                f"{table}.parquet is missing the length column {name!r} — "
+                "re-bundle this source with the current ifcfast version"
+            )
+        t = t.set_column(
+            idx,
+            t.schema.field(idx),
+            _rescale_column(
+                t.column(idx), lambda c: _rescale_fsl_chunk(c, factor, None)
+            ),
+        )
+    if table == "instances":
+        idx = t.schema.get_field_index("transform")
+        t = t.set_column(
+            idx,
+            t.schema.field(idx),
+            _rescale_column(
+                t.column(idx),
+                lambda c: _rescale_fsl_chunk(c, factor, _TRANSFORM_TRANSLATION_SLOTS),
+            ),
+        )
+    else:
+        idx = t.schema.get_field_index("vertices_le")
+        t = t.set_column(
+            idx,
+            t.schema.field(idx),
+            _rescale_column(
+                t.column(idx), lambda c: _rescale_binary_f32_chunk(c, factor)
+            ),
+        )
+    return t
+
+
+def _stamp_unit_scale(t: pa.Table, raw: str) -> pa.Table:
+    meta = dict(t.schema.metadata or {})
+    meta[b"ifcfast.unit_scale"] = raw.encode()
+    return t.replace_schema_metadata(meta)
 
 
 def _offset_rep_id(t: pa.Table, offset: int) -> pa.Table:
@@ -144,19 +322,30 @@ def federate(
 
     Returns:
         The sidecar dict (also written to ``out_dir/federation.json``):
-        ``{"sources": [...], "unit_scale": str, "rep_id_offsets":
+        ``{"sources": [...], "unit_scale": str, "unit_scales":
+        {stem: str}, "unit_factors": {stem: float}, "rep_id_offsets":
         {stem: int}, "n_instances": int, "n_representations": int,
         "guid_collisions": [...], "guid_source": {guid: stem},
         "on_collision": str, "reference_only": [...],
         "source_stats": {stem: {table: [size_bytes, mtime_ns]}}}``.
 
+    Mixed units (GH #169): constituents may be authored in different
+    length units. The federated substrate adopts the FINEST unit
+    (smallest ``ifcfast.unit_scale``) and coarser sources are converted
+    into it — every source-unit length column is multiplied by
+    ``unit_scale_source / unit_scale_target`` (metres → millimetres is
+    ×1000), QTO columns (m² / m³) are left alone. When every source
+    already agrees, no rescale pass runs and the merge is bitwise
+    identical to a single-unit federation.
+
     Raises:
         ValueError: ``out_dir`` is one of the input bundles,
             fewer than two bundles, duplicate bundle dir names,
             mismatched schemas (re-bundle all sources with the same
-            ifcfast version), mixed ``unit_scale`` across sources,
-            unknown ``on_collision`` / ``reference_only`` values, or
-            guid collisions under ``on_collision="fail"``.
+            ifcfast version), an unresolvable / non-positive
+            ``unit_scale`` on any source, unknown ``on_collision`` /
+            ``reference_only`` values, or guid collisions under
+            ``on_collision="fail"``.
         FileNotFoundError: a source dir is missing its parquet files.
     """
     bundle_dirs = [Path(d) for d in bundles]
@@ -203,24 +392,56 @@ def federate(
             )
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    # GH #169: mixed-unit federation. Real projects mix authoring units
+    # across disciplines (the buildingSMART Clinic sample is ARK/STR/EL
+    # in metres, HVAC/PL in millimetres), so refusing was the wrong
+    # policy — every length column is in source units and the substrate
+    # records the unit, so the merge can convert. Target = the FINEST
+    # constituent (smallest metres-per-unit); coarser sources scale UP.
+    # Scaling up keeps f32 RELATIVE precision, where scaling everything
+    # down to metres would quantise far-from-origin site coordinates at
+    # centimetre level.
+    unit_value: dict[str, float] = {}
+    unit_raw: dict[str, str] = {}
+    for d in bundle_dirs:
+        seen: dict[float, str] = {}
+        for table in _TABLES:
+            f = d / f"{table}.parquet"
+            if not f.is_file():
+                raise FileNotFoundError(
+                    f"{d} is not a substrate bundle: missing {f.name}"
+                )
+            value, raw = _unit_scale(pq.read_schema(f))
+            seen.setdefault(value, raw)
+        if len(seen) != 1:
+            raise ValueError(
+                f"{d}: instances.parquet and representations.parquet "
+                f"disagree on ifcfast.unit_scale ({sorted(seen.values())}) — "
+                "corrupt bundle, re-bundle the source IFC"
+            )
+        unit_value[d.name], unit_raw[d.name] = next(iter(seen.items()))
+    target = min(unit_value.values())
+    if not target > 0:
+        raise ValueError(
+            f"ifcfast.unit_scale must be a positive metres-per-unit factor; "
+            f"got {sorted(set(unit_raw.values()))}"
+        )
+    target_raw = next(unit_raw[s] for s in stems if unit_value[s] == target)
+    factors = {s: unit_value[s] / target for s in stems}
+    rescaled = {s: f for s, f in factors.items() if f != 1.0}
+
     inst_parts: list[pa.Table] = []
     rep_parts: list[pa.Table] = []
     guid_source: dict[str, str] = {}
     collisions: list[str] = []
     offsets: dict[str, int] = {}
     next_offset = 0
-    scales: set[float] = set()
-    scale_raw: list[str] = []
     schemas0: dict[str, pa.Schema] = {}
 
     for d in bundle_dirs:
         stem = d.name
         inst = _read(d, "instances")
         rep = _read(d, "representations")
-        for t in (inst, rep):
-            value, raw = _unit_scale(t)
-            scales.add(value)
-            scale_raw.append(raw)
         # GH #162: BOTH tables are schema-checked. Checking only
         # `instances` let a representations mismatch through to
         # `pa.concat_tables`, which reports it as an opaque
@@ -233,6 +454,15 @@ def federate(
                     f"{d}: {name} schema differs from {bundle_dirs[0]} — "
                     "re-bundle all sources with the same ifcfast version"
                 )
+
+        # GH #169: convert this source's lengths into the target unit.
+        # Untouched (identity table objects) when the source is already
+        # the finest unit — the all-same-unit federation must stay
+        # bitwise identical to the pre-#169 merge.
+        factor = factors[stem]
+        if factor != 1.0:
+            inst = _rescale_table(inst, "instances", factor)
+            rep = _rescale_table(rep, "representations", factor)
 
         keep_mask: list[bool] = []
         for g in inst.column("guid").to_pylist():
@@ -251,11 +481,6 @@ def federate(
         max_rep = pc.max(rep.column("rep_id")).as_py()
         next_offset += (max_rep if max_rep is not None else 0) + 1
 
-    if len(scales) != 1:
-        raise ValueError(
-            f"unit_scale differs across bundles ({sorted(set(scale_raw))}); "
-            "cannot federate mixed-unit substrates"
-        )
     if collisions:
         if on_collision == "fail":
             sample = sorted(set(collisions))[:5]
@@ -275,6 +500,13 @@ def federate(
 
     merged_inst = pa.concat_tables(inst_parts)
     merged_rep = pa.concat_tables(rep_parts)
+    if rescaled:
+        # `concat_tables` inherits the FIRST constituent's schema
+        # metadata, which after a rescale may name the wrong unit.
+        # Only stamped when a rescale actually happened, so the
+        # all-same-unit merge keeps its bytes byte-for-byte.
+        merged_inst = _stamp_unit_scale(merged_inst, target_raw)
+        merged_rep = _stamp_unit_scale(merged_rep, target_raw)
     pq.write_table(merged_inst, out_dir / "instances.parquet")
     pq.write_table(merged_rep, out_dir / "representations.parquet")
 
@@ -289,10 +521,14 @@ def federate(
 
     sidecar = {
         "sources": [str(d) for d in bundle_dirs],
-        # Raw metadata string of the first constituent — all sources
-        # agree numerically (checked above), and the string is what
-        # downstream consumers compare against a bundle's own metadata.
-        "unit_scale": scale_raw[0],
+        # GH #169: the FEDERATED unit — the finest constituent's raw
+        # metadata string, which is what the merged parquets are
+        # stamped with and what downstream consumers compare against.
+        # `unit_scales` / `unit_factors` record what each source was
+        # authored in and the factor applied to it (1.0 = untouched).
+        "unit_scale": target_raw,
+        "unit_scales": {s: unit_raw[s] for s in stems},
+        "unit_factors": {s: factors[s] for s in stems},
         "rep_id_offsets": offsets,
         "n_instances": merged_inst.num_rows,
         "n_representations": merged_rep.num_rows,
@@ -395,6 +631,10 @@ def federation_cache_dir(
 
     h = hashlib.sha256()
     h.update(_CACHE_SCHEMA_VERSION.to_bytes(4, "little"))
+    # GH #169: the merge algorithm itself is part of the key — the same
+    # constituent bytes federate differently before/after mixed-unit
+    # rescaling, and the target unit is derived from those bytes.
+    h.update(_FEDERATION_VERSION.to_bytes(4, "little"))
     # warn/fail produce identical tables; only dedup changes content.
     h.update((b"dedup" if on_collision == "dedup" else b"keep"))
     for d in bundle_dirs:

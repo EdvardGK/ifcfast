@@ -441,10 +441,34 @@ What it does, precisely:
   its rep_ids offset (in BOTH tables) so geometry never cross-links.
 - Arrow schemas must match exactly across sources — BOTH
   `instances` and `representations` are checked (mixed ifcfast
-  versions → `ValueError`: re-bundle). `ifcfast.unit_scale` must agree
-  (mixed-unit merges would silently misplace geometry → `ValueError`);
-  it is compared **numerically**, so `"0.001"` and `"1e-3"` are the
-  same substrate, not a mixed-unit error.
+  versions → `ValueError`: re-bundle).
+- **Mixed units are rescaled, not refused (GH #169).** Disciplines
+  routinely disagree on the authoring unit (different tools, different
+  template years). The federated substrate adopts the **finest**
+  constituent unit — the smallest `ifcfast.unit_scale` — and every
+  coarser source is multiplied by `unit_scale_src / unit_scale_target`
+  (metres → millimetres is ×1000). Scaling UP preserves f32 relative
+  precision; scaling everything down to metres would quantise
+  far-from-origin site coordinates at centimetre level.
+  - Rescaled: `representations.vertices_le`,
+    `representations.local_bbox_min_xyz` / `local_bbox_max_xyz`;
+    `instances.bbox_min_xyz` / `bbox_max_xyz` / `centroid_xyz` /
+    `placement_xyz`, and `instances.transform`'s **translation only**
+    (column-major slots 12/13/14).
+  - NOT rescaled: all QTO columns (`volume_m3`, `*_m2`,
+    `surfaces[].area_m2`, …) — already m² / m³;
+    `materials[].thickness_mm` — normalised to mm at parse time;
+    `indices_le` / `segments` — topology; `quantities[].value` — raw
+    authored strings, kept verbatim in the authoring model's own units.
+  - The merged parquets are stamped with the target
+    `ifcfast.unit_scale`, so `ifcfast.clash()` converts to metres
+    correctly with no caller action. When every source already agrees,
+    no rescale pass runs and the merge is byte-identical.
+  - `unit_scale` is read **numerically**, so `"0.001"` and `"1e-3"` are
+    the same unit, not a conversion. A missing, non-numeric or
+    non-positive `unit_scale`, or one that differs between a bundle's
+    OWN two parquets, still raises `ValueError` — an unresolved unit is
+    never guessed.
 - `out_dir` must NOT be one of the input bundles: federating into a
   constituent would overwrite its parquets with the merged tables and
   destroy the source. Raises `ValueError` before any write.
@@ -459,9 +483,12 @@ What it does, precisely:
 - Output: merged `instances.parquet` + `representations.parquet`, a
   copy of `view.sql`, and a `federation.json` sidecar
   (`sources`, `rep_id_offsets`, `guid_source` — guid → source stem,
-  first wins — `guid_collisions`, `unit_scale`, `on_collision`,
-  `reference_only`, `n_instances`, `n_representations`, and
-  `source_stats`: `{stem: {table: [size_bytes, mtime_ns]}}`).
+  first wins — `guid_collisions`, `unit_scale` (the federated target),
+  `unit_scales`: `{stem: str}` — what each source was authored in,
+  `unit_factors`: `{stem: float}` — the factor applied (`1.0` =
+  untouched), `on_collision`, `reference_only`, `n_instances`,
+  `n_representations`, and `source_stats`:
+  `{stem: {table: [size_bytes, mtime_ns]}}`).
   `federation.json` is written LAST — its presence marks the merge
   complete.
 - `source_stats` is what revalidates the federation cache. The cache
