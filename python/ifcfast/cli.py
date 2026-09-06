@@ -23,6 +23,8 @@ import zipfile
 from pathlib import Path
 from typing import Any
 
+from . import IfcfastError
+
 
 # ----------------------------------------------------------------------
 # Output formatting
@@ -465,12 +467,17 @@ def main(argv: list[str] | None = None) -> int:
     except (PermissionError, IsADirectoryError) as e:
         print(f"ifcfast: {type(e).__name__}: {e}", file=sys.stderr)
         return 1
-    except (ValueError, zipfile.BadZipFile) as e:
+    except (ValueError, zipfile.BadZipFile, IfcfastError) as e:
         # Bad *content* (not a STEP file, truncated, empty archive, …)
         # gets the same clean treatment as bad paths — agents parse
         # stderr/exit codes, not tracebacks. GH #84. BadZipFile's
         # message ("File is not a zip file") names no file — append
         # the subcommand's path so the error is actionable.
+        #
+        # `IfcfastError` (GH #162) is the native core's recoverable
+        # failure — the class AGENTS.md tells agents to catch. It was
+        # missing here, so a Rust-side failure exited the CLI with a
+        # PyO3 traceback instead of `ifcfast: <msg>` + exit 1.
         msg = str(e)
         target = getattr(args, "file", None)
         if target is not None and str(target) not in msg:

@@ -59,7 +59,20 @@ strip = true
 python-source = "python"
 # LICENSE / AGENTS.md live outside python-source, so they need an explicit
 # entry to land in the sdist. Files under python-source (data/minimal.ifc,
-# py.typed, etc.) are auto-packaged into both wheel and sdist by maturin.
+# data/AGENTS.md, py.typed, etc.) are auto-packaged into both wheel and
+# sdist by maturin.
+#
+# GH #157 — why AGENTS.md is COPIED into python/ifcfast/data/ instead of
+# just widening this entry to `format = ["sdist", "wheel"]`: a
+# [tool.maturin] include path is materialised in the wheel at the same
+# path relative to the wheel ROOT, i.e. `site-packages/AGENTS.md`. That
+# is not importable as package data (`importlib.resources` / the
+# `Path(__file__).parent` lookup in `ifcfast.agents_guide()` can't see
+# it), and it litters site-packages with a generic filename that would
+# collide with any other package doing the same. The only tree maturin
+# puts INSIDE the package is python-source, so the guide is mirrored to
+# `python/ifcfast/data/AGENTS.md` and `tests/test_agents_guide.py` gates
+# the two copies byte-for-byte. The root file stays canonical.
 include = [
     { path = "LICENSE", format = "sdist" },
     { path = "AGENTS.md", format = "sdist" },

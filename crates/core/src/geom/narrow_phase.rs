@@ -108,22 +108,34 @@ mod tests {
     fn unit_cube_at(origin: [f32; 3]) -> (Vec<f32>, Vec<u32>) {
         let [ox, oy, oz] = origin;
         let v: Vec<f32> = vec![
-            ox, oy, oz,
-            ox + 1.0, oy, oz,
-            ox + 1.0, oy + 1.0, oz,
-            ox, oy + 1.0, oz,
-            ox, oy, oz + 1.0,
-            ox + 1.0, oy, oz + 1.0,
-            ox + 1.0, oy + 1.0, oz + 1.0,
-            ox, oy + 1.0, oz + 1.0,
+            ox,
+            oy,
+            oz,
+            ox + 1.0,
+            oy,
+            oz,
+            ox + 1.0,
+            oy + 1.0,
+            oz,
+            ox,
+            oy + 1.0,
+            oz,
+            ox,
+            oy,
+            oz + 1.0,
+            ox + 1.0,
+            oy,
+            oz + 1.0,
+            ox + 1.0,
+            oy + 1.0,
+            oz + 1.0,
+            ox,
+            oy + 1.0,
+            oz + 1.0,
         ];
         let i: Vec<u32> = vec![
-            0, 2, 1, 0, 3, 2,
-            4, 5, 6, 4, 6, 7,
-            0, 1, 5, 0, 5, 4,
-            2, 3, 7, 2, 7, 6,
-            1, 2, 6, 1, 6, 5,
-            0, 4, 7, 0, 7, 3,
+            0, 2, 1, 0, 3, 2, 4, 5, 6, 4, 6, 7, 0, 1, 5, 0, 5, 4, 2, 3, 7, 2, 7, 6, 1, 2, 6, 1, 6,
+            5, 0, 4, 7, 0, 7, 3,
         ];
         (v, i)
     }
@@ -158,7 +170,10 @@ mod tests {
         assert!(intersects(&a, &b).unwrap());
         // Exact touch — parry reports 0 distance.
         let d = min_distance(&a, &b).unwrap();
-        assert!(d.abs() < 1e-4, "expected ~0 distance for face-touching cubes, got {d}");
+        assert!(
+            d.abs() < 1e-4,
+            "expected ~0 distance for face-touching cubes, got {d}"
+        );
     }
 
     #[test]

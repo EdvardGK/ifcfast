@@ -153,9 +153,7 @@ fn indexed_poly_curve_3d_points(table: &EntityTable, id: u64) -> Option<Vec<Vec3
     // without this, arcs collapse to chords through their control
     // points (GH #48).
     if let Some(Field::List(seg_body)) = fields.get(1).copied().map(parse_field) {
-        if let Some(poly) =
-            crate::mesh::indexed_curve::eval_segments_3d(&raw_pts, seg_body)
-        {
+        if let Some(poly) = crate::mesh::indexed_curve::eval_segments_3d(&raw_pts, seg_body) {
             return Some(poly);
         }
     }

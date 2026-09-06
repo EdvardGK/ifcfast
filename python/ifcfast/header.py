@@ -579,7 +579,20 @@ def _resolve_step_escapes(s: str) -> str:
 #       QTO and all other columns are byte-identical — the bump exists
 #       because the column set changed and because federation caches
 #       (`cache_root()/federated/<key>`) key on it.
-_CACHE_SCHEMA_VERSION = 29
+# v30 (2026-09-06 review sweep, GH #147-#165) — column set + values move:
+#       `materials` gains `source` (Utf8, non-null, "instance"/"type") and
+#       `classifications` gains `assignment_source` (same semantics; the
+#       existing `source` there is IfcClassification.Source) — both from
+#       the new IfcRelDefinesByType inheritance pass (GH #165), which also
+#       adds rows for occurrences of typed products. Values that move:
+#       IFC2x3 IfcSpace / IfcRoof `predefined_type` → null and IfcSpace
+#       `tag` → null (GH #159, ifcopenshell parity); QTO on products whose
+#       opening cut failed drops the synthetic half-space slab (GH #147);
+#       IFC2x3 brep/SBSM vertices are rebased through `rep_origin`
+#       (GH #153); IfcIndexedPolygonalFaceWithVoids holes are cut
+#       (GH #160); composite-curve profiles with an untessellatable
+#       segment are now unhandled instead of bridged (GH #154).
+_CACHE_SCHEMA_VERSION = 30
 
 _FIELD_RE = re.compile(r"\(\s*(.*?)\s*\)\s*;", re.DOTALL)
 

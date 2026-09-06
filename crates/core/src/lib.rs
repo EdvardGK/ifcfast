@@ -1,3 +1,20 @@
+// Clippy allow-list (GH #164 — CI runs `clippy -D warnings`). Each
+// entry is a deliberate style choice, not a deferred fix:
+// - too_many_arguments / type_complexity: the QTO + glTF kernels pass
+//   parallel column slices; bundling them into structs would allocate
+//   on the hot path for no clarity gain.
+// - large_enum_variant: `MeshFragment` / `Routed` carry a whole mesh in
+//   one arm by design — boxing would add an indirection per fragment.
+// - doc_overindented_list_items / doc_lazy_continuation: rustdoc
+//   renders the existing hanging-indent lists fine; re-flowing ~30
+//   doc blocks buys nothing.
+#![allow(
+    clippy::too_many_arguments,
+    clippy::type_complexity,
+    clippy::large_enum_variant,
+    clippy::doc_overindented_list_items,
+    clippy::doc_lazy_continuation
+)]
 //! `_ifcfast` — fast native IFC parsing and data extraction.
 //!
 //! Public surface:
@@ -21,8 +38,8 @@
 
 pub mod doc;
 pub mod entity_table;
-pub mod guid;
 pub mod extractors;
+pub mod guid;
 pub mod indexer;
 pub mod lexer;
 pub mod source;
@@ -140,17 +157,17 @@ mod python {
     // own unwind off the PyO3 boundary so the panic can be shipped over
     // the channel and re-raised as `IfcfastError` from `__next__`.
     #[cfg(feature = "mesh")]
-    use std::panic::{catch_unwind, AssertUnwindSafe};
-    #[cfg(feature = "mesh")]
     use crate::panic_payload_to_string;
+    #[cfg(feature = "mesh")]
+    use std::panic::{catch_unwind, AssertUnwindSafe};
 
     use std::path::Path;
     use std::time::Instant;
 
     use pyo3::prelude::*;
-    use pyo3::types::{PyDict, PyList};
     #[cfg(feature = "mesh")]
     use pyo3::types::PyBytes;
+    use pyo3::types::{PyDict, PyList};
 
     use crate::indexer;
     use crate::source::IfcSource;
@@ -304,137 +321,142 @@ mod python {
     #[pyfunction]
     fn index_ifc<'py>(py: Python<'py>, path: &str) -> PyResult<Bound<'py, PyDict>> {
         catch_panic(|| {
-        let (mmap, open_ms) = open_mmap(path)?;
+            let (mmap, open_ms) = open_mmap(path)?;
 
-        let t_index = Instant::now();
-        let idx = py.detach(|| indexer::index(&mmap));
-        let index_ms = t_index.elapsed().as_secs_f64() * 1000.0;
+            let t_index = Instant::now();
+            let idx = py.detach(|| indexer::index(&mmap));
+            refuse_truncated_index(&idx, path)?;
+            let index_ms = t_index.elapsed().as_secs_f64() * 1000.0;
 
-        let t_marshal = Instant::now();
+            let t_marshal = Instant::now();
 
-        let dict = PyDict::new(py);
-        dict.set_item("schema", &idx.schema)?;
-        dict.set_item("project_name", &idx.project_name)?;
-        dict.set_item("authoring_app", &idx.authoring_app)?;
-        dict.set_item("unit_scale", idx.unit_scale)?;
-        dict.set_item("size_bytes", mmap.len() as u64)?;
-        dict.set_item("open_ms", open_ms)?;
-        dict.set_item("index_ms", index_ms)?;
+            let dict = PyDict::new(py);
+            dict.set_item("schema", &idx.schema)?;
+            dict.set_item("project_name", &idx.project_name)?;
+            dict.set_item("authoring_app", &idx.authoring_app)?;
+            dict.set_item("unit_scale", idx.unit_scale)?;
+            dict.set_item("warnings", &idx.warnings)?;
+            dict.set_item("parse_error", &idx.parse_error)?;
+            dict.set_item("size_bytes", mmap.len() as u64)?;
+            dict.set_item("open_ms", open_ms)?;
+            dict.set_item("index_ms", index_ms)?;
 
-        let tc = PyDict::new(py);
-        for (k, v) in &idx.type_counts {
-            tc.set_item(k, v)?;
-        }
-        dict.set_item("type_counts", tc)?;
+            let tc = PyDict::new(py);
+            for (k, v) in &idx.type_counts {
+                tc.set_item(k, v)?;
+            }
+            dict.set_item("type_counts", tc)?;
 
-        let products = PyDict::new(py);
-        products.set_item("step_id", PyList::new(py, &idx.product_step_id)?)?;
-        products.set_item("guid", PyList::new(py, &idx.product_guid)?)?;
-        products.set_item("entity", PyList::new(py, &idx.product_entity)?)?;
-        products.set_item("name", PyList::new(py, &idx.product_name)?)?;
-        products.set_item(
-            "predefined_type",
-            PyList::new(py, &idx.product_predefined_type)?,
-        )?;
-        products.set_item("object_type", PyList::new(py, &idx.product_object_type)?)?;
-        products.set_item("tag", PyList::new(py, &idx.product_tag)?)?;
-        dict.set_item("products", products)?;
+            let products = PyDict::new(py);
+            products.set_item("step_id", PyList::new(py, &idx.product_step_id)?)?;
+            products.set_item("guid", PyList::new(py, &idx.product_guid)?)?;
+            products.set_item("entity", PyList::new(py, &idx.product_entity)?)?;
+            products.set_item("name", PyList::new(py, &idx.product_name)?)?;
+            products.set_item(
+                "predefined_type",
+                PyList::new(py, &idx.product_predefined_type)?,
+            )?;
+            products.set_item("object_type", PyList::new(py, &idx.product_object_type)?)?;
+            products.set_item("tag", PyList::new(py, &idx.product_tag)?)?;
+            dict.set_item("products", products)?;
 
-        let storeys = PyDict::new(py);
-        storeys.set_item("step_id", PyList::new(py, &idx.storey_step_id)?)?;
-        storeys.set_item("guid", PyList::new(py, &idx.storey_guid)?)?;
-        storeys.set_item("name", PyList::new(py, &idx.storey_name)?)?;
-        storeys.set_item("elevation", PyList::new(py, &idx.storey_elevation)?)?;
-        storeys.set_item(
-            "building_step_id",
-            PyList::new(py, &idx.storey_building_step_id)?,
-        )?;
-        dict.set_item("storeys", storeys)?;
+            let storeys = PyDict::new(py);
+            storeys.set_item("step_id", PyList::new(py, &idx.storey_step_id)?)?;
+            storeys.set_item("guid", PyList::new(py, &idx.storey_guid)?)?;
+            storeys.set_item("name", PyList::new(py, &idx.storey_name)?)?;
+            storeys.set_item("elevation", PyList::new(py, &idx.storey_elevation)?)?;
+            storeys.set_item(
+                "building_step_id",
+                PyList::new(py, &idx.storey_building_step_id)?,
+            )?;
+            dict.set_item("storeys", storeys)?;
 
-        let contained = PyDict::new(py);
-        contained.set_item("child", PyList::new(py, &idx.contained_in_child)?)?;
-        contained.set_item("structure", PyList::new(py, &idx.contained_in_structure)?)?;
-        dict.set_item("contained_in", contained)?;
+            let contained = PyDict::new(py);
+            contained.set_item("child", PyList::new(py, &idx.contained_in_child)?)?;
+            contained.set_item("structure", PyList::new(py, &idx.contained_in_structure)?)?;
+            dict.set_item("contained_in", contained)?;
 
-        let agg = PyDict::new(py);
-        agg.set_item("child", PyList::new(py, &idx.aggregates_child)?)?;
-        agg.set_item("parent", PyList::new(py, &idx.aggregates_parent)?)?;
-        dict.set_item("aggregates", agg)?;
+            let agg = PyDict::new(py);
+            agg.set_item("child", PyList::new(py, &idx.aggregates_child)?)?;
+            agg.set_item("parent", PyList::new(py, &idx.aggregates_parent)?)?;
+            dict.set_item("aggregates", agg)?;
 
-        let sb = PyDict::new(py);
-        sb.set_item("storey", PyList::new(py, &idx.storey_building_storey)?)?;
-        sb.set_item("building", PyList::new(py, &idx.storey_building_building)?)?;
-        dict.set_item("storey_building", sb)?;
+            let sb = PyDict::new(py);
+            sb.set_item("storey", PyList::new(py, &idx.storey_building_storey)?)?;
+            sb.set_item("building", PyList::new(py, &idx.storey_building_building)?)?;
+            dict.set_item("storey_building", sb)?;
 
-        let voids = PyDict::new(py);
-        voids.set_item("opening", PyList::new(py, &idx.voids_opening)?)?;
-        voids.set_item("host", PyList::new(py, &idx.voids_host)?)?;
-        dict.set_item("voids", voids)?;
+            let voids = PyDict::new(py);
+            voids.set_item("opening", PyList::new(py, &idx.voids_opening)?)?;
+            voids.set_item("host", PyList::new(py, &idx.voids_host)?)?;
+            dict.set_item("voids", voids)?;
 
-        // IfcRelDefinesByType: (product_step_id, type_step_id) pairs, plus
-        // the IfcTypeObject table that lets Python resolve type_step_id to
-        // (type_guid, type_name, type_entity).
-        let dbt = PyDict::new(py);
-        dbt.set_item("product", PyList::new(py, &idx.defines_by_type_product)?)?;
-        dbt.set_item("type", PyList::new(py, &idx.defines_by_type_type)?)?;
-        dict.set_item("defines_by_type", dbt)?;
+            // IfcRelDefinesByType: (product_step_id, type_step_id) pairs, plus
+            // the IfcTypeObject table that lets Python resolve type_step_id to
+            // (type_guid, type_name, type_entity).
+            let dbt = PyDict::new(py);
+            dbt.set_item("product", PyList::new(py, &idx.defines_by_type_product)?)?;
+            dbt.set_item("type", PyList::new(py, &idx.defines_by_type_type)?)?;
+            dict.set_item("defines_by_type", dbt)?;
 
-        let types = PyDict::new(py);
-        types.set_item("step_id", PyList::new(py, &idx.type_object_step_id)?)?;
-        types.set_item("entity", PyList::new(py, &idx.type_object_entity)?)?;
-        types.set_item("guid", PyList::new(py, &idx.type_object_guid)?)?;
-        types.set_item("name", PyList::new(py, &idx.type_object_name)?)?;
-        dict.set_item("type_objects", types)?;
+            let types = PyDict::new(py);
+            types.set_item("step_id", PyList::new(py, &idx.type_object_step_id)?)?;
+            types.set_item("entity", PyList::new(py, &idx.type_object_entity)?)?;
+            types.set_item("guid", PyList::new(py, &idx.type_object_guid)?)?;
+            types.set_item("name", PyList::new(py, &idx.type_object_name)?)?;
+            dict.set_item("type_objects", types)?;
 
-        let site_ids: Vec<u64> = idx.site_step_id_to_guid.keys().copied().collect();
-        let site_guids: Vec<&str> = site_ids
-            .iter()
-            .map(|i| idx.site_step_id_to_guid.get(i).unwrap().as_str())
-            .collect();
-        let sites = PyDict::new(py);
-        sites.set_item("step_id", PyList::new(py, site_ids)?)?;
-        sites.set_item("guid", PyList::new(py, site_guids)?)?;
-        dict.set_item("sites", sites)?;
+            let site_ids: Vec<u64> = idx.site_step_id_to_guid.keys().copied().collect();
+            let site_guids: Vec<&str> = site_ids
+                .iter()
+                .map(|i| idx.site_step_id_to_guid.get(i).unwrap().as_str())
+                .collect();
+            let sites = PyDict::new(py);
+            sites.set_item("step_id", PyList::new(py, site_ids)?)?;
+            sites.set_item("guid", PyList::new(py, site_guids)?)?;
+            dict.set_item("sites", sites)?;
 
-        let bldg_ids: Vec<u64> = idx.building_step_id_to_guid.keys().copied().collect();
-        let bldg_guids: Vec<&str> = bldg_ids
-            .iter()
-            .map(|i| idx.building_step_id_to_guid.get(i).unwrap().as_str())
-            .collect();
-        let buildings = PyDict::new(py);
-        buildings.set_item("step_id", PyList::new(py, bldg_ids)?)?;
-        buildings.set_item("guid", PyList::new(py, bldg_guids)?)?;
-        dict.set_item("buildings", buildings)?;
+            let bldg_ids: Vec<u64> = idx.building_step_id_to_guid.keys().copied().collect();
+            let bldg_guids: Vec<&str> = bldg_ids
+                .iter()
+                .map(|i| idx.building_step_id_to_guid.get(i).unwrap().as_str())
+                .collect();
+            let buildings = PyDict::new(py);
+            buildings.set_item("step_id", PyList::new(py, bldg_ids)?)?;
+            buildings.set_item("guid", PyList::new(py, bldg_guids)?)?;
+            dict.set_item("buildings", buildings)?;
 
-        let proj_ids: Vec<u64> = idx.project_step_id_to_guid.keys().copied().collect();
-        let proj_guids: Vec<&str> = proj_ids
-            .iter()
-            .map(|i| idx.project_step_id_to_guid.get(i).unwrap().as_str())
-            .collect();
-        let projects = PyDict::new(py);
-        projects.set_item("step_id", PyList::new(py, proj_ids)?)?;
-        projects.set_item("guid", PyList::new(py, proj_guids)?)?;
-        dict.set_item("projects", projects)?;
+            let proj_ids: Vec<u64> = idx.project_step_id_to_guid.keys().copied().collect();
+            let proj_guids: Vec<&str> = proj_ids
+                .iter()
+                .map(|i| idx.project_step_id_to_guid.get(i).unwrap().as_str())
+                .collect();
+            let projects = PyDict::new(py);
+            projects.set_item("step_id", PyList::new(py, proj_ids)?)?;
+            projects.set_item("guid", PyList::new(py, proj_guids)?)?;
+            dict.set_item("projects", projects)?;
 
-        let space_ids: Vec<u64> = idx.space_step_id_to_guid.keys().copied().collect();
-        let space_guids: Vec<&str> = space_ids
-            .iter()
-            .map(|i| idx.space_step_id_to_guid.get(i).unwrap().as_str())
-            .collect();
-        let spaces = PyDict::new(py);
-        spaces.set_item("step_id", PyList::new(py, space_ids)?)?;
-        spaces.set_item("guid", PyList::new(py, space_guids)?)?;
-        dict.set_item("spaces", spaces)?;
+            let space_ids: Vec<u64> = idx.space_step_id_to_guid.keys().copied().collect();
+            let space_guids: Vec<&str> = space_ids
+                .iter()
+                .map(|i| idx.space_step_id_to_guid.get(i).unwrap().as_str())
+                .collect();
+            let spaces = PyDict::new(py);
+            spaces.set_item("step_id", PyList::new(py, space_ids)?)?;
+            spaces.set_item("guid", PyList::new(py, space_guids)?)?;
+            dict.set_item("spaces", spaces)?;
 
-        let marshal_ms = t_marshal.elapsed().as_secs_f64() * 1000.0;
-        dict.set_item("marshal_ms", marshal_ms)?;
-        Ok(dict)
+            let marshal_ms = t_marshal.elapsed().as_secs_f64() * 1000.0;
+            dict.set_item("marshal_ms", marshal_ms)?;
+            Ok(dict)
         })
     }
 
     // ----- shared GUID-index helper used by every extractor below ------
 
-    fn build_guid_index(table: &crate::entity_table::EntityTable) -> std::collections::HashMap<u64, String> {
+    fn build_guid_index(
+        table: &crate::entity_table::EntityTable,
+    ) -> std::collections::HashMap<u64, String> {
         let mut step_to_guid: std::collections::HashMap<u64, String> =
             std::collections::HashMap::with_capacity(64_000);
         for (sid, type_name, args) in table.iter() {
@@ -457,6 +479,31 @@ mod python {
     /// bytes via [`crate::source::open`]: plain `.ifc` → mmap (zero
     /// copy), `.ifczip` → decompressed owned buffer. Either variant
     /// derefs to `&[u8]` so callers don't change.
+    /// GH #148: a parse that stopped early (garbage byte, unterminated
+    /// record, missing `DATA;`) is refused, never served as a smaller
+    /// model. Raised as `IfcfastError` — the recoverable native
+    /// failure class AGENTS.md documents.
+    fn refuse_truncated_index(idx: &indexer::IndexedFile, path: &str) -> PyResult<()> {
+        match &idx.parse_error {
+            Some(err) => Err(PyErr::new::<IfcfastError, _>(format!(
+                "ifcfast: refusing a truncated IFC ({path}): {err}"
+            ))),
+            None => Ok(()),
+        }
+    }
+
+    fn refuse_truncated_table(
+        table: &crate::entity_table::EntityTable,
+        path: &str,
+    ) -> PyResult<()> {
+        match table.scan_error() {
+            Some(err) => Err(PyErr::new::<IfcfastError, _>(format!(
+                "ifcfast: refusing a truncated IFC ({path}): {err}"
+            ))),
+            None => Ok(()),
+        }
+    }
+
     fn open_mmap(path: &str) -> PyResult<(IfcSource, f64)> {
         let t_open = Instant::now();
         let src = crate::source::open(Path::new(path))
@@ -469,32 +516,34 @@ mod python {
     #[pyfunction]
     pub fn extract_psets<'py>(py: Python<'py>, path: &str) -> PyResult<Bound<'py, PyDict>> {
         catch_panic(|| {
-        let (mmap, open_ms) = open_mmap(path)?;
-        let t_table = Instant::now();
-        let table = crate::entity_table::EntityTable::build(&mmap);
-        let table_ms = t_table.elapsed().as_secs_f64() * 1000.0;
-        let t_guids = Instant::now();
-        let step_to_guid = build_guid_index(&table);
-        let guid_ms = t_guids.elapsed().as_secs_f64() * 1000.0;
-        let t_psets = Instant::now();
-        let psets = py.detach(|| crate::extractors::psets::build(&table, &step_to_guid));
-        let pset_ms = t_psets.elapsed().as_secs_f64() * 1000.0;
+            let (mmap, open_ms) = open_mmap(path)?;
+            let t_table = Instant::now();
+            let table = crate::entity_table::EntityTable::build(&mmap);
+            refuse_truncated_table(&table, path)?;
+            let table_ms = t_table.elapsed().as_secs_f64() * 1000.0;
+            let t_guids = Instant::now();
+            let step_to_guid = build_guid_index(&table);
+            let guid_ms = t_guids.elapsed().as_secs_f64() * 1000.0;
+            let t_psets = Instant::now();
+            let psets = py.detach(|| crate::extractors::psets::build(&table, &step_to_guid));
+            let pset_ms = t_psets.elapsed().as_secs_f64() * 1000.0;
 
-        let t_marshal = Instant::now();
-        let out = PyDict::new(py);
-        out.set_item("guid", PyList::new(py, &psets.guid)?)?;
-        out.set_item("pset_name", PyList::new(py, &psets.pset_name)?)?;
-        out.set_item("prop_name", PyList::new(py, &psets.prop_name)?)?;
-        out.set_item("value", PyList::new(py, &psets.value)?)?;
-        out.set_item("value_type", PyList::new(py, &psets.value_type)?)?;
-        out.set_item("source", PyList::new(py, &psets.source)?)?;
-        out.set_item("open_ms", open_ms)?;
-        out.set_item("entity_table_ms", table_ms)?;
-        out.set_item("guid_index_ms", guid_ms)?;
-        out.set_item("pset_extract_ms", pset_ms)?;
-        out.set_item("marshal_ms", t_marshal.elapsed().as_secs_f64() * 1000.0)?;
-        out.set_item("size_bytes", mmap.len() as u64)?;
-        Ok(out)
+            let t_marshal = Instant::now();
+            let out = PyDict::new(py);
+            out.set_item("guid", PyList::new(py, &psets.guid)?)?;
+            out.set_item("pset_name", PyList::new(py, &psets.pset_name)?)?;
+            out.set_item("prop_name", PyList::new(py, &psets.prop_name)?)?;
+            out.set_item("value", PyList::new(py, &psets.value)?)?;
+            out.set_item("value_type", PyList::new(py, &psets.value_type)?)?;
+            out.set_item("source", PyList::new(py, &psets.source)?)?;
+            out.set_item("open_ms", open_ms)?;
+            out.set_item("entity_table_ms", table_ms)?;
+            out.set_item("warnings", table.warnings())?;
+            out.set_item("guid_index_ms", guid_ms)?;
+            out.set_item("pset_extract_ms", pset_ms)?;
+            out.set_item("marshal_ms", t_marshal.elapsed().as_secs_f64() * 1000.0)?;
+            out.set_item("size_bytes", mmap.len() as u64)?;
+            Ok(out)
         })
     }
 
@@ -503,33 +552,35 @@ mod python {
     #[pyfunction]
     pub fn extract_quantities<'py>(py: Python<'py>, path: &str) -> PyResult<Bound<'py, PyDict>> {
         catch_panic(|| {
-        let (mmap, open_ms) = open_mmap(path)?;
-        let t_table = Instant::now();
-        let table = crate::entity_table::EntityTable::build(&mmap);
-        let table_ms = t_table.elapsed().as_secs_f64() * 1000.0;
-        let t_guids = Instant::now();
-        let step_to_guid = build_guid_index(&table);
-        let guid_ms = t_guids.elapsed().as_secs_f64() * 1000.0;
-        let t_qto = Instant::now();
-        let qto = py.detach(|| crate::extractors::quantities::build(&table, &step_to_guid));
-        let qto_ms = t_qto.elapsed().as_secs_f64() * 1000.0;
+            let (mmap, open_ms) = open_mmap(path)?;
+            let t_table = Instant::now();
+            let table = crate::entity_table::EntityTable::build(&mmap);
+            refuse_truncated_table(&table, path)?;
+            let table_ms = t_table.elapsed().as_secs_f64() * 1000.0;
+            let t_guids = Instant::now();
+            let step_to_guid = build_guid_index(&table);
+            let guid_ms = t_guids.elapsed().as_secs_f64() * 1000.0;
+            let t_qto = Instant::now();
+            let qto = py.detach(|| crate::extractors::quantities::build(&table, &step_to_guid));
+            let qto_ms = t_qto.elapsed().as_secs_f64() * 1000.0;
 
-        let t_marshal = Instant::now();
-        let out = PyDict::new(py);
-        out.set_item("guid", PyList::new(py, &qto.guid)?)?;
-        out.set_item("qto_name", PyList::new(py, &qto.qto_name)?)?;
-        out.set_item("quantity_name", PyList::new(py, &qto.quantity_name)?)?;
-        out.set_item("value", PyList::new(py, &qto.value)?)?;
-        out.set_item("quantity_type", PyList::new(py, &qto.quantity_type)?)?;
-        out.set_item("unit_step_id", PyList::new(py, &qto.unit_step_id)?)?;
-        out.set_item("source", PyList::new(py, &qto.source)?)?;
-        out.set_item("open_ms", open_ms)?;
-        out.set_item("entity_table_ms", table_ms)?;
-        out.set_item("guid_index_ms", guid_ms)?;
-        out.set_item("qto_extract_ms", qto_ms)?;
-        out.set_item("marshal_ms", t_marshal.elapsed().as_secs_f64() * 1000.0)?;
-        out.set_item("size_bytes", mmap.len() as u64)?;
-        Ok(out)
+            let t_marshal = Instant::now();
+            let out = PyDict::new(py);
+            out.set_item("guid", PyList::new(py, &qto.guid)?)?;
+            out.set_item("qto_name", PyList::new(py, &qto.qto_name)?)?;
+            out.set_item("quantity_name", PyList::new(py, &qto.quantity_name)?)?;
+            out.set_item("value", PyList::new(py, &qto.value)?)?;
+            out.set_item("quantity_type", PyList::new(py, &qto.quantity_type)?)?;
+            out.set_item("unit_step_id", PyList::new(py, &qto.unit_step_id)?)?;
+            out.set_item("source", PyList::new(py, &qto.source)?)?;
+            out.set_item("open_ms", open_ms)?;
+            out.set_item("entity_table_ms", table_ms)?;
+            out.set_item("warnings", table.warnings())?;
+            out.set_item("guid_index_ms", guid_ms)?;
+            out.set_item("qto_extract_ms", qto_ms)?;
+            out.set_item("marshal_ms", t_marshal.elapsed().as_secs_f64() * 1000.0)?;
+            out.set_item("size_bytes", mmap.len() as u64)?;
+            Ok(out)
         })
     }
 
@@ -538,39 +589,42 @@ mod python {
     #[pyfunction]
     pub fn extract_materials<'py>(py: Python<'py>, path: &str) -> PyResult<Bound<'py, PyDict>> {
         catch_panic(|| {
-        let (mmap, open_ms) = open_mmap(path)?;
-        let t_table = Instant::now();
-        let table = crate::entity_table::EntityTable::build(&mmap);
-        let table_ms = t_table.elapsed().as_secs_f64() * 1000.0;
-        let t_guids = Instant::now();
-        let step_to_guid = build_guid_index(&table);
-        let guid_ms = t_guids.elapsed().as_secs_f64() * 1000.0;
-        let t_mat = Instant::now();
-        let mats = py.detach(|| {
-            let unit_scale = crate::indexer::extract_unit_scale(&table).unwrap_or(1.0);
-            crate::extractors::materials::build(&table, &step_to_guid, unit_scale)
-        });
-        let mat_ms = t_mat.elapsed().as_secs_f64() * 1000.0;
+            let (mmap, open_ms) = open_mmap(path)?;
+            let t_table = Instant::now();
+            let table = crate::entity_table::EntityTable::build(&mmap);
+            refuse_truncated_table(&table, path)?;
+            let table_ms = t_table.elapsed().as_secs_f64() * 1000.0;
+            let t_guids = Instant::now();
+            let step_to_guid = build_guid_index(&table);
+            let guid_ms = t_guids.elapsed().as_secs_f64() * 1000.0;
+            let t_mat = Instant::now();
+            let mats = py.detach(|| {
+                let unit_scale = crate::indexer::extract_unit_scale(&table).unwrap_or(1.0);
+                crate::extractors::materials::build(&table, &step_to_guid, unit_scale)
+            });
+            let mat_ms = t_mat.elapsed().as_secs_f64() * 1000.0;
 
-        let t_marshal = Instant::now();
-        let out = PyDict::new(py);
-        out.set_item("guid", PyList::new(py, &mats.guid)?)?;
-        out.set_item("role", PyList::new(py, &mats.role)?)?;
-        out.set_item("layer_index", PyList::new(py, &mats.layer_index)?)?;
-        out.set_item("material_name", PyList::new(py, &mats.material_name)?)?;
-        out.set_item("fraction", PyList::new(py, &mats.fraction)?)?;
-        out.set_item(
-            "layer_thickness_mm",
-            PyList::new(py, &mats.layer_thickness_mm)?,
-        )?;
-        out.set_item("category", PyList::new(py, &mats.category)?)?;
-        out.set_item("open_ms", open_ms)?;
-        out.set_item("entity_table_ms", table_ms)?;
-        out.set_item("guid_index_ms", guid_ms)?;
-        out.set_item("materials_extract_ms", mat_ms)?;
-        out.set_item("marshal_ms", t_marshal.elapsed().as_secs_f64() * 1000.0)?;
-        out.set_item("size_bytes", mmap.len() as u64)?;
-        Ok(out)
+            let t_marshal = Instant::now();
+            let out = PyDict::new(py);
+            out.set_item("guid", PyList::new(py, &mats.guid)?)?;
+            out.set_item("role", PyList::new(py, &mats.role)?)?;
+            out.set_item("layer_index", PyList::new(py, &mats.layer_index)?)?;
+            out.set_item("material_name", PyList::new(py, &mats.material_name)?)?;
+            out.set_item("fraction", PyList::new(py, &mats.fraction)?)?;
+            out.set_item(
+                "layer_thickness_mm",
+                PyList::new(py, &mats.layer_thickness_mm)?,
+            )?;
+            out.set_item("category", PyList::new(py, &mats.category)?)?;
+            out.set_item("source", PyList::new(py, &mats.source)?)?;
+            out.set_item("open_ms", open_ms)?;
+            out.set_item("entity_table_ms", table_ms)?;
+            out.set_item("warnings", table.warnings())?;
+            out.set_item("guid_index_ms", guid_ms)?;
+            out.set_item("materials_extract_ms", mat_ms)?;
+            out.set_item("marshal_ms", t_marshal.elapsed().as_secs_f64() * 1000.0)?;
+            out.set_item("size_bytes", mmap.len() as u64)?;
+            Ok(out)
         })
     }
 
@@ -582,33 +636,40 @@ mod python {
         path: &str,
     ) -> PyResult<Bound<'py, PyDict>> {
         catch_panic(|| {
-        let (mmap, open_ms) = open_mmap(path)?;
-        let t_table = Instant::now();
-        let table = crate::entity_table::EntityTable::build(&mmap);
-        let table_ms = t_table.elapsed().as_secs_f64() * 1000.0;
-        let t_guids = Instant::now();
-        let step_to_guid = build_guid_index(&table);
-        let guid_ms = t_guids.elapsed().as_secs_f64() * 1000.0;
-        let t_cls = Instant::now();
-        let cls = py.detach(|| crate::extractors::classifications::build(&table, &step_to_guid));
-        let cls_ms = t_cls.elapsed().as_secs_f64() * 1000.0;
+            let (mmap, open_ms) = open_mmap(path)?;
+            let t_table = Instant::now();
+            let table = crate::entity_table::EntityTable::build(&mmap);
+            refuse_truncated_table(&table, path)?;
+            let table_ms = t_table.elapsed().as_secs_f64() * 1000.0;
+            let t_guids = Instant::now();
+            let step_to_guid = build_guid_index(&table);
+            let guid_ms = t_guids.elapsed().as_secs_f64() * 1000.0;
+            let t_cls = Instant::now();
+            let cls =
+                py.detach(|| crate::extractors::classifications::build(&table, &step_to_guid));
+            let cls_ms = t_cls.elapsed().as_secs_f64() * 1000.0;
 
-        let t_marshal = Instant::now();
-        let out = PyDict::new(py);
-        out.set_item("guid", PyList::new(py, &cls.guid)?)?;
-        out.set_item("system_name", PyList::new(py, &cls.system_name)?)?;
-        out.set_item("edition", PyList::new(py, &cls.edition)?)?;
-        out.set_item("identification", PyList::new(py, &cls.identification)?)?;
-        out.set_item("name", PyList::new(py, &cls.name)?)?;
-        out.set_item("location", PyList::new(py, &cls.location)?)?;
-        out.set_item("source", PyList::new(py, &cls.source)?)?;
-        out.set_item("open_ms", open_ms)?;
-        out.set_item("entity_table_ms", table_ms)?;
-        out.set_item("guid_index_ms", guid_ms)?;
-        out.set_item("classifications_extract_ms", cls_ms)?;
-        out.set_item("marshal_ms", t_marshal.elapsed().as_secs_f64() * 1000.0)?;
-        out.set_item("size_bytes", mmap.len() as u64)?;
-        Ok(out)
+            let t_marshal = Instant::now();
+            let out = PyDict::new(py);
+            out.set_item("guid", PyList::new(py, &cls.guid)?)?;
+            out.set_item("system_name", PyList::new(py, &cls.system_name)?)?;
+            out.set_item("edition", PyList::new(py, &cls.edition)?)?;
+            out.set_item("identification", PyList::new(py, &cls.identification)?)?;
+            out.set_item("name", PyList::new(py, &cls.name)?)?;
+            out.set_item("location", PyList::new(py, &cls.location)?)?;
+            out.set_item("source", PyList::new(py, &cls.source)?)?;
+            out.set_item(
+                "assignment_source",
+                PyList::new(py, &cls.assignment_source)?,
+            )?;
+            out.set_item("open_ms", open_ms)?;
+            out.set_item("entity_table_ms", table_ms)?;
+            out.set_item("warnings", table.warnings())?;
+            out.set_item("guid_index_ms", guid_ms)?;
+            out.set_item("classifications_extract_ms", cls_ms)?;
+            out.set_item("marshal_ms", t_marshal.elapsed().as_secs_f64() * 1000.0)?;
+            out.set_item("size_bytes", mmap.len() as u64)?;
+            Ok(out)
         })
     }
 
@@ -619,100 +680,111 @@ mod python {
     #[pyfunction]
     pub fn extract_all<'py>(py: Python<'py>, path: &str) -> PyResult<Bound<'py, PyDict>> {
         catch_panic(|| {
-        let t_total = Instant::now();
-        let (mmap, open_ms) = open_mmap(path)?;
-        let t_table = Instant::now();
-        let table = crate::entity_table::EntityTable::build(&mmap);
-        let table_ms = t_table.elapsed().as_secs_f64() * 1000.0;
-        let t_guids = Instant::now();
-        let step_to_guid = build_guid_index(&table);
-        let guid_ms = t_guids.elapsed().as_secs_f64() * 1000.0;
+            let t_total = Instant::now();
+            let (mmap, open_ms) = open_mmap(path)?;
+            let t_table = Instant::now();
+            let table = crate::entity_table::EntityTable::build(&mmap);
+            refuse_truncated_table(&table, path)?;
+            let table_ms = t_table.elapsed().as_secs_f64() * 1000.0;
+            let t_guids = Instant::now();
+            let step_to_guid = build_guid_index(&table);
+            let guid_ms = t_guids.elapsed().as_secs_f64() * 1000.0;
 
-        let (psets, quantities, materials, classifications,
-             pset_ms, qto_ms, mat_ms, cls_ms) =
-            py.detach(|| {
-                // Materials needs the project's linear-unit scale to
-                // normalize LayerThickness to mm. Cheap walk over the
-                // table for IfcUnitAssignment + IfcSIUnit only — much
-                // less work than a full indexer pass.
-                let unit_scale =
-                    crate::indexer::extract_unit_scale(&table).unwrap_or(1.0);
-                let t = Instant::now();
-                let p = crate::extractors::psets::build(&table, &step_to_guid);
-                let pt = t.elapsed().as_secs_f64() * 1000.0;
-                let t = Instant::now();
-                let q = crate::extractors::quantities::build(&table, &step_to_guid);
-                let qt = t.elapsed().as_secs_f64() * 1000.0;
-                let t = Instant::now();
-                let m = crate::extractors::materials::build(&table, &step_to_guid, unit_scale);
-                let mt = t.elapsed().as_secs_f64() * 1000.0;
-                let t = Instant::now();
-                let c = crate::extractors::classifications::build(&table, &step_to_guid);
-                let ct = t.elapsed().as_secs_f64() * 1000.0;
-                (p, q, m, c, pt, qt, mt, ct)
-            });
+            let (psets, quantities, materials, classifications, pset_ms, qto_ms, mat_ms, cls_ms) =
+                py.detach(|| {
+                    // Materials needs the project's linear-unit scale to
+                    // normalize LayerThickness to mm. Cheap walk over the
+                    // table for IfcUnitAssignment + IfcSIUnit only — much
+                    // less work than a full indexer pass.
+                    let unit_scale = crate::indexer::extract_unit_scale(&table).unwrap_or(1.0);
+                    let t = Instant::now();
+                    let p = crate::extractors::psets::build(&table, &step_to_guid);
+                    let pt = t.elapsed().as_secs_f64() * 1000.0;
+                    let t = Instant::now();
+                    let q = crate::extractors::quantities::build(&table, &step_to_guid);
+                    let qt = t.elapsed().as_secs_f64() * 1000.0;
+                    let t = Instant::now();
+                    let m = crate::extractors::materials::build(&table, &step_to_guid, unit_scale);
+                    let mt = t.elapsed().as_secs_f64() * 1000.0;
+                    let t = Instant::now();
+                    let c = crate::extractors::classifications::build(&table, &step_to_guid);
+                    let ct = t.elapsed().as_secs_f64() * 1000.0;
+                    (p, q, m, c, pt, qt, mt, ct)
+                });
 
-        let t_marshal = Instant::now();
-        let out = PyDict::new(py);
-        {
-            let d = PyDict::new(py);
-            d.set_item("guid", PyList::new(py, &psets.guid)?)?;
-            d.set_item("pset_name", PyList::new(py, &psets.pset_name)?)?;
-            d.set_item("prop_name", PyList::new(py, &psets.prop_name)?)?;
-            d.set_item("value", PyList::new(py, &psets.value)?)?;
-            d.set_item("value_type", PyList::new(py, &psets.value_type)?)?;
-            d.set_item("source", PyList::new(py, &psets.source)?)?;
-            out.set_item("psets", d)?;
-        }
-        {
-            let d = PyDict::new(py);
-            d.set_item("guid", PyList::new(py, &quantities.guid)?)?;
-            d.set_item("qto_name", PyList::new(py, &quantities.qto_name)?)?;
-            d.set_item("quantity_name", PyList::new(py, &quantities.quantity_name)?)?;
-            d.set_item("value", PyList::new(py, &quantities.value)?)?;
-            d.set_item("quantity_type", PyList::new(py, &quantities.quantity_type)?)?;
-            d.set_item("unit_step_id", PyList::new(py, &quantities.unit_step_id)?)?;
-            d.set_item("source", PyList::new(py, &quantities.source)?)?;
-            out.set_item("quantities", d)?;
-        }
-        {
-            let d = PyDict::new(py);
-            d.set_item("guid", PyList::new(py, &materials.guid)?)?;
-            d.set_item("role", PyList::new(py, &materials.role)?)?;
-            d.set_item("layer_index", PyList::new(py, &materials.layer_index)?)?;
-            d.set_item("material_name", PyList::new(py, &materials.material_name)?)?;
-            d.set_item(
-                "layer_thickness_mm",
-                PyList::new(py, &materials.layer_thickness_mm)?,
-            )?;
-            d.set_item("category", PyList::new(py, &materials.category)?)?;
-            d.set_item("fraction", PyList::new(py, &materials.fraction)?)?;
-            out.set_item("materials", d)?;
-        }
-        {
-            let d = PyDict::new(py);
-            d.set_item("guid", PyList::new(py, &classifications.guid)?)?;
-            d.set_item("system_name", PyList::new(py, &classifications.system_name)?)?;
-            d.set_item("edition", PyList::new(py, &classifications.edition)?)?;
-            d.set_item("identification", PyList::new(py, &classifications.identification)?)?;
-            d.set_item("name", PyList::new(py, &classifications.name)?)?;
-            d.set_item("location", PyList::new(py, &classifications.location)?)?;
-            d.set_item("source", PyList::new(py, &classifications.source)?)?;
-            out.set_item("classifications", d)?;
-        }
-        let marshal_ms = t_marshal.elapsed().as_secs_f64() * 1000.0;
-        let total_ms = t_total.elapsed().as_secs_f64() * 1000.0;
-        out.set_item("open_ms", open_ms)?;
-        out.set_item("entity_table_ms", table_ms)?;
-        out.set_item("guid_index_ms", guid_ms)?;
-        out.set_item("psets_extract_ms", pset_ms)?;
-        out.set_item("quantities_extract_ms", qto_ms)?;
-        out.set_item("materials_extract_ms", mat_ms)?;
-        out.set_item("classifications_extract_ms", cls_ms)?;
-        out.set_item("marshal_ms", marshal_ms)?;
-        out.set_item("total_ms", total_ms)?;
-        out.set_item("size_bytes", mmap.len() as u64)?;
-        Ok(out)
+            let t_marshal = Instant::now();
+            let out = PyDict::new(py);
+            {
+                let d = PyDict::new(py);
+                d.set_item("guid", PyList::new(py, &psets.guid)?)?;
+                d.set_item("pset_name", PyList::new(py, &psets.pset_name)?)?;
+                d.set_item("prop_name", PyList::new(py, &psets.prop_name)?)?;
+                d.set_item("value", PyList::new(py, &psets.value)?)?;
+                d.set_item("value_type", PyList::new(py, &psets.value_type)?)?;
+                d.set_item("source", PyList::new(py, &psets.source)?)?;
+                out.set_item("psets", d)?;
+            }
+            {
+                let d = PyDict::new(py);
+                d.set_item("guid", PyList::new(py, &quantities.guid)?)?;
+                d.set_item("qto_name", PyList::new(py, &quantities.qto_name)?)?;
+                d.set_item("quantity_name", PyList::new(py, &quantities.quantity_name)?)?;
+                d.set_item("value", PyList::new(py, &quantities.value)?)?;
+                d.set_item("quantity_type", PyList::new(py, &quantities.quantity_type)?)?;
+                d.set_item("unit_step_id", PyList::new(py, &quantities.unit_step_id)?)?;
+                d.set_item("source", PyList::new(py, &quantities.source)?)?;
+                out.set_item("quantities", d)?;
+            }
+            {
+                let d = PyDict::new(py);
+                d.set_item("guid", PyList::new(py, &materials.guid)?)?;
+                d.set_item("role", PyList::new(py, &materials.role)?)?;
+                d.set_item("layer_index", PyList::new(py, &materials.layer_index)?)?;
+                d.set_item("material_name", PyList::new(py, &materials.material_name)?)?;
+                d.set_item(
+                    "layer_thickness_mm",
+                    PyList::new(py, &materials.layer_thickness_mm)?,
+                )?;
+                d.set_item("category", PyList::new(py, &materials.category)?)?;
+                d.set_item("fraction", PyList::new(py, &materials.fraction)?)?;
+                d.set_item("source", PyList::new(py, &materials.source)?)?;
+                out.set_item("materials", d)?;
+            }
+            {
+                let d = PyDict::new(py);
+                d.set_item("guid", PyList::new(py, &classifications.guid)?)?;
+                d.set_item(
+                    "system_name",
+                    PyList::new(py, &classifications.system_name)?,
+                )?;
+                d.set_item("edition", PyList::new(py, &classifications.edition)?)?;
+                d.set_item(
+                    "identification",
+                    PyList::new(py, &classifications.identification)?,
+                )?;
+                d.set_item("name", PyList::new(py, &classifications.name)?)?;
+                d.set_item("location", PyList::new(py, &classifications.location)?)?;
+                d.set_item("source", PyList::new(py, &classifications.source)?)?;
+                d.set_item(
+                    "assignment_source",
+                    PyList::new(py, &classifications.assignment_source)?,
+                )?;
+                out.set_item("classifications", d)?;
+            }
+            let marshal_ms = t_marshal.elapsed().as_secs_f64() * 1000.0;
+            let total_ms = t_total.elapsed().as_secs_f64() * 1000.0;
+            out.set_item("open_ms", open_ms)?;
+            out.set_item("entity_table_ms", table_ms)?;
+            out.set_item("warnings", table.warnings())?;
+            out.set_item("guid_index_ms", guid_ms)?;
+            out.set_item("psets_extract_ms", pset_ms)?;
+            out.set_item("quantities_extract_ms", qto_ms)?;
+            out.set_item("materials_extract_ms", mat_ms)?;
+            out.set_item("classifications_extract_ms", cls_ms)?;
+            out.set_item("marshal_ms", marshal_ms)?;
+            out.set_item("total_ms", total_ms)?;
+            out.set_item("size_bytes", mmap.len() as u64)?;
+            Ok(out)
         })
     }
 
@@ -749,254 +821,265 @@ mod python {
         cut_openings: bool,
     ) -> PyResult<Bound<'py, PyDict>> {
         catch_panic(|| {
-        use crate::mesh::{
-            mesh_ifc_streaming_framed, qto, BakeFrame, ProductMesh, ProductSink,
-        };
+            use crate::mesh::{
+                mesh_ifc_streaming_framed, qto, BakeFrame, ProductMesh, ProductSink,
+            };
 
-        // cut_openings requires the `csg` feature — surface a clear
-        // error rather than silently ignoring the flag (same pattern as
-        // extract_meshes).
-        #[cfg(not(feature = "csg"))]
-        if cut_openings {
-            return Err(pyo3::exceptions::PyRuntimeError::new_err(
-                "mesh_qto(cut_openings=True) requires the `csg` Cargo feature; \
+            // cut_openings requires the `csg` feature — surface a clear
+            // error rather than silently ignoring the flag (same pattern as
+            // extract_meshes).
+            #[cfg(not(feature = "csg"))]
+            if cut_openings {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                    "mesh_qto(cut_openings=True) requires the `csg` Cargo feature; \
                  this wheel was built without it.",
-            ));
-        }
-
-        let t_total = Instant::now();
-        let (mmap, _open_ms) = open_mmap(path)?;
-
-        // Project unit-scale (mm files: 0.001; metre files: 1.0).
-        // Pulled from the indexer — same source the bundle pre-pass
-        // uses. None → assume metres so geometry-derived numbers stay
-        // sane on schema-incomplete files.
-        let t_idx = Instant::now();
-        let idx = py.detach(|| indexer::index(&mmap));
-        let idx_ms = t_idx.elapsed().as_secs_f64() * 1000.0;
-        let unit_scale = idx.unit_scale.unwrap_or(1.0) as f32;
-
-        // Per-product accumulator sink. One row per meshed product
-        // landing in `products`; one row per distinct planar surface
-        // landing in `surfaces`. Avoids holding the meshes themselves
-        // — drops each ProductMesh after computing its QTO.
-        struct QtoSink {
-            unit_scale: f32,
-            cut_openings: bool,
-            guid: Vec<String>,
-            entity: Vec<String>,
-            volume_m3: Vec<f32>,
-            volume_mesh_m3: Vec<f32>,
-            volume_prism_bound_m3: Vec<f32>,
-            volume_reliable: Vec<bool>,
-            volume_method: Vec<&'static str>,
-            mesh_quality: Vec<&'static str>,
-            aabb_volume_m3: Vec<f32>,
-            surface_area_m2: Vec<f32>,
-            area_top_m2: Vec<f32>,
-            area_bottom_m2: Vec<f32>,
-            area_side_m2: Vec<f32>,
-            area_inclined_m2: Vec<f32>,
-            largest_surface_m2: Vec<f32>,
-            smallest_surface_m2: Vec<f32>,
-            surface_count: Vec<u32>,
-            // Long-format per-surface columns.
-            s_guid: Vec<String>,
-            s_index: Vec<u32>,
-            s_area_m2: Vec<f32>,
-            s_nx: Vec<f32>,
-            s_ny: Vec<f32>,
-            s_nz: Vec<f32>,
-            cut_stats: crate::mesh::cut_stats::CutOpeningsStats,
-            // Cross-product IfcRelVoidsElement buffer — same pattern as
-            // extract_meshes. Only `Some` when cut_openings && at least
-            // one void relation exists; else the hot path is identical
-            // to the no-cut version.
-            #[cfg(feature = "csg")]
-            cross: Option<crate::mesh::cut_openings::CrossProductCut>,
-        }
-        impl QtoSink {
-            /// Compute QTO for a (cut-applied or unchanged) mesh and
-            /// push its row + per-surface rows. Shared between the
-            /// streaming `on_product` and the post-stream cross-product
-            /// flush.
-            fn record(&mut self, mesh: ProductMesh) {
-                let q = qto::compute(&mesh.vertices, &mesh.indices, self.unit_scale);
-                self.guid.push(mesh.guid.clone());
-                self.entity.push(mesh.entity.clone());
-                self.volume_m3.push(q.volume_best_m3);
-                self.volume_mesh_m3.push(q.volume_m3.abs());
-                self.volume_prism_bound_m3.push(q.volume_prism_bound_m3);
-                self.volume_reliable.push(q.volume_reliable);
-                self.volume_method.push(q.volume_method);
-                self.mesh_quality.push(q.mesh_quality);
-                self.aabb_volume_m3.push(q.aabb_volume_m3);
-                self.surface_area_m2.push(q.surface_area_m2);
-                self.area_top_m2.push(q.area_top_m2);
-                self.area_bottom_m2.push(q.area_bottom_m2);
-                self.area_side_m2.push(q.area_side_m2);
-                self.area_inclined_m2.push(q.area_inclined_m2);
-                self.largest_surface_m2.push(q.largest_surface_m2);
-                self.smallest_surface_m2.push(q.smallest_surface_m2);
-                self.surface_count.push(q.surface_count);
-                for (i, s) in q.surfaces.iter().enumerate() {
-                    self.s_guid.push(mesh.guid.clone());
-                    self.s_index.push(i as u32);
-                    self.s_area_m2.push(s.area_m2);
-                    self.s_nx.push(s.nx);
-                    self.s_ny.push(s.ny);
-                    self.s_nz.push(s.nz);
-                }
+                ));
             }
 
-            #[cfg(feature = "csg")]
-            fn bump_outcome(&mut self, outcome: crate::mesh::cut_stats::Outcome) {
-                outcome.accumulate(&mut self.cut_stats);
-            }
-        }
-        impl ProductSink for QtoSink {
-            fn on_product(&mut self, mut mesh: ProductMesh) {
-                if mesh.indices.is_empty() || mesh.vertices.is_empty() {
-                    return;
-                }
+            let t_total = Instant::now();
+            let (mmap, _open_ms) = open_mmap(path)?;
+
+            // Project unit-scale (mm files: 0.001; metre files: 1.0).
+            // Pulled from the indexer — same source the bundle pre-pass
+            // uses. None → assume metres so geometry-derived numbers stay
+            // sane on schema-incomplete files.
+            let t_idx = Instant::now();
+            let idx = py.detach(|| indexer::index(&mmap));
+            refuse_truncated_index(&idx, path)?;
+            let idx_ms = t_idx.elapsed().as_secs_f64() * 1000.0;
+            let unit_scale = idx.unit_scale.unwrap_or(1.0) as f32;
+
+            // Per-product accumulator sink. One row per meshed product
+            // landing in `products`; one row per distinct planar surface
+            // landing in `surfaces`. Avoids holding the meshes themselves
+            // — drops each ProductMesh after computing its QTO.
+            struct QtoSink {
+                unit_scale: f32,
+                cut_openings: bool,
+                guid: Vec<String>,
+                entity: Vec<String>,
+                volume_m3: Vec<f32>,
+                volume_mesh_m3: Vec<f32>,
+                volume_prism_bound_m3: Vec<f32>,
+                volume_reliable: Vec<bool>,
+                volume_method: Vec<&'static str>,
+                mesh_quality: Vec<&'static str>,
+                aabb_volume_m3: Vec<f32>,
+                surface_area_m2: Vec<f32>,
+                area_top_m2: Vec<f32>,
+                area_bottom_m2: Vec<f32>,
+                area_side_m2: Vec<f32>,
+                area_inclined_m2: Vec<f32>,
+                largest_surface_m2: Vec<f32>,
+                smallest_surface_m2: Vec<f32>,
+                surface_count: Vec<u32>,
+                // Long-format per-surface columns.
+                s_guid: Vec<String>,
+                s_index: Vec<u32>,
+                s_area_m2: Vec<f32>,
+                s_nx: Vec<f32>,
+                s_ny: Vec<f32>,
+                s_nz: Vec<f32>,
+                cut_stats: crate::mesh::cut_stats::CutOpeningsStats,
+                // Cross-product IfcRelVoidsElement buffer — same pattern as
+                // extract_meshes. Only `Some` when cut_openings && at least
+                // one void relation exists; else the hot path is identical
+                // to the no-cut version.
                 #[cfg(feature = "csg")]
-                if self.cut_openings {
-                    // Cross-product routing first: suppress openings,
-                    // hold hosts for flush, pass-through the rest into
-                    // the in-rep apply.
-                    if let Some(cross) = self.cross.as_mut() {
-                        use crate::mesh::cut_openings::Routed;
-                        match cross.route(mesh) {
-                            Routed::Suppressed | Routed::Held => return,
-                            Routed::PassThrough(m) => mesh = m,
+                cross: Option<crate::mesh::cut_openings::CrossProductCut>,
+            }
+            impl QtoSink {
+                /// Compute QTO for a (cut-applied or unchanged) mesh and
+                /// push its row + per-surface rows. Shared between the
+                /// streaming `on_product` and the post-stream cross-product
+                /// flush.
+                fn record(&mut self, mesh: ProductMesh) {
+                    let q = qto::compute(&mesh.vertices, &mesh.indices, self.unit_scale);
+                    self.guid.push(mesh.guid.clone());
+                    self.entity.push(mesh.entity.clone());
+                    self.volume_m3.push(q.volume_best_m3);
+                    self.volume_mesh_m3.push(q.volume_m3.abs());
+                    self.volume_prism_bound_m3.push(q.volume_prism_bound_m3);
+                    self.volume_reliable.push(q.volume_reliable);
+                    self.volume_method.push(q.volume_method);
+                    self.mesh_quality.push(q.mesh_quality);
+                    self.aabb_volume_m3.push(q.aabb_volume_m3);
+                    self.surface_area_m2.push(q.surface_area_m2);
+                    self.area_top_m2.push(q.area_top_m2);
+                    self.area_bottom_m2.push(q.area_bottom_m2);
+                    self.area_side_m2.push(q.area_side_m2);
+                    self.area_inclined_m2.push(q.area_inclined_m2);
+                    self.largest_surface_m2.push(q.largest_surface_m2);
+                    self.smallest_surface_m2.push(q.smallest_surface_m2);
+                    self.surface_count.push(q.surface_count);
+                    for (i, s) in q.surfaces.iter().enumerate() {
+                        self.s_guid.push(mesh.guid.clone());
+                        self.s_index.push(i as u32);
+                        self.s_area_m2.push(s.area_m2);
+                        self.s_nx.push(s.nx);
+                        self.s_ny.push(s.ny);
+                        self.s_nz.push(s.nz);
+                    }
+                }
+
+                #[cfg(feature = "csg")]
+                fn bump_outcome(&mut self, outcome: crate::mesh::cut_stats::Outcome) {
+                    outcome.accumulate(&mut self.cut_stats);
+                }
+            }
+            impl ProductSink for QtoSink {
+                fn on_product(&mut self, mut mesh: ProductMesh) {
+                    if mesh.indices.is_empty() || mesh.vertices.is_empty() {
+                        return;
+                    }
+                    #[cfg(feature = "csg")]
+                    if self.cut_openings {
+                        // Cross-product routing first: suppress openings,
+                        // hold hosts for flush, pass-through the rest into
+                        // the in-rep apply.
+                        if let Some(cross) = self.cross.as_mut() {
+                            use crate::mesh::cut_openings::Routed;
+                            match cross.route(mesh) {
+                                Routed::Suppressed | Routed::Held => return,
+                                Routed::PassThrough(m) => mesh = m,
+                            }
+                        }
+                        let outcome = crate::mesh::cut_openings::apply(&mut mesh, self.unit_scale);
+                        self.bump_outcome(outcome);
+                        if mesh.indices.is_empty() || mesh.vertices.is_empty() {
+                            return;
                         }
                     }
-                    let outcome = crate::mesh::cut_openings::apply(&mut mesh, self.unit_scale);
-                    self.bump_outcome(outcome);
-                    if mesh.indices.is_empty() || mesh.vertices.is_empty() {
-                        return;
-                    }
-                }
-                #[cfg(not(feature = "csg"))]
-                let _ = self.cut_openings;
+                    #[cfg(not(feature = "csg"))]
+                    let _ = self.cut_openings;
 
-                // No cut ran -> the synthetic half-space stand-in slabs
-                // are still in the buffers and would be summed into the
-                // signed-tetra volume and the AABB (GH #66). QTO must
-                // measure the element, never tool geometry.
-                if !(cfg!(feature = "csg") && self.cut_openings) {
-                    crate::mesh::strip_synthetic_cutters(&mut mesh);
-                    if mesh.indices.is_empty() || mesh.vertices.is_empty() {
-                        return;
+                    // No cut ran -> the synthetic half-space stand-in slabs
+                    // are still in the buffers and would be summed into the
+                    // signed-tetra volume and the AABB (GH #66). QTO must
+                    // measure the element, never tool geometry.
+                    if !(cfg!(feature = "csg") && self.cut_openings) {
+                        crate::mesh::strip_synthetic_cutters(&mut mesh);
+                        if mesh.indices.is_empty() || mesh.vertices.is_empty() {
+                            return;
+                        }
                     }
-                }
 
-                self.record(mesh);
+                    self.record(mesh);
+                }
             }
-        }
-        #[cfg(feature = "csg")]
-        let cross = if cut_openings {
-            let c = crate::mesh::cut_openings::CrossProductCut::from_indexer(
-                &idx.voids_opening,
-                &idx.voids_host,
-            );
-            if c.is_empty() { None } else { Some(c) }
-        } else {
-            None
-        };
-        let mut sink = QtoSink {
-            unit_scale,
-            cut_openings,
-            guid: Vec::with_capacity(idx.product_step_id.len()),
-            entity: Vec::with_capacity(idx.product_step_id.len()),
-            volume_m3: Vec::with_capacity(idx.product_step_id.len()),
-            volume_mesh_m3: Vec::with_capacity(idx.product_step_id.len()),
-            volume_prism_bound_m3: Vec::with_capacity(idx.product_step_id.len()),
-            volume_reliable: Vec::with_capacity(idx.product_step_id.len()),
-            volume_method: Vec::with_capacity(idx.product_step_id.len()),
-            mesh_quality: Vec::with_capacity(idx.product_step_id.len()),
-            aabb_volume_m3: Vec::with_capacity(idx.product_step_id.len()),
-            surface_area_m2: Vec::with_capacity(idx.product_step_id.len()),
-            area_top_m2: Vec::with_capacity(idx.product_step_id.len()),
-            area_bottom_m2: Vec::with_capacity(idx.product_step_id.len()),
-            area_side_m2: Vec::with_capacity(idx.product_step_id.len()),
-            area_inclined_m2: Vec::with_capacity(idx.product_step_id.len()),
-            largest_surface_m2: Vec::with_capacity(idx.product_step_id.len()),
-            smallest_surface_m2: Vec::with_capacity(idx.product_step_id.len()),
-            surface_count: Vec::with_capacity(idx.product_step_id.len()),
-            s_guid: Vec::new(),
-            s_index: Vec::new(),
-            s_area_m2: Vec::new(),
-            s_nx: Vec::new(),
-            s_ny: Vec::new(),
-            s_nz: Vec::new(),
-            cut_stats: crate::mesh::cut_stats::CutOpeningsStats::default(),
             #[cfg(feature = "csg")]
-            cross,
-        };
-
-        let t_mesh = Instant::now();
-        // Local frame: QTO is translation-invariant, so meshing the shape
-        // near origin gives correct volume/area/orientation AND stays
-        // precise for far-from-origin objects (georeferenced MEP) that
-        // would otherwise collapse into an f32-quantised point and report
-        // surface_count = 0.
-        let mesh_stats =
-            py.detach(|| mesh_ifc_streaming_framed(&mmap, &mut sink, BakeFrame::Local));
-
-        // Cross-product flush — mirror extract_meshes. Fold every
-        // buffered host with its arrived openings and run the folded
-        // mesh through the same QTO recorder.
-        #[cfg(feature = "csg")]
-        if let Some(mut cross) = sink.cross.take() {
-            let prism_table = prism_table_for_flush(&mmap);
-            for (folded, outcome) in cross.flush(sink.unit_scale, prism_table.as_ref()) {
-                sink.bump_outcome(outcome);
-                if folded.indices.is_empty() || folded.vertices.is_empty() {
-                    continue;
+            let cross = if cut_openings {
+                let c = crate::mesh::cut_openings::CrossProductCut::from_indexer(
+                    &idx.voids_opening,
+                    &idx.voids_host,
+                );
+                if c.is_empty() {
+                    None
+                } else {
+                    Some(c)
                 }
-                sink.record(folded);
-            }
-        }
-        let mesh_ms = t_mesh.elapsed().as_secs_f64() * 1000.0;
+            } else {
+                None
+            };
+            let mut sink = QtoSink {
+                unit_scale,
+                cut_openings,
+                guid: Vec::with_capacity(idx.product_step_id.len()),
+                entity: Vec::with_capacity(idx.product_step_id.len()),
+                volume_m3: Vec::with_capacity(idx.product_step_id.len()),
+                volume_mesh_m3: Vec::with_capacity(idx.product_step_id.len()),
+                volume_prism_bound_m3: Vec::with_capacity(idx.product_step_id.len()),
+                volume_reliable: Vec::with_capacity(idx.product_step_id.len()),
+                volume_method: Vec::with_capacity(idx.product_step_id.len()),
+                mesh_quality: Vec::with_capacity(idx.product_step_id.len()),
+                aabb_volume_m3: Vec::with_capacity(idx.product_step_id.len()),
+                surface_area_m2: Vec::with_capacity(idx.product_step_id.len()),
+                area_top_m2: Vec::with_capacity(idx.product_step_id.len()),
+                area_bottom_m2: Vec::with_capacity(idx.product_step_id.len()),
+                area_side_m2: Vec::with_capacity(idx.product_step_id.len()),
+                area_inclined_m2: Vec::with_capacity(idx.product_step_id.len()),
+                largest_surface_m2: Vec::with_capacity(idx.product_step_id.len()),
+                smallest_surface_m2: Vec::with_capacity(idx.product_step_id.len()),
+                surface_count: Vec::with_capacity(idx.product_step_id.len()),
+                s_guid: Vec::new(),
+                s_index: Vec::new(),
+                s_area_m2: Vec::new(),
+                s_nx: Vec::new(),
+                s_ny: Vec::new(),
+                s_nz: Vec::new(),
+                cut_stats: crate::mesh::cut_stats::CutOpeningsStats::default(),
+                #[cfg(feature = "csg")]
+                cross,
+            };
 
-        let out = PyDict::new(py);
-        out.set_item("guid", PyList::new(py, sink.guid)?)?;
-        out.set_item("entity", PyList::new(py, sink.entity)?)?;
-        out.set_item("volume_m3", PyList::new(py, sink.volume_m3)?)?;
-        out.set_item("volume_mesh_m3", PyList::new(py, sink.volume_mesh_m3)?)?;
-        out.set_item(
-            "volume_prism_bound_m3",
-            PyList::new(py, sink.volume_prism_bound_m3)?,
-        )?;
-        out.set_item("volume_reliable", PyList::new(py, sink.volume_reliable)?)?;
-        out.set_item("volume_method", PyList::new(py, sink.volume_method)?)?;
-        out.set_item("mesh_quality", PyList::new(py, sink.mesh_quality)?)?;
-        out.set_item("aabb_volume_m3", PyList::new(py, sink.aabb_volume_m3)?)?;
-        out.set_item("surface_area_m2", PyList::new(py, sink.surface_area_m2)?)?;
-        out.set_item("area_top_m2", PyList::new(py, sink.area_top_m2)?)?;
-        out.set_item("area_bottom_m2", PyList::new(py, sink.area_bottom_m2)?)?;
-        out.set_item("area_side_m2", PyList::new(py, sink.area_side_m2)?)?;
-        out.set_item("area_inclined_m2", PyList::new(py, sink.area_inclined_m2)?)?;
-        out.set_item("largest_surface_m2", PyList::new(py, sink.largest_surface_m2)?)?;
-        out.set_item("smallest_surface_m2", PyList::new(py, sink.smallest_surface_m2)?)?;
-        out.set_item("surface_count", PyList::new(py, sink.surface_count)?)?;
-        out.set_item("surface_guid", PyList::new(py, sink.s_guid)?)?;
-        out.set_item("surface_index", PyList::new(py, sink.s_index)?)?;
-        out.set_item("surface_area_m2_long", PyList::new(py, sink.s_area_m2)?)?;
-        out.set_item("surface_nx", PyList::new(py, sink.s_nx)?)?;
-        out.set_item("surface_ny", PyList::new(py, sink.s_ny)?)?;
-        out.set_item("surface_nz", PyList::new(py, sink.s_nz)?)?;
-        out.set_item("unit_scale", unit_scale as f64)?;
-        out.set_item("indexer_ms", idx_ms)?;
-        out.set_item("mesh_ms", mesh_ms)?;
-        out.set_item("entity_table_ms", mesh_stats.entity_table_build_ms)?;
-        out.set_item("total_ms", t_total.elapsed().as_secs_f64() * 1000.0)?;
-        out.set_item("products_meshed", mesh_stats.products_meshed)?;
-        out.set_item("size_bytes", mmap.len() as u64)?;
-        out.set_item("cut_openings", cut_openings)?;
-        set_cut_openings_stats(&out, &sink.cut_stats)?;
-        Ok(out)
+            let t_mesh = Instant::now();
+            // Local frame: QTO is translation-invariant, so meshing the shape
+            // near origin gives correct volume/area/orientation AND stays
+            // precise for far-from-origin objects (georeferenced MEP) that
+            // would otherwise collapse into an f32-quantised point and report
+            // surface_count = 0.
+            let mesh_stats =
+                py.detach(|| mesh_ifc_streaming_framed(&mmap, &mut sink, BakeFrame::Local));
+
+            // Cross-product flush — mirror extract_meshes. Fold every
+            // buffered host with its arrived openings and run the folded
+            // mesh through the same QTO recorder.
+            #[cfg(feature = "csg")]
+            if let Some(mut cross) = sink.cross.take() {
+                let prism_table = prism_table_for_flush(&mmap);
+                for (folded, outcome) in cross.flush(sink.unit_scale, prism_table.as_ref()) {
+                    sink.bump_outcome(outcome);
+                    if folded.indices.is_empty() || folded.vertices.is_empty() {
+                        continue;
+                    }
+                    sink.record(folded);
+                }
+            }
+            let mesh_ms = t_mesh.elapsed().as_secs_f64() * 1000.0;
+
+            let out = PyDict::new(py);
+            out.set_item("guid", PyList::new(py, sink.guid)?)?;
+            out.set_item("entity", PyList::new(py, sink.entity)?)?;
+            out.set_item("volume_m3", PyList::new(py, sink.volume_m3)?)?;
+            out.set_item("volume_mesh_m3", PyList::new(py, sink.volume_mesh_m3)?)?;
+            out.set_item(
+                "volume_prism_bound_m3",
+                PyList::new(py, sink.volume_prism_bound_m3)?,
+            )?;
+            out.set_item("volume_reliable", PyList::new(py, sink.volume_reliable)?)?;
+            out.set_item("volume_method", PyList::new(py, sink.volume_method)?)?;
+            out.set_item("mesh_quality", PyList::new(py, sink.mesh_quality)?)?;
+            out.set_item("aabb_volume_m3", PyList::new(py, sink.aabb_volume_m3)?)?;
+            out.set_item("surface_area_m2", PyList::new(py, sink.surface_area_m2)?)?;
+            out.set_item("area_top_m2", PyList::new(py, sink.area_top_m2)?)?;
+            out.set_item("area_bottom_m2", PyList::new(py, sink.area_bottom_m2)?)?;
+            out.set_item("area_side_m2", PyList::new(py, sink.area_side_m2)?)?;
+            out.set_item("area_inclined_m2", PyList::new(py, sink.area_inclined_m2)?)?;
+            out.set_item(
+                "largest_surface_m2",
+                PyList::new(py, sink.largest_surface_m2)?,
+            )?;
+            out.set_item(
+                "smallest_surface_m2",
+                PyList::new(py, sink.smallest_surface_m2)?,
+            )?;
+            out.set_item("surface_count", PyList::new(py, sink.surface_count)?)?;
+            out.set_item("surface_guid", PyList::new(py, sink.s_guid)?)?;
+            out.set_item("surface_index", PyList::new(py, sink.s_index)?)?;
+            out.set_item("surface_area_m2_long", PyList::new(py, sink.s_area_m2)?)?;
+            out.set_item("surface_nx", PyList::new(py, sink.s_nx)?)?;
+            out.set_item("surface_ny", PyList::new(py, sink.s_ny)?)?;
+            out.set_item("surface_nz", PyList::new(py, sink.s_nz)?)?;
+            out.set_item("unit_scale", unit_scale as f64)?;
+            out.set_item("indexer_ms", idx_ms)?;
+            out.set_item("mesh_ms", mesh_ms)?;
+            out.set_item("entity_table_ms", mesh_stats.entity_table_build_ms)?;
+            out.set_item("total_ms", t_total.elapsed().as_secs_f64() * 1000.0)?;
+            out.set_item("products_meshed", mesh_stats.products_meshed)?;
+            out.set_item("size_bytes", mmap.len() as u64)?;
+            out.set_item("cut_openings", cut_openings)?;
+            set_cut_openings_stats(&out, &sink.cut_stats)?;
+            Ok(out)
         })
     }
 
@@ -1004,195 +1087,209 @@ mod python {
     #[pyfunction]
     pub fn analyse_drift<'py>(py: Python<'py>, path: &str) -> PyResult<Bound<'py, PyDict>> {
         catch_panic(|| {
-        let t_total = Instant::now();
-        let (mmap, _open_ms) = open_mmap(path)?;
-        // Unit scale (metres per model unit) for column rescaling.
-        // mm-unit files: 0.001; metre files: 1.0. We index up front
-        // because the drift consumer (Python) needs SI columns by
-        // contract — see `m.drift` docstring. ~indexer cost is small
-        // next to the mesh pass that follows.
-        let idx = py.detach(|| indexer::index(&mmap));
-        let unit_scale = idx.unit_scale.unwrap_or(1.0) as f32;
-        let us_len = unit_scale;
-        let us_area = unit_scale * unit_scale;
-        let us_vol = unit_scale * unit_scale * unit_scale;
-        let (mut meshes, mesh_stats) = py.detach(|| crate::mesh::mesh_ifc(&mmap));
-        // Drift is the geometry-validity signal layer: its centroid /
-        // AABB / volume columns must describe the ELEMENT. Strip the
-        // synthetic half-space stand-in slabs first, or every clipped
-        // product reports a foreign-extent bbox (GH #66 — the very
-        // "broken mesh" class drift exists to catch).
-        for m in &mut meshes {
-            crate::mesh::strip_synthetic_cutters(m);
-        }
-        let prod_stats: Vec<crate::mesh::stats::ProductStats> = meshes
-            .iter()
-            .map(|m| crate::mesh::stats::ProductStats::from_mesh(m, unit_scale))
-            .collect();
-        let file_stats = crate::mesh::stats::FileStats::from_products(&prod_stats);
-
-        let out = PyDict::new(py);
-        let n = prod_stats.len();
-        let (mut guid, mut entity, mut source) =
-            (Vec::with_capacity(n), Vec::with_capacity(n), Vec::with_capacity(n));
-        let mut tri_count = Vec::with_capacity(n);
-        let mut surface_area = Vec::with_capacity(n);
-        let mut volume_abs = Vec::with_capacity(n);
-        let (mut px, mut py_v, mut pz) =
-            (Vec::with_capacity(n), Vec::with_capacity(n), Vec::with_capacity(n));
-        let (mut cx, mut cy, mut cz) =
-            (Vec::with_capacity(n), Vec::with_capacity(n), Vec::with_capacity(n));
-        let mut drift_distance = Vec::with_capacity(n);
-        let mut max_extent = Vec::with_capacity(n);
-        let mut drift_ratio = Vec::with_capacity(n);
-        let mut drift_severity: Vec<&'static str> = Vec::with_capacity(n);
-        let mut aabb_volume = Vec::with_capacity(n);
-        let mut mesh_quality = Vec::with_capacity(n);
-        let mut meshed_total = 0u32;
-        let mut raw_error_count = 0u32;
-        for s in &prod_stats {
-            let px_m = s.placement_x * us_len;
-            let py_m = s.placement_y * us_len;
-            let pz_m = s.placement_z * us_len;
-            let cx_m = ((s.xmin + s.xmax) * 0.5) * us_len;
-            let cy_m = ((s.ymin + s.ymax) * 0.5) * us_len;
-            let cz_m = ((s.zmin + s.zmax) * 0.5) * us_len;
-            let drift_m = s.drift_distance * us_len;
-            let extent_m = s.max_extent * us_len;
-            // Per-row severity, recomputed against SI values so the
-            // 10 mm absolute threshold is unit-independent (the old
-            // `drift < 10.0` rule against raw model units was 10 mm
-            // on mm-files but 10 m on metre-files — over-strict on
-            // mm files and over-lenient on metre files).
-            let severity: &'static str = if drift_m < 0.010 || s.drift_ratio <= 2.0 {
-                "ok"
-            } else if s.drift_ratio <= 10.0 {
-                "warn"
-            } else {
-                "error"
-            };
-            guid.push(s.guid.clone());
-            entity.push(s.entity.clone());
-            source.push(s.source);
-            tri_count.push(s.triangle_count);
-            surface_area.push(s.surface_area * us_area);
-            volume_abs.push(s.volume.abs() * us_vol);
-            px.push(px_m);
-            py_v.push(py_m);
-            pz.push(pz_m);
-            cx.push(cx_m);
-            cy.push(cy_m);
-            cz.push(cz_m);
-            drift_distance.push(drift_m);
-            max_extent.push(extent_m);
-            drift_ratio.push(s.drift_ratio);
-            drift_severity.push(severity);
-            aabb_volume.push(s.aabb_volume * us_vol);
-            mesh_quality.push(s.mesh_quality);
-
-            meshed_total += 1;
-            if severity == "error" {
-                raw_error_count += 1;
+            let t_total = Instant::now();
+            let (mmap, _open_ms) = open_mmap(path)?;
+            // Unit scale (metres per model unit) for column rescaling.
+            // mm-unit files: 0.001; metre files: 1.0. We index up front
+            // because the drift consumer (Python) needs SI columns by
+            // contract — see `m.drift` docstring. ~indexer cost is small
+            // next to the mesh pass that follows.
+            let idx = py.detach(|| indexer::index(&mmap));
+            refuse_truncated_index(&idx, path)?;
+            let unit_scale = idx.unit_scale.unwrap_or(1.0) as f32;
+            let us_len = unit_scale;
+            let us_area = unit_scale * unit_scale;
+            let us_vol = unit_scale * unit_scale * unit_scale;
+            let (mut meshes, mesh_stats) = py.detach(|| crate::mesh::mesh_ifc(&mmap));
+            // Drift is the geometry-validity signal layer: its centroid /
+            // AABB / volume columns must describe the ELEMENT. Strip the
+            // synthetic half-space stand-in slabs first, or every clipped
+            // product reports a foreign-extent bbox (GH #66 — the very
+            // "broken mesh" class drift exists to catch).
+            for m in &mut meshes {
+                crate::mesh::strip_synthetic_cutters(m);
             }
-        }
+            let prod_stats: Vec<crate::mesh::stats::ProductStats> = meshes
+                .iter()
+                .map(|m| crate::mesh::stats::ProductStats::from_mesh(m, unit_scale))
+                .collect();
+            let file_stats = crate::mesh::stats::FileStats::from_products(&prod_stats);
 
-        // Model-level drift-pattern detector — see
-        // `crate::mesh::stats::is_world_coordinate_baked` for the
-        // heuristic and the GH #33 rationale.
-        let world_coord_baked =
-            crate::mesh::stats::is_world_coordinate_baked(meshed_total, raw_error_count);
-        if world_coord_baked {
-            for sev in drift_severity.iter_mut() {
-                if *sev == "error" || *sev == "warn" {
-                    *sev = "info";
+            let out = PyDict::new(py);
+            let n = prod_stats.len();
+            let (mut guid, mut entity, mut source) = (
+                Vec::with_capacity(n),
+                Vec::with_capacity(n),
+                Vec::with_capacity(n),
+            );
+            let mut tri_count = Vec::with_capacity(n);
+            let mut surface_area = Vec::with_capacity(n);
+            let mut volume_abs = Vec::with_capacity(n);
+            let (mut px, mut py_v, mut pz) = (
+                Vec::with_capacity(n),
+                Vec::with_capacity(n),
+                Vec::with_capacity(n),
+            );
+            let (mut cx, mut cy, mut cz) = (
+                Vec::with_capacity(n),
+                Vec::with_capacity(n),
+                Vec::with_capacity(n),
+            );
+            let mut drift_distance = Vec::with_capacity(n);
+            let mut max_extent = Vec::with_capacity(n);
+            let mut drift_ratio = Vec::with_capacity(n);
+            let mut drift_severity: Vec<&'static str> = Vec::with_capacity(n);
+            let mut aabb_volume = Vec::with_capacity(n);
+            let mut mesh_quality = Vec::with_capacity(n);
+            let mut meshed_total = 0u32;
+            let mut raw_error_count = 0u32;
+            for s in &prod_stats {
+                let px_m = s.placement_x * us_len;
+                let py_m = s.placement_y * us_len;
+                let pz_m = s.placement_z * us_len;
+                let cx_m = ((s.xmin + s.xmax) * 0.5) * us_len;
+                let cy_m = ((s.ymin + s.ymax) * 0.5) * us_len;
+                let cz_m = ((s.zmin + s.zmax) * 0.5) * us_len;
+                let drift_m = s.drift_distance * us_len;
+                let extent_m = s.max_extent * us_len;
+                // Per-row severity, recomputed against SI values so the
+                // 10 mm absolute threshold is unit-independent (the old
+                // `drift < 10.0` rule against raw model units was 10 mm
+                // on mm-files but 10 m on metre-files — over-strict on
+                // mm files and over-lenient on metre files).
+                let severity: &'static str = if drift_m < 0.010 || s.drift_ratio <= 2.0 {
+                    "ok"
+                } else if s.drift_ratio <= 10.0 {
+                    "warn"
+                } else {
+                    "error"
+                };
+                guid.push(s.guid.clone());
+                entity.push(s.entity.clone());
+                source.push(s.source);
+                tri_count.push(s.triangle_count);
+                surface_area.push(s.surface_area * us_area);
+                volume_abs.push(s.volume.abs() * us_vol);
+                px.push(px_m);
+                py_v.push(py_m);
+                pz.push(pz_m);
+                cx.push(cx_m);
+                cy.push(cy_m);
+                cz.push(cz_m);
+                drift_distance.push(drift_m);
+                max_extent.push(extent_m);
+                drift_ratio.push(s.drift_ratio);
+                drift_severity.push(severity);
+                aabb_volume.push(s.aabb_volume * us_vol);
+                mesh_quality.push(s.mesh_quality);
+
+                meshed_total += 1;
+                if severity == "error" {
+                    raw_error_count += 1;
                 }
             }
-        }
 
-        // Recount severity buckets post-demotion so file-level
-        // counts agree with what `drift_severity` actually emits.
-        let mut sev_ok = 0u32;
-        let mut sev_warn = 0u32;
-        let mut sev_error = 0u32;
-        let mut sev_info = 0u32;
-        for sev in &drift_severity {
-            match *sev {
-                "ok" => sev_ok += 1,
-                "warn" => sev_warn += 1,
-                "error" => sev_error += 1,
-                "info" => sev_info += 1,
-                _ => {}
+            // Model-level drift-pattern detector — see
+            // `crate::mesh::stats::is_world_coordinate_baked` for the
+            // heuristic and the GH #33 rationale.
+            let world_coord_baked =
+                crate::mesh::stats::is_world_coordinate_baked(meshed_total, raw_error_count);
+            if world_coord_baked {
+                for sev in drift_severity.iter_mut() {
+                    if *sev == "error" || *sev == "warn" {
+                        *sev = "info";
+                    }
+                }
             }
-        }
-        out.set_item("guid", PyList::new(py, guid)?)?;
-        out.set_item("entity", PyList::new(py, entity)?)?;
-        out.set_item("source", PyList::new(py, source)?)?;
-        out.set_item("triangle_count", PyList::new(py, tri_count)?)?;
-        out.set_item("surface_area_m2", PyList::new(py, surface_area)?)?;
-        out.set_item("volume_abs_m3", PyList::new(py, volume_abs)?)?;
-        out.set_item("placement_x_m", PyList::new(py, px)?)?;
-        out.set_item("placement_y_m", PyList::new(py, py_v)?)?;
-        out.set_item("placement_z_m", PyList::new(py, pz)?)?;
-        out.set_item("centroid_x_m", PyList::new(py, cx)?)?;
-        out.set_item("centroid_y_m", PyList::new(py, cy)?)?;
-        out.set_item("centroid_z_m", PyList::new(py, cz)?)?;
-        out.set_item("drift_distance_m", PyList::new(py, drift_distance)?)?;
-        out.set_item("max_extent_m", PyList::new(py, max_extent)?)?;
-        out.set_item("drift_ratio", PyList::new(py, drift_ratio)?)?;
-        out.set_item("drift_severity", PyList::new(py, drift_severity)?)?;
-        out.set_item("aabb_volume_m3", PyList::new(py, aabb_volume)?)?;
-        out.set_item("mesh_quality", PyList::new(py, mesh_quality)?)?;
-        out.set_item("unit_scale", unit_scale as f64)?;
-        // Use the SI-recomputed counts so file-level totals agree
-        // with the per-row severity actually emitted (after the
-        // world-coordinate-baked demotion, if any).
-        out.set_item("drift_ok", sev_ok)?;
-        out.set_item("drift_warn", sev_warn)?;
-        out.set_item("drift_error", sev_error)?;
-        out.set_item("drift_info", sev_info)?;
-        out.set_item("world_coordinate_baked", world_coord_baked)?;
-        // Silence the unused-binding warning on builds where these
-        // raw-unit FileStats counters aren't surfaced. They're still
-        // populated by `FileStats::from_products` and used by the
-        // CLI `analyse_drift` text path elsewhere.
-        let _ = (file_stats.drift_ok, file_stats.drift_warn, file_stats.drift_error);
 
-        // Per-segment provenance — flat long-format columns, one row
-        // per MeshSegment across all products. A product with a single
-        // representation item contributes one row; an IfcBooleanResult
-        // contributes one row per operand. The compound `role|leaf`
-        // tag (e.g. "boolean_second_operand|halfspace_bounded") is
-        // preserved verbatim in `seg_source` so consumers can split or
-        // colour by either half.
-        let total_segments: usize = meshes.iter().map(|m| m.segments.len()).sum();
-        let mut seg_guid: Vec<String> = Vec::with_capacity(total_segments);
-        let mut seg_product_index: Vec<u32> = Vec::with_capacity(total_segments);
-        let mut seg_index: Vec<u32> = Vec::with_capacity(total_segments);
-        let mut seg_source: Vec<String> = Vec::with_capacity(total_segments);
-        let mut seg_triangle_count: Vec<u32> = Vec::with_capacity(total_segments);
-        let mut seg_index_start: Vec<u32> = Vec::with_capacity(total_segments);
-        for (pi, mesh) in meshes.iter().enumerate() {
-            for (si, seg) in mesh.segments.iter().enumerate() {
-                seg_guid.push(mesh.guid.clone());
-                seg_product_index.push(pi as u32);
-                seg_index.push(si as u32);
-                seg_source.push(seg.source.clone());
-                seg_triangle_count.push(seg.index_count / 3);
-                seg_index_start.push(seg.index_start);
+            // Recount severity buckets post-demotion so file-level
+            // counts agree with what `drift_severity` actually emits.
+            let mut sev_ok = 0u32;
+            let mut sev_warn = 0u32;
+            let mut sev_error = 0u32;
+            let mut sev_info = 0u32;
+            for sev in &drift_severity {
+                match *sev {
+                    "ok" => sev_ok += 1,
+                    "warn" => sev_warn += 1,
+                    "error" => sev_error += 1,
+                    "info" => sev_info += 1,
+                    _ => {}
+                }
             }
-        }
-        out.set_item("seg_guid", PyList::new(py, seg_guid)?)?;
-        out.set_item("seg_product_index", PyList::new(py, seg_product_index)?)?;
-        out.set_item("seg_index", PyList::new(py, seg_index)?)?;
-        out.set_item("seg_source", PyList::new(py, seg_source)?)?;
-        out.set_item("seg_triangle_count", PyList::new(py, seg_triangle_count)?)?;
-        out.set_item("seg_index_start", PyList::new(py, seg_index_start)?)?;
+            out.set_item("guid", PyList::new(py, guid)?)?;
+            out.set_item("entity", PyList::new(py, entity)?)?;
+            out.set_item("source", PyList::new(py, source)?)?;
+            out.set_item("triangle_count", PyList::new(py, tri_count)?)?;
+            out.set_item("surface_area_m2", PyList::new(py, surface_area)?)?;
+            out.set_item("volume_abs_m3", PyList::new(py, volume_abs)?)?;
+            out.set_item("placement_x_m", PyList::new(py, px)?)?;
+            out.set_item("placement_y_m", PyList::new(py, py_v)?)?;
+            out.set_item("placement_z_m", PyList::new(py, pz)?)?;
+            out.set_item("centroid_x_m", PyList::new(py, cx)?)?;
+            out.set_item("centroid_y_m", PyList::new(py, cy)?)?;
+            out.set_item("centroid_z_m", PyList::new(py, cz)?)?;
+            out.set_item("drift_distance_m", PyList::new(py, drift_distance)?)?;
+            out.set_item("max_extent_m", PyList::new(py, max_extent)?)?;
+            out.set_item("drift_ratio", PyList::new(py, drift_ratio)?)?;
+            out.set_item("drift_severity", PyList::new(py, drift_severity)?)?;
+            out.set_item("aabb_volume_m3", PyList::new(py, aabb_volume)?)?;
+            out.set_item("mesh_quality", PyList::new(py, mesh_quality)?)?;
+            out.set_item("unit_scale", unit_scale as f64)?;
+            // Use the SI-recomputed counts so file-level totals agree
+            // with the per-row severity actually emitted (after the
+            // world-coordinate-baked demotion, if any).
+            out.set_item("drift_ok", sev_ok)?;
+            out.set_item("drift_warn", sev_warn)?;
+            out.set_item("drift_error", sev_error)?;
+            out.set_item("drift_info", sev_info)?;
+            out.set_item("world_coordinate_baked", world_coord_baked)?;
+            // Silence the unused-binding warning on builds where these
+            // raw-unit FileStats counters aren't surfaced. They're still
+            // populated by `FileStats::from_products` and used by the
+            // CLI `analyse_drift` text path elsewhere.
+            let _ = (
+                file_stats.drift_ok,
+                file_stats.drift_warn,
+                file_stats.drift_error,
+            );
 
-        out.set_item("mesh_emission_ms", mesh_stats.elapsed_ms)?;
-        out.set_item("entity_table_ms", mesh_stats.entity_table_build_ms)?;
-        out.set_item("total_ms", t_total.elapsed().as_secs_f64() * 1000.0)?;
-        out.set_item("size_bytes", mmap.len() as u64)?;
-        Ok(out)
+            // Per-segment provenance — flat long-format columns, one row
+            // per MeshSegment across all products. A product with a single
+            // representation item contributes one row; an IfcBooleanResult
+            // contributes one row per operand. The compound `role|leaf`
+            // tag (e.g. "boolean_second_operand|halfspace_bounded") is
+            // preserved verbatim in `seg_source` so consumers can split or
+            // colour by either half.
+            let total_segments: usize = meshes.iter().map(|m| m.segments.len()).sum();
+            let mut seg_guid: Vec<String> = Vec::with_capacity(total_segments);
+            let mut seg_product_index: Vec<u32> = Vec::with_capacity(total_segments);
+            let mut seg_index: Vec<u32> = Vec::with_capacity(total_segments);
+            let mut seg_source: Vec<String> = Vec::with_capacity(total_segments);
+            let mut seg_triangle_count: Vec<u32> = Vec::with_capacity(total_segments);
+            let mut seg_index_start: Vec<u32> = Vec::with_capacity(total_segments);
+            for (pi, mesh) in meshes.iter().enumerate() {
+                for (si, seg) in mesh.segments.iter().enumerate() {
+                    seg_guid.push(mesh.guid.clone());
+                    seg_product_index.push(pi as u32);
+                    seg_index.push(si as u32);
+                    seg_source.push(seg.source.clone());
+                    seg_triangle_count.push(seg.index_count / 3);
+                    seg_index_start.push(seg.index_start);
+                }
+            }
+            out.set_item("seg_guid", PyList::new(py, seg_guid)?)?;
+            out.set_item("seg_product_index", PyList::new(py, seg_product_index)?)?;
+            out.set_item("seg_index", PyList::new(py, seg_index)?)?;
+            out.set_item("seg_source", PyList::new(py, seg_source)?)?;
+            out.set_item("seg_triangle_count", PyList::new(py, seg_triangle_count)?)?;
+            out.set_item("seg_index_start", PyList::new(py, seg_index_start)?)?;
+
+            out.set_item("mesh_emission_ms", mesh_stats.elapsed_ms)?;
+            out.set_item("entity_table_ms", mesh_stats.entity_table_build_ms)?;
+            out.set_item("total_ms", t_total.elapsed().as_secs_f64() * 1000.0)?;
+            out.set_item("size_bytes", mmap.len() as u64)?;
+            Ok(out)
         })
     }
 
@@ -1299,169 +1396,170 @@ mod python {
         seed: u64,
     ) -> PyResult<Bound<'py, PyDict>> {
         catch_panic(|| {
-        use crate::mesh::{sample::sample as sample_mesh, BakeFrame, ProductMesh, ProductSink};
+            use crate::mesh::{sample::sample as sample_mesh, BakeFrame, ProductMesh, ProductSink};
 
-        let t_total = Instant::now();
-        let (mmap, _open_ms) = open_mmap(path)?;
-        let t_idx = Instant::now();
-        let idx = py.detach(|| indexer::index(&mmap));
-        let idx_ms = t_idx.elapsed().as_secs_f64() * 1000.0;
-        let unit_scale = idx.unit_scale.unwrap_or(1.0) as f32;
-        let area_scale = unit_scale * unit_scale;
+            let t_total = Instant::now();
+            let (mmap, _open_ms) = open_mmap(path)?;
+            let t_idx = Instant::now();
+            let idx = py.detach(|| indexer::index(&mmap));
+            refuse_truncated_index(&idx, path)?;
+            let idx_ms = t_idx.elapsed().as_secs_f64() * 1000.0;
+            let unit_scale = idx.unit_scale.unwrap_or(1.0) as f32;
+            let area_scale = unit_scale * unit_scale;
 
-        struct CloudSink {
-            per_m2: f32,
-            seed: u64,
-            area_scale: f32,
-            // Linear-unit-to-metres factor. Sampled point COORDINATES
-            // are scaled by this so the output is always metres,
-            // matching mesh_qto's m²/m³ convention. Normals are
-            // direction vectors and stay unit-length (not scaled).
-            unit_scale: f32,
-            // Model-wide global shift (CloudCompare contract), in model
-            // units. Set lazily from the first geometry product's f64
-            // world origin (rounded). Points are positioned as
-            // `local_shape + (world_origin - shift)` — both terms small,
-            // the sum stays in f32-safe range even for georeferenced
-            // models. Exposed back to the caller (scaled to metres) so
-            // absolute world coords are `point + global_shift`.
-            shift: Option<[f64; 3]>,
-            // One row per emitted point. Each Vec has length equal to
-            // the total point count.
-            guid: Vec<String>,
-            entity: Vec<String>,
-            x: Vec<f32>,
-            y: Vec<f32>,
-            z: Vec<f32>,
-            nx: Vec<f32>,
-            ny: Vec<f32>,
-            nz: Vec<f32>,
-        }
-
-        impl ProductSink for CloudSink {
-            fn on_product(&mut self, mut mesh: ProductMesh) {
-                // Area-weighted sampling walks every triangle — a
-                // synthetic ±20 000-unit half-space slab would soak up
-                // nearly all of a product's point budget (GH #66).
-                crate::mesh::strip_synthetic_cutters(&mut mesh);
-                // Derive a per-product seed from `(seed, ifc_id)` so
-                // every product's PRNG stream is independent — adding
-                // a product to the file doesn't shift every other
-                // product's sampled points. Cheap one-line splitmix64.
-                let mut s = self.seed ^ mesh.ifc_id.wrapping_mul(0x9E3779B97F4A7C15);
-                s = (s ^ (s >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
-                s = (s ^ (s >> 27)).wrapping_mul(0x94D049BB133111EB);
-                s ^= s >> 31;
-
-                let cloud = sample_mesh(
-                    &mesh.vertices,
-                    &mesh.indices,
-                    self.area_scale,
-                    self.per_m2,
-                    s,
-                );
-                let n = cloud.len();
-                if n == 0 {
-                    return;
-                }
-                // Pin the model-wide shift to the first geometry product's
-                // world origin (rounded to a clean model-unit value). All
-                // later products subtract the same shift, so the relative
-                // layout of the whole model is preserved while every point
-                // stays near origin in f32. Threshold-gated like
-                // CloudCompare: only shift when the origin is large enough
-                // (>10 km in metres) to actually lose f32 precision, so
-                // normal building models stay byte-identical (shift 0) and
-                // return absolute world coordinates as before.
-                let shift = *self
-                    .shift
-                    .get_or_insert_with(|| global_shift_for(&mesh.mesh_anchor, self.unit_scale));
-                // Offset from shift to THIS product's precise origin, in
-                // model units. Small for any product within a sane model
-                // extent — computed in f64 so it never collapses.
-                let off = [
-                    mesh.mesh_anchor[0] - shift[0],
-                    mesh.mesh_anchor[1] - shift[1],
-                    mesh.mesh_anchor[2] - shift[2],
-                ];
-                self.guid.reserve(n);
-                self.entity.reserve(n);
-                for _ in 0..n {
-                    self.guid.push(mesh.guid.clone());
-                    self.entity.push(mesh.entity.clone());
-                }
-                // Position each local-frame point at `local + off` (f64),
-                // then scale native-unit → metres. Local shape is near
-                // origin, `off` is small → no f32 collapse. Normals are
-                // direction vectors, copied through unchanged.
-                let us = self.unit_scale as f64;
-                self.x
-                    .extend(cloud.x.iter().map(|v| ((*v as f64 + off[0]) * us) as f32));
-                self.y
-                    .extend(cloud.y.iter().map(|v| ((*v as f64 + off[1]) * us) as f32));
-                self.z
-                    .extend(cloud.z.iter().map(|v| ((*v as f64 + off[2]) * us) as f32));
-                self.nx.extend(cloud.nx);
-                self.ny.extend(cloud.ny);
-                self.nz.extend(cloud.nz);
+            struct CloudSink {
+                per_m2: f32,
+                seed: u64,
+                area_scale: f32,
+                // Linear-unit-to-metres factor. Sampled point COORDINATES
+                // are scaled by this so the output is always metres,
+                // matching mesh_qto's m²/m³ convention. Normals are
+                // direction vectors and stay unit-length (not scaled).
+                unit_scale: f32,
+                // Model-wide global shift (CloudCompare contract), in model
+                // units. Set lazily from the first geometry product's f64
+                // world origin (rounded). Points are positioned as
+                // `local_shape + (world_origin - shift)` — both terms small,
+                // the sum stays in f32-safe range even for georeferenced
+                // models. Exposed back to the caller (scaled to metres) so
+                // absolute world coords are `point + global_shift`.
+                shift: Option<[f64; 3]>,
+                // One row per emitted point. Each Vec has length equal to
+                // the total point count.
+                guid: Vec<String>,
+                entity: Vec<String>,
+                x: Vec<f32>,
+                y: Vec<f32>,
+                z: Vec<f32>,
+                nx: Vec<f32>,
+                ny: Vec<f32>,
+                nz: Vec<f32>,
             }
-        }
 
-        let mut sink = CloudSink {
-            per_m2,
-            seed,
-            area_scale,
-            unit_scale,
-            shift: None,
-            guid: Vec::new(),
-            entity: Vec::new(),
-            x: Vec::new(),
-            y: Vec::new(),
-            z: Vec::new(),
-            nx: Vec::new(),
-            ny: Vec::new(),
-            nz: Vec::new(),
-        };
-        let t_mesh = Instant::now();
-        // Local frame: shape near origin (f32-precise even for
-        // georeferenced models), repositioned per-product in f64 via the
-        // global shift. World-frame baking would collapse small far-from-
-        // origin geometry before sampling ever ran.
-        let mesh_stats = py.detach(|| {
-            crate::mesh::mesh_ifc_streaming_framed(&mmap, &mut sink, BakeFrame::Local)
-        });
-        let mesh_ms = t_mesh.elapsed().as_secs_f64() * 1000.0;
+            impl ProductSink for CloudSink {
+                fn on_product(&mut self, mut mesh: ProductMesh) {
+                    // Area-weighted sampling walks every triangle — a
+                    // synthetic ±20 000-unit half-space slab would soak up
+                    // nearly all of a product's point budget (GH #66).
+                    crate::mesh::strip_synthetic_cutters(&mut mesh);
+                    // Derive a per-product seed from `(seed, ifc_id)` so
+                    // every product's PRNG stream is independent — adding
+                    // a product to the file doesn't shift every other
+                    // product's sampled points. Cheap one-line splitmix64.
+                    let mut s = self.seed ^ mesh.ifc_id.wrapping_mul(0x9E3779B97F4A7C15);
+                    s = (s ^ (s >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+                    s = (s ^ (s >> 27)).wrapping_mul(0x94D049BB133111EB);
+                    s ^= s >> 31;
 
-        let t_marshal = Instant::now();
-        let out = PyDict::new(py);
-        out.set_item("guid", PyList::new(py, &sink.guid)?)?;
-        out.set_item("entity", PyList::new(py, &sink.entity)?)?;
-        out.set_item("x", PyList::new(py, &sink.x)?)?;
-        out.set_item("y", PyList::new(py, &sink.y)?)?;
-        out.set_item("z", PyList::new(py, &sink.z)?)?;
-        out.set_item("nx", PyList::new(py, &sink.nx)?)?;
-        out.set_item("ny", PyList::new(py, &sink.ny)?)?;
-        out.set_item("nz", PyList::new(py, &sink.nz)?)?;
-        out.set_item("unit_scale", unit_scale as f64)?;
-        // Global shift in METRES: add this back to (x, y, z) to recover
-        // absolute world coordinates. `[0, 0, 0]` when the model has no
-        // geometry or already sits near origin.
-        let gs = sink.shift.unwrap_or([0.0, 0.0, 0.0]);
-        let us = unit_scale as f64;
-        out.set_item(
-            "global_shift",
-            PyList::new(py, [gs[0] * us, gs[1] * us, gs[2] * us])?,
-        )?;
-        out.set_item("per_m2", per_m2 as f64)?;
-        out.set_item("seed", seed)?;
-        out.set_item("points_emitted", sink.x.len() as u64)?;
-        out.set_item("products_meshed", mesh_stats.products_meshed as u64)?;
-        out.set_item("indexer_ms", idx_ms)?;
-        out.set_item("mesh_ms", mesh_ms)?;
-        out.set_item("marshal_ms", t_marshal.elapsed().as_secs_f64() * 1000.0)?;
-        out.set_item("total_ms", t_total.elapsed().as_secs_f64() * 1000.0)?;
-        out.set_item("size_bytes", mmap.len() as u64)?;
-        Ok(out)
+                    let cloud = sample_mesh(
+                        &mesh.vertices,
+                        &mesh.indices,
+                        self.area_scale,
+                        self.per_m2,
+                        s,
+                    );
+                    let n = cloud.len();
+                    if n == 0 {
+                        return;
+                    }
+                    // Pin the model-wide shift to the first geometry product's
+                    // world origin (rounded to a clean model-unit value). All
+                    // later products subtract the same shift, so the relative
+                    // layout of the whole model is preserved while every point
+                    // stays near origin in f32. Threshold-gated like
+                    // CloudCompare: only shift when the origin is large enough
+                    // (>10 km in metres) to actually lose f32 precision, so
+                    // normal building models stay byte-identical (shift 0) and
+                    // return absolute world coordinates as before.
+                    let shift = *self.shift.get_or_insert_with(|| {
+                        global_shift_for(&mesh.mesh_anchor, self.unit_scale)
+                    });
+                    // Offset from shift to THIS product's precise origin, in
+                    // model units. Small for any product within a sane model
+                    // extent — computed in f64 so it never collapses.
+                    let off = [
+                        mesh.mesh_anchor[0] - shift[0],
+                        mesh.mesh_anchor[1] - shift[1],
+                        mesh.mesh_anchor[2] - shift[2],
+                    ];
+                    self.guid.reserve(n);
+                    self.entity.reserve(n);
+                    for _ in 0..n {
+                        self.guid.push(mesh.guid.clone());
+                        self.entity.push(mesh.entity.clone());
+                    }
+                    // Position each local-frame point at `local + off` (f64),
+                    // then scale native-unit → metres. Local shape is near
+                    // origin, `off` is small → no f32 collapse. Normals are
+                    // direction vectors, copied through unchanged.
+                    let us = self.unit_scale as f64;
+                    self.x
+                        .extend(cloud.x.iter().map(|v| ((*v as f64 + off[0]) * us) as f32));
+                    self.y
+                        .extend(cloud.y.iter().map(|v| ((*v as f64 + off[1]) * us) as f32));
+                    self.z
+                        .extend(cloud.z.iter().map(|v| ((*v as f64 + off[2]) * us) as f32));
+                    self.nx.extend(cloud.nx);
+                    self.ny.extend(cloud.ny);
+                    self.nz.extend(cloud.nz);
+                }
+            }
+
+            let mut sink = CloudSink {
+                per_m2,
+                seed,
+                area_scale,
+                unit_scale,
+                shift: None,
+                guid: Vec::new(),
+                entity: Vec::new(),
+                x: Vec::new(),
+                y: Vec::new(),
+                z: Vec::new(),
+                nx: Vec::new(),
+                ny: Vec::new(),
+                nz: Vec::new(),
+            };
+            let t_mesh = Instant::now();
+            // Local frame: shape near origin (f32-precise even for
+            // georeferenced models), repositioned per-product in f64 via the
+            // global shift. World-frame baking would collapse small far-from-
+            // origin geometry before sampling ever ran.
+            let mesh_stats = py.detach(|| {
+                crate::mesh::mesh_ifc_streaming_framed(&mmap, &mut sink, BakeFrame::Local)
+            });
+            let mesh_ms = t_mesh.elapsed().as_secs_f64() * 1000.0;
+
+            let t_marshal = Instant::now();
+            let out = PyDict::new(py);
+            out.set_item("guid", PyList::new(py, &sink.guid)?)?;
+            out.set_item("entity", PyList::new(py, &sink.entity)?)?;
+            out.set_item("x", PyList::new(py, &sink.x)?)?;
+            out.set_item("y", PyList::new(py, &sink.y)?)?;
+            out.set_item("z", PyList::new(py, &sink.z)?)?;
+            out.set_item("nx", PyList::new(py, &sink.nx)?)?;
+            out.set_item("ny", PyList::new(py, &sink.ny)?)?;
+            out.set_item("nz", PyList::new(py, &sink.nz)?)?;
+            out.set_item("unit_scale", unit_scale as f64)?;
+            // Global shift in METRES: add this back to (x, y, z) to recover
+            // absolute world coordinates. `[0, 0, 0]` when the model has no
+            // geometry or already sits near origin.
+            let gs = sink.shift.unwrap_or([0.0, 0.0, 0.0]);
+            let us = unit_scale as f64;
+            out.set_item(
+                "global_shift",
+                PyList::new(py, [gs[0] * us, gs[1] * us, gs[2] * us])?,
+            )?;
+            out.set_item("per_m2", per_m2 as f64)?;
+            out.set_item("seed", seed)?;
+            out.set_item("points_emitted", sink.x.len() as u64)?;
+            out.set_item("products_meshed", mesh_stats.products_meshed as u64)?;
+            out.set_item("indexer_ms", idx_ms)?;
+            out.set_item("mesh_ms", mesh_ms)?;
+            out.set_item("marshal_ms", t_marshal.elapsed().as_secs_f64() * 1000.0)?;
+            out.set_item("total_ms", t_total.elapsed().as_secs_f64() * 1000.0)?;
+            out.set_item("size_bytes", mmap.len() as u64)?;
+            Ok(out)
         })
     }
 
@@ -1556,8 +1654,7 @@ mod python {
             if self.tx.send(Ok(chunk)).is_err() {
                 // Consumer dropped the iterator — flip the stop flag so
                 // the rest of the mesh pass returns early.
-                self.stop
-                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
             }
         }
 
@@ -1574,10 +1671,7 @@ mod python {
     impl crate::mesh::ProductSink for StreamingCloudSink {
         fn on_product(&mut self, mut mesh: crate::mesh::ProductMesh) {
             use crate::mesh::sample::sample as sample_mesh;
-            if self
-                .stop
-                .load(std::sync::atomic::Ordering::Relaxed)
-            {
+            if self.stop.load(std::sync::atomic::Ordering::Relaxed) {
                 return;
             }
             // Same contract as the batch CloudSink: never sample the
@@ -1616,12 +1710,9 @@ mod python {
             // remaining-to-chunk-boundary count so a single huge product
             // doesn't briefly balloon the buffer past chunk_points.
             for i in 0..n {
-                self.buf_x
-                    .push(((cloud.x[i] as f64 + off[0]) * us) as f32);
-                self.buf_y
-                    .push(((cloud.y[i] as f64 + off[1]) * us) as f32);
-                self.buf_z
-                    .push(((cloud.z[i] as f64 + off[2]) * us) as f32);
+                self.buf_x.push(((cloud.x[i] as f64 + off[0]) * us) as f32);
+                self.buf_y.push(((cloud.y[i] as f64 + off[1]) * us) as f32);
+                self.buf_z.push(((cloud.z[i] as f64 + off[2]) * us) as f32);
                 self.buf_nx.push(cloud.nx[i]);
                 self.buf_ny.push(cloud.ny[i]);
                 self.buf_nz.push(cloud.nz[i]);
@@ -1629,10 +1720,7 @@ mod python {
                 self.buf_entity.push(mesh.entity.clone());
                 if self.buf_len() >= self.chunk_points {
                     self.flush();
-                    if self
-                        .stop
-                        .load(std::sync::atomic::Ordering::Relaxed)
-                    {
+                    if self.stop.load(std::sync::atomic::Ordering::Relaxed) {
                         return;
                     }
                 }
@@ -1662,8 +1750,7 @@ mod python {
         /// `Drop` and after the worker reports either StopIteration or
         /// a panic, so subsequent `__next__` calls just return None.
         fn close(&mut self) {
-            self.stop
-                .store(true, std::sync::atomic::Ordering::Relaxed);
+            self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
             self.rx.take();
         }
     }
@@ -1671,8 +1758,7 @@ mod python {
     #[cfg(feature = "mesh")]
     impl Drop for PointCloudIter {
         fn drop(&mut self) {
-            self.stop
-                .store(true, std::sync::atomic::Ordering::Relaxed);
+            self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
             // Detach the receiver so the worker's next send fails fast
             // and it exits without blocking. Don't join — the worker
             // may still be inside a `mesh_ifc_streaming_framed` phase;
@@ -1690,10 +1776,7 @@ mod python {
             slf
         }
 
-        fn __next__<'py>(
-            &mut self,
-            py: Python<'py>,
-        ) -> PyResult<Option<Bound<'py, PyDict>>> {
+        fn __next__<'py>(&mut self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyDict>>> {
             let Some(rx) = self.rx.take() else {
                 return Ok(None);
             };
@@ -1723,10 +1806,7 @@ mod python {
                     out.set_item("nx", PyList::new(py, &chunk.nx)?)?;
                     out.set_item("ny", PyList::new(py, &chunk.ny)?)?;
                     out.set_item("nz", PyList::new(py, &chunk.nz)?)?;
-                    out.set_item(
-                        "global_shift",
-                        PyList::new(py, chunk.global_shift_m)?,
-                    )?;
+                    out.set_item("global_shift", PyList::new(py, chunk.global_shift_m)?)?;
                     out.set_item("per_m2", self.per_m2 as f64)?;
                     out.set_item("seed", self.seed)?;
                     out.set_item("points_in_chunk", chunk.x.len() as u64)?;
@@ -1767,9 +1847,7 @@ mod python {
     ) -> PyResult<PointCloudIter> {
         catch_panic(|| {
             if chunk_points == 0 {
-                return Err(PyErr::new::<IfcfastError, _>(
-                    "chunk_points must be > 0",
-                ));
+                return Err(PyErr::new::<IfcfastError, _>("chunk_points must be > 0"));
             }
             // Open the file on the calling thread so I/O errors surface
             // synchronously (matches `sample_point_cloud` / `extract_meshes`
@@ -1779,8 +1857,7 @@ mod python {
             // per chunk, that's ~100 MB of in-flight backpressure — small
             // enough not to dominate RAM, large enough that the worker
             // never starves when Python is mid-DataFrame-build.
-            let (tx, rx) =
-                std::sync::mpsc::sync_channel::<CloudChunkResult>(2);
+            let (tx, rx) = std::sync::mpsc::sync_channel::<CloudChunkResult>(2);
             let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             let worker_tx = tx.clone();
             let worker_stop = stop.clone();
@@ -1791,6 +1868,12 @@ mod python {
                 // the uncatchable `pyo3_runtime.PanicException`.
                 let result = catch_unwind(AssertUnwindSafe(|| {
                     let idx = crate::indexer::index(&mmap);
+                    // GH #148: inside catch_unwind the panic is the
+                    // error channel — it surfaces as `IfcfastError`
+                    // from `__next__`, same as any other worker failure.
+                    if let Some(err) = &idx.parse_error {
+                        panic!("ifcfast: refusing a truncated IFC: {err}");
+                    }
                     let unit_scale = idx.unit_scale.unwrap_or(1.0) as f32;
                     let area_scale = unit_scale * unit_scale;
                     let sink = StreamingCloudSink {
@@ -1884,281 +1967,291 @@ mod python {
         frame: &str,
     ) -> PyResult<Bound<'py, PyDict>> {
         catch_panic(|| {
-        use crate::mesh::{BakeFrame, ProductMesh, ProductSink};
+            use crate::mesh::{BakeFrame, ProductMesh, ProductSink};
 
-        // frame="local" (GH #127): per-element representation-item
-        // coordinates in native units — the m.hotswap input frame.
-        // Incompatible with cut_openings (validated here).
-        let local_frame = parse_mesh_frame(frame, cut_openings)?;
+            // frame="local" (GH #127): per-element representation-item
+            // coordinates in native units — the m.hotswap input frame.
+            // Incompatible with cut_openings (validated here).
+            let local_frame = parse_mesh_frame(frame, cut_openings)?;
 
-        // cut_openings requires the `csg` feature — surface a clear
-        // error rather than silently ignoring the flag.
-        #[cfg(not(feature = "csg"))]
-        if cut_openings {
-            return Err(pyo3::exceptions::PyRuntimeError::new_err(
-                "extract_meshes(cut_openings=True) requires the `csg` Cargo feature; \
+            // cut_openings requires the `csg` feature — surface a clear
+            // error rather than silently ignoring the flag.
+            #[cfg(not(feature = "csg"))]
+            if cut_openings {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                    "extract_meshes(cut_openings=True) requires the `csg` Cargo feature; \
                  this wheel was built without it. Build with \
                  `pip install ifcfast[csg]` (once published) or \
                  `maturin develop --features csg` from source.",
-            ));
-        }
-
-        let t_total = Instant::now();
-        let (mmap, _open_ms) = open_mmap(path)?;
-
-        // Linear-unit-to-metres factor — vertices are scaled to metres
-        // so the output matches the metres contract (and mesh_qto). The
-        // indexer pass is the same source point_cloud uses.
-        let idx = py.detach(|| indexer::index(&mmap));
-        let unit_scale = idx.unit_scale.unwrap_or(1.0) as f32;
-
-        struct MeshSink {
-            unit_scale: f32,
-            cut_openings: bool,
-            // GH #127: emit representation-item-frame vertices verbatim
-            // (native units, no shift, no metre scaling) instead of the
-            // shifted world-metres encode. `global_shift` stays [0,0,0]
-            // because `shift` is never pinned on this path.
-            local_frame: bool,
-            // Reveal-all opt-in (GH #66): keep the synthetic half-space
-            // visualisation slabs in the no-cut output. Default `false`
-            // — they are tool geometry with foreign extent (±20 000
-            // model units), not element geometry.
-            keep_cutters: bool,
-            cutters_stripped: u64,
-            // Model-wide global shift (CloudCompare contract), model
-            // units. Same scheme as `sample_point_cloud`: set from the
-            // first geometry product's f64 origin (rounded); per-product
-            // vertices are `local + (world_origin - shift)`, scaled to
-            // metres. Add `global_shift` back for absolute coords.
-            shift: Option<[f64; 3]>,
-            guid: Vec<String>,
-            entity: Vec<String>,
-            vertex_count: Vec<u32>,
-            triangle_count: Vec<u32>,
-            vertices_le: Vec<Vec<u8>>,
-            indices_le: Vec<Vec<u8>>,
-            // Per-product `world_from_local` placement, flat row-major
-            // 16 f64 in native units (GH #127) — both frames carry it.
-            placement: Vec<[f64; 16]>,
-            cut_stats: crate::mesh::cut_stats::CutOpeningsStats,
-            // Cross-product IfcRelVoidsElement buffer. Some(_) only
-            // when cut_openings && the file has at least one void
-            // relation; otherwise None keeps the hot path identical
-            // to the no-cut behaviour. Stored in an Option so the
-            // sink wrapper can mem::take it for the flush phase
-            // without holding two mutable borrows simultaneously.
-            #[cfg(feature = "csg")]
-            cross: Option<crate::mesh::cut_openings::CrossProductCut>,
-        }
-
-        impl MeshSink {
-            /// Take a (presumed cut-applied, non-empty) mesh and
-            /// push its scaled+rebased byte buffers onto the output
-            /// columns. Shared between the streaming `on_product`
-            /// path and the post-stream cross-product flush.
-            fn encode(&mut self, mesh: ProductMesh) {
-                let mut vbytes = Vec::with_capacity(mesh.vertices.len() * 4);
-                if self.local_frame {
-                    // Representation-item frame (GH #127): the bake
-                    // already produced the item's own coordinates in
-                    // native units — the exact m.hotswap input. Copy
-                    // through verbatim: no shift, no metre scaling.
-                    for v in &mesh.vertices {
-                        vbytes.extend_from_slice(&v.to_le_bytes());
-                    }
-                } else {
-                    let shift = *self
-                        .shift
-                        .get_or_insert_with(|| global_shift_for(&mesh.mesh_anchor, self.unit_scale));
-                    let off = [
-                        mesh.mesh_anchor[0] - shift[0],
-                        mesh.mesh_anchor[1] - shift[1],
-                        mesh.mesh_anchor[2] - shift[2],
-                    ];
-                    // Reposition local-frame shape to `local + off` (f64),
-                    // scale native-unit → metres. Far-from-origin geometry
-                    // stays precise: shape near origin, off small.
-                    let us = self.unit_scale as f64;
-                    for chunk in mesh.vertices.chunks_exact(3) {
-                        let x = ((chunk[0] as f64 + off[0]) * us) as f32;
-                        let y = ((chunk[1] as f64 + off[1]) * us) as f32;
-                        let z = ((chunk[2] as f64 + off[2]) * us) as f32;
-                        vbytes.extend_from_slice(&x.to_le_bytes());
-                        vbytes.extend_from_slice(&y.to_le_bytes());
-                        vbytes.extend_from_slice(&z.to_le_bytes());
-                    }
-                }
-                let mut ibytes = Vec::with_capacity(mesh.indices.len() * 4);
-                for i in &mesh.indices {
-                    ibytes.extend_from_slice(&i.to_le_bytes());
-                }
-                self.placement
-                    .push(placement_row_major(&mesh.world_transform, &mesh.world_origin));
-                self.guid.push(mesh.guid);
-                self.entity.push(mesh.entity);
-                self.vertex_count.push((mesh.vertices.len() / 3) as u32);
-                self.triangle_count.push((mesh.indices.len() / 3) as u32);
-                self.vertices_le.push(vbytes);
-                self.indices_le.push(ibytes);
+                ));
             }
 
-            #[cfg(feature = "csg")]
-            fn bump_outcome(&mut self, outcome: crate::mesh::cut_stats::Outcome) {
-                outcome.accumulate(&mut self.cut_stats);
-            }
-        }
+            let t_total = Instant::now();
+            let (mmap, _open_ms) = open_mmap(path)?;
 
-        impl ProductSink for MeshSink {
-            fn on_product(&mut self, mut mesh: ProductMesh) {
-                // Skip geometryless products — no triangles to hand back.
-                if mesh.indices.is_empty() || mesh.vertices.is_empty() {
-                    return;
-                }
+            // Linear-unit-to-metres factor — vertices are scaled to metres
+            // so the output matches the metres contract (and mesh_qto). The
+            // indexer pass is the same source point_cloud uses.
+            let idx = py.detach(|| indexer::index(&mmap));
+            refuse_truncated_index(&idx, path)?;
+            let unit_scale = idx.unit_scale.unwrap_or(1.0) as f32;
+
+            struct MeshSink {
+                unit_scale: f32,
+                cut_openings: bool,
+                // GH #127: emit representation-item-frame vertices verbatim
+                // (native units, no shift, no metre scaling) instead of the
+                // shifted world-metres encode. `global_shift` stays [0,0,0]
+                // because `shift` is never pinned on this path.
+                local_frame: bool,
+                // Reveal-all opt-in (GH #66): keep the synthetic half-space
+                // visualisation slabs in the no-cut output. Default `false`
+                // — they are tool geometry with foreign extent (±20 000
+                // model units), not element geometry.
+                keep_cutters: bool,
+                cutters_stripped: u64,
+                // Model-wide global shift (CloudCompare contract), model
+                // units. Same scheme as `sample_point_cloud`: set from the
+                // first geometry product's f64 origin (rounded); per-product
+                // vertices are `local + (world_origin - shift)`, scaled to
+                // metres. Add `global_shift` back for absolute coords.
+                shift: Option<[f64; 3]>,
+                guid: Vec<String>,
+                entity: Vec<String>,
+                vertex_count: Vec<u32>,
+                triangle_count: Vec<u32>,
+                vertices_le: Vec<Vec<u8>>,
+                indices_le: Vec<Vec<u8>>,
+                // Per-product `world_from_local` placement, flat row-major
+                // 16 f64 in native units (GH #127) — both frames carry it.
+                placement: Vec<[f64; 16]>,
+                cut_stats: crate::mesh::cut_stats::CutOpeningsStats,
+                // Cross-product IfcRelVoidsElement buffer. Some(_) only
+                // when cut_openings && the file has at least one void
+                // relation; otherwise None keeps the hot path identical
+                // to the no-cut behaviour. Stored in an Option so the
+                // sink wrapper can mem::take it for the flush phase
+                // without holding two mutable borrows simultaneously.
                 #[cfg(feature = "csg")]
-                if self.cut_openings {
-                    // Cross-product routing first: openings get
-                    // suppressed, hosts get held for the flush phase,
-                    // everything else continues into the in-rep apply.
-                    if let Some(cross) = self.cross.as_mut() {
-                        use crate::mesh::cut_openings::Routed;
-                        match cross.route(mesh) {
-                            Routed::Suppressed | Routed::Held => return,
-                            Routed::PassThrough(m) => mesh = m,
+                cross: Option<crate::mesh::cut_openings::CrossProductCut>,
+            }
+
+            impl MeshSink {
+                /// Take a (presumed cut-applied, non-empty) mesh and
+                /// push its scaled+rebased byte buffers onto the output
+                /// columns. Shared between the streaming `on_product`
+                /// path and the post-stream cross-product flush.
+                fn encode(&mut self, mesh: ProductMesh) {
+                    let mut vbytes = Vec::with_capacity(mesh.vertices.len() * 4);
+                    if self.local_frame {
+                        // Representation-item frame (GH #127): the bake
+                        // already produced the item's own coordinates in
+                        // native units — the exact m.hotswap input. Copy
+                        // through verbatim: no shift, no metre scaling.
+                        for v in &mesh.vertices {
+                            vbytes.extend_from_slice(&v.to_le_bytes());
+                        }
+                    } else {
+                        let shift = *self.shift.get_or_insert_with(|| {
+                            global_shift_for(&mesh.mesh_anchor, self.unit_scale)
+                        });
+                        let off = [
+                            mesh.mesh_anchor[0] - shift[0],
+                            mesh.mesh_anchor[1] - shift[1],
+                            mesh.mesh_anchor[2] - shift[2],
+                        ];
+                        // Reposition local-frame shape to `local + off` (f64),
+                        // scale native-unit → metres. Far-from-origin geometry
+                        // stays precise: shape near origin, off small.
+                        let us = self.unit_scale as f64;
+                        for chunk in mesh.vertices.as_chunks::<3>().0 {
+                            let x = ((chunk[0] as f64 + off[0]) * us) as f32;
+                            let y = ((chunk[1] as f64 + off[1]) * us) as f32;
+                            let z = ((chunk[2] as f64 + off[2]) * us) as f32;
+                            vbytes.extend_from_slice(&x.to_le_bytes());
+                            vbytes.extend_from_slice(&y.to_le_bytes());
+                            vbytes.extend_from_slice(&z.to_le_bytes());
                         }
                     }
-                    let outcome = crate::mesh::cut_openings::apply(&mut mesh, self.unit_scale);
-                    self.bump_outcome(outcome);
-                    // The cut may have emptied the mesh (cutter fully
-                    // consumed the host); skip in that case.
-                    if mesh.indices.is_empty() || mesh.vertices.is_empty() {
-                        return;
+                    let mut ibytes = Vec::with_capacity(mesh.indices.len() * 4);
+                    for i in &mesh.indices {
+                        ibytes.extend_from_slice(&i.to_le_bytes());
                     }
-                }
-                #[cfg(not(feature = "csg"))]
-                let _ = self.cut_openings; // silence unused-field warning
-
-                // When the cut did NOT run, the reveal-all fragments
-                // still include the synthetic half-space stand-in slabs
-                // (±20 000 model units — GH #66). Strip them unless the
-                // caller explicitly asked for reveal-all geometry.
-                let cut_applied = cfg!(feature = "csg") && self.cut_openings;
-                if !cut_applied && !self.keep_cutters {
-                    self.cutters_stripped +=
-                        crate::mesh::strip_synthetic_cutters(&mut mesh) as u64;
-                    if mesh.indices.is_empty() || mesh.vertices.is_empty() {
-                        return;
-                    }
+                    self.placement.push(placement_row_major(
+                        &mesh.world_transform,
+                        &mesh.world_origin,
+                    ));
+                    self.guid.push(mesh.guid);
+                    self.entity.push(mesh.entity);
+                    self.vertex_count.push((mesh.vertices.len() / 3) as u32);
+                    self.triangle_count.push((mesh.indices.len() / 3) as u32);
+                    self.vertices_le.push(vbytes);
+                    self.indices_le.push(ibytes);
                 }
 
-                self.encode(mesh);
+                #[cfg(feature = "csg")]
+                fn bump_outcome(&mut self, outcome: crate::mesh::cut_stats::Outcome) {
+                    outcome.accumulate(&mut self.cut_stats);
+                }
             }
-        }
 
-        // Build the cross-product void index from the indexer's
-        // parallel arrays. `from_indexer` collapses to an empty
-        // CrossProductCut when no IfcRelVoidsElement exists, so we
-        // only carry the struct when both the flag is on AND there's
-        // actually work for it to do.
-        #[cfg(feature = "csg")]
-        let cross = if cut_openings {
-            let c = crate::mesh::cut_openings::CrossProductCut::from_indexer(
-                &idx.voids_opening,
-                &idx.voids_host,
-            );
-            if c.is_empty() { None } else { Some(c) }
-        } else {
-            None
-        };
+            impl ProductSink for MeshSink {
+                fn on_product(&mut self, mut mesh: ProductMesh) {
+                    // Skip geometryless products — no triangles to hand back.
+                    if mesh.indices.is_empty() || mesh.vertices.is_empty() {
+                        return;
+                    }
+                    #[cfg(feature = "csg")]
+                    if self.cut_openings {
+                        // Cross-product routing first: openings get
+                        // suppressed, hosts get held for the flush phase,
+                        // everything else continues into the in-rep apply.
+                        if let Some(cross) = self.cross.as_mut() {
+                            use crate::mesh::cut_openings::Routed;
+                            match cross.route(mesh) {
+                                Routed::Suppressed | Routed::Held => return,
+                                Routed::PassThrough(m) => mesh = m,
+                            }
+                        }
+                        let outcome = crate::mesh::cut_openings::apply(&mut mesh, self.unit_scale);
+                        self.bump_outcome(outcome);
+                        // The cut may have emptied the mesh (cutter fully
+                        // consumed the host); skip in that case.
+                        if mesh.indices.is_empty() || mesh.vertices.is_empty() {
+                            return;
+                        }
+                    }
+                    #[cfg(not(feature = "csg"))]
+                    let _ = self.cut_openings; // silence unused-field warning
 
-        let mut sink = MeshSink {
-            unit_scale,
-            cut_openings,
-            local_frame,
-            keep_cutters,
-            cutters_stripped: 0,
-            shift: None,
-            guid: Vec::new(),
-            entity: Vec::new(),
-            vertex_count: Vec::new(),
-            triangle_count: Vec::new(),
-            vertices_le: Vec::new(),
-            indices_le: Vec::new(),
-            placement: Vec::new(),
-            cut_stats: crate::mesh::cut_stats::CutOpeningsStats::default(),
+                    // When the cut did NOT run, the reveal-all fragments
+                    // still include the synthetic half-space stand-in slabs
+                    // (±20 000 model units — GH #66). Strip them unless the
+                    // caller explicitly asked for reveal-all geometry.
+                    let cut_applied = cfg!(feature = "csg") && self.cut_openings;
+                    if !cut_applied && !self.keep_cutters {
+                        self.cutters_stripped +=
+                            crate::mesh::strip_synthetic_cutters(&mut mesh) as u64;
+                        if mesh.indices.is_empty() || mesh.vertices.is_empty() {
+                            return;
+                        }
+                    }
+
+                    self.encode(mesh);
+                }
+            }
+
+            // Build the cross-product void index from the indexer's
+            // parallel arrays. `from_indexer` collapses to an empty
+            // CrossProductCut when no IfcRelVoidsElement exists, so we
+            // only carry the struct when both the flag is on AND there's
+            // actually work for it to do.
             #[cfg(feature = "csg")]
-            cross,
-        };
-        let t_mesh = Instant::now();
-        // World output: Local (QTO) bake + per-product f64 shift — see
-        // sample_point_cloud. Local output: ItemLocal bake, encoded
-        // verbatim (GH #127).
-        let bake = if local_frame { BakeFrame::ItemLocal } else { BakeFrame::Local };
-        let mesh_stats = py.detach(|| {
-            crate::mesh::mesh_ifc_streaming_framed(&mmap, &mut sink, bake)
-        });
-
-        // Cross-product flush. After the streaming pass, fold every
-        // buffered host with its arrived openings and run the result
-        // through the same encode path. Stats accumulate per host.
-        #[cfg(feature = "csg")]
-        if let Some(mut cross) = sink.cross.take() {
-            let prism_table = prism_table_for_flush(&mmap);
-            for (folded, outcome) in cross.flush(sink.unit_scale, prism_table.as_ref()) {
-                sink.bump_outcome(outcome);
-                if folded.indices.is_empty() || folded.vertices.is_empty() {
-                    continue;
+            let cross = if cut_openings {
+                let c = crate::mesh::cut_openings::CrossProductCut::from_indexer(
+                    &idx.voids_opening,
+                    &idx.voids_host,
+                );
+                if c.is_empty() {
+                    None
+                } else {
+                    Some(c)
                 }
-                sink.encode(folded);
-            }
-        }
-        let mesh_ms = t_mesh.elapsed().as_secs_f64() * 1000.0;
+            } else {
+                None
+            };
 
-        let t_marshal = Instant::now();
-        let out = PyDict::new(py);
-        out.set_item("guid", PyList::new(py, &sink.guid)?)?;
-        out.set_item("entity", PyList::new(py, &sink.entity)?)?;
-        out.set_item("vertex_count", PyList::new(py, &sink.vertex_count)?)?;
-        out.set_item("triangle_count", PyList::new(py, &sink.triangle_count)?)?;
-        let verts: Vec<Bound<'py, PyBytes>> = sink
-            .vertices_le
-            .iter()
-            .map(|b| PyBytes::new(py, b))
-            .collect();
-        let inds: Vec<Bound<'py, PyBytes>> = sink
-            .indices_le
-            .iter()
-            .map(|b| PyBytes::new(py, b))
-            .collect();
-        out.set_item("vertices", PyList::new(py, verts)?)?;
-        out.set_item("indices", PyList::new(py, inds)?)?;
-        // Per-product world_from_local placement: flat row-major 16 f64,
-        // native units (GH #127). `np.array(p).reshape(4, 4)` Python-side.
-        let placements: Vec<Bound<'py, PyList>> = sink
-            .placement
-            .iter()
-            .map(|p| PyList::new(py, p))
-            .collect::<PyResult<Vec<_>>>()?;
-        out.set_item("placement", PyList::new(py, placements)?)?;
-        out.set_item("frame", frame)?;
-        // Global shift in METRES — add back to vertices for absolute
-        // world coords. `[0, 0, 0]` for near-origin or empty models.
-        let gs = sink.shift.unwrap_or([0.0, 0.0, 0.0]);
-        let us = unit_scale as f64;
-        out.set_item(
-            "global_shift",
-            PyList::new(py, [gs[0] * us, gs[1] * us, gs[2] * us])?,
-        )?;
-        out.set_item("products_meshed", mesh_stats.products_meshed as u64)?;
-        out.set_item("mesh_ms", mesh_ms)?;
-        out.set_item("marshal_ms", t_marshal.elapsed().as_secs_f64() * 1000.0)?;
-        out.set_item("total_ms", t_total.elapsed().as_secs_f64() * 1000.0)?;
-        out.set_item("size_bytes", mmap.len() as u64)?;
-        out.set_item("cut_openings", cut_openings)?;
-        out.set_item("keep_cutters", keep_cutters)?;
-        out.set_item("cutters_stripped", sink.cutters_stripped)?;
-        set_cut_openings_stats(&out, &sink.cut_stats)?;
-        Ok(out)
+            let mut sink = MeshSink {
+                unit_scale,
+                cut_openings,
+                local_frame,
+                keep_cutters,
+                cutters_stripped: 0,
+                shift: None,
+                guid: Vec::new(),
+                entity: Vec::new(),
+                vertex_count: Vec::new(),
+                triangle_count: Vec::new(),
+                vertices_le: Vec::new(),
+                indices_le: Vec::new(),
+                placement: Vec::new(),
+                cut_stats: crate::mesh::cut_stats::CutOpeningsStats::default(),
+                #[cfg(feature = "csg")]
+                cross,
+            };
+            let t_mesh = Instant::now();
+            // World output: Local (QTO) bake + per-product f64 shift — see
+            // sample_point_cloud. Local output: ItemLocal bake, encoded
+            // verbatim (GH #127).
+            let bake = if local_frame {
+                BakeFrame::ItemLocal
+            } else {
+                BakeFrame::Local
+            };
+            let mesh_stats =
+                py.detach(|| crate::mesh::mesh_ifc_streaming_framed(&mmap, &mut sink, bake));
+
+            // Cross-product flush. After the streaming pass, fold every
+            // buffered host with its arrived openings and run the result
+            // through the same encode path. Stats accumulate per host.
+            #[cfg(feature = "csg")]
+            if let Some(mut cross) = sink.cross.take() {
+                let prism_table = prism_table_for_flush(&mmap);
+                for (folded, outcome) in cross.flush(sink.unit_scale, prism_table.as_ref()) {
+                    sink.bump_outcome(outcome);
+                    if folded.indices.is_empty() || folded.vertices.is_empty() {
+                        continue;
+                    }
+                    sink.encode(folded);
+                }
+            }
+            let mesh_ms = t_mesh.elapsed().as_secs_f64() * 1000.0;
+
+            let t_marshal = Instant::now();
+            let out = PyDict::new(py);
+            out.set_item("guid", PyList::new(py, &sink.guid)?)?;
+            out.set_item("entity", PyList::new(py, &sink.entity)?)?;
+            out.set_item("vertex_count", PyList::new(py, &sink.vertex_count)?)?;
+            out.set_item("triangle_count", PyList::new(py, &sink.triangle_count)?)?;
+            let verts: Vec<Bound<'py, PyBytes>> = sink
+                .vertices_le
+                .iter()
+                .map(|b| PyBytes::new(py, b))
+                .collect();
+            let inds: Vec<Bound<'py, PyBytes>> = sink
+                .indices_le
+                .iter()
+                .map(|b| PyBytes::new(py, b))
+                .collect();
+            out.set_item("vertices", PyList::new(py, verts)?)?;
+            out.set_item("indices", PyList::new(py, inds)?)?;
+            // Per-product world_from_local placement: flat row-major 16 f64,
+            // native units (GH #127). `np.array(p).reshape(4, 4)` Python-side.
+            let placements: Vec<Bound<'py, PyList>> = sink
+                .placement
+                .iter()
+                .map(|p| PyList::new(py, p))
+                .collect::<PyResult<Vec<_>>>()?;
+            out.set_item("placement", PyList::new(py, placements)?)?;
+            out.set_item("frame", frame)?;
+            // Global shift in METRES — add back to vertices for absolute
+            // world coords. `[0, 0, 0]` for near-origin or empty models.
+            let gs = sink.shift.unwrap_or([0.0, 0.0, 0.0]);
+            let us = unit_scale as f64;
+            out.set_item(
+                "global_shift",
+                PyList::new(py, [gs[0] * us, gs[1] * us, gs[2] * us])?,
+            )?;
+            out.set_item("products_meshed", mesh_stats.products_meshed as u64)?;
+            out.set_item("mesh_ms", mesh_ms)?;
+            out.set_item("marshal_ms", t_marshal.elapsed().as_secs_f64() * 1000.0)?;
+            out.set_item("total_ms", t_total.elapsed().as_secs_f64() * 1000.0)?;
+            out.set_item("size_bytes", mmap.len() as u64)?;
+            out.set_item("cut_openings", cut_openings)?;
+            out.set_item("keep_cutters", keep_cutters)?;
+            out.set_item("cutters_stripped", sink.cutters_stripped)?;
+            set_cut_openings_stats(&out, &sink.cut_stats)?;
+            Ok(out)
         })
     }
 
@@ -2231,164 +2324,167 @@ mod python {
         frame: &str,
     ) -> PyResult<Option<Bound<'py, PyDict>>> {
         catch_panic(|| {
-        use crate::mesh::{BakeFrame, ProductMesh};
+            use crate::mesh::{BakeFrame, ProductMesh};
 
-        // frame="local" (GH #127): the element's representation-item
-        // coordinates in native units — the hotswap_ifc input frame.
-        // Incompatible with cut_openings (validated here).
-        let local_frame = parse_mesh_frame(frame, cut_openings)?;
+            // frame="local" (GH #127): the element's representation-item
+            // coordinates in native units — the hotswap_ifc input frame.
+            // Incompatible with cut_openings (validated here).
+            let local_frame = parse_mesh_frame(frame, cut_openings)?;
 
-        // cut_openings requires the `csg` feature — same contract as
-        // extract_meshes: surface a clear error rather than silently
-        // ignoring the flag.
-        #[cfg(not(feature = "csg"))]
-        if cut_openings {
-            return Err(pyo3::exceptions::PyRuntimeError::new_err(
-                "mesh(cut_openings=True) requires the `csg` Cargo feature; \
+            // cut_openings requires the `csg` feature — same contract as
+            // extract_meshes: surface a clear error rather than silently
+            // ignoring the flag.
+            #[cfg(not(feature = "csg"))]
+            if cut_openings {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                    "mesh(cut_openings=True) requires the `csg` Cargo feature; \
                  this wheel was built without it.",
-            ));
-        }
+                ));
+            }
 
-        let (mmap, _open_ms) = open_mmap(path)?;
-        let idx = py.detach(|| indexer::index(&mmap));
-        let unit_scale = idx.unit_scale.unwrap_or(1.0) as f32;
+            let (mmap, _open_ms) = open_mmap(path)?;
+            let idx = py.detach(|| indexer::index(&mmap));
+            refuse_truncated_index(&idx, path)?;
+            let unit_scale = idx.unit_scale.unwrap_or(1.0) as f32;
 
-        // GlobalId → step id via the indexer's parallel product arrays.
-        let target_step = idx
-            .product_guid
-            .iter()
-            .position(|g| g == guid)
-            .map(|i| idx.product_step_id[i]);
-        let target_step = match target_step {
-            Some(s) => s,
-            None => return Ok(None), // unknown GUID
-        };
+            // GlobalId → step id via the indexer's parallel product arrays.
+            let target_step = idx
+                .product_guid
+                .iter()
+                .position(|g| g == guid)
+                .map(|i| idx.product_step_id[i]);
+            let target_step = match target_step {
+                Some(s) => s,
+                None => return Ok(None), // unknown GUID
+            };
 
-        // In cut mode a directly-targeted opening is suppressed (it's a
-        // cutter, not a user-visible product) — matches extract_meshes.
-        #[cfg(feature = "csg")]
-        if cut_openings && idx.voids_opening.iter().any(|&o| o == target_step) {
-            return Ok(None);
-        }
+            // In cut mode a directly-targeted opening is suppressed (it's a
+            // cutter, not a user-visible product) — matches extract_meshes.
+            #[cfg(feature = "csg")]
+            if cut_openings && idx.voids_opening.contains(&target_step) {
+                return Ok(None);
+            }
 
-        // Tessellation set: the target, plus (cut mode) the openings
-        // voiding it so the cross-product fold has its operands. (`mut`
-        // is only exercised on the csg path that appends openings.)
-        #[cfg_attr(not(feature = "csg"), allow(unused_mut))]
-        let mut step_ids = vec![target_step];
-        #[cfg(feature = "csg")]
-        if cut_openings {
-            for (op, host) in idx.voids_opening.iter().zip(idx.voids_host.iter()) {
-                if *host == target_step && *op != target_step {
-                    step_ids.push(*op);
+            // Tessellation set: the target, plus (cut mode) the openings
+            // voiding it so the cross-product fold has its operands. (`mut`
+            // is only exercised on the csg path that appends openings.)
+            #[cfg_attr(not(feature = "csg"), allow(unused_mut))]
+            let mut step_ids = vec![target_step];
+            #[cfg(feature = "csg")]
+            if cut_openings {
+                for (op, host) in idx.voids_opening.iter().zip(idx.voids_host.iter()) {
+                    if *host == target_step && *op != target_step {
+                        step_ids.push(*op);
+                    }
                 }
             }
-        }
 
-        // World output: Local (QTO) bake + f64 anchor reposition below.
-        // Local output: ItemLocal bake, emitted verbatim (GH #127).
-        let bake = if local_frame { BakeFrame::ItemLocal } else { BakeFrame::Local };
-        let meshes = py.detach(|| {
-            crate::mesh::mesh_products_by_step(&mmap, &step_ids, bake)
-        });
+            // World output: Local (QTO) bake + f64 anchor reposition below.
+            // Local output: ItemLocal bake, emitted verbatim (GH #127).
+            let bake = if local_frame {
+                BakeFrame::ItemLocal
+            } else {
+                BakeFrame::Local
+            };
+            let meshes = py.detach(|| crate::mesh::mesh_products_by_step(&mmap, &step_ids, bake));
 
-        // Resolve the final target mesh, applying cuts when requested by
-        // routing the subset through the SAME CrossProductCut the batch
-        // path uses — identical operands in, identical fold out.
-        let final_mesh: Option<ProductMesh> = {
-            #[cfg(feature = "csg")]
-            {
-                if cut_openings {
-                    let mut cross = crate::mesh::cut_openings::CrossProductCut::from_indexer(
-                        &idx.voids_opening,
-                        &idx.voids_host,
-                    );
-                    let mut passthrough_target: Option<ProductMesh> = None;
-                    for mesh in meshes {
-                        use crate::mesh::cut_openings::Routed;
-                        let is_target = mesh.ifc_id == target_step;
-                        match cross.route(mesh) {
-                            // Opening buffered / host held for the flush.
-                            Routed::Suppressed | Routed::Held => {}
-                            Routed::PassThrough(mut m) => {
-                                // Target isn't voided cross-product; still
-                                // collapse any in-rep IfcBooleanClippingResult
-                                // so the result matches the batch cut path.
-                                let _ = crate::mesh::cut_openings::apply(&mut m, unit_scale);
-                                if is_target {
-                                    passthrough_target = Some(m);
+            // Resolve the final target mesh, applying cuts when requested by
+            // routing the subset through the SAME CrossProductCut the batch
+            // path uses — identical operands in, identical fold out.
+            let final_mesh: Option<ProductMesh> = {
+                #[cfg(feature = "csg")]
+                {
+                    if cut_openings {
+                        let mut cross = crate::mesh::cut_openings::CrossProductCut::from_indexer(
+                            &idx.voids_opening,
+                            &idx.voids_host,
+                        );
+                        let mut passthrough_target: Option<ProductMesh> = None;
+                        for mesh in meshes {
+                            use crate::mesh::cut_openings::Routed;
+                            let is_target = mesh.ifc_id == target_step;
+                            match cross.route(mesh) {
+                                // Opening buffered / host held for the flush.
+                                Routed::Suppressed | Routed::Held => {}
+                                Routed::PassThrough(mut m) => {
+                                    // Target isn't voided cross-product; still
+                                    // collapse any in-rep IfcBooleanClippingResult
+                                    // so the result matches the batch cut path.
+                                    let _ = crate::mesh::cut_openings::apply(&mut m, unit_scale);
+                                    if is_target {
+                                        passthrough_target = Some(m);
+                                    }
                                 }
                             }
                         }
-                    }
-                    // Flush the held host. `None` prism table forces the
-                    // manifold fold (geometrically equivalent to the prism
-                    // fast-path; the fast-path only matches a Local host
-                    // mesh and is a batch-throughput optimisation).
-                    let mut folded_target = None;
-                    for (folded, _outcome) in cross.flush(unit_scale, None) {
-                        if folded.ifc_id == target_step {
-                            folded_target = Some(folded);
+                        // Flush the held host. `None` prism table forces the
+                        // manifold fold (geometrically equivalent to the prism
+                        // fast-path; the fast-path only matches a Local host
+                        // mesh and is a batch-throughput optimisation).
+                        let mut folded_target = None;
+                        for (folded, _outcome) in cross.flush(unit_scale, None) {
+                            if folded.ifc_id == target_step {
+                                folded_target = Some(folded);
+                            }
                         }
+                        folded_target.or(passthrough_target)
+                    } else {
+                        pick_target_uncut(meshes, target_step, keep_cutters)
                     }
-                    folded_target.or(passthrough_target)
-                } else {
+                }
+                #[cfg(not(feature = "csg"))]
+                {
+                    let _ = unit_scale;
                     pick_target_uncut(meshes, target_step, keep_cutters)
                 }
-            }
-            #[cfg(not(feature = "csg"))]
-            {
-                let _ = unit_scale;
-                pick_target_uncut(meshes, target_step, keep_cutters)
-            }
-        };
+            };
 
-        let mesh = match final_mesh {
-            Some(m) if !m.indices.is_empty() && !m.vertices.is_empty() => m,
-            _ => return Ok(None), // geometryless, or cut consumed the host
-        };
+            let mesh = match final_mesh {
+                Some(m) if !m.indices.is_empty() && !m.vertices.is_empty() => m,
+                _ => return Ok(None), // geometryless, or cut consumed the host
+            };
 
-        let mut vbytes = Vec::with_capacity(mesh.vertices.len() * 8);
-        if local_frame {
-            // Representation-item frame (GH #127): the ItemLocal bake
-            // already produced the item's own coordinates in native
-            // units — the exact hotswap_ifc input. Upcast to f64 and
-            // emit verbatim: no anchor, no metre scaling.
-            for v in &mesh.vertices {
-                vbytes.extend_from_slice(&(*v as f64).to_le_bytes());
+            let mut vbytes = Vec::with_capacity(mesh.vertices.len() * 8);
+            if local_frame {
+                // Representation-item frame (GH #127): the ItemLocal bake
+                // already produced the item's own coordinates in native
+                // units — the exact hotswap_ifc input. Upcast to f64 and
+                // emit verbatim: no anchor, no metre scaling.
+                for v in &mesh.vertices {
+                    vbytes.extend_from_slice(&(*v as f64).to_le_bytes());
+                }
+            } else {
+                // Encode absolute world coords in metres as f64 (full precision —
+                // no global shift). Absolute = (local + mesh_anchor) * unit_scale,
+                // the same identity extract_meshes' shifted-frame encode reduces
+                // to when its model-wide shift is added back.
+                let us = unit_scale as f64;
+                let anchor = mesh.mesh_anchor;
+                for chunk in mesh.vertices.as_chunks::<3>().0 {
+                    let x = (chunk[0] as f64 + anchor[0]) * us;
+                    let y = (chunk[1] as f64 + anchor[1]) * us;
+                    let z = (chunk[2] as f64 + anchor[2]) * us;
+                    vbytes.extend_from_slice(&x.to_le_bytes());
+                    vbytes.extend_from_slice(&y.to_le_bytes());
+                    vbytes.extend_from_slice(&z.to_le_bytes());
+                }
             }
-        } else {
-            // Encode absolute world coords in metres as f64 (full precision —
-            // no global shift). Absolute = (local + mesh_anchor) * unit_scale,
-            // the same identity extract_meshes' shifted-frame encode reduces
-            // to when its model-wide shift is added back.
-            let us = unit_scale as f64;
-            let anchor = mesh.mesh_anchor;
-            for chunk in mesh.vertices.chunks_exact(3) {
-                let x = (chunk[0] as f64 + anchor[0]) * us;
-                let y = (chunk[1] as f64 + anchor[1]) * us;
-                let z = (chunk[2] as f64 + anchor[2]) * us;
-                vbytes.extend_from_slice(&x.to_le_bytes());
-                vbytes.extend_from_slice(&y.to_le_bytes());
-                vbytes.extend_from_slice(&z.to_le_bytes());
+            let mut ibytes = Vec::with_capacity(mesh.indices.len() * 4);
+            for i in &mesh.indices {
+                ibytes.extend_from_slice(&i.to_le_bytes());
             }
-        }
-        let mut ibytes = Vec::with_capacity(mesh.indices.len() * 4);
-        for i in &mesh.indices {
-            ibytes.extend_from_slice(&i.to_le_bytes());
-        }
 
-        let placement = placement_row_major(&mesh.world_transform, &mesh.world_origin);
+            let placement = placement_row_major(&mesh.world_transform, &mesh.world_origin);
 
-        let out = PyDict::new(py);
-        out.set_item("guid", &mesh.guid)?;
-        out.set_item("entity", &mesh.entity)?;
-        out.set_item("vertices", PyBytes::new(py, &vbytes))?;
-        out.set_item("indices", PyBytes::new(py, &ibytes))?;
-        // world_from_local, flat row-major 16 f64, native units (GH #127).
-        out.set_item("placement", PyList::new(py, placement)?)?;
-        out.set_item("frame", frame)?;
-        Ok(Some(out))
+            let out = PyDict::new(py);
+            out.set_item("guid", &mesh.guid)?;
+            out.set_item("entity", &mesh.entity)?;
+            out.set_item("vertices", PyBytes::new(py, &vbytes))?;
+            out.set_item("indices", PyBytes::new(py, &ibytes))?;
+            // world_from_local, flat row-major 16 f64, native units (GH #127).
+            out.set_item("placement", PyList::new(py, placement)?)?;
+            out.set_item("frame", frame)?;
+            Ok(Some(out))
         })
     }
 
@@ -2432,6 +2528,7 @@ mod python {
             let t_total = Instant::now();
             let (mmap, _open_ms) = open_mmap(path)?;
             let idx = py.detach(|| indexer::index(&mmap));
+            refuse_truncated_index(&idx, path)?;
             let unit_scale = idx.unit_scale.unwrap_or(1.0) as f32;
 
             /// Accumulating sink: collects every `ProductMesh` into a
@@ -2462,7 +2559,7 @@ mod python {
                         return;
                     }
                     let us = self.unit_scale as f64;
-                    for chunk in mesh.vertices.chunks_exact_mut(3) {
+                    for chunk in mesh.vertices.as_chunks_mut::<3>().0 {
                         chunk[0] = (chunk[0] as f64 * us) as f32;
                         chunk[1] = (chunk[1] as f64 * us) as f32;
                         chunk[2] = (chunk[2] as f64 * us) as f32;
@@ -2508,7 +2605,11 @@ mod python {
                     &idx.voids_opening,
                     &idx.voids_host,
                 );
-                if c.is_empty() { None } else { Some(c) }
+                if c.is_empty() {
+                    None
+                } else {
+                    Some(c)
+                }
             } else {
                 None
             };
@@ -2528,11 +2629,7 @@ mod python {
             // applies the model-wide global shift to prevent far-from-
             // origin f32 collapse internally.
             let mesh_stats = py.detach(|| {
-                crate::mesh::mesh_ifc_streaming_framed(
-                    &mmap,
-                    &mut sink,
-                    BakeFrame::World,
-                )
+                crate::mesh::mesh_ifc_streaming_framed(&mmap, &mut sink, BakeFrame::World)
             });
 
             // Cross-product flush — fold buffered hosts with their
@@ -2558,22 +2655,15 @@ mod python {
 
             let t_write = Instant::now();
             let file = std::fs::File::create(out_path).map_err(|e| {
-                pyo3::exceptions::PyIOError::new_err(format!(
-                    "create {out_path}: {e}"
-                ))
+                pyo3::exceptions::PyIOError::new_err(format!("create {out_path}: {e}"))
             })?;
             let mut buf = std::io::BufWriter::with_capacity(1 << 20, file);
-            crate::mesh::gltf::write_with_options(&sink.products, &options, &mut buf)
-                .map_err(|e| {
-                    pyo3::exceptions::PyIOError::new_err(format!(
-                        "write {out_path}: {e}"
-                    ))
-                })?;
+            crate::mesh::gltf::write_with_options(&sink.products, &options, &mut buf).map_err(
+                |e| pyo3::exceptions::PyIOError::new_err(format!("write {out_path}: {e}")),
+            )?;
             use std::io::Write;
             buf.flush().map_err(|e| {
-                pyo3::exceptions::PyIOError::new_err(format!(
-                    "flush {out_path}: {e}"
-                ))
+                pyo3::exceptions::PyIOError::new_err(format!("flush {out_path}: {e}"))
             })?;
             let write_ms = t_write.elapsed().as_secs_f64() * 1000.0;
 
@@ -2614,102 +2704,107 @@ mod python {
         out_dir: Option<&str>,
     ) -> PyResult<Bound<'py, PyDict>> {
         catch_panic(|| {
-        use crate::bundle::parquet_sink::ParquetSink;
-        use crate::bundle::Bundle;
-        use crate::mesh::mesh_ifc_streaming;
+            use crate::bundle::parquet_sink::ParquetSink;
+            use crate::bundle::Bundle;
+            use crate::mesh::mesh_ifc_streaming;
 
-        const VIEW_SQL: &str = include_str!("bundle/view.sql");
+            const VIEW_SQL: &str = include_str!("bundle/view.sql");
 
-        let in_path = Path::new(ifc_path).to_path_buf();
-        let out_dir_path = match out_dir {
-            Some(o) => std::path::PathBuf::from(o),
-            None => {
-                let stem = in_path
-                    .file_stem()
-                    .map(|s| s.to_owned())
-                    .unwrap_or_default();
-                let mut p = in_path.clone();
-                p.set_file_name(format!("{}.bundle", stem.to_string_lossy()));
-                p
+            let in_path = Path::new(ifc_path).to_path_buf();
+            let out_dir_path = match out_dir {
+                Some(o) => std::path::PathBuf::from(o),
+                None => {
+                    let stem = in_path
+                        .file_stem()
+                        .map(|s| s.to_owned())
+                        .unwrap_or_default();
+                    let mut p = in_path.clone();
+                    p.set_file_name(format!("{}.bundle", stem.to_string_lossy()));
+                    p
+                }
+            };
+            std::fs::create_dir_all(&out_dir_path).map_err(|e| {
+                pyo3::exceptions::PyIOError::new_err(format!(
+                    "mkdir {}: {e}",
+                    out_dir_path.display()
+                ))
+            })?;
+
+            let (src, open_ms) = open_mmap(ifc_path)?;
+            let buf: &[u8] = &src;
+
+            let t_bundle = Instant::now();
+            let bundle = py.detach(|| Bundle::build(buf));
+            if let Some(err) = &bundle.parse_error {
+                return Err(PyErr::new::<IfcfastError, _>(format!(
+                    "ifcfast: refusing to bundle a truncated IFC ({ifc_path}): {err}"
+                )));
             }
-        };
-        std::fs::create_dir_all(&out_dir_path).map_err(|e| {
-            pyo3::exceptions::PyIOError::new_err(format!(
-                "mkdir {}: {e}",
-                out_dir_path.display()
-            ))
-        })?;
+            let bundle_ms = t_bundle.elapsed().as_secs_f64() * 1000.0;
+            let sem = bundle.semantic_stats();
 
-        let (src, open_ms) = open_mmap(ifc_path)?;
-        let buf: &[u8] = &src;
+            // `source_model` = the source IFC's file stem — the model
+            // identity carried on every instance row (GH #50). Federation
+            // re-stamps it per constituent bundle dir when merging.
+            let source_model = in_path
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let mut sink = ParquetSink::create_in_dir(&out_dir_path, &bundle, &source_model)
+                .map_err(|e| {
+                    pyo3::exceptions::PyIOError::new_err(format!(
+                        "create sink in {}: {e}",
+                        out_dir_path.display()
+                    ))
+                })?;
 
-        let t_bundle = Instant::now();
-        let bundle = py.detach(|| Bundle::build(buf));
-        let bundle_ms = t_bundle.elapsed().as_secs_f64() * 1000.0;
-        let sem = bundle.semantic_stats();
+            let t_stream = Instant::now();
+            let stats = py.detach(|| mesh_ifc_streaming(buf, &mut sink));
+            let stream_ms = t_stream.elapsed().as_secs_f64() * 1000.0;
 
-        // `source_model` = the source IFC's file stem — the model
-        // identity carried on every instance row (GH #50). Federation
-        // re-stamps it per constituent bundle dir when merging.
-        let source_model = in_path
-            .file_stem()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        let mut sink = ParquetSink::create_in_dir(&out_dir_path, &bundle, &source_model)
-            .map_err(|e| {
-            pyo3::exceptions::PyIOError::new_err(format!(
-                "create sink in {}: {e}",
-                out_dir_path.display()
-            ))
-        })?;
+            let (instances_written, reps_written) = sink.finish().map_err(|e| {
+                pyo3::exceptions::PyIOError::new_err(format!(
+                    "finish substrate write in {}: {e}",
+                    out_dir_path.display()
+                ))
+            })?;
 
-        let t_stream = Instant::now();
-        let stats = py.detach(|| mesh_ifc_streaming(buf, &mut sink));
-        let stream_ms = t_stream.elapsed().as_secs_f64() * 1000.0;
+            let view_path = out_dir_path.join("view.sql");
+            std::fs::write(&view_path, VIEW_SQL).map_err(|e| {
+                pyo3::exceptions::PyIOError::new_err(format!("write {}: {e}", view_path.display()))
+            })?;
 
-        let (instances_written, reps_written) = sink.finish().map_err(|e| {
-            pyo3::exceptions::PyIOError::new_err(format!(
-                "finish substrate write in {}: {e}",
-                out_dir_path.display()
-            ))
-        })?;
+            let rep_path = out_dir_path.join("representations.parquet");
+            let inst_path = out_dir_path.join("instances.parquet");
+            let rep_bytes = std::fs::metadata(&rep_path).map(|m| m.len()).unwrap_or(0);
+            let inst_bytes = std::fs::metadata(&inst_path).map(|m| m.len()).unwrap_or(0);
 
-        let view_path = out_dir_path.join("view.sql");
-        std::fs::write(&view_path, VIEW_SQL).map_err(|e| {
-            pyo3::exceptions::PyIOError::new_err(format!(
-                "write {}: {e}",
-                view_path.display()
-            ))
-        })?;
-
-        let rep_path = out_dir_path.join("representations.parquet");
-        let inst_path = out_dir_path.join("instances.parquet");
-        let rep_bytes = std::fs::metadata(&rep_path).map(|m| m.len()).unwrap_or(0);
-        let inst_bytes = std::fs::metadata(&inst_path).map(|m| m.len()).unwrap_or(0);
-
-        let out = PyDict::new(py);
-        out.set_item("bundle_dir", out_dir_path.to_string_lossy().to_string())?;
-        out.set_item("instances_parquet", inst_path.to_string_lossy().to_string())?;
-        out.set_item("representations_parquet", rep_path.to_string_lossy().to_string())?;
-        out.set_item("view_sql", view_path.to_string_lossy().to_string())?;
-        out.set_item("products_indexed", sem.products_indexed as u64)?;
-        out.set_item("pset_rows", sem.pset_rows as u64)?;
-        out.set_item("material_rows", sem.material_rows as u64)?;
-        out.set_item("quantity_rows", sem.quantity_rows as u64)?;
-        out.set_item("classification_rows", sem.classification_rows as u64)?;
-        out.set_item("products_seen", stats.products_seen as u64)?;
-        out.set_item("products_meshed", stats.products_meshed as u64)?;
-        out.set_item("products_deferred", stats.products_deferred as u64)?;
-        out.set_item("triangles", stats.triangles as u64)?;
-        out.set_item("instances_written", instances_written as u64)?;
-        out.set_item("unique_reps_written", reps_written as u64)?;
-        out.set_item("instances_parquet_bytes", inst_bytes)?;
-        out.set_item("representations_parquet_bytes", rep_bytes)?;
-        out.set_item("open_ms", open_ms)?;
-        out.set_item("bundle_ms", bundle_ms)?;
-        out.set_item("entity_table_build_ms", stats.entity_table_build_ms)?;
-        out.set_item("stream_ms", stream_ms)?;
-        Ok(out)
+            let out = PyDict::new(py);
+            out.set_item("bundle_dir", out_dir_path.to_string_lossy().to_string())?;
+            out.set_item("instances_parquet", inst_path.to_string_lossy().to_string())?;
+            out.set_item(
+                "representations_parquet",
+                rep_path.to_string_lossy().to_string(),
+            )?;
+            out.set_item("view_sql", view_path.to_string_lossy().to_string())?;
+            out.set_item("products_indexed", sem.products_indexed as u64)?;
+            out.set_item("pset_rows", sem.pset_rows as u64)?;
+            out.set_item("material_rows", sem.material_rows as u64)?;
+            out.set_item("quantity_rows", sem.quantity_rows as u64)?;
+            out.set_item("classification_rows", sem.classification_rows as u64)?;
+            out.set_item("products_seen", stats.products_seen as u64)?;
+            out.set_item("products_meshed", stats.products_meshed as u64)?;
+            out.set_item("products_deferred", stats.products_deferred as u64)?;
+            out.set_item("triangles", stats.triangles as u64)?;
+            out.set_item("instances_written", instances_written as u64)?;
+            out.set_item("unique_reps_written", reps_written as u64)?;
+            out.set_item("instances_parquet_bytes", inst_bytes)?;
+            out.set_item("representations_parquet_bytes", rep_bytes)?;
+            out.set_item("open_ms", open_ms)?;
+            out.set_item("bundle_ms", bundle_ms)?;
+            out.set_item("entity_table_build_ms", stats.entity_table_build_ms)?;
+            out.set_item("stream_ms", stream_ms)?;
+            Ok(out)
         })
     }
 
@@ -2735,86 +2830,120 @@ mod python {
         reference_only: Vec<String>,
     ) -> PyResult<Bound<'py, PyDict>> {
         catch_panic(|| {
-        use crate::clash::{
-            clash as run_clash, write_clashes_parquet, ClashKind, ClashOptions,
-        };
-        let bundle_dir = Path::new(bundle_dir).to_path_buf();
-        let opts = ClashOptions {
-            tolerance_m,
-            include_classes,
-            exclude_self_class,
-            reference_only,
-        };
+            use crate::clash::{
+                clash as run_clash, write_clashes_parquet, ClashKind, ClashOptions,
+            };
+            // GH #161: a negative tolerance shrinks every broad-phase AABB
+            // (genuine hard clashes silently drop out) and NaN makes every
+            // expanded AABB NaN (zero pairs, zero warnings). Refuse both at
+            // the boundary instead of returning a plausible, wrong report.
+            if !tolerance_m.is_finite() || tolerance_m < 0.0 {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "clash: tolerance_m must be finite and >= 0, got {tolerance_m}"
+                )));
+            }
+            let bundle_dir = Path::new(bundle_dir).to_path_buf();
+            let opts = ClashOptions {
+                tolerance_m,
+                include_classes,
+                exclude_self_class,
+                reference_only,
+            };
 
-        let t = Instant::now();
-        let report = py
-            .detach(|| run_clash(&bundle_dir, &opts))
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("clash: {e}")))?;
-        let clash_ms = t.elapsed().as_secs_f64() * 1000.0;
+            let t = Instant::now();
+            let report = py
+                .detach(|| run_clash(&bundle_dir, &opts))
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("clash: {e}")))?;
+            let clash_ms = t.elapsed().as_secs_f64() * 1000.0;
 
-        let mut written_path: Option<String> = None;
-        if write_parquet {
-            let out = bundle_dir.join("clashes.parquet");
-            py.detach(|| write_clashes_parquet(&out, &report.pairs))
-                .map_err(|e| {
-                    pyo3::exceptions::PyIOError::new_err(format!(
-                        "write {}: {e}",
-                        out.display()
-                    ))
-                })?;
-            written_path = Some(out.to_string_lossy().to_string());
-        }
+            let mut written_path: Option<String> = None;
+            if write_parquet {
+                let out = bundle_dir.join("clashes.parquet");
+                py.detach(|| write_clashes_parquet(&out, &report.pairs))
+                    .map_err(|e| {
+                        pyo3::exceptions::PyIOError::new_err(format!(
+                            "write {}: {e}",
+                            out.display()
+                        ))
+                    })?;
+                written_path = Some(out.to_string_lossy().to_string());
+            }
 
-        let n = report.pairs.len();
-        let mut ifc_id_a: Vec<u64> = Vec::with_capacity(n);
-        let mut ifc_id_b: Vec<u64> = Vec::with_capacity(n);
-        let mut guid_a: Vec<String> = Vec::with_capacity(n);
-        let mut guid_b: Vec<String> = Vec::with_capacity(n);
-        let mut class_a: Vec<String> = Vec::with_capacity(n);
-        let mut class_b: Vec<String> = Vec::with_capacity(n);
-        let mut source_model_a: Vec<String> = Vec::with_capacity(n);
-        let mut source_model_b: Vec<String> = Vec::with_capacity(n);
-        let mut kind: Vec<&'static str> = Vec::with_capacity(n);
-        let mut category: Vec<&'static str> = Vec::with_capacity(n);
-        let mut min_distance_m: Vec<f32> = Vec::with_capacity(n);
-        for p in &report.pairs {
-            ifc_id_a.push(p.ifc_id_a);
-            ifc_id_b.push(p.ifc_id_b);
-            guid_a.push(p.guid_a.clone());
-            guid_b.push(p.guid_b.clone());
-            class_a.push(p.class_a.clone());
-            class_b.push(p.class_b.clone());
-            source_model_a.push(p.source_model_a.clone());
-            source_model_b.push(p.source_model_b.clone());
-            kind.push(match p.kind {
-                ClashKind::Hard => "hard",
-                ClashKind::Clearance => "clearance",
-            });
-            category.push(p.category.as_str());
-            min_distance_m.push(p.min_distance_m);
-        }
+            let n = report.pairs.len();
+            let mut ifc_id_a: Vec<u64> = Vec::with_capacity(n);
+            let mut ifc_id_b: Vec<u64> = Vec::with_capacity(n);
+            let mut guid_a: Vec<String> = Vec::with_capacity(n);
+            let mut guid_b: Vec<String> = Vec::with_capacity(n);
+            let mut class_a: Vec<String> = Vec::with_capacity(n);
+            let mut class_b: Vec<String> = Vec::with_capacity(n);
+            let mut source_model_a: Vec<String> = Vec::with_capacity(n);
+            let mut source_model_b: Vec<String> = Vec::with_capacity(n);
+            let mut kind: Vec<&'static str> = Vec::with_capacity(n);
+            let mut category: Vec<&'static str> = Vec::with_capacity(n);
+            let mut min_distance_m: Vec<f32> = Vec::with_capacity(n);
+            for p in &report.pairs {
+                ifc_id_a.push(p.ifc_id_a);
+                ifc_id_b.push(p.ifc_id_b);
+                guid_a.push(p.guid_a.clone());
+                guid_b.push(p.guid_b.clone());
+                class_a.push(p.class_a.clone());
+                class_b.push(p.class_b.clone());
+                source_model_a.push(p.source_model_a.clone());
+                source_model_b.push(p.source_model_b.clone());
+                kind.push(match p.kind {
+                    ClashKind::Hard => "hard",
+                    ClashKind::Clearance => "clearance",
+                });
+                category.push(p.category.as_str());
+                min_distance_m.push(p.min_distance_m);
+            }
 
-        let out = PyDict::new(py);
-        out.set_item("ifc_id_a", PyList::new(py, &ifc_id_a)?)?;
-        out.set_item("ifc_id_b", PyList::new(py, &ifc_id_b)?)?;
-        out.set_item("guid_a", PyList::new(py, &guid_a)?)?;
-        out.set_item("guid_b", PyList::new(py, &guid_b)?)?;
-        out.set_item("class_a", PyList::new(py, &class_a)?)?;
-        out.set_item("class_b", PyList::new(py, &class_b)?)?;
-        out.set_item("source_model_a", PyList::new(py, &source_model_a)?)?;
-        out.set_item("source_model_b", PyList::new(py, &source_model_b)?)?;
-        out.set_item("kind", PyList::new(py, &kind)?)?;
-        out.set_item("category", PyList::new(py, &category)?)?;
-        out.set_item("min_distance_m", PyList::new(py, &min_distance_m)?)?;
-        out.set_item("geometryless_skipped", report.geometryless_skipped as u64)?;
-        out.set_item("narrow_phase_residuals", report.narrow_phase_residuals as u64)?;
-        out.set_item("pair_count", n as u64)?;
-        out.set_item("tolerance_m", tolerance_m)?;
-        out.set_item("clash_ms", clash_ms)?;
-        if let Some(p) = written_path {
-            out.set_item("clashes_parquet", p)?;
-        }
-        Ok(out)
+            let out = PyDict::new(py);
+            out.set_item("ifc_id_a", PyList::new(py, &ifc_id_a)?)?;
+            out.set_item("ifc_id_b", PyList::new(py, &ifc_id_b)?)?;
+            out.set_item("guid_a", PyList::new(py, &guid_a)?)?;
+            out.set_item("guid_b", PyList::new(py, &guid_b)?)?;
+            out.set_item("class_a", PyList::new(py, &class_a)?)?;
+            out.set_item("class_b", PyList::new(py, &class_b)?)?;
+            out.set_item("source_model_a", PyList::new(py, &source_model_a)?)?;
+            out.set_item("source_model_b", PyList::new(py, &source_model_b)?)?;
+            out.set_item("kind", PyList::new(py, &kind)?)?;
+            out.set_item("category", PyList::new(py, &category)?)?;
+            out.set_item("min_distance_m", PyList::new(py, &min_distance_m)?)?;
+            out.set_item("geometryless_skipped", report.geometryless_skipped as u64)?;
+            out.set_item(
+                "narrow_phase_residuals",
+                report.narrow_phase_residuals as u64,
+            )?;
+            // GH #161: who went missing and why, not just how many. One
+            // dict per residual, in candidate-pair order.
+            let mut residual_details: Vec<Bound<'py, PyDict>> =
+                Vec::with_capacity(report.narrow_phase_residual_details.len());
+            for r in &report.narrow_phase_residual_details {
+                let d = PyDict::new(py);
+                d.set_item("ifc_id_a", r.ifc_id_a)?;
+                d.set_item("ifc_id_b", r.ifc_id_b)?;
+                d.set_item("guid_a", r.guid_a.as_str())?;
+                d.set_item("guid_b", r.guid_b.as_str())?;
+                d.set_item("class_a", r.class_a.as_str())?;
+                d.set_item("class_b", r.class_b.as_str())?;
+                d.set_item("source_model_a", r.source_model_a.as_str())?;
+                d.set_item("source_model_b", r.source_model_b.as_str())?;
+                d.set_item("side", r.side)?;
+                d.set_item("reason", r.reason.as_str())?;
+                residual_details.push(d);
+            }
+            out.set_item(
+                "narrow_phase_residual_details",
+                PyList::new(py, residual_details)?,
+            )?;
+            out.set_item("pair_count", n as u64)?;
+            out.set_item("tolerance_m", tolerance_m)?;
+            out.set_item("clash_ms", clash_ms)?;
+            if let Some(p) = written_path {
+                out.set_item("clashes_parquet", p)?;
+            }
+            Ok(out)
         })
     }
 
@@ -2875,8 +3004,7 @@ mod python {
                     &missing[..missing.len().min(5)]
                 )));
             }
-            let (bytes, stats) =
-                py.detach(|| crate::doc::subset(&doc, &seed_step_ids));
+            let (bytes, stats) = py.detach(|| crate::doc::subset(&doc, &seed_step_ids));
 
             let out = PyDict::new(py);
             out.set_item("seeds_present", stats.seeds_present as u64)?;
@@ -3011,14 +3139,14 @@ mod python {
     /// Parse one Python op dict into a [`crate::doc::MutateOp`].
     fn parse_op(op: &Bound<'_, PyDict>, i: usize) -> PyResult<crate::doc::MutateOp> {
         use crate::doc::{MutateOp, PropValue};
-        let bad = |msg: String| {
-            pyo3::exceptions::PyValueError::new_err(format!("mutate: op {i}: {msg}"))
-        };
+        let bad =
+            |msg: String| pyo3::exceptions::PyValueError::new_err(format!("mutate: op {i}: {msg}"));
         let get_str = |key: &str| -> PyResult<Option<String>> {
             match op.get_item(key)? {
-                Some(v) if !v.is_none() => Ok(Some(v.extract::<String>().map_err(|_| {
-                    bad(format!("'{key}' must be a string"))
-                })?)),
+                Some(v) if !v.is_none() => Ok(Some(
+                    v.extract::<String>()
+                        .map_err(|_| bad(format!("'{key}' must be a string")))?,
+                )),
                 _ => Ok(None),
             }
         };
@@ -3033,7 +3161,10 @@ mod python {
                 .extract()
                 .map_err(|_| bad(format!("'{key}' must be [x, y, z]")))?;
             if l.len() != 3 {
-                return Err(bad(format!("'{key}' must have 3 components, got {}", l.len())));
+                return Err(bad(format!(
+                    "'{key}' must have 3 components, got {}",
+                    l.len()
+                )));
             }
             Ok([l[0], l[1], l[2]])
         };
@@ -3047,7 +3178,11 @@ mod python {
                 if name.is_none() && description.is_none() {
                     return Err(bad("rename needs 'name' and/or 'description'".into()));
                 }
-                Ok(MutateOp::Rename { guid, name, description })
+                Ok(MutateOp::Rename {
+                    guid,
+                    name,
+                    description,
+                })
             }
             "set_property" => {
                 let pset = require_str("pset")?;
@@ -3067,13 +3202,24 @@ mod python {
                         } else if let Ok(s) = v.extract::<String>() {
                             PropValue::Str(s)
                         } else {
-                            return Err(bad("'value' must be str, int, float, bool or None".into()));
+                            return Err(
+                                bad("'value' must be str, int, float, bool or None".into()),
+                            );
                         }
                     }
                 };
-                Ok(MutateOp::SetProperty { guid, pset, prop, value, ifc_type })
+                Ok(MutateOp::SetProperty {
+                    guid,
+                    pset,
+                    prop,
+                    value,
+                    ifc_type,
+                })
             }
-            "translate" => Ok(MutateOp::Translate { guid, delta: get_xyz("delta")? }),
+            "translate" => Ok(MutateOp::Translate {
+                guid,
+                delta: get_xyz("delta")?,
+            }),
             "rotate" => {
                 let degrees = match op.get_item("degrees")? {
                     Some(v) => v
@@ -3093,7 +3239,11 @@ mod python {
                     }
                     _ => [0.0, 0.0, 1.0],
                 };
-                Ok(MutateOp::Rotate { guid, axis, degrees })
+                Ok(MutateOp::Rotate {
+                    guid,
+                    axis,
+                    degrees,
+                })
             }
             other => Err(bad(format!(
                 "unknown op '{other}' (expected rename / set_property / translate / rotate)"

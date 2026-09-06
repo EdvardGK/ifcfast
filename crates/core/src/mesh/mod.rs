@@ -18,6 +18,7 @@
 pub mod boolean;
 pub mod brep;
 pub mod csg_primitive;
+pub mod curveset;
 #[cfg(feature = "csg")]
 pub mod cut_openings;
 /// Pure-data outcome + counter types for the cut-openings pipeline.
@@ -27,7 +28,6 @@ pub mod cut_openings;
 pub mod cut_stats;
 #[cfg(feature = "csg")]
 pub mod cut_validate;
-pub mod curveset;
 pub mod extrusion;
 pub mod faceset;
 pub mod gltf;
@@ -66,10 +66,22 @@ use crate::mesh::placement::PlacementResolver;
 fn mat4_to_dmat4(m: Mat4) -> DMat4 {
     let c = m.to_cols_array();
     DMat4::from_cols_array(&[
-        c[0] as f64, c[1] as f64, c[2] as f64, c[3] as f64,
-        c[4] as f64, c[5] as f64, c[6] as f64, c[7] as f64,
-        c[8] as f64, c[9] as f64, c[10] as f64, c[11] as f64,
-        c[12] as f64, c[13] as f64, c[14] as f64, c[15] as f64,
+        c[0] as f64,
+        c[1] as f64,
+        c[2] as f64,
+        c[3] as f64,
+        c[4] as f64,
+        c[5] as f64,
+        c[6] as f64,
+        c[7] as f64,
+        c[8] as f64,
+        c[9] as f64,
+        c[10] as f64,
+        c[11] as f64,
+        c[12] as f64,
+        c[13] as f64,
+        c[14] as f64,
+        c[15] as f64,
     ])
 }
 
@@ -567,8 +579,7 @@ pub fn mesh_ifc_streaming_framed<S: ProductSink>(
                 Some(Field::Ref(id)) => Some(id),
                 _ => None,
             };
-            let entity_name =
-                crate::indexer::type_name_uppercase_with_proper_case(type_name);
+            let entity_name = crate::indexer::type_name_uppercase_with_proper_case(type_name);
             Some(PartialWork {
                 step_id,
                 guid,
@@ -589,6 +600,22 @@ pub fn mesh_ifc_streaming_framed<S: ProductSink>(
         if let Some(pid) = pw.placement_id {
             let _ = resolver.world(pid);
         }
+    }
+    // GH #160: surface the placement-resolution defects as facts. A
+    // broken `PlacementRelTo` cycle or an unresolved `IfcGridPlacement`
+    // silently plants the element at the world origin; the counters make
+    // that visible in the same `by_source` map the unhandled markers use.
+    if resolver.cycle_count() > 0 {
+        *stats
+            .by_source
+            .entry("placement_cycle_broken".to_string())
+            .or_insert(0) += resolver.cycle_count() as usize;
+    }
+    if resolver.grid_placement_count() > 0 {
+        *stats
+            .by_source
+            .entry("unhandled:IFCGRIDPLACEMENT".to_string())
+            .or_insert(0) += resolver.grid_placement_count() as usize;
     }
     let placement_cache = std::sync::Arc::new(resolver.into_cache());
 
@@ -695,13 +722,8 @@ pub fn mesh_ifc_streaming_framed<S: ProductSink>(
             work.into_par_iter()
                 .enumerate()
                 .for_each_with(tx, |tx, (seq, w)| {
-                    let outcome = tessellate_one(
-                        table_ref,
-                        shape_cache_ref,
-                        style_index_ref,
-                        frame,
-                        w,
-                    );
+                    let outcome =
+                        tessellate_one(table_ref, shape_cache_ref, style_index_ref, frame, w);
                     let _ = tx.send((seq, outcome));
                 });
         });
@@ -734,8 +756,7 @@ pub fn mesh_ifc_streaming_framed<S: ProductSink>(
         // never sent (panic); drain in seq order anyway so the sink
         // sees the surviving outcomes. The panic will re-raise from
         // `std::thread::scope` once the spawn joins.
-        let mut leftover: Vec<(usize, ProductOutcome)> =
-            buffer.into_iter().collect();
+        let mut leftover: Vec<(usize, ProductOutcome)> = buffer.into_iter().collect();
         leftover.sort_by_key(|(seq, _)| *seq);
         for (_, outcome) in leftover {
             apply_outcome(outcome, sink, &mut stats);
@@ -892,8 +913,7 @@ fn tessellate_one(
                             (effective, anchor_f32)
                         }
                         BakeFrame::Local => {
-                            let anchor = mesh_anchor_f64
-                                .expect("pinned above for all bake frames");
+                            let anchor = mesh_anchor_f64.expect("pinned above for all bake frames");
                             let frag_off_f64 = precise_anchor_f64 - anchor;
                             let frag_off = Vec3::new(
                                 frag_off_f64.x as f32,
@@ -907,8 +927,7 @@ fn tessellate_one(
                             // placement chain entirely; re-apply only the
                             // instance composition + the item's rep_origin
                             // rebase, anchored in f64 like the world bake.
-                            let local_anchor_f64 =
-                                instance_f64.transform_point3(rep_origin_f64);
+                            let local_anchor_f64 = instance_f64.transform_point3(rep_origin_f64);
                             let local_anchor = Vec3::new(
                                 local_anchor_f64.x as f32,
                                 local_anchor_f64.y as f32,
@@ -917,7 +936,7 @@ fn tessellate_one(
                             (instance_transform, local_anchor)
                         }
                     };
-                    for chunk in local.vertices.chunks_exact(3) {
+                    for chunk in local.vertices.as_chunks::<3>().0 {
                         let p = Vec3::new(chunk[0], chunk[1], chunk[2]);
                         let v = bake_linear.transform_vector3(p) + bake_translation;
                         combined_v.push(v.x);
@@ -957,14 +976,11 @@ fn tessellate_one(
                         // the plane normal correctly instead of skewing /
                         // flipping it (GH #64 #6). For a pure rotation
                         // (R⁻¹)ᵀ = R, identical to the linear part.
-                        let normal_xform =
-                            glam::Mat3::from_mat4(bake_linear).inverse().transpose();
+                        let normal_xform = glam::Mat3::from_mat4(bake_linear).inverse().transpose();
                         bounded_halfspaces.push(BoundedHalfspacePayload {
                             boundary: p.boundary,
                             boundary_xform: bake * p.boundary_xform,
-                            plane_normal: normal_xform
-                                .mul_vec3(p.plane_normal)
-                                .normalize_or_zero(),
+                            plane_normal: normal_xform.mul_vec3(p.plane_normal).normalize_or_zero(),
                             plane_point: bake.transform_point3(p.plane_point),
                         });
                     }
@@ -984,8 +1000,9 @@ fn tessellate_one(
                         let tag = if roles.is_empty() {
                             source.to_string()
                         } else {
-                            let mut buf =
-                                String::with_capacity(roles.iter().map(|r| r.len() + 1).sum::<usize>() + source.len());
+                            let mut buf = String::with_capacity(
+                                roles.iter().map(|r| r.len() + 1).sum::<usize>() + source.len(),
+                            );
                             for r in roles.iter().rev() {
                                 buf.push_str(r);
                                 buf.push('|');
@@ -999,9 +1016,25 @@ fn tessellate_one(
                             source: tag.clone(),
                         });
                         let surface_color = style_index.item.get(&rep_step_id).copied();
+                        // GH #167: `local.vertices` are relative to the
+                        // item's `rep_origin` (the far-origin rebase for
+                        // facesets since GH #116, and for breps / SBSMs
+                        // since GH #153). The substrate re-derives world
+                        // as `world_transform * part.instance_transform *
+                        // local`, so the rebase has to ride on the part's
+                        // transform or every consumer of `parts` (the
+                        // bundle's shared-rep rows, the clash engine, glTF
+                        // instancing) places the mesh `rep_origin` short
+                        // of where the baked `vertices` put it.
+                        let part_transform = instance_transform
+                            * Mat4::from_translation(Vec3::new(
+                                local.rep_origin[0] as f32,
+                                local.rep_origin[1] as f32,
+                                local.rep_origin[2] as f32,
+                            ));
                         parts.push(InstancePart {
                             rep_step_id,
-                            instance_transform: instance_transform.to_cols_array(),
+                            instance_transform: part_transform.to_cols_array(),
                             local_vertices: local.vertices,
                             local_indices: local.indices,
                             index_start: seg_index_start,
@@ -1035,7 +1068,10 @@ fn tessellate_one(
         .first()
         .and_then(|s| {
             let leaf = s.source.rsplit('|').next().unwrap_or(s.source.as_str());
-            MeshFragment::source_tags().iter().find(|t| **t == leaf).copied()
+            MeshFragment::source_tags()
+                .iter()
+                .find(|t| **t == leaf)
+                .copied()
         })
         .unwrap_or("composite");
 
@@ -1087,11 +1123,7 @@ fn tessellate_one(
 /// that (it already holds the `IfcRelVoidsElement` index from the
 /// indexer) and routes the returned meshes through
 /// [`cut_openings::CrossProductCut`] exactly as the batch path does.
-pub fn mesh_products_by_step(
-    buf: &[u8],
-    step_ids: &[u64],
-    frame: BakeFrame,
-) -> Vec<ProductMesh> {
+pub fn mesh_products_by_step(buf: &[u8], step_ids: &[u64], frame: BakeFrame) -> Vec<ProductMesh> {
     let table = EntityTable::build(buf);
     let style_index = styles::StyleIndex::build(&table);
     // One resolver shared across the (few) requested products — its
@@ -1157,11 +1189,7 @@ pub fn mesh_products_by_step(
 /// phase 3 of [`mesh_ifc_streaming_framed`] so emission order matches
 /// the IFC entity-table iteration order and stats counters need no
 /// synchronisation.
-fn apply_outcome<S: ProductSink>(
-    outcome: ProductOutcome,
-    sink: &mut S,
-    stats: &mut MeshStats,
-) {
+fn apply_outcome<S: ProductSink>(outcome: ProductOutcome, sink: &mut S, stats: &mut MeshStats) {
     match outcome {
         ProductOutcome::Mesh {
             product,
@@ -1287,6 +1315,12 @@ pub(crate) fn mesh_item(
         None => return Vec::new(),
     };
 
+    // GH #154: a handler that returns `None` (unsupported profile
+    // subtype, untessellatable curve, degenerate params) must surface an
+    // `Unhandled` marker naming the IFC type — NOT an empty Vec. An
+    // empty Vec makes the item disappear from a multi-item Body with
+    // zero counter movement while the product still counts as meshed,
+    // which is exactly the silent drop mod.rs:10 forbids.
     let single = |maybe: Option<LocalMesh>, tag: &'static str| -> Vec<MeshFragment> {
         match maybe {
             Some(m) => vec![MeshFragment::Mesh {
@@ -1297,95 +1331,118 @@ pub(crate) fn mesh_item(
                 instance_transform: Mat4::IDENTITY,
                 bounded_halfspace: None,
             }],
-            None => Vec::new(),
+            None => vec![MeshFragment::Unhandled {
+                ifc_type: bytes_to_string(type_name),
+            }],
         }
     };
 
-    let result: Vec<MeshFragment> =
-        if type_name.eq_ignore_ascii_case(b"IFCEXTRUDEDAREASOLID") {
-            single(extrusion::extrude(table, item_id), "extrusion")
-        } else if type_name.eq_ignore_ascii_case(b"IFCMAPPEDITEM") {
-            mapped::expand(table, item_id, shape_cache)
-        } else if type_name.eq_ignore_ascii_case(b"IFCPOLYGONALFACESET") {
-            single(faceset::polygonal_face_set(table, item_id), "polygonal_faceset")
-        } else if type_name.eq_ignore_ascii_case(b"IFCTRIANGULATEDFACESET") {
-            single(
-                faceset::triangulated_face_set(table, item_id),
-                "triangulated_faceset",
-            )
-        } else if type_name.eq_ignore_ascii_case(b"IFCFACETEDBREP")
-            || type_name.eq_ignore_ascii_case(b"IFCMANIFOLDSOLIDBREP")
-        {
-            single(brep::faceted_brep(table, item_id), "brep")
-        } else if type_name.eq_ignore_ascii_case(b"IFCADVANCEDBREP") {
-            single(brep::faceted_brep(table, item_id), "advanced_brep_approx")
-        } else if type_name.eq_ignore_ascii_case(b"IFCFACEBASEDSURFACEMODEL") {
-            single(brep::face_based_surface_model(table, item_id), "faceset_fbsm")
-        } else if type_name.eq_ignore_ascii_case(b"IFCSHELLBASEDSURFACEMODEL") {
-            single(brep::shell_based_surface_model(table, item_id), "faceset_sbsm")
-        } else if type_name.eq_ignore_ascii_case(b"IFCBOOLEANRESULT")
-            || type_name.eq_ignore_ascii_case(b"IFCBOOLEANCLIPPINGRESULT")
-        {
-            // The recurse callback into mesh_item threads the shared
-            // `&ShapeCache` through — boolean::boolean_result takes a
-            // function pointer so the recursion happens on this exact
-            // frame (still useful for clarity; the borrow argument
-            // is now moot since DashMap is share-by-reference).
-            boolean::boolean_result(table, item_id, shape_cache, &mesh_item)
-        } else if type_name.eq_ignore_ascii_case(b"IFCCSGSOLID") {
-            boolean::csg_solid(table, item_id, shape_cache, &mesh_item)
-        } else if type_name.eq_ignore_ascii_case(b"IFCPOLYGONALBOUNDEDHALFSPACE") {
-            match boolean::polygonal_bounded_halfspace(table, item_id) {
-                // Construct the fragment directly (not via `single`) so we
-                // can attach the W6 bounded-halfspace payload. The payload
-                // rides up the boolean tree via `retag` and lands on the
-                // product's `bounded_halfspaces` list in `tessellate_one`.
-                Some((m, agreement, payload)) => vec![MeshFragment::Mesh {
-                    mesh: m,
-                    source: if agreement {
-                        "halfspace_bounded:agree"
-                    } else {
-                        "halfspace_bounded:disagree"
-                    },
-                    roles: Vec::new(),
-                    rep_step_id: item_id,
-                    instance_transform: Mat4::IDENTITY,
-                    bounded_halfspace: Some(payload),
-                }],
-                None => Vec::new(),
-            }
-        } else if type_name.eq_ignore_ascii_case(b"IFCHALFSPACESOLID") {
-            match boolean::halfspace_solid(table, item_id) {
-                Some((m, agreement)) => single(
-                    Some(m),
-                    if agreement { "halfspace_plane:agree" } else { "halfspace_plane:disagree" },
-                ),
-                None => Vec::new(),
-            }
-        } else if type_name.eq_ignore_ascii_case(b"IFCGEOMETRICCURVESET")
-            || type_name.eq_ignore_ascii_case(b"IFCGEOMETRICSET")
-        {
-            single(curveset::geometric_curve_set(table, item_id), "curve_set")
-        } else if type_name.eq_ignore_ascii_case(b"IFCBLOCK") {
-            single(csg_primitive::block(table, item_id), "csg_block")
-        } else if type_name.eq_ignore_ascii_case(b"IFCRIGHTCIRCULARCYLINDER") {
-            single(csg_primitive::right_circular_cylinder(table, item_id), "csg_cylinder")
-        } else if type_name.eq_ignore_ascii_case(b"IFCRIGHTCIRCULARCONE") {
-            single(csg_primitive::right_circular_cone(table, item_id), "csg_cone")
-        } else if type_name.eq_ignore_ascii_case(b"IFCSPHERE") {
-            single(csg_primitive::sphere(table, item_id), "csg_sphere")
-        } else if type_name.eq_ignore_ascii_case(b"IFCRECTANGULARPYRAMID") {
-            single(csg_primitive::rectangular_pyramid(table, item_id), "csg_pyramid")
-        } else if type_name.eq_ignore_ascii_case(b"IFCREVOLVEDAREASOLID") {
-            single(revolved::revolved_area_solid(table, item_id), "revolved")
-        } else {
-            // Reveal-all stance: name the type explicitly so the
-            // consumer sees exactly what's in the file we can't yet
-            // tessellate, instead of a silent black hole.
-            vec![MeshFragment::Unhandled {
-                ifc_type: bytes_to_string(type_name),
-            }]
-        };
+    let result: Vec<MeshFragment> = if type_name.eq_ignore_ascii_case(b"IFCEXTRUDEDAREASOLID") {
+        single(extrusion::extrude(table, item_id), "extrusion")
+    } else if type_name.eq_ignore_ascii_case(b"IFCMAPPEDITEM") {
+        mapped::expand(table, item_id, shape_cache)
+    } else if type_name.eq_ignore_ascii_case(b"IFCPOLYGONALFACESET") {
+        single(
+            faceset::polygonal_face_set(table, item_id),
+            "polygonal_faceset",
+        )
+    } else if type_name.eq_ignore_ascii_case(b"IFCTRIANGULATEDFACESET") {
+        single(
+            faceset::triangulated_face_set(table, item_id),
+            "triangulated_faceset",
+        )
+    } else if type_name.eq_ignore_ascii_case(b"IFCFACETEDBREP")
+        || type_name.eq_ignore_ascii_case(b"IFCMANIFOLDSOLIDBREP")
+    {
+        single(brep::faceted_brep(table, item_id), "brep")
+    } else if type_name.eq_ignore_ascii_case(b"IFCADVANCEDBREP") {
+        single(brep::faceted_brep(table, item_id), "advanced_brep_approx")
+    } else if type_name.eq_ignore_ascii_case(b"IFCFACEBASEDSURFACEMODEL") {
+        single(
+            brep::face_based_surface_model(table, item_id),
+            "faceset_fbsm",
+        )
+    } else if type_name.eq_ignore_ascii_case(b"IFCSHELLBASEDSURFACEMODEL") {
+        single(
+            brep::shell_based_surface_model(table, item_id),
+            "faceset_sbsm",
+        )
+    } else if type_name.eq_ignore_ascii_case(b"IFCBOOLEANRESULT")
+        || type_name.eq_ignore_ascii_case(b"IFCBOOLEANCLIPPINGRESULT")
+    {
+        // The recurse callback into mesh_item threads the shared
+        // `&ShapeCache` through — boolean::boolean_result takes a
+        // function pointer so the recursion happens on this exact
+        // frame (still useful for clarity; the borrow argument
+        // is now moot since DashMap is share-by-reference).
+        boolean::boolean_result(table, item_id, shape_cache, &mesh_item)
+    } else if type_name.eq_ignore_ascii_case(b"IFCCSGSOLID") {
+        boolean::csg_solid(table, item_id, shape_cache, &mesh_item)
+    } else if type_name.eq_ignore_ascii_case(b"IFCPOLYGONALBOUNDEDHALFSPACE") {
+        match boolean::polygonal_bounded_halfspace(table, item_id) {
+            // Construct the fragment directly (not via `single`) so we
+            // can attach the W6 bounded-halfspace payload. The payload
+            // rides up the boolean tree via `retag` and lands on the
+            // product's `bounded_halfspaces` list in `tessellate_one`.
+            Some((m, agreement, payload)) => vec![MeshFragment::Mesh {
+                mesh: m,
+                source: if agreement {
+                    "halfspace_bounded:agree"
+                } else {
+                    "halfspace_bounded:disagree"
+                },
+                roles: Vec::new(),
+                rep_step_id: item_id,
+                instance_transform: Mat4::IDENTITY,
+                bounded_halfspace: Some(payload),
+            }],
+            None => Vec::new(),
+        }
+    } else if type_name.eq_ignore_ascii_case(b"IFCHALFSPACESOLID") {
+        match boolean::halfspace_solid(table, item_id) {
+            Some((m, agreement)) => single(
+                Some(m),
+                if agreement {
+                    "halfspace_plane:agree"
+                } else {
+                    "halfspace_plane:disagree"
+                },
+            ),
+            None => Vec::new(),
+        }
+    } else if type_name.eq_ignore_ascii_case(b"IFCGEOMETRICCURVESET")
+        || type_name.eq_ignore_ascii_case(b"IFCGEOMETRICSET")
+    {
+        single(curveset::geometric_curve_set(table, item_id), "curve_set")
+    } else if type_name.eq_ignore_ascii_case(b"IFCBLOCK") {
+        single(csg_primitive::block(table, item_id), "csg_block")
+    } else if type_name.eq_ignore_ascii_case(b"IFCRIGHTCIRCULARCYLINDER") {
+        single(
+            csg_primitive::right_circular_cylinder(table, item_id),
+            "csg_cylinder",
+        )
+    } else if type_name.eq_ignore_ascii_case(b"IFCRIGHTCIRCULARCONE") {
+        single(
+            csg_primitive::right_circular_cone(table, item_id),
+            "csg_cone",
+        )
+    } else if type_name.eq_ignore_ascii_case(b"IFCSPHERE") {
+        single(csg_primitive::sphere(table, item_id), "csg_sphere")
+    } else if type_name.eq_ignore_ascii_case(b"IFCRECTANGULARPYRAMID") {
+        single(
+            csg_primitive::rectangular_pyramid(table, item_id),
+            "csg_pyramid",
+        )
+    } else if type_name.eq_ignore_ascii_case(b"IFCREVOLVEDAREASOLID") {
+        single(revolved::revolved_area_solid(table, item_id), "revolved")
+    } else {
+        // Reveal-all stance: name the type explicitly so the
+        // consumer sees exactly what's in the file we can't yet
+        // tessellate, instead of a silent black hole.
+        vec![MeshFragment::Unhandled {
+            ifc_type: bytes_to_string(type_name),
+        }]
+    };
 
     // Cache only the real mesh fragments — unhandled markers are cheap
     // to re-derive. Composite handlers (boolean / csg) don't cache the
@@ -1405,13 +1462,22 @@ pub(crate) fn mesh_item(
         || type_name.eq_ignore_ascii_case(b"IFCBOOLEANCLIPPINGRESULT")
         || type_name.eq_ignore_ascii_case(b"IFCCSGSOLID")
         || type_name.eq_ignore_ascii_case(b"IFCPOLYGONALBOUNDEDHALFSPACE");
-    if !is_composite {
+    //
+    // A result that carries an `Unhandled` marker is NOT cached either
+    // (GH #154): the cache stores only `(LocalMesh, tag)` pairs, so a
+    // cached unhandled item would come back as an empty Vec on the
+    // second reference — the marker would survive the first lookup and
+    // silently vanish for every re-use of the same item (shared
+    // `IfcMappedItem` mapping sources hit this constantly), under-
+    // counting the unhandled bucket.
+    let has_unhandled = result
+        .iter()
+        .any(|f| matches!(f, MeshFragment::Unhandled { .. }));
+    if !is_composite && !has_unhandled {
         let cacheable: Vec<(LocalMesh, &'static str)> = result
             .iter()
             .filter_map(|f| match f {
-                MeshFragment::Mesh { mesh, source, .. } => {
-                    Some((clone_local(mesh), *source))
-                }
+                MeshFragment::Mesh { mesh, source, .. } => Some((clone_local(mesh), *source)),
                 MeshFragment::Unhandled { .. } => None,
             })
             .collect();
@@ -1457,7 +1523,9 @@ fn body_items(table: &EntityTable, repr_id: u64) -> Vec<u64> {
             }
         }
         let chosen = body_id.or(any_id);
-        return chosen.map(|id| representation_items(table, id)).unwrap_or_default();
+        return chosen
+            .map(|id| representation_items(table, id))
+            .unwrap_or_default();
     }
     // IfcShapeRepresentation directly (rare top-level).
     representation_items(table, repr_id)
@@ -1554,9 +1622,7 @@ pub fn is_synthetic_cutter_tag(tag: &str) -> bool {
     for link in tag.split('|') {
         if link == "boolean_second_operand" {
             second_operand = true;
-        } else if link.starts_with("halfspace_plane")
-            || link.starts_with("halfspace_bounded")
-        {
+        } else if link.starts_with("halfspace_plane") || link.starts_with("halfspace_bounded") {
             halfspace_leaf = true;
         }
     }
@@ -1616,8 +1682,7 @@ pub fn strip_synthetic_cutters(mesh: &mut ProductMesh) -> u32 {
 
     // Parts are pushed in lockstep with segments and share index_start;
     // keep the ones whose old range survived, retargeted to the new one.
-    let retarget: std::collections::HashMap<u32, u32> =
-        kept_ranges.into_iter().collect();
+    let retarget: std::collections::HashMap<u32, u32> = kept_ranges.into_iter().collect();
     mesh.parts.retain(|p| retarget.contains_key(&p.index_start));
     for p in &mut mesh.parts {
         if let Some(&ns) = retarget.get(&p.index_start) {
@@ -1658,13 +1723,25 @@ mod strip_cutter_tests {
         let start = indices.len() as u32;
         let s = size;
         let corners = [
-            [ox, 0.0, 0.0], [ox + s, 0.0, 0.0], [ox + s, s, 0.0], [ox, s, 0.0],
-            [ox, 0.0, s], [ox + s, 0.0, s], [ox + s, s, s], [ox, s, s],
+            [ox, 0.0, 0.0],
+            [ox + s, 0.0, 0.0],
+            [ox + s, s, 0.0],
+            [ox, s, 0.0],
+            [ox, 0.0, s],
+            [ox + s, 0.0, s],
+            [ox + s, s, s],
+            [ox, s, s],
         ];
-        for c in corners { vertices.extend_from_slice(&c); }
+        for c in corners {
+            vertices.extend_from_slice(&c);
+        }
         const QUADS: [[u32; 4]; 6] = [
-            [0, 1, 2, 3], [4, 5, 6, 7], [0, 1, 5, 4],
-            [2, 3, 7, 6], [1, 2, 6, 5], [0, 3, 7, 4],
+            [0, 1, 2, 3],
+            [4, 5, 6, 7],
+            [0, 1, 5, 4],
+            [2, 3, 7, 6],
+            [1, 2, 6, 5],
+            [0, 3, 7, 4],
         ];
         for q in QUADS {
             indices.extend_from_slice(&[base + q[0], base + q[1], base + q[2]]);
@@ -1705,9 +1782,15 @@ mod strip_cutter_tests {
 
     #[test]
     fn tag_predicate_matches_synthetic_cutters_only() {
-        assert!(is_synthetic_cutter_tag("boolean_second_operand|halfspace_plane"));
-        assert!(is_synthetic_cutter_tag("boolean_second_operand|halfspace_bounded"));
-        assert!(is_synthetic_cutter_tag("boolean_second_operand|halfspace_plane:agree"));
+        assert!(is_synthetic_cutter_tag(
+            "boolean_second_operand|halfspace_plane"
+        ));
+        assert!(is_synthetic_cutter_tag(
+            "boolean_second_operand|halfspace_bounded"
+        ));
+        assert!(is_synthetic_cutter_tag(
+            "boolean_second_operand|halfspace_plane:agree"
+        ));
         assert!(is_synthetic_cutter_tag(
             "boolean_second_operand|boolean_second_operand|halfspace_bounded:disagree"
         ));
@@ -1716,7 +1799,9 @@ mod strip_cutter_tests {
         // host-side geometry never stripped
         assert!(!is_synthetic_cutter_tag("boolean_first_operand|extrusion"));
         // union operands are additive geometry
-        assert!(!is_synthetic_cutter_tag("boolean_union_operand|halfspace_plane"));
+        assert!(!is_synthetic_cutter_tag(
+            "boolean_union_operand|halfspace_plane"
+        ));
         assert!(!is_synthetic_cutter_tag("extrusion"));
         // halfspace leaf without a boolean role (bare clip target) stays
         assert!(!is_synthetic_cutter_tag("halfspace_bounded"));
@@ -1736,10 +1821,12 @@ mod strip_cutter_tests {
         assert_eq!(mesh.segments.len(), 1);
         assert_eq!(mesh.indices.len() / 3, before_tris / 3); // 36 -> 12
         assert_eq!(mesh.vertices.len() / 3, 8); // compacted to host verts
-        // AABB over the raw vertex buffer no longer sees the 40-unit caps
+                                                // AABB over the raw vertex buffer no longer sees the 40-unit caps
         let max_x = mesh
             .vertices
-            .chunks_exact(3)
+            .as_chunks::<3>()
+            .0
+            .iter()
             .map(|c| c[0])
             .fold(f32::MIN, f32::max);
         assert!(max_x <= 1.0 + 1e-6, "max_x={max_x}");
@@ -1783,4 +1870,3 @@ mod strip_cutter_tests {
         assert_eq!(mesh.vertices.len() / 3, 16);
     }
 }
-

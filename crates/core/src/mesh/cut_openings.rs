@@ -27,9 +27,9 @@ use glam::Vec3;
 
 use crate::entity_table::EntityTable;
 use crate::geom::csg::{self, CsgKernelError};
-use crate::mesh::{cut_validate, halfspace_clip, InstancePart, MeshSegment, ProductMesh};
 #[cfg(feature = "prism-csg-fast")]
 use crate::mesh::BoundedHalfspacePayload;
+use crate::mesh::{cut_validate, halfspace_clip, InstancePart, MeshSegment, ProductMesh};
 
 // The pure-data outcome + counter types moved to `crate::mesh::cut_stats`
 // (GH #61) so mesh / prism builds without `csg` can still carry the
@@ -46,9 +46,33 @@ pub use crate::mesh::cut_stats::{CutOpeningsStats, Outcome, UnsupportedReason};
 /// cleared because the cut destroys the per-fragment instance dedup
 /// (a wall-minus-this-specific-window is unique to that wall).
 ///
-/// On `Outcome::Passthrough` or `Outcome::Fallback`, the mesh is
-/// untouched.
+/// On `Outcome::Passthrough`, `Outcome::Fallback` or
+/// `Outcome::Unsupported`, the host geometry is untouched — but the
+/// **synthetic half-space stand-in slabs are stripped anyway** (GH
+/// #147): they are tool geometry, never element geometry, and leaving
+/// them in on a non-`Cut` outcome poisons QTO volume, the AABB and
+/// glTF exactly as if the cut had never been requested. See the
+/// wrapper below.
 pub fn apply(mesh: &mut ProductMesh, unit_scale: f32) -> Outcome {
+    let outcome = apply_inner(mesh, unit_scale);
+    // GH #147: every non-`Cut` exit leaves the `±HALFSPACE_PLANE_EXTENT`
+    // stand-in slabs in the mesh. `Cut` replaces the whole segment list
+    // with a single `cut_openings` segment, so there is nothing to strip
+    // there. Doing it HERE (rather than in the sinks) makes the guard
+    // unconditional: no sink has to know whether `apply` consumed the
+    // cutters or bailed. Authored solid cutters on the subtracted side
+    // stay revealed — `is_synthetic_cutter_tag` only matches the
+    // synthetic `halfspace_*` leaves.
+    if !matches!(outcome, Outcome::Cut) {
+        crate::mesh::strip_synthetic_cutters(mesh);
+    }
+    outcome
+}
+
+/// The cut pipeline proper. Every `return` here is a *non-`Cut`* exit
+/// that leaves the mesh as the extractor built it; [`apply`] wraps this
+/// and strips the synthetic cutters on those exits.
+fn apply_inner(mesh: &mut ProductMesh, unit_scale: f32) -> Outcome {
     let (host_segs, cutter_segs) = partition_segments(&mesh.segments);
 
     if cutter_segs.is_empty() {
@@ -181,14 +205,13 @@ pub fn apply(mesh: &mut ProductMesh, unit_scale: f32) -> Outcome {
     #[cfg(feature = "prism-csg-fast")]
     {
         let bounded = std::mem::take(&mut mesh.bounded_halfspaces);
-        let handled: Vec<usize> =
-            match bounded_halfspace::try_bounded_cut_multi(&host, &bounded) {
-                Some((new_v, new_i, handled)) => {
-                    host = (new_v, new_i);
-                    handled
-                }
-                None => Vec::new(),
-            };
+        let handled: Vec<usize> = match bounded_halfspace::try_bounded_cut_multi(&host, &bounded) {
+            Some((new_v, new_i, handled)) => {
+                host = (new_v, new_i);
+                handled
+            }
+            None => Vec::new(),
+        };
         for (i, p) in bounded.iter().enumerate() {
             if !handled.contains(&i) {
                 halfspace_planes.push((p.plane_point, p.plane_normal));
@@ -216,9 +239,7 @@ pub fn apply(mesh: &mut ProductMesh, unit_scale: f32) -> Outcome {
     // Run remaining solid cutters (real opening extrusions, etc.)
     // through Manifold. If the host has been emptied by the
     // half-space clips alone, skip the boolean step entirely.
-    let (final_v, final_i) = if solid_cutters.is_empty() {
-        host
-    } else if host.1.is_empty() {
+    let (final_v, final_i) = if solid_cutters.is_empty() || host.1.is_empty() {
         host
     } else {
         let cutter_refs: Vec<(&[f32], &[u32])> = solid_cutters
@@ -289,21 +310,9 @@ fn derive_plane_from_slab(vertices: &[f32], indices: &[u32]) -> Option<(Vec3, Ve
     if (i0 * 3 + 2).max(i1 * 3 + 2).max(i2 * 3 + 2) >= vertices.len() {
         return None;
     }
-    let v0 = Vec3::new(
-        vertices[i0 * 3],
-        vertices[i0 * 3 + 1],
-        vertices[i0 * 3 + 2],
-    );
-    let v1 = Vec3::new(
-        vertices[i1 * 3],
-        vertices[i1 * 3 + 1],
-        vertices[i1 * 3 + 2],
-    );
-    let v2 = Vec3::new(
-        vertices[i2 * 3],
-        vertices[i2 * 3 + 1],
-        vertices[i2 * 3 + 2],
-    );
+    let v0 = Vec3::new(vertices[i0 * 3], vertices[i0 * 3 + 1], vertices[i0 * 3 + 2]);
+    let v1 = Vec3::new(vertices[i1 * 3], vertices[i1 * 3 + 1], vertices[i1 * 3 + 2]);
+    let v2 = Vec3::new(vertices[i2 * 3], vertices[i2 * 3 + 1], vertices[i2 * 3 + 2]);
     let raw_normal = (v1 - v0).cross(v2 - v0);
     if raw_normal.length_squared() < 1e-12 {
         return None;
@@ -319,7 +328,7 @@ fn derive_plane_from_slab(vertices: &[f32], indices: &[u32]) -> Option<(Vec3, Ve
     if n < 4.0 {
         return None;
     }
-    for chunk in vertices.chunks_exact(3) {
+    for chunk in vertices.as_chunks::<3>().0 {
         sum += Vec3::new(chunk[0], chunk[1], chunk[2]);
     }
     let plane_point = sum / n;
@@ -430,8 +439,13 @@ mod bounded_halfspace {
             if d.abs() < AXIS_DOT_MIN {
                 continue; // different sweep axis → fallback
             }
-            let boundary_fp =
-                project_boundary(&p.boundary, &p.boundary_xform, prism.origin, prism.e1, prism.e2);
+            let boundary_fp = project_boundary(
+                &p.boundary,
+                &p.boundary_xform,
+                prism.origin,
+                prism.e1,
+                prism.e2,
+            );
             if boundary_fp.outer.len() < 3 {
                 continue;
             }
@@ -488,9 +502,15 @@ mod bounded_halfspace {
                     (band.s_lo.max(e.s_p), band.s_hi)
                 };
                 if hi - lo > 1e-4 {
-                    for sh in polygon_bool::intersection(&band.fp, std::slice::from_ref(&e.boundary)) {
+                    for sh in
+                        polygon_bool::intersection(&band.fp, std::slice::from_ref(&e.boundary))
+                    {
                         if shape_area(&sh) > min_area {
-                            next.push(Band { fp: sh, s_lo: lo, s_hi: hi });
+                            next.push(Band {
+                                fp: sh,
+                                s_lo: lo,
+                                s_hi: hi,
+                            });
                         }
                     }
                 }
@@ -579,7 +599,10 @@ mod bounded_halfspace {
         if hull.len() < 3 {
             return None;
         }
-        let fp = Polygon2D { outer: hull, holes: Vec::new() };
+        let fp = Polygon2D {
+            outer: hull,
+            holes: Vec::new(),
+        };
 
         let hull_area = polygon_area(&fp.outer).abs();
         let prism_vol = hull_area * span;
@@ -588,7 +611,15 @@ mod bounded_halfspace {
             return None;
         }
 
-        Some(HostPrism { e1, e2, n, origin, s_min, s_max, fp })
+        Some(HostPrism {
+            e1,
+            e2,
+            n,
+            origin,
+            s_min,
+            s_max,
+            fp,
+        })
     }
 
     /// A boundary is tight unless it effectively contains the host
@@ -618,8 +649,15 @@ mod bounded_halfspace {
 
     /// Net area of a facade shape: |outer| − Σ|holes|, clamped at 0.
     fn shape_area(s: &Shape) -> f64 {
-        let outer = s.first().map(|r| polygon_bool::signed_area(r).abs()).unwrap_or(0.0);
-        let holes: f64 = s.iter().skip(1).map(|r| polygon_bool::signed_area(r).abs()).sum();
+        let outer = s
+            .first()
+            .map(|r| polygon_bool::signed_area(r).abs())
+            .unwrap_or(0.0);
+        let holes: f64 = s
+            .iter()
+            .skip(1)
+            .map(|r| polygon_bool::signed_area(r).abs())
+            .sum();
         (outer - holes).max(0.0)
     }
 
@@ -637,7 +675,11 @@ mod bounded_halfspace {
         };
         Polygon2D {
             outer: boundary.outer.iter().map(f).collect(),
-            holes: boundary.holes.iter().map(|h| h.iter().map(f).collect()).collect(),
+            holes: boundary
+                .holes
+                .iter()
+                .map(|h| h.iter().map(f).collect())
+                .collect(),
         }
     }
 
@@ -663,7 +705,10 @@ mod bounded_halfspace {
         m
     }
 
-    fn append(dst: &mut crate::mesh::extrusion::LocalMesh, src: &crate::mesh::extrusion::LocalMesh) {
+    fn append(
+        dst: &mut crate::mesh::extrusion::LocalMesh,
+        src: &crate::mesh::extrusion::LocalMesh,
+    ) {
         let base = (dst.vertices.len() / 3) as u32;
         dst.vertices.extend_from_slice(&src.vertices);
         dst.indices.extend(src.indices.iter().map(|i| i + base));
@@ -682,7 +727,8 @@ mod bounded_halfspace {
         if npts < 3 {
             return None;
         }
-        let cross = |o: Vec2, a: Vec2, b: Vec2| (a.x - o.x) * (b.y - o.y) - (a.y - o.y) * (b.x - o.x);
+        let cross =
+            |o: Vec2, a: Vec2, b: Vec2| (a.x - o.x) * (b.y - o.y) - (a.y - o.y) * (b.x - o.x);
         let mut hull: Vec<Vec2> = Vec::with_capacity(npts + 1);
         // Lower hull.
         for &p in &pts {
@@ -778,9 +824,18 @@ mod bounded_halfspace {
         fn tight_boundary_is_tight() {
             // Host 1000×200, boundary 300×200 centred — strictly smaller
             // in X → tight.
-            let host = poly(&[(-500.0, -100.0), (500.0, -100.0), (500.0, 100.0), (-500.0, 100.0)]);
-            let boundary =
-                poly(&[(-150.0, -100.0), (150.0, -100.0), (150.0, 100.0), (-150.0, 100.0)]);
+            let host = poly(&[
+                (-500.0, -100.0),
+                (500.0, -100.0),
+                (500.0, 100.0),
+                (-500.0, 100.0),
+            ]);
+            let boundary = poly(&[
+                (-150.0, -100.0),
+                (150.0, -100.0),
+                (150.0, 100.0),
+                (-150.0, 100.0),
+            ]);
             assert!(is_tight_boundary(&host, &boundary));
         }
 
@@ -788,7 +843,12 @@ mod bounded_halfspace {
         fn oversized_boundary_is_not_tight() {
             // Revit's oversize convention: boundary 5000×5000 around a
             // 1000×200 host → NOT tight (cheap plane clip is correct).
-            let host = poly(&[(-500.0, -100.0), (500.0, -100.0), (500.0, 100.0), (-500.0, 100.0)]);
+            let host = poly(&[
+                (-500.0, -100.0),
+                (500.0, -100.0),
+                (500.0, 100.0),
+                (-500.0, 100.0),
+            ]);
             let boundary = poly(&[
                 (-2500.0, -2500.0),
                 (2500.0, -2500.0),
@@ -808,9 +868,19 @@ mod bounded_halfspace {
         /// boundary` remainder and correctly classifies it as tight.
         #[test]
         fn rotated_strip_boundary_is_tight() {
-            let host = poly(&[(-400.0, -400.0), (400.0, -400.0), (400.0, 400.0), (-400.0, 400.0)]);
+            let host = poly(&[
+                (-400.0, -400.0),
+                (400.0, -400.0),
+                (400.0, 400.0),
+                (-400.0, 400.0),
+            ]);
             // 1400×100 strip about the origin, rotated 45°.
-            let strip = [(-700.0, -50.0), (700.0, -50.0), (700.0, 50.0), (-700.0, 50.0)];
+            let strip = [
+                (-700.0, -50.0),
+                (700.0, -50.0),
+                (700.0, 50.0),
+                (-700.0, 50.0),
+            ];
             let boundary = rotate(&strip, 45.0);
             assert!(
                 is_tight_boundary(&host, &boundary),
@@ -823,8 +893,18 @@ mod bounded_halfspace {
         /// happy-path complement to the strip case).
         #[test]
         fn rotated_tight_boundary_is_tight() {
-            let host_ring = [(-500.0, -100.0), (500.0, -100.0), (500.0, 100.0), (-500.0, 100.0)];
-            let bnd_ring = [(-150.0, -100.0), (150.0, -100.0), (150.0, 100.0), (-150.0, 100.0)];
+            let host_ring = [
+                (-500.0, -100.0),
+                (500.0, -100.0),
+                (500.0, 100.0),
+                (-500.0, 100.0),
+            ];
+            let bnd_ring = [
+                (-150.0, -100.0),
+                (150.0, -100.0),
+                (150.0, 100.0),
+                (-150.0, 100.0),
+            ];
             let host = rotate(&host_ring, 30.0);
             let boundary = rotate(&bnd_ring, 30.0);
             assert!(is_tight_boundary(&host, &boundary));
@@ -834,9 +914,18 @@ mod bounded_halfspace {
         /// containment test is rotation-invariant in both directions.
         #[test]
         fn rotated_oversized_boundary_is_not_tight() {
-            let host_ring = [(-500.0, -100.0), (500.0, -100.0), (500.0, 100.0), (-500.0, 100.0)];
-            let bnd_ring =
-                [(-2500.0, -2500.0), (2500.0, -2500.0), (2500.0, 2500.0), (-2500.0, 2500.0)];
+            let host_ring = [
+                (-500.0, -100.0),
+                (500.0, -100.0),
+                (500.0, 100.0),
+                (-500.0, 100.0),
+            ];
+            let bnd_ring = [
+                (-2500.0, -2500.0),
+                (2500.0, -2500.0),
+                (2500.0, 2500.0),
+                (-2500.0, 2500.0),
+            ];
             let host = rotate(&host_ring, 37.0);
             let boundary = rotate(&bnd_ring, 37.0);
             assert!(!is_tight_boundary(&host, &boundary));
@@ -1040,7 +1129,13 @@ impl CrossProductCut {
     ) -> Vec<(ProductMesh, Outcome)> {
         let _ = table; // consulted only by the prism-csg-fast path
         let mut out = Vec::with_capacity(self.held_hosts.len());
-        let held_hosts = std::mem::take(&mut self.held_hosts);
+        // GH #152: `held_hosts` is a `HashMap`, so draining it directly
+        // emitted voided hosts in `RandomState` order — a different row
+        // order per process run, which the bitwise parity gates read as
+        // phantom drift. Sort by host step_id: same rows, stable order.
+        let mut held_hosts: Vec<(u64, ProductMesh)> =
+            std::mem::take(&mut self.held_hosts).into_iter().collect();
+        held_hosts.sort_by_key(|(id, _)| *id);
         for (host_id, mut host_mesh) in held_hosts {
             // Run in-rep cut first. Combined outcome accounting is
             // simplified to "did any subtraction happen on this
@@ -1068,18 +1163,17 @@ impl CrossProductCut {
             // mutated. A `None` return drops through to the manifold
             // fold below with the host mesh untouched.
             #[cfg(feature = "prism-csg-fast")]
-            let prism_outcome: Option<Outcome> =
-                if matches!(in_rep, Outcome::Passthrough) {
-                    table.and_then(|t| {
-                        let openings: Vec<&HeldOpening> = arrived
-                            .iter()
-                            .filter_map(|oid| self.held_openings.get(oid))
-                            .collect();
-                        try_prism_cut(&mut host_mesh, &openings, t)
-                    })
-                } else {
-                    None
-                };
+            let prism_outcome: Option<Outcome> = if matches!(in_rep, Outcome::Passthrough) {
+                table.and_then(|t| {
+                    let openings: Vec<&HeldOpening> = arrived
+                        .iter()
+                        .filter_map(|oid| self.held_openings.get(oid))
+                        .collect();
+                    try_prism_cut(&mut host_mesh, &openings, t)
+                })
+            } else {
+                None
+            };
             #[cfg(not(feature = "prism-csg-fast"))]
             let prism_outcome: Option<Outcome> = None;
 
@@ -1102,10 +1196,10 @@ impl CrossProductCut {
                     ];
                     let translated: Vec<f32> = op
                         .vertices
-                        .chunks_exact(3)
-                        .flat_map(|c| {
-                            [c[0] + off[0], c[1] + off[1], c[2] + off[2]]
-                        })
+                        .as_chunks::<3>()
+                        .0
+                        .iter()
+                        .flat_map(|c| [c[0] + off[0], c[1] + off[1], c[2] + off[2]])
                         .collect();
                     Some((translated, op.indices.clone()))
                 })
@@ -1121,11 +1215,7 @@ impl CrossProductCut {
                     .iter()
                     .map(|(v, i)| (v.as_slice(), i.as_slice()))
                     .collect();
-                match csg::subtract_many(
-                    &host_mesh.vertices,
-                    &host_mesh.indices,
-                    &cutter_refs,
-                ) {
+                match csg::subtract_many(&host_mesh.vertices, &host_mesh.indices, &cutter_refs) {
                     Ok((verts, idx)) => {
                         let triangle_count = (idx.len() / 3) as u32;
                         host_mesh.vertices = verts;
@@ -1464,11 +1554,15 @@ fn assemble_submesh(
 /// without invoking the full `apply` path. The double-underscore name
 /// signals "test/inspection surface, do not depend on this in
 /// production". Returns `(hosts, cutters)`.
-pub fn _expose_partition<'a>(
-    segments: &'a [MeshSegment],
-) -> (Vec<&'a MeshSegment>, Vec<&'a MeshSegment>) {
+pub fn _expose_partition(segments: &[MeshSegment]) -> (Vec<&MeshSegment>, Vec<&MeshSegment>) {
     partition_segments(segments)
 }
+
+// Silence unused-import warning on the geom::csg::CsgKernelError type
+// in non-test compiles where the error variant naming would otherwise
+// be flagged. We keep the alias for callers that want to refer to it.
+#[allow(dead_code)]
+type _CsgError = CsgKernelError;
 
 #[cfg(test)]
 mod tests {
@@ -1478,22 +1572,13 @@ mod tests {
     /// buffer form.
     fn box_at(min: [f32; 3], max: [f32; 3]) -> (Vec<f32>, Vec<u32>) {
         let v: Vec<f32> = vec![
-            min[0], min[1], min[2],
-            max[0], min[1], min[2],
-            max[0], max[1], min[2],
-            min[0], max[1], min[2],
-            min[0], min[1], max[2],
-            max[0], min[1], max[2],
-            max[0], max[1], max[2],
-            min[0], max[1], max[2],
+            min[0], min[1], min[2], max[0], min[1], min[2], max[0], max[1], min[2], min[0], max[1],
+            min[2], min[0], min[1], max[2], max[0], min[1], max[2], max[0], max[1], max[2], min[0],
+            max[1], max[2],
         ];
         let i: Vec<u32> = vec![
-            0, 2, 1, 0, 3, 2,
-            4, 5, 6, 4, 6, 7,
-            0, 1, 5, 0, 5, 4,
-            2, 3, 7, 2, 7, 6,
-            1, 2, 6, 1, 6, 5,
-            0, 4, 7, 0, 7, 3,
+            0, 2, 1, 0, 3, 2, 4, 5, 6, 4, 6, 7, 0, 1, 5, 0, 5, 4, 2, 3, 7, 2, 7, 6, 1, 2, 6, 1, 6,
+            5, 0, 4, 7, 0, 7, 3,
         ];
         (v, i)
     }
@@ -1539,10 +1624,7 @@ mod tests {
             placement_origin: [0.0, 0.0, 0.0],
             parts: Vec::new(),
             world_transform: [
-                1.0, 0.0, 0.0, 0.0,
-                0.0, 1.0, 0.0, 0.0,
-                0.0, 0.0, 1.0, 0.0,
-                0.0, 0.0, 0.0, 1.0,
+                1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
             ],
             world_origin: [0.0, 0.0, 0.0],
             mesh_anchor: [0.0, 0.0, 0.0],
@@ -1554,7 +1636,9 @@ mod tests {
     #[test]
     fn partition_classifies_segments_by_chain_link() {
         assert!(is_cutter("boolean_second_operand|extrusion"));
-        assert!(is_cutter("boolean_first_operand|boolean_second_operand|halfspace_bounded"));
+        assert!(is_cutter(
+            "boolean_first_operand|boolean_second_operand|halfspace_bounded"
+        ));
         assert!(!is_cutter("boolean_first_operand|extrusion"));
         assert!(!is_cutter("extrusion"));
         assert!(!is_cutter("mapped"));
@@ -1579,10 +1663,7 @@ mod tests {
             placement_origin: [0.0, 0.0, 0.0],
             parts: Vec::new(),
             world_transform: [
-                1.0, 0.0, 0.0, 0.0,
-                0.0, 1.0, 0.0, 0.0,
-                0.0, 0.0, 1.0, 0.0,
-                0.0, 0.0, 0.0, 1.0,
+                1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
             ],
             world_origin: [0.0, 0.0, 0.0],
             mesh_anchor: [0.0, 0.0, 0.0],
@@ -1612,8 +1693,7 @@ mod tests {
         assert_eq!(mesh.segments[0].index_count as usize, mesh.indices.len());
 
         // Volume should equal host (1.0) minus opening (0.5³ = 0.125).
-        let m = csg::build_manifold(&mesh.vertices, &mesh.indices)
-            .expect("cut wall is manifold");
+        let m = csg::build_manifold(&mesh.vertices, &mesh.indices).expect("cut wall is manifold");
         let expected = 1.0_f64 - 0.5_f64.powi(3);
         assert!(
             (m.volume() - expected).abs() < 1e-3,
@@ -1629,10 +1709,7 @@ mod tests {
         mesh.parts.push(crate::mesh::InstancePart {
             rep_step_id: 42,
             instance_transform: [
-                1.0, 0.0, 0.0, 0.0,
-                0.0, 1.0, 0.0, 0.0,
-                0.0, 0.0, 1.0, 0.0,
-                0.0, 0.0, 0.0, 1.0,
+                1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
             ],
             local_vertices: vec![0.0, 0.0, 0.0],
             local_indices: vec![],
@@ -1701,6 +1778,82 @@ mod tests {
         );
     }
 
+    /// GH #147: a non-`Cut` outcome must not leave the synthetic
+    /// half-space stand-in slab in the product mesh. Host + synthetic
+    /// slab + a malformed solid cutter that forces `subtract_many` to
+    /// fail: the slab triangle and its vertices are gone, the authored
+    /// operands survive (reveal-all).
+    #[test]
+    fn subtract_failure_strips_synthetic_cutters() {
+        // Host: closed unit box (all 8 vertices referenced).
+        let (host_v, host_i) = box_at([0.0, 0.0, 0.0], [1.0, 1.0, 1.0]);
+        // Authored solid cutter: a real box on the subtracted side.
+        let (auth_v, _auth_i) = box_at([0.25, 0.25, 0.25], [0.75, 0.75, 0.75]);
+
+        let mut vertices = host_v;
+        // Synthetic half-space slab: three vertices far from the host.
+        // Three is deliberate — `derive_plane_from_slab` needs >= 4, so
+        // no plane is derived and the run reaches the solid-cutter
+        // subtraction below instead of clipping the host away.
+        let slab_base = (vertices.len() / 3) as u32;
+        vertices.extend_from_slice(&[1000.0, 0.0, 0.0, 1000.0, 1.0, 0.0, 1000.0, 1.0, 1.0]);
+        let auth_base = (vertices.len() / 3) as u32;
+        vertices.extend_from_slice(&auth_v);
+
+        let mut indices = host_i;
+        let host_count = indices.len() as u32;
+        indices.extend_from_slice(&[slab_base, slab_base + 1, slab_base + 2]);
+        // Malformed cutter range: FOUR indices, so `csg::subtract_many`
+        // rejects the buffer (`InvalidIndexBuffer`) before it ever
+        // reaches the kernel — a deterministic subtract failure.
+        indices.extend_from_slice(&[auth_base, auth_base + 1, auth_base + 2, auth_base + 3]);
+
+        let mut mesh = synthetic_wall_with_opening();
+        mesh.vertices = vertices;
+        mesh.indices = indices;
+        mesh.segments = vec![
+            MeshSegment {
+                index_start: 0,
+                index_count: host_count,
+                source: "boolean_first_operand|extrusion".to_string(),
+            },
+            MeshSegment {
+                index_start: host_count,
+                index_count: 3,
+                source: "boolean_second_operand|halfspace_plane:agree".to_string(),
+            },
+            MeshSegment {
+                index_start: host_count + 3,
+                index_count: 4,
+                source: "boolean_second_operand|extrusion".to_string(),
+            },
+        ];
+
+        let outcome = apply(&mut mesh, 1.0);
+        assert!(
+            !matches!(outcome, Outcome::Cut),
+            "expected a non-Cut outcome, got {outcome:?}"
+        );
+        // No synthetic cutter segment survives...
+        assert!(
+            mesh.segments
+                .iter()
+                .all(|s| !crate::mesh::is_synthetic_cutter_tag(&s.source)),
+            "synthetic cutter segment survived: {:?}",
+            mesh.segments,
+        );
+        // ...and neither do its vertices (they would poison the AABB).
+        assert!(
+            !mesh.vertices.contains(&1000.0),
+            "synthetic slab vertices survived the strip",
+        );
+        // Reveal-all: the authored operands are still there.
+        assert_eq!(mesh.segments.len(), 2);
+        assert_eq!(mesh.segments[0].source, "boolean_first_operand|extrusion");
+        assert_eq!(mesh.segments[1].source, "boolean_second_operand|extrusion");
+        assert_eq!(mesh.vertices.len() / 3, 12);
+    }
+
     #[test]
     fn non_manifold_cutter_classified_on_failure() {
         // A single triangle is not a closed manifold; an empty host is
@@ -1720,9 +1873,3 @@ mod tests {
         );
     }
 }
-
-// Silence unused-import warning on the geom::csg::CsgKernelError type
-// in non-test compiles where the error variant naming would otherwise
-// be flagged. We keep the alias for callers that want to refer to it.
-#[allow(dead_code)]
-type _CsgError = CsgKernelError;

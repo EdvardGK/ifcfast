@@ -68,6 +68,18 @@ pub struct ProductStats {
     pub mesh_quality: &'static str,
 }
 
+/// Truncate to at most `n` **characters** for fixed-width report
+/// columns. GH #160: `&s[..n]` byte-slices and panics the moment the
+/// cut lands inside a multi-byte UTF-8 sequence. IFC GlobalIds are
+/// base64 ASCII by spec, but a hand-edited or non-conforming file can
+/// carry anything, and a stats report must never panic on its input.
+fn truncate_chars(s: &str, n: usize) -> &str {
+    match s.char_indices().nth(n) {
+        Some((byte_idx, _)) => &s[..byte_idx],
+        None => s,
+    }
+}
+
 impl ProductStats {
     /// Compute stats for one product. `unit_scale` is the IFC project's
     /// linear-unit-to-metres factor (0.001 for mm files, 1.0 for metre
@@ -86,18 +98,34 @@ impl ProductStats {
         let mut ymax = f32::NEG_INFINITY;
         let mut zmax = f32::NEG_INFINITY;
 
-        for chunk in mesh.vertices.chunks_exact(3) {
+        for chunk in mesh.vertices.as_chunks::<3>().0 {
             let (x, y, z) = (chunk[0], chunk[1], chunk[2]);
-            if x < xmin { xmin = x; }
-            if y < ymin { ymin = y; }
-            if z < zmin { zmin = z; }
-            if x > xmax { xmax = x; }
-            if y > ymax { ymax = y; }
-            if z > zmax { zmax = z; }
+            if x < xmin {
+                xmin = x;
+            }
+            if y < ymin {
+                ymin = y;
+            }
+            if z < zmin {
+                zmin = z;
+            }
+            if x > xmax {
+                xmax = x;
+            }
+            if y > ymax {
+                ymax = y;
+            }
+            if z > zmax {
+                zmax = z;
+            }
         }
         if !xmin.is_finite() {
-            xmin = 0.0; ymin = 0.0; zmin = 0.0;
-            xmax = 0.0; ymax = 0.0; zmax = 0.0;
+            xmin = 0.0;
+            ymin = 0.0;
+            zmin = 0.0;
+            xmax = 0.0;
+            ymax = 0.0;
+            zmax = 0.0;
         }
 
         // GH #116: rebase by the AABB-min origin before forming the
@@ -115,17 +143,27 @@ impl ProductStats {
         let mut surface_area: f64 = 0.0;
         let mut volume_x6: f64 = 0.0; // volume × 6, divided out at end
 
-        for tri in mesh.indices.chunks_exact(3) {
+        for tri in mesh.indices.as_chunks::<3>().0 {
             let (a, b, c) = (tri[0] as usize, tri[1] as usize, tri[2] as usize);
             // Bounds-safe — we wrote these triangles ourselves. Rebase in
             // f64 so the subtraction is exact at far georef.
-            let ax = mesh.vertices[a * 3] as f64 - ox;     let ay = mesh.vertices[a * 3 + 1] as f64 - oy; let az = mesh.vertices[a * 3 + 2] as f64 - oz;
-            let bx = mesh.vertices[b * 3] as f64 - ox;     let by = mesh.vertices[b * 3 + 1] as f64 - oy; let bz = mesh.vertices[b * 3 + 2] as f64 - oz;
-            let cx = mesh.vertices[c * 3] as f64 - ox;     let cy = mesh.vertices[c * 3 + 1] as f64 - oy; let cz = mesh.vertices[c * 3 + 2] as f64 - oz;
+            let ax = mesh.vertices[a * 3] as f64 - ox;
+            let ay = mesh.vertices[a * 3 + 1] as f64 - oy;
+            let az = mesh.vertices[a * 3 + 2] as f64 - oz;
+            let bx = mesh.vertices[b * 3] as f64 - ox;
+            let by = mesh.vertices[b * 3 + 1] as f64 - oy;
+            let bz = mesh.vertices[b * 3 + 2] as f64 - oz;
+            let cx = mesh.vertices[c * 3] as f64 - ox;
+            let cy = mesh.vertices[c * 3 + 1] as f64 - oy;
+            let cz = mesh.vertices[c * 3 + 2] as f64 - oz;
 
             // ((b - a) × (c - a)) — un-normalised area normal
-            let ux = bx - ax; let uy = by - ay; let uz = bz - az;
-            let vx = cx - ax; let vy = cy - ay; let vz = cz - az;
+            let ux = bx - ax;
+            let uy = by - ay;
+            let uz = bz - az;
+            let vx = cx - ax;
+            let vy = cy - ay;
+            let vz = cz - az;
             let nx = uy * vz - uz * vy;
             let ny = uz * vx - ux * vz;
             let nz = ux * vy - uy * vx;
@@ -133,9 +171,8 @@ impl ProductStats {
             surface_area += 0.5 * cross_mag;
 
             // Signed tetrahedra divergence: V = (1/6) Σ a · (b × c)
-            volume_x6 += ax * (by * cz - bz * cy)
-                       + ay * (bz * cx - bx * cz)
-                       + az * (bx * cy - by * cx);
+            volume_x6 +=
+                ax * (by * cz - bz * cy) + ay * (bz * cx - bx * cz) + az * (bx * cy - by * cx);
         }
         // Cast the f64 accumulators back to f32 only at the struct boundary.
         let surface_area = surface_area as f32;
@@ -164,10 +201,17 @@ impl ProductStats {
         let max_extent = ex.max(ey).max(ez).max(1e-6);
         let ratio = drift / max_extent;
         // Severity heuristic:
-        //   ok    — ratio <= 2.0  OR  drift < 10 mm absolute (rounding noise)
+        //   ok    — ratio <= 2.0  OR  drift < 10 mm PHYSICAL (rounding noise)
         //   warn  — 2.0 < ratio <= 10.0
         //   error — ratio > 10.0 AND drift > 10 mm
-        let severity = if drift < 10.0 || ratio <= 2.0 {
+        //
+        // GH #160: the floor is a FIXED PHYSICAL 10 mm, expressed in the
+        // model's own units — `0.01 m / unit_scale` (metres-per-unit).
+        // Hard-coding `10.0` silently meant 10 mm in a mm file but 10
+        // METRES in a metre file, which classified real placement drift
+        // as rounding noise on every metric-metre model.
+        let drift_floor = 0.01_f32 / unit_scale.max(1e-12);
+        let severity = if drift < drift_floor || ratio <= 2.0 {
             "ok"
         } else if ratio <= 10.0 {
             "warn"
@@ -204,8 +248,7 @@ impl ProductStats {
             "closed"
         } else {
             let weld_eps = 1e-4_f32 / unit_scale.max(1e-12);
-            let welded =
-                crate::mesh::qto::welded_indices(&mesh.vertices, &mesh.indices, weld_eps);
+            let welded = crate::mesh::qto::welded_indices(&mesh.vertices, &mesh.indices, weld_eps);
             if crate::mesh::qto::is_closed_manifold(&welded) {
                 "closed"
             } else {
@@ -219,11 +262,18 @@ impl ProductStats {
             source: mesh.source,
             vertex_count: n_verts,
             triangle_count: n_tris,
-            xmin, ymin, zmin, xmax, ymax, zmax,
+            xmin,
+            ymin,
+            zmin,
+            xmax,
+            ymax,
+            zmax,
             surface_area,
             volume,
             aabb_volume,
-            placement_x: px, placement_y: py, placement_z: pz,
+            placement_x: px,
+            placement_y: py,
+            placement_z: pz,
             drift_distance: drift,
             max_extent,
             drift_ratio: ratio,
@@ -401,12 +451,24 @@ impl FileStats {
             total_t += s.triangle_count as u64;
             total_a += s.surface_area as f64;
             total_vol += s.volume.abs() as f64;
-            if s.xmin < bb_min[0] { bb_min[0] = s.xmin; }
-            if s.ymin < bb_min[1] { bb_min[1] = s.ymin; }
-            if s.zmin < bb_min[2] { bb_min[2] = s.zmin; }
-            if s.xmax > bb_max[0] { bb_max[0] = s.xmax; }
-            if s.ymax > bb_max[1] { bb_max[1] = s.ymax; }
-            if s.zmax > bb_max[2] { bb_max[2] = s.zmax; }
+            if s.xmin < bb_min[0] {
+                bb_min[0] = s.xmin;
+            }
+            if s.ymin < bb_min[1] {
+                bb_min[1] = s.ymin;
+            }
+            if s.zmin < bb_min[2] {
+                bb_min[2] = s.zmin;
+            }
+            if s.xmax > bb_max[0] {
+                bb_max[0] = s.xmax;
+            }
+            if s.ymax > bb_max[1] {
+                bb_max[1] = s.ymax;
+            }
+            if s.zmax > bb_max[2] {
+                bb_max[2] = s.zmax;
+            }
 
             *by_tris.entry(s.entity.clone()).or_insert(0) += s.triangle_count as u64;
             *by_count.entry(s.entity.clone()).or_insert(0) += 1;
@@ -417,7 +479,7 @@ impl FileStats {
             .iter()
             .map(|s| (s.guid.clone(), s.entity.clone(), s.triangle_count))
             .collect();
-        top.sort_by(|a, b| b.2.cmp(&a.2));
+        top.sort_by_key(|t| std::cmp::Reverse(t.2));
         top.truncate(20);
 
         // Drift severity histogram + top-50 worst offenders.
@@ -434,14 +496,16 @@ impl FileStats {
         let mut drift: Vec<(String, String, f32, f32, f32, &'static str)> = stats
             .iter()
             .filter(|s| s.drift_severity != "ok")
-            .map(|s| (
-                s.guid.clone(),
-                s.entity.clone(),
-                s.drift_distance,
-                s.max_extent,
-                s.drift_ratio,
-                s.drift_severity,
-            ))
+            .map(|s| {
+                (
+                    s.guid.clone(),
+                    s.entity.clone(),
+                    s.drift_distance,
+                    s.max_extent,
+                    s.drift_ratio,
+                    s.drift_severity,
+                )
+            })
             .collect();
         drift.sort_by(|a, b| b.4.partial_cmp(&a.4).unwrap_or(std::cmp::Ordering::Equal));
         drift.truncate(50);
@@ -483,8 +547,12 @@ impl FileStats {
             self.total_surface_area / 1e6,
             self.total_abs_volume,
             self.total_abs_volume / 1e9,
-            self.bbox_min[0], self.bbox_min[1], self.bbox_min[2],
-            self.bbox_max[0], self.bbox_max[1], self.bbox_max[2],
+            self.bbox_min[0],
+            self.bbox_min[1],
+            self.bbox_min[2],
+            self.bbox_max[0],
+            self.bbox_max[1],
+            self.bbox_max[2],
             self.bbox_max[0] - self.bbox_min[0],
             self.bbox_max[1] - self.bbox_min[1],
             self.bbox_max[2] - self.bbox_min[2],
@@ -496,19 +564,29 @@ impl FileStats {
             let count = self.by_entity_count.get(*e).copied().unwrap_or(0);
             s.push_str(&format!(
                 "  {:<35} {:>10} tris  ({} elements, {:.0} avg)\n",
-                e, t, count, **t as f64 / count.max(1) as f64,
+                e,
+                t,
+                count,
+                **t as f64 / count.max(1) as f64,
             ));
         }
         s.push_str("\ntop 10 complex products (triangle count):\n");
         for (guid, entity, t) in self.top_complex.iter().take(10) {
-            s.push_str(&format!("  {:<22} {:<30} {:>8} tris\n", &guid[..guid.len().min(22)], entity, t));
+            s.push_str(&format!(
+                "  {:<22} {:<30} {:>8} tris\n",
+                truncate_chars(guid, 22),
+                entity,
+                t
+            ));
         }
         s.push_str(&format!(
             "\nplacement-vs-geometry drift:\n  ok:    {}\n  warn:  {}  (drift_ratio in 2-10)\n  error: {}  (drift_ratio > 10 and drift > 10mm)\n",
             self.drift_ok, self.drift_warn, self.drift_error,
         ));
         if !self.top_drift.is_empty() {
-            s.push_str("\ntop drift offenders (geometry far from placement, scaled by element size):\n");
+            s.push_str(
+                "\ntop drift offenders (geometry far from placement, scaled by element size):\n",
+            );
             s.push_str(&format!(
                 "  {:<22} {:<30} {:>12} {:>12} {:>12}  {}\n",
                 "guid", "entity", "drift_mm", "extent_mm", "ratio", "severity",
@@ -516,7 +594,7 @@ impl FileStats {
             for (guid, entity, dd, mx, ratio, sev) in self.top_drift.iter().take(20) {
                 s.push_str(&format!(
                     "  {:<22} {:<30} {:>12.0} {:>12.0} {:>12.1}  {}\n",
-                    &guid[..guid.len().min(22)],
+                    truncate_chars(guid, 22),
                     entity,
                     dd,
                     mx,
@@ -526,5 +604,96 @@ impl FileStats {
             }
         }
         s
+    }
+}
+
+#[cfg(test)]
+mod drift_floor_tests {
+    use super::*;
+    use crate::mesh::MeshSegment;
+
+    /// A 1×1×1 axis-aligned box mesh whose placement origin sits
+    /// `offset` away on +X, in whatever units the caller means.
+    fn box_product(size: f32, offset: f32) -> ProductMesh {
+        let s = size;
+        let vertices: Vec<f32> = vec![
+            0.0, 0.0, 0.0, s, 0.0, 0.0, s, s, 0.0, 0.0, s, 0.0, 0.0, 0.0, s, s, 0.0, s, s, s, s,
+            0.0, s, s,
+        ];
+        let indices: Vec<u32> = vec![
+            0, 2, 1, 0, 3, 2, 4, 5, 6, 4, 6, 7, 0, 1, 5, 0, 5, 4, 2, 3, 7, 2, 7, 6, 1, 2, 6, 1, 6,
+            5, 0, 4, 7, 0, 7, 3,
+        ];
+        ProductMesh {
+            guid: "drift-test-guid".into(),
+            entity: "IfcWall".into(),
+            ifc_id: 1,
+            vertices,
+            indices,
+            source: "extrusion",
+            segments: vec![MeshSegment {
+                index_start: 0,
+                index_count: 36,
+                source: "extrusion".to_string(),
+            }],
+            // Mesh centroid is (s/2, s/2, s/2); push the placement away
+            // on X so the drift is `offset`.
+            placement_origin: [s * 0.5 - offset, s * 0.5, s * 0.5],
+            parts: Vec::new(),
+            world_transform: [
+                1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+            ],
+            world_origin: [0.0, 0.0, 0.0],
+            mesh_anchor: [0.0, 0.0, 0.0],
+            surface_color: None,
+            bounded_halfspaces: Vec::new(),
+        }
+    }
+
+    /// GH #160: the "rounding noise" floor is a physical 10 mm. In a
+    /// METRE file (unit_scale = 1.0) a 1 m drift on a 1 mm element is
+    /// a real authoring bug and must NOT be excused — the hard-coded
+    /// `drift < 10.0` read 10 metres and swallowed it.
+    #[test]
+    fn metre_file_does_not_excuse_metre_scale_drift() {
+        // 1 mm cube (0.001 m), placement 1 m away → ratio 1000.
+        let mesh = box_product(0.001, 1.0);
+        let stats = ProductStats::from_mesh(&mesh, 1.0);
+        assert!(
+            (stats.drift_distance - 1.0).abs() < 1e-4,
+            "expected a 1.0 drift, got {}",
+            stats.drift_distance
+        );
+        assert_eq!(stats.drift_severity, "error");
+    }
+
+    /// The same physical tolerance in a mm file: a 1 mm drift is noise.
+    #[test]
+    fn millimetre_file_still_excuses_sub_10mm_drift() {
+        // 1 mm cube in a mm-unit file, placement 1 mm away.
+        let mesh = box_product(1.0, 1.0);
+        let stats = ProductStats::from_mesh(&mesh, 0.001);
+        assert_eq!(stats.drift_severity, "ok");
+    }
+
+    /// And a metre file excuses a sub-10 mm drift, as intended.
+    #[test]
+    fn metre_file_excuses_sub_10mm_drift() {
+        // 1 mm cube, placement 5 mm away → ratio 5, but under the floor.
+        let mesh = box_product(0.001, 0.005);
+        let stats = ProductStats::from_mesh(&mesh, 1.0);
+        assert_eq!(stats.drift_severity, "ok");
+    }
+
+    /// GH #160: byte-slicing a String panics on a multi-byte boundary.
+    #[test]
+    fn truncate_chars_is_utf8_safe() {
+        assert_eq!(truncate_chars("abc", 22), "abc");
+        assert_eq!(truncate_chars("abcdef", 3), "abc");
+        // 22 chars of a 2-byte-per-char string: the byte cut at 22 would
+        // land mid-sequence and panic.
+        let s = "æøå".repeat(10);
+        let t = truncate_chars(&s, 22);
+        assert_eq!(t.chars().count(), 22);
     }
 }

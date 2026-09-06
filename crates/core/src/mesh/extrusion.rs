@@ -109,7 +109,11 @@ pub fn extrude_params(table: &EntityTable, id: u64) -> Option<ExtrudeParams> {
         _ => Vec3::Z,
     };
     let dir = dir.normalize_or_zero();
-    let dir = if dir.length_squared() < 1e-12 { Vec3::Z } else { dir };
+    let dir = if dir.length_squared() < 1e-12 {
+        Vec3::Z
+    } else {
+        dir
+    };
 
     // Depth (arg[3]).
     let depth = match parse_field(fields.get(3)?) {
@@ -127,7 +131,12 @@ pub fn extrude_params(table: &EntityTable, id: u64) -> Option<ExtrudeParams> {
         })
         .unwrap_or(Mat4::IDENTITY);
 
-    Some(ExtrudeParams { profile, dir, depth, local_xform })
+    Some(ExtrudeParams {
+        profile,
+        dir,
+        depth,
+        local_xform,
+    })
 }
 
 /// Build a mesh for an `IfcExtrudedAreaSolid` entity (by step_id).
@@ -173,16 +182,21 @@ pub fn extrude_polygon(polygon: &Polygon2D, dir: Vec3, depth: f32, local_xform: 
     // The profile is triangulated with a +Z (CCW) normal (profile::extract
     // normalises outer CCW / holes CW, GH #62). The cap and wall winding
     // below is built assuming the extrusion runs *up* that normal. When the
-    // direction points against it (dir·(+Z) = dir.z < 0 — e.g. an
-    // `IFCDIRECTION((0.,0.,-1.))` extrusion) the emitted solid is inside-out:
-    // its signed-tetra volume is negative and it CANCELS against the other
+    // sweep points against it the emitted solid is inside-out: its
+    // signed-tetra volume is negative and it CANCELS against the other
     // solids in a multi-item Body instead of adding (GH #138). Flip every
     // cap/wall triangle so the solid is consistently outward-oriented
     // regardless of the extrusion sign.
-    let flip = dir.z < 0.0;
+    //
+    // The sweep is `dir * depth`, so the test is the sign of the PRODUCT
+    // (GH #160), not of `dir.z` alone: `IFCDIRECTION((0.,0.,1.))` with a
+    // negative `Depth` sweeps downward and reproduces the exact #138
+    // inside-out solid that the `dir.z < 0` test was added to fix — while
+    // a negative Depth along `(0.,0.,-1.)` sweeps UP and must NOT flip.
+    let flip = (dir.z * depth) < 0.0;
 
     // 3. Cap triangles. Bottom flipped (CW so normal points -dir).
-    for tri in tris.chunks_exact(3) {
+    for tri in tris.as_chunks::<3>().0 {
         let (a, b, c) = (tri[0] as u32, tri[1] as u32, tri[2] as u32);
         if flip {
             // Reversed extrusion: swap each cap's winding.
@@ -264,7 +278,9 @@ fn direction(table: &EntityTable, id: u64) -> Option<Vec3> {
 fn triangulate(polygon: &Polygon2D) -> Vec<usize> {
     // earcutr expects a flat [x, y, x, y, ...] coord array + a list of
     // hole start indices.
-    let mut coords: Vec<f64> = Vec::with_capacity(2 * (polygon.outer.len() + polygon.holes.iter().map(|h| h.len()).sum::<usize>()));
+    let mut coords: Vec<f64> = Vec::with_capacity(
+        2 * (polygon.outer.len() + polygon.holes.iter().map(|h| h.len()).sum::<usize>()),
+    );
     for p in &polygon.outer {
         coords.push(p.x as f64);
         coords.push(p.y as f64);
@@ -291,7 +307,7 @@ mod tests {
     /// for an outward-oriented closed solid, negative for an inside-out one.
     fn signed_volume(m: &LocalMesh) -> f64 {
         let mut acc = 0.0_f64;
-        for tri in m.indices.chunks_exact(3) {
+        for tri in m.indices.as_chunks::<3>().0 {
             let p = |i: u32| {
                 let b = i as usize * 3;
                 (
@@ -303,8 +319,7 @@ mod tests {
             let (ax, ay, az) = p(tri[0]);
             let (bx, by, bz) = p(tri[1]);
             let (cx, cy, cz) = p(tri[2]);
-            acc += ax * (by * cz - bz * cy) - ay * (bx * cz - bz * cx)
-                + az * (bx * cy - by * cx);
+            acc += ax * (by * cz - bz * cy) - ay * (bx * cz - bz * cx) + az * (bx * cy - by * cx);
         }
         acc / 6.0
     }
@@ -347,6 +362,28 @@ mod tests {
             (v_up.abs() - 1.0).abs() < 1e-5 && (v_down.abs() - 1.0).abs() < 1e-5,
             "both unit extrusions should have |volume| 1.0, got up={v_up} down={v_down}"
         );
+    }
+
+    /// GH #160: the winding test must read the sign of the SWEEP
+    /// (`dir * depth`), not of `dir.z`. All four sign combinations of
+    /// direction and depth describe a real solid and every one of them
+    /// must come out outward-oriented (positive signed volume).
+    #[test]
+    fn negative_depth_stays_outward_oriented() {
+        let sq = unit_square();
+        for (dir, depth, label) in [
+            (Vec3::Z, 1.0_f32, "+Z, +depth"),
+            (Vec3::Z, -1.0, "+Z, -depth"),
+            (Vec3::NEG_Z, 1.0, "-Z, +depth"),
+            (Vec3::NEG_Z, -1.0, "-Z, -depth"),
+        ] {
+            let m = extrude_polygon(&sq, dir, depth, Mat4::IDENTITY);
+            let v = signed_volume(&m);
+            assert!(
+                v > 0.0 && (v - 1.0).abs() < 1e-5,
+                "{label}: expected +1.0 signed volume, got {v}"
+            );
+        }
     }
 
     /// The corpus mechanism directly: a Body of two solids where the second

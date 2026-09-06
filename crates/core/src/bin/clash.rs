@@ -111,8 +111,14 @@ fn main() -> ExitCode {
     eprintln!("[ifcfast-clash] cat insulation      : {cat_insulation}");
     eprintln!("[ifcfast-clash] cat connection      : {cat_connection}");
     eprintln!("[ifcfast-clash] cat non_physical    : {cat_non_physical}");
-    eprintln!("[ifcfast-clash] geometryless skip   : {}", report.geometryless_skipped);
-    eprintln!("[ifcfast-clash] narrow residuals    : {}", report.narrow_phase_residuals);
+    eprintln!(
+        "[ifcfast-clash] geometryless skip   : {}",
+        report.geometryless_skipped
+    );
+    eprintln!(
+        "[ifcfast-clash] narrow residuals    : {}",
+        report.narrow_phase_residuals
+    );
     eprintln!("[ifcfast-clash] elapsed             : {:.1} ms", elapsed_ms);
 
     if let Err(e) = write_clashes_parquet(&out_path, &report.pairs) {

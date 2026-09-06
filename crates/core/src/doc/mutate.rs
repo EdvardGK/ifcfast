@@ -33,7 +33,11 @@
 //!   Do not "optimize" this into an in-place edit behind a refcount
 //!   check — leaving the old records untouched and letting GC decide is
 //!   the load-bearing safety property. A shared `IfcLocalPlacement`
-//!   (several products, one placement) is CoW-cloned first.
+//!   (several *products*, one placement) is CoW-cloned first. The
+//!   sharing test counts product referrers only: child
+//!   `IfcLocalPlacement`s chaining through the placement via
+//!   `PlacementRelTo` are not sharers, they are dependents, and must
+//!   move with the parent (GH #150).
 //!
 //! ## Atomicity and failure semantics
 //!
@@ -116,7 +120,8 @@ pub struct MutateStats {
     /// `IfcRelDefinesByProperties` cloned when the element was spliced
     /// out of a shared rel.
     pub rels_cloned: usize,
-    /// `IfcLocalPlacement`s cloned because several products shared one.
+    /// `IfcLocalPlacement`s cloned because several *products* shared one
+    /// (child placements chaining through do not count — GH #150).
     pub placements_cloned: usize,
     pub translated: usize,
     pub rotated: usize,
@@ -215,6 +220,12 @@ struct Editor<'d> {
     /// Current inbound refcount per record — derived from `out_refs`,
     /// maintained incrementally. THE sharing oracle.
     in_count: HashMap<u64, u32>,
+    /// For each `IfcLocalPlacement`, how many *child* `IfcLocalPlacement`s
+    /// name it as `PlacementRelTo`. `in_count - lp_child_count` is the
+    /// number of referrers that are products; only those force a
+    /// placement copy-on-write (GH #150 — children must FOLLOW the
+    /// parent, or every opening is stranded behind a moved wall).
+    lp_child_count: HashMap<u64, u32>,
     /// Roots detached by placement/property replacement; GC candidates.
     detached: Vec<u64>,
     /// GlobalId (field 0 string) → step id, first occurrence; plus the
@@ -243,10 +254,14 @@ impl<'d> Editor<'d> {
         // One up-front scan builds the reference graph and the guid maps.
         let mut out_refs: HashMap<u64, Vec<u64>> = HashMap::with_capacity(doc.len());
         let mut in_count: HashMap<u64, u32> = HashMap::with_capacity(doc.len());
+        let mut lp_child_count: HashMap<u64, u32> = HashMap::new();
         let mut guid_to_id: HashMap<String, u64> = HashMap::new();
         let mut taken_guids: HashSet<String> = HashSet::new();
         for (id, i) in doc.records() {
             let span = &doc.buf()[doc.record_span(i)];
+            if let Some(parent) = local_placement_parent(span) {
+                *lp_child_count.entry(parent).or_insert(0) += 1;
+            }
             let refs = forward_refs(doc, id);
             for &r in &refs {
                 *in_count.entry(r).or_insert(0) += 1;
@@ -276,6 +291,7 @@ impl<'d> Editor<'d> {
             next_id: doc.max_id(),
             out_refs,
             in_count,
+            lp_child_count,
             detached: Vec::new(),
             guid_to_id,
             taken_guids,
@@ -289,6 +305,20 @@ impl<'d> Editor<'d> {
     /// Install `bytes` as record `id`'s current bytes, updating the
     /// reference graph incrementally (diff old refs vs new).
     fn set_bytes(&mut self, id: u64, bytes: Vec<u8>) {
+        // Keep the placement-parent index in step with the write, so the
+        // product-vs-child referrer split stays exact across a batch.
+        let old_parent = self.current_bytes(id).and_then(local_placement_parent);
+        let new_parent = local_placement_parent(&bytes);
+        if old_parent != new_parent {
+            if let Some(p) = old_parent {
+                if let Some(c) = self.lp_child_count.get_mut(&p) {
+                    *c = c.saturating_sub(1);
+                }
+            }
+            if let Some(p) = new_parent {
+                *self.lp_child_count.entry(p).or_insert(0) += 1;
+            }
+        }
         let mut new_refs = scan_ref_tokens(&bytes);
         if !new_refs.is_empty() {
             new_refs.remove(0); // leading token is the record's own id
@@ -684,9 +714,17 @@ impl<'d> Editor<'d> {
             }
             None => return Err(format!("element {guid} placement #{lp} absent")),
         }
-        let lp = if self.in_count.get(&lp).copied().unwrap_or(0) > 1 {
-            // Several records share this placement (products, or child
-            // placements chaining through it): give this element its own.
+        // GH #150: only *product* referrers (ObjectPlacement edges) force
+        // copy-on-write. Child IfcLocalPlacements that chain through this
+        // one via PlacementRelTo must MOVE WITH it — cloning for their
+        // sake would leave every opening, void and nested part behind.
+        let referrers = self.in_count.get(&lp).copied().unwrap_or(0);
+        let children = self.lp_child_count.get(&lp).copied().unwrap_or(0);
+        let product_referrers = referrers.saturating_sub(children);
+        let lp = if product_referrers > 1 {
+            // Several products genuinely share this placement: give this
+            // element its own. (Children stay on the shared original —
+            // whose child they are is ambiguous by construction.)
             let clone = self.clone_record(lp, &[])?;
             self.splice_field(elem, 5, format!("#{clone}").as_bytes())?;
             self.stats.placements_cloned += 1;
@@ -848,6 +886,12 @@ impl<'d> Editor<'d> {
                 continue; // still referenced by a live record
             }
             let children = self.out_refs.get(&c).cloned().unwrap_or_default();
+            let lp_parent = self.current_bytes(c).and_then(local_placement_parent);
+            if let Some(p) = lp_parent {
+                if let Some(n) = self.lp_child_count.get_mut(&p) {
+                    *n = n.saturating_sub(1);
+                }
+            }
             self.removed.insert(c);
             self.stats.records_gc += 1;
             for child in children {
@@ -893,6 +937,21 @@ impl<'d> Editor<'d> {
 // ----------------------------------------------------------------------
 // Pure helpers
 // ----------------------------------------------------------------------
+
+/// The `PlacementRelTo` parent of a record, if the record is an
+/// `IfcLocalPlacement` with a non-`$` parent. Used to tell a child
+/// placement referrer apart from a product referrer (GH #150).
+fn local_placement_parent(bytes: &[u8]) -> Option<u64> {
+    let (_id, ty, args) = parse_record_span(bytes)?;
+    if !ty.eq_ignore_ascii_case(b"IFCLOCALPLACEMENT") {
+        return None;
+    }
+    let split = split_top_level_args(args);
+    match parse_field(split.first()?) {
+        Field::Ref(r) => Some(r),
+        _ => None,
+    }
+}
 
 /// Rodrigues rotation of `v` about unit axis `u` by `theta` radians.
 fn rotate_about(u: [f64; 3], theta: f64, v: [f64; 3]) -> [f64; 3] {

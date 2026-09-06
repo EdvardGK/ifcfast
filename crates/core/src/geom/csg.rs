@@ -60,10 +60,10 @@ impl From<CsgError> for CsgKernelError {
 }
 
 fn validate(vertices: &[f32], indices: &[u32]) -> Result<(), CsgKernelError> {
-    if vertices.is_empty() || vertices.len() % 3 != 0 {
+    if vertices.is_empty() || !vertices.len().is_multiple_of(3) {
         return Err(CsgKernelError::InvalidVertexBuffer);
     }
-    if indices.is_empty() || indices.len() % 3 != 0 {
+    if indices.is_empty() || !indices.len().is_multiple_of(3) {
         return Err(CsgKernelError::InvalidIndexBuffer);
     }
     let n_verts = (vertices.len() / 3) as u32;
@@ -130,6 +130,23 @@ pub fn subtract_many(
     }
 
     let result = Manifold::batch_difference(&all);
+    // GH #160: manifold's batch ops are infallible in the type system —
+    // a rejected boolean comes back as a valid-looking handle carrying a
+    // non-`NoError` status and decodes to ZERO triangles. Unchecked, the
+    // caller reads that as "the cutters consumed the host" and flushes an
+    // empty mesh over a real wall. Query the status and surface the
+    // failure so `cut_openings` can classify it as a Fallback instead.
+    // (An *empty* result with `NoError` is still legitimate — a cutter
+    // genuinely can consume its host — so emptiness alone is not an
+    // error.) The enum is `#[repr(C)]` and field-less; `NoError` is
+    // discriminant 0 and the type itself is not re-exported by
+    // `manifold-csg`, hence the integer comparison.
+    let status = result.status();
+    if (status as i32) != 0 {
+        return Err(CsgKernelError::ManifoldRejected(CsgError::ManifoldStatus(
+            status,
+        )));
+    }
     Ok(manifold_to_buffers(&result))
 }
 
@@ -157,44 +174,47 @@ mod tests {
     fn unit_cube_at(origin: [f32; 3]) -> (Vec<f32>, Vec<u32>) {
         let [ox, oy, oz] = origin;
         let v: Vec<f32> = vec![
-            ox, oy, oz,
-            ox + 1.0, oy, oz,
-            ox + 1.0, oy + 1.0, oz,
-            ox, oy + 1.0, oz,
-            ox, oy, oz + 1.0,
-            ox + 1.0, oy, oz + 1.0,
-            ox + 1.0, oy + 1.0, oz + 1.0,
-            ox, oy + 1.0, oz + 1.0,
+            ox,
+            oy,
+            oz,
+            ox + 1.0,
+            oy,
+            oz,
+            ox + 1.0,
+            oy + 1.0,
+            oz,
+            ox,
+            oy + 1.0,
+            oz,
+            ox,
+            oy,
+            oz + 1.0,
+            ox + 1.0,
+            oy,
+            oz + 1.0,
+            ox + 1.0,
+            oy + 1.0,
+            oz + 1.0,
+            ox,
+            oy + 1.0,
+            oz + 1.0,
         ];
         let i: Vec<u32> = vec![
-            0, 2, 1, 0, 3, 2,
-            4, 5, 6, 4, 6, 7,
-            0, 1, 5, 0, 5, 4,
-            2, 3, 7, 2, 7, 6,
-            1, 2, 6, 1, 6, 5,
-            0, 4, 7, 0, 7, 3,
+            0, 2, 1, 0, 3, 2, 4, 5, 6, 4, 6, 7, 0, 1, 5, 0, 5, 4, 2, 3, 7, 2, 7, 6, 1, 2, 6, 1, 6,
+            5, 0, 4, 7, 0, 7, 3,
         ];
         (v, i)
     }
 
     fn box_at(min: [f32; 3], max: [f32; 3]) -> (Vec<f32>, Vec<u32>) {
         let v: Vec<f32> = vec![
-            min[0], min[1], min[2],
-            max[0], min[1], min[2],
-            max[0], max[1], min[2],
-            min[0], max[1], min[2],
-            min[0], min[1], max[2],
-            max[0], min[1], max[2],
-            max[0], max[1], max[2],
-            min[0], max[1], max[2],
+            min[0], min[1], min[2], max[0], min[1], min[2], max[0], max[1], min[2], min[0], max[1],
+            min[2], min[0], min[1], max[2], max[0], min[1], max[2], max[0], max[1], max[2], min[0],
+            max[1], max[2],
         ];
         let i: Vec<u32> = vec![
-            0, 2, 1, 0, 3, 2,
-            4, 5, 6, 4, 6, 7,
-            0, 1, 5, 0, 5, 4,
-            2, 3, 7, 2, 7, 6,
-            1, 2, 6, 1, 6, 5,
-            0, 4, 7, 0, 7, 3,
+            0, 2, 1, 0, 3, 2, 4, 5, 6, 4, 6, 7, 0, 1, 5, 0, 5, 4, 2, 3, 7, 2, 7, 6, 1, 2, 6, 1, 6,
+            5, 0, 4, 7, 0, 7, 3,
         ];
         (v, i)
     }
@@ -286,12 +306,8 @@ mod tests {
         let host = box_at([0.0, 0.0, 0.0], [2.0, 1.0, 1.0]);
         let o1 = box_at([0.25, 0.25, 0.25], [0.75, 0.75, 0.75]);
         let o2 = box_at([1.25, 0.25, 0.25], [1.75, 0.75, 0.75]);
-        let (verts, idx) = subtract_many(
-            &host.0,
-            &host.1,
-            &[(&o1.0, &o1.1), (&o2.0, &o2.1)],
-        )
-        .expect("multi-opening subtract");
+        let (verts, idx) = subtract_many(&host.0, &host.1, &[(&o1.0, &o1.1), (&o2.0, &o2.1)])
+            .expect("multi-opening subtract");
         let m = build_manifold(&verts, &idx).expect("result is manifold");
         // 2.0 − 2 × 0.125 = 1.75
         let expected = 2.0_f64 - 2.0 * 0.125;
@@ -306,9 +322,12 @@ mod tests {
     #[test]
     fn subtract_with_no_cutters_returns_host_volume() {
         let host = box_at([0.0, 0.0, 0.0], [1.0, 1.0, 1.0]);
-        let (verts, idx) =
-            subtract_many(&host.0, &host.1, &[]).expect("no-cutter subtract");
+        let (verts, idx) = subtract_many(&host.0, &host.1, &[]).expect("no-cutter subtract");
         let m = build_manifold(&verts, &idx).expect("result is manifold");
-        assert!((m.volume() - 1.0).abs() < 1e-3, "expected ≈ 1.0, got {}", m.volume());
+        assert!(
+            (m.volume() - 1.0).abs() < 1e-3,
+            "expected ≈ 1.0, got {}",
+            m.volume()
+        );
     }
 }

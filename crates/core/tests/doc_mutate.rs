@@ -553,3 +553,136 @@ fn property_names_do_not_resolve_as_guids() {
     assert!(found.is_empty());
     assert_eq!(missing, vec!["FireRating".to_string()]);
 }
+
+// ---- GH #150: child placements follow their parent -------------------
+
+const GUID_HOST: &str = "HostWallGuid000000001";
+const GUID_OPENING: &str = "OpeningGuid0000000002";
+const GUID_TWIN: &str = "TwinWallGuid000000003";
+
+/// A wall whose LocalPlacement is the PlacementRelTo of an opening's
+/// LocalPlacement — the chain every real void rides on. With
+/// `twin_shares_wall_placement`, a second wall also names the wall's
+/// placement as its ObjectPlacement (genuine product sharing).
+fn fixture_child_placement(twin_shares_wall_placement: bool) -> String {
+    let mut s = String::new();
+    s.push_str("ISO-10303-21;\nHEADER;\n");
+    s.push_str("FILE_DESCRIPTION((''),'2;1');\n");
+    s.push_str("FILE_NAME('t','',(''),(''),'','','');\n");
+    s.push_str("FILE_SCHEMA(('IFC4'));\nENDSEC;\nDATA;\n");
+    // Storey root placement.
+    s.push_str("#100=IFCCARTESIANPOINT((0.,0.,0.));\n");
+    s.push_str("#101=IFCAXIS2PLACEMENT3D(#100,$,$);\n");
+    s.push_str("#102=IFCLOCALPLACEMENT($,#101);\n");
+    // Wall placement, relative to the storey.
+    s.push_str("#110=IFCCARTESIANPOINT((1.,2.,3.));\n");
+    s.push_str("#111=IFCAXIS2PLACEMENT3D(#110,$,$);\n");
+    s.push_str("#112=IFCLOCALPLACEMENT(#102,#111);\n");
+    // Opening placement, relative to the WALL's placement.
+    s.push_str("#120=IFCCARTESIANPOINT((0.5,0.,1.));\n");
+    s.push_str("#121=IFCAXIS2PLACEMENT3D(#120,$,$);\n");
+    s.push_str("#122=IFCLOCALPLACEMENT(#112,#121);\n");
+    s.push_str(&format!(
+        "#130=IFCWALL('{GUID_HOST}',$,'Host wall',$,$,#112,$,$,$);\n"
+    ));
+    s.push_str(&format!(
+        "#131=IFCOPENINGELEMENT('{GUID_OPENING}',$,'Void',$,$,#122,$,$);\n"
+    ));
+    s.push_str("#132=IFCRELVOIDSELEMENT('RelVoidGuid0000000004',$,$,$,#130,#131);\n");
+    if twin_shares_wall_placement {
+        s.push_str(&format!(
+            "#133=IFCWALL('{GUID_TWIN}',$,'Twin wall',$,$,#112,$,$,$);\n"
+        ));
+    }
+    s.push_str("ENDSEC;\nEND-ISO-10303-21;\n");
+    s
+}
+
+fn point_xyz(doc: &Doc, pt: u64) -> [f64; 3] {
+    let raw = field_raw(doc, pt, 0);
+    let Field::List(body) = parse_field(&raw) else {
+        panic!("not a list")
+    };
+    let mut out = [0.0; 3];
+    for (i, p) in split_top_level_args(body).iter().enumerate() {
+        let Field::Number(n) = parse_field(p) else {
+            panic!("coord")
+        };
+        out[i] = n;
+    }
+    out
+}
+
+/// World location of a product: the sum of the placement chain. The
+/// fixture uses default axes throughout, so summing is exact.
+fn world_location(doc: &Doc, guid: &str) -> [f64; 3] {
+    let elem = resolve(doc, guid);
+    let mut lp = refs_of_field(doc, elem, 5)[0];
+    let mut out = [0.0f64; 3];
+    for _ in 0..64 {
+        let a2p = refs_of_field(doc, lp, 1)[0];
+        let loc = point_xyz(doc, refs_of_field(doc, a2p, 0)[0]);
+        for i in 0..3 {
+            out[i] += loc[i];
+        }
+        match refs_of_field(doc, lp, 0).first() {
+            Some(&parent) => lp = parent,
+            None => return out,
+        }
+    }
+    panic!("placement chain of {guid} did not terminate");
+}
+
+#[test]
+fn translate_wall_carries_its_opening_along() {
+    // GH #150: the wall's LocalPlacement has TWO referrers — the wall and
+    // the opening's child placement — but only ONE product referrer, so
+    // it must be edited in place and the opening must ride along.
+    let doc = Doc::from_bytes(fixture_child_placement(false).into_bytes());
+    assert_eq!(world_location(&doc, GUID_HOST), [1.0, 2.0, 3.0]);
+    assert_eq!(world_location(&doc, GUID_OPENING), [1.5, 2.0, 4.0]);
+
+    let delta = [10.0, 0.0, -1.0];
+    let ops = [MutateOp::Translate {
+        guid: GUID_HOST.to_string(),
+        delta,
+    }];
+    let (bytes, stats) = mutate(&doc, &ops, Some(1)).expect("translate");
+    assert_eq!(
+        stats.placements_cloned, 0,
+        "a child placement is not a sharer — the wall's LP is edited in place"
+    );
+
+    let out = Doc::from_bytes(bytes);
+    assert_no_dangling(&out);
+    // The wall still owns #112, and the opening still chains through it.
+    let host = resolve(&out, GUID_HOST);
+    assert_eq!(refs_of_field(&out, host, 5), vec![112]);
+    let opening = resolve(&out, GUID_OPENING);
+    assert_eq!(refs_of_field(&out, opening, 5), vec![122]);
+    assert_eq!(refs_of_field(&out, 122, 0), vec![112]);
+    // Both moved by the same delta.
+    assert_eq!(world_location(&out, GUID_HOST), [11.0, 2.0, 2.0]);
+    assert_eq!(world_location(&out, GUID_OPENING), [11.5, 2.0, 3.0]);
+}
+
+#[test]
+fn translate_wall_sharing_placement_with_twin_still_cows() {
+    // The same chain, but a second WALL shares the placement: product
+    // sharing is real, so CoW must still fire and the twin stay put.
+    let doc = Doc::from_bytes(fixture_child_placement(true).into_bytes());
+    let ops = [MutateOp::Translate {
+        guid: GUID_HOST.to_string(),
+        delta: [10.0, 0.0, -1.0],
+    }];
+    let (bytes, stats) = mutate(&doc, &ops, Some(1)).expect("translate");
+    assert_eq!(stats.placements_cloned, 1, "two products share #112");
+
+    let out = Doc::from_bytes(bytes);
+    assert_no_dangling(&out);
+    assert_eq!(world_location(&out, GUID_HOST), [11.0, 2.0, 2.0]);
+    assert_eq!(world_location(&out, GUID_TWIN), [1.0, 2.0, 3.0]);
+    // The opening stays on the original (shared) placement.
+    assert_eq!(refs_of_field(&out, 122, 0), vec![112]);
+    assert_eq!(world_location(&out, GUID_OPENING), [1.5, 2.0, 4.0]);
+}

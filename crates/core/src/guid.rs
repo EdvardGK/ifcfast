@@ -101,7 +101,17 @@ impl GuidMinter {
             let mut v = ((hi as u128) << 64) | lo as u128;
             // RFC 4122 version 4 + variant bits, so the id decompresses to
             // an honest random UUID.
-            v = (v & !(0xF000u128 << 48)) | (0x4000u128 << 48);
+            //
+            // Version nibble = the top nibble of `time_hi_and_version`,
+            // i.e. bits 76-79 of the big-endian 128-bit value — NOT bits
+            // 60-63. The old `0xF000 << 48` shift wrote into
+            // `clock_seq`/`node` territory (and the variant write below
+            // then partially overwrote it), so minted ids decoded to a
+            // random version nibble while the module doc promised v4
+            // (GH #159).
+            v = (v & !(0xF000u128 << 64)) | (0x4000u128 << 64);
+            // Variant `10x` = RFC 4122: top two bits of
+            // `clock_seq_hi_and_reserved`, bits 62-63.
             v = (v & !(0xC0u128 << 56)) | (0x80u128 << 56);
             let s = encode_guid(v);
             if !taken.contains(&s) {
@@ -153,5 +163,30 @@ mod tests {
         assert_eq!(m2.mint(&std::collections::HashSet::new()), a);
         // Minted ids are valid 22-char compressed GUIDs.
         assert!(decode_guid(&a).is_some());
+    }
+
+    /// GH #159: a minted id must decode to a UUID whose version nibble
+    /// is 4 and whose variant is RFC-4122 (`10x`). The pre-fix encoder
+    /// wrote the version nibble at bits 60-63 (then clobbered part of it
+    /// with the variant write), so this decoded to whatever the PRNG
+    /// happened to produce.
+    #[test]
+    fn minted_guids_decode_to_rfc4122_v4() {
+        let mut m = GuidMinter::new(Some(0xDEAD_BEEF));
+        let taken = std::collections::HashSet::new();
+        for _ in 0..64 {
+            let s = m.mint(&taken);
+            let v = decode_guid(&s).expect("minted id must decode");
+            assert_eq!(
+                (v >> 76) & 0xF,
+                4,
+                "version nibble (bits 76-79) must be 4 for {s}"
+            );
+            assert_eq!(
+                (v >> 62) & 0x3,
+                0b10,
+                "variant bits (62-63) must be RFC-4122 `10x` for {s}"
+            );
+        }
     }
 }

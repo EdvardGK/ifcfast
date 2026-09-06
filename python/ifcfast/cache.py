@@ -28,10 +28,12 @@ All parquet writes use zstd. Cache invalidates if cache_key, schema, or
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
 import time
+import warnings
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -105,6 +107,86 @@ def _write_manifest(d: Path, manifest: dict) -> None:
     )
 
 
+def _lock_path(d: Path) -> Path:
+    return d / "meta.json.lock"
+
+
+def _acquire(fh) -> None:
+    """Blocking exclusive lock on an open file handle. Raises OSError."""
+    try:
+        import fcntl
+    except ImportError:  # Windows (CI runs it)
+        import msvcrt
+
+        fh.seek(0)
+        # LK_LOCK blocks, retrying for ~10 s, then raises OSError.
+        msvcrt.locking(fh.fileno(), msvcrt.LK_LOCK, 1)
+        return
+    fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+
+
+def _release(fh) -> None:
+    try:
+        import fcntl
+    except ImportError:  # Windows
+        import msvcrt
+
+        fh.seek(0)
+        msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+        return
+    fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+
+
+@contextlib.contextmanager
+def _manifest_lock(d: Path):
+    """Serialise a manifest read-modify-write across processes (GH #158).
+
+    `meta.json` is patched by several writers — `write_index`,
+    `_patch_data_manifest`, and anything else that adds its own
+    `has_*` keys — and each of them reads the whole dict, adds keys, and
+    writes it back. Unlocked, two workers on the same IFC interleave: B
+    reads before A writes `has_index`, B writes back a dict without it,
+    and `is_index_cached` never honours the `index.parquet` sitting
+    right there. `_atomic_write_text` makes each write atomic; it does
+    nothing about the lost update between read and write.
+
+    The lock is advisory, on a sidecar `meta.json.lock`. That file is
+    never read and never unlinked — unlinking it would race the next
+    acquirer onto a fresh inode and silently drop mutual exclusion.
+
+    Platform: `fcntl.flock` on POSIX, `msvcrt.locking` on Windows. If
+    the lock cannot be taken (no locking on the filesystem — some NFS /
+    CIFS mounts — or the Windows retry window expires) the write
+    proceeds UNLOCKED after a `UserWarning`. A lost manifest update
+    costs a cache miss, never wrong data, so degrading loudly beats
+    failing the parse.
+    """
+    d.mkdir(parents=True, exist_ok=True)
+    fh = open(_lock_path(d), "a+b")
+    locked = False
+    try:
+        try:
+            _acquire(fh)
+            locked = True
+        except OSError as exc:
+            warnings.warn(
+                f"ifcfast cache: could not lock {_lock_path(d)} ({exc}); "
+                f"writing the manifest unlocked. A concurrent writer may "
+                f"drop this update — the effect is a cache miss, not bad "
+                f"data.",
+                UserWarning,
+                stacklevel=3,
+            )
+        yield
+    finally:
+        if locked:
+            try:
+                _release(fh)
+            except OSError:
+                pass
+        fh.close()
+
+
 def _atomic_write_text(dest: Path, text: str) -> None:
     """Write `text` to `dest` via a temp file + atomic rename.
 
@@ -174,8 +256,51 @@ def _source_matches(hdr: IFCHeader, manifest: dict) -> bool:
     return cached_size == hdr.size_bytes and cached_mtime == hdr.mtime_ns
 
 
+_CLASSIFIER_SIGNATURE: Optional[str] = None
+
+
+def _supertype_map_digest() -> str:
+    """Structural digest of the generated per-schema SUPERTYPE map.
+
+    `classify_by_name` resolves an entity's mode by walking this map, so
+    regenerating `data/schema_supertypes.py` against a newer
+    ifcopenshell schema bundle can change the `mode` column for entities
+    whose ancestry moved — with no change to the explicit entity sets.
+    Before GH #158 those rows stayed cached forever.
+
+    Structural (sorted child→parent pairs), not file-bytes: a docstring
+    or formatting change in the generated file must NOT invalidate every
+    cache on the machine, but a single re-parented entity must.
+    """
+    from .data.schema_supertypes import SUPERTYPE
+
+    h = hashlib.sha256()
+    for schema in sorted(SUPERTYPE):
+        h.update(schema.encode())
+        h.update(b"\x00")
+        for child, parent in sorted(SUPERTYPE[schema].items()):
+            h.update(child.encode())
+            h.update(b">")
+            h.update(parent.encode())
+            h.update(b"\x00")
+    return h.hexdigest()
+
+
 def _classifier_signature() -> str:
-    """Hash of the classify.py entity sets. Cache invalidates on change."""
+    """Hash of every input to `classify.classify_by_name`.
+
+    Anything that can change an element's `mode` belongs here: the four
+    explicit entity sets, the inheritance-rule parent sets
+    (`_COUNT_PARENT_TYPES` / `_LINEAR_PARENT_TYPES` /
+    `_MEASURE_PARENT_TYPES` — the IfcBuildingElement / IfcBuiltElement
+    rule), and the generated SUPERTYPE map the ancestor walk reads
+    (GH #158). Memoised: the SUPERTYPE digest walks ~12k pairs and the
+    inputs are all module constants, immutable for the process.
+    """
+    global _CLASSIFIER_SIGNATURE
+    if _CLASSIFIER_SIGNATURE is not None:
+        return _CLASSIFIER_SIGNATURE
+
     from . import classify
 
     parts = []
@@ -184,11 +309,31 @@ def _classifier_signature() -> str:
         "MEASURE_ENTITIES",
         "LINEAR_ENTITIES",
         "SKIP_ENTITIES",
+        "_COUNT_PARENT_TYPES",
+        "_LINEAR_PARENT_TYPES",
+        "_MEASURE_PARENT_TYPES",
     ):
         s = getattr(classify, setname, set())
         parts.append(setname + ":" + ",".join(sorted(s)))
+    parts.append("SUPERTYPE:" + _supertype_map_digest())
     h = hashlib.sha256("|".join(parts).encode()).hexdigest()
-    return h[:12]
+    _CLASSIFIER_SIGNATURE = h[:12]
+    return _CLASSIFIER_SIGNATURE
+
+
+def _existing_manifest_or_empty(d: Path) -> dict:
+    """Manifest to merge new keys into — `{}` when it can't be trusted.
+
+    A manifest written under a different `CACHE_VERSION` describes a
+    different on-disk layout. Merging into it would carry its `has_*`
+    flags forward and stamp them with the current version, blessing
+    old-layout parquets that every read gate would otherwise have
+    rejected. Start clean instead (GH #158).
+    """
+    m = _read_manifest(d)
+    if m is None or m.get("cache_version") != CACHE_VERSION:
+        return {}
+    return m
 
 
 # ----------------------------------------------------------------------
@@ -258,12 +403,12 @@ _LAYER_DTYPES: dict[str, dict[str, str]] = {
     "materials": {
         "guid": "object", "role": "object", "layer_index": "int64",
         "material_name": "object", "layer_thickness_mm": "object",
-        "category": "object", "fraction": "object",
+        "category": "object", "fraction": "object", "source": "object",
     },
     "classifications": {
         "guid": "object", "system_name": "object", "edition": "object",
         "identification": "object", "name": "object", "location": "object",
-        "source": "object",
+        "source": "object", "assignment_source": "object",
     },
     "drift": {
         "guid": "object", "entity": "object", "source": "object",
@@ -570,15 +715,7 @@ def _patch_data_manifest(
     out: DataLayers,
     include_drift: bool,
 ) -> None:
-    m = _read_manifest(cache_dir) or {
-        "cache_version": CACHE_VERSION,
-        "classifier_signature": _classifier_signature(),
-        "cache_key": hdr.cache_key,
-        "source_path": hdr.path,
-        "size_bytes": hdr.size_bytes,
-        "mtime_ns": hdr.mtime_ns,
-        "schema": hdr.schema,
-    }
+    m: dict = {}
     if out.psets is not None:
         m["has_psets"] = True
         m["pset_count"] = int(len(out.psets))
@@ -617,7 +754,27 @@ def _patch_data_manifest(
     # short-circuits on `not include_drift` for readers that don't want it.
     if out.drift_unavailable:
         m["drift_unavailable"] = True
-    _write_manifest(cache_dir, m)
+
+    # GH #158: identity + source stat are REFRESHED, never inherited.
+    # The pre-fix code reused whatever manifest was already there, so a
+    # dir written before the source was copied/re-saved kept the old
+    # (size_bytes, mtime_ns) and `_source_matches` stayed False forever
+    # — every `extract_data_layers()` / `ifcfast extract` call re-parsed.
+    # (open_ifc masked it because write_index refreshes the same keys.)
+    identity = {
+        "cache_version": CACHE_VERSION,
+        "classifier_signature": _classifier_signature(),
+        "cache_key": hdr.cache_key,
+        "source_path": hdr.path,
+        "size_bytes": hdr.size_bytes,
+        "mtime_ns": hdr.mtime_ns,
+        "schema": hdr.schema,
+    }
+    with _manifest_lock(cache_dir):
+        base = _existing_manifest_or_empty(cache_dir)
+        base.update(identity)
+        base.update(m)
+        _write_manifest(cache_dir, base)
 
 
 # ----------------------------------------------------------------------
@@ -683,8 +840,7 @@ def write_index(model) -> Path:
         )
     _atomic_write_parquet(todf, d / TYPE_OBJECTS_FILE)
 
-    m = _read_manifest(d) or {}
-    m.update({
+    updates = {
         "cache_version": CACHE_VERSION,
         "classifier_signature": _classifier_signature(),
         "cache_key": model.header.cache_key,
@@ -700,6 +856,7 @@ def write_index(model) -> Path:
         # GH #71 (5): persist the dedup count so a cache-hit Model still
         # reports it in summary().
         "duplicate_step_ids": int(getattr(model, "duplicate_step_ids", 0)),
+        "warnings": list(getattr(model, "warnings", [])),
         "type_counts": model.type_counts,
         "encoded_at": time.time(),
         "has_index": True,
@@ -722,8 +879,11 @@ def write_index(model) -> Path:
             int(len(model._voids_df))
             if model._voids_df is not None else 0
         ),
-    })
-    _write_manifest(d, m)
+    }
+    with _manifest_lock(d):
+        m = _existing_manifest_or_empty(d)
+        m.update(updates)
+        _write_manifest(d, m)
     return d
 
 
@@ -819,6 +979,7 @@ def read_index(hdr: IFCHeader):
         type_counts=dict(m.get("type_counts", {})),
         parse_seconds=time.time() - started,
         duplicate_step_ids=int(m.get("duplicate_step_ids", 0)),
+        warnings=[str(w) for w in m.get("warnings", [])],
         _products_df=df,
         _contained_in_df=contained_in_df,
         _aggregates_df=aggregates_df,

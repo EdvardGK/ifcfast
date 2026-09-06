@@ -21,7 +21,7 @@
 
 use std::collections::HashSet;
 use std::fs::File;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use arrow::array::{
@@ -40,11 +40,38 @@ use crate::mesh::{ProductMesh, ProductSink};
 
 const DEFAULT_ROW_GROUP_SIZE: usize = 1024;
 
+/// `<final>.tmp.<pid>` next to `final_path` — the staging file a writer
+/// streams into before renaming it over the destination (GH #151).
+///
+/// Same directory on purpose: `rename(2)` is only atomic within one
+/// filesystem, and a temp in `/tmp` would cross a mount on most Linux
+/// setups. The pid keeps two processes bundling into the same output
+/// directory off each other's staging file; two *threads* of one
+/// process writing the same destination is a caller bug either way.
+pub(crate) fn temp_sibling_path(final_path: &Path) -> PathBuf {
+    let mut name = final_path
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_default();
+    name.push(format!(".tmp.{}", std::process::id()));
+    final_path.with_file_name(name)
+}
+
 /// Streaming substrate writer — fans each `ProductMesh` out into the
 /// representations + instances Parquet files. Implements `ProductSink`
 /// so the standard `mesh_ifc_streaming` pipeline drives it directly.
 pub struct ParquetSink<'a> {
     bundle: &'a Bundle,
+    /// Final destinations, and the sibling `*.tmp.<pid>` files rows
+    /// actually stream into. Only a successful [`ParquetSink::finish`]
+    /// renames them into place (GH #151): a failed bundle must never
+    /// leave a readable-but-truncated substrate where the previous good
+    /// one was — `python/ifcfast/cache.py` accepts any file with size
+    /// > 0, so a truncated file reads as a valid, silently short bundle.
+    rep_path: PathBuf,
+    inst_path: PathBuf,
+    rep_tmp: PathBuf,
+    inst_tmp: PathBuf,
     /// Model identity stamped on every instance row (`source_model`
     /// column). `bundle()` passes the source IFC's file stem; the
     /// federation layer re-stamps rows with the constituent bundle
@@ -106,18 +133,24 @@ impl<'a> ParquetSink<'a> {
         let rep_schema = Arc::new(build_representation_schema().with_metadata(meta.clone()));
         let inst_schema = Arc::new(build_instance_schema().with_metadata(meta));
 
-        let rep_file = File::create(&rep_path).map_err(|e| {
-            parquet::errors::ParquetError::General(format!(
-                "create {}: {e}",
-                rep_path.display()
-            ))
+        // Stream into temp siblings; publish by rename in `finish()`.
+        let rep_tmp = temp_sibling_path(&rep_path);
+        let inst_tmp = temp_sibling_path(&inst_path);
+
+        let rep_file = File::create(&rep_tmp).map_err(|e| {
+            parquet::errors::ParquetError::General(format!("create {}: {e}", rep_tmp.display()))
         })?;
-        let inst_file = File::create(&inst_path).map_err(|e| {
-            parquet::errors::ParquetError::General(format!(
-                "create {}: {e}",
-                inst_path.display()
-            ))
-        })?;
+        let inst_file = match File::create(&inst_tmp) {
+            Ok(f) => f,
+            Err(e) => {
+                drop(rep_file);
+                let _ = std::fs::remove_file(&rep_tmp);
+                return Err(parquet::errors::ParquetError::General(format!(
+                    "create {}: {e}",
+                    inst_tmp.display()
+                )));
+            }
+        };
 
         // Zstd compresses IFC GUIDs and pset strings extremely well via
         // dictionary encoding; geometry blobs still benefit modestly
@@ -127,11 +160,31 @@ impl<'a> ParquetSink<'a> {
             .set_dictionary_enabled(true)
             .build();
 
-        let rep_writer = ArrowWriter::try_new(rep_file, rep_schema.clone(), Some(props.clone()))?;
-        let inst_writer = ArrowWriter::try_new(inst_file, inst_schema.clone(), Some(props))?;
+        let rep_writer =
+            match ArrowWriter::try_new(rep_file, rep_schema.clone(), Some(props.clone())) {
+                Ok(w) => w,
+                Err(e) => {
+                    let _ = std::fs::remove_file(&rep_tmp);
+                    let _ = std::fs::remove_file(&inst_tmp);
+                    return Err(e);
+                }
+            };
+        let inst_writer = match ArrowWriter::try_new(inst_file, inst_schema.clone(), Some(props)) {
+            Ok(w) => w,
+            Err(e) => {
+                drop(rep_writer);
+                let _ = std::fs::remove_file(&rep_tmp);
+                let _ = std::fs::remove_file(&inst_tmp);
+                return Err(e);
+            }
+        };
 
         Ok(Self {
             bundle,
+            rep_path,
+            inst_path,
+            rep_tmp,
+            inst_tmp,
             source_model: source_model.to_string(),
             rep_schema,
             inst_schema,
@@ -163,7 +216,8 @@ impl<'a> ParquetSink<'a> {
         self.reps_written
     }
 
-    /// Drain pending records, write final row groups, close both files.
+    /// Drain pending records, write final row groups, close both temp
+    /// files and rename them over the final paths.
     /// Returns `(products_written, reps_written)`.
     ///
     /// If a row-group flush failed mid-stream during `on_product`, that
@@ -172,40 +226,80 @@ impl<'a> ParquetSink<'a> {
     /// caller learns about it at close time. Subsequent `on_product`
     /// calls after the first failure are no-ops so the streaming pass
     /// terminates cleanly without writing more partial rows.
+    ///
+    /// GH #151: on ANY error the half-written temps are removed and the
+    /// previously published pair of files is left exactly as it was —
+    /// a failed bundle never downgrades a good substrate to a truncated
+    /// one. The two renames are not one atomic step (POSIX has no
+    /// two-file rename), but they happen back-to-back after both temps
+    /// are complete and fsync-free, so the window is a single syscall
+    /// wide; a failure between them is reported and the second temp is
+    /// removed.
     pub fn finish(mut self) -> parquet::errors::Result<(usize, usize)> {
-        if let Some(err) = self.first_error.take() {
-            // Best-effort close of the files we've half-written. Drop
-            // these results — the prior streaming error is what the
-            // caller needs to see.
-            let _ = self.rep_writer.close();
-            let _ = self.inst_writer.close();
-            return Err(err);
+        let mut outcome: parquet::errors::Result<()> = match self.first_error.take() {
+            Some(err) => Err(err),
+            None => {
+                let mut r = Ok(());
+                if !self.pending_reps.is_empty() {
+                    r = self.flush_reps();
+                }
+                if r.is_ok() && !self.pending_insts.is_empty() {
+                    r = self.flush_insts();
+                }
+                r
+            }
+        };
+
+        // Close both writers unconditionally (a footer-less temp is
+        // useless either way); only report a close error when nothing
+        // has failed yet.
+        let rep_closed = self.rep_writer.close();
+        let inst_closed = self.inst_writer.close();
+        if outcome.is_ok() {
+            outcome = rep_closed.and(inst_closed).map(|_| ());
         }
-        if !self.pending_reps.is_empty() {
-            self.flush_reps()?;
+
+        match outcome {
+            Ok(()) => {
+                if let Err(e) = std::fs::rename(&self.rep_tmp, &self.rep_path) {
+                    let _ = std::fs::remove_file(&self.rep_tmp);
+                    let _ = std::fs::remove_file(&self.inst_tmp);
+                    return Err(parquet::errors::ParquetError::General(format!(
+                        "publish {}: {e}",
+                        self.rep_path.display()
+                    )));
+                }
+                if let Err(e) = std::fs::rename(&self.inst_tmp, &self.inst_path) {
+                    let _ = std::fs::remove_file(&self.inst_tmp);
+                    return Err(parquet::errors::ParquetError::General(format!(
+                        "publish {}: {e}",
+                        self.inst_path.display()
+                    )));
+                }
+                Ok((self.products_written, self.reps_written))
+            }
+            Err(e) => {
+                let _ = std::fs::remove_file(&self.rep_tmp);
+                let _ = std::fs::remove_file(&self.inst_tmp);
+                Err(e)
+            }
         }
-        if !self.pending_insts.is_empty() {
-            self.flush_insts()?;
-        }
-        self.rep_writer.close()?;
-        self.inst_writer.close()?;
-        Ok((self.products_written, self.reps_written))
     }
 
     fn flush_reps(&mut self) -> parquet::errors::Result<()> {
-        let batch = build_rep_batch(&self.rep_schema, &self.pending_reps).map_err(|e| {
-            parquet::errors::ParquetError::General(format!("build rep batch: {e}"))
-        })?;
+        let batch = build_rep_batch(&self.rep_schema, &self.pending_reps)
+            .map_err(|e| parquet::errors::ParquetError::General(format!("build rep batch: {e}")))?;
         self.rep_writer.write(&batch)?;
         self.pending_reps.clear();
         Ok(())
     }
 
     fn flush_insts(&mut self) -> parquet::errors::Result<()> {
-        let batch = build_instance_batch(&self.inst_schema, &self.pending_insts, &self.source_model)
-            .map_err(|e| {
-                parquet::errors::ParquetError::General(format!("build instance batch: {e}"))
-            })?;
+        let batch =
+            build_instance_batch(&self.inst_schema, &self.pending_insts, &self.source_model)
+                .map_err(|e| {
+                    parquet::errors::ParquetError::General(format!("build instance batch: {e}"))
+                })?;
         self.inst_writer.write(&batch)?;
         self.pending_insts.clear();
         Ok(())
@@ -257,9 +351,9 @@ impl ProductSink for ParquetSink<'_> {
                 self.reps_written += 1;
                 if self.pending_reps.len() >= self.row_group_size {
                     if let Err(e) = self.flush_reps() {
-                        self.first_error = Some(parquet::errors::ParquetError::General(
-                            format!("rep row-group flush failed: {e}"),
-                        ));
+                        self.first_error = Some(parquet::errors::ParquetError::General(format!(
+                            "rep row-group flush failed: {e}"
+                        )));
                         return;
                     }
                 }
@@ -270,9 +364,9 @@ impl ProductSink for ParquetSink<'_> {
         self.products_written += 1;
         if self.pending_insts.len() >= self.row_group_size {
             if let Err(e) = self.flush_insts() {
-                self.first_error = Some(parquet::errors::ParquetError::General(
-                    format!("instance row-group flush failed: {e}"),
-                ));
+                self.first_error = Some(parquet::errors::ParquetError::General(format!(
+                    "instance row-group flush failed: {e}"
+                )));
             }
         }
     }
@@ -318,11 +412,7 @@ fn build_representation_schema() -> Schema {
             DataType::FixedSizeList(xyz.clone(), 3),
             false,
         ),
-        Field::new(
-            "local_bbox_max_xyz",
-            DataType::FixedSizeList(xyz, 3),
-            false,
-        ),
+        Field::new("local_bbox_max_xyz", DataType::FixedSizeList(xyz, 3), false),
     ])
 }
 
@@ -336,6 +426,9 @@ fn build_instance_schema() -> Schema {
         // Composition fraction for constituent rows; null otherwise.
         // See `crate::extractors::materials::MaterialTable::fraction`.
         Field::new("fraction", DataType::Float64, true),
+        // Provenance: "instance" or "type" (IfcRelDefinesByType
+        // inheritance, GH #165). Non-null.
+        Field::new("source", DataType::Utf8, false),
     ]);
     let pset_fields = Fields::from(vec![
         Field::new("set_name", DataType::Utf8, false),
@@ -366,6 +459,9 @@ fn build_instance_schema() -> Schema {
         Field::new("name", DataType::Utf8, true),
         Field::new("location", DataType::Utf8, true),
         Field::new("source", DataType::Utf8, true),
+        // Provenance of the association ("instance" / "type"); `source`
+        // above is IfcClassification.Source, the publisher. GH #165.
+        Field::new("assignment_source", DataType::Utf8, false),
     ]);
     let xyz = xyz_field();
     let mat4_item = Arc::new(Field::new("item", DataType::Float32, true));
@@ -386,12 +482,24 @@ fn build_instance_schema() -> Schema {
         Field::new("type_name", DataType::Utf8, true),
         Field::new("rep_id", DataType::UInt64, true),
         Field::new("transform", DataType::FixedSizeList(mat4_item, 16), false),
-        Field::new("bbox_min_xyz", DataType::FixedSizeList(xyz.clone(), 3), false),
-        Field::new("bbox_max_xyz", DataType::FixedSizeList(xyz.clone(), 3), false),
+        Field::new(
+            "bbox_min_xyz",
+            DataType::FixedSizeList(xyz.clone(), 3),
+            false,
+        ),
+        Field::new(
+            "bbox_max_xyz",
+            DataType::FixedSizeList(xyz.clone(), 3),
+            false,
+        ),
         // World-AABB midpoint (falls back to placement_xyz for
         // geometryless products). Broad-phase clash + dup-detection
         // signal — see `InstanceRecord::centroid_xyz`.
-        Field::new("centroid_xyz", DataType::FixedSizeList(xyz.clone(), 3), false),
+        Field::new(
+            "centroid_xyz",
+            DataType::FixedSizeList(xyz.clone(), 3),
+            false,
+        ),
         // Vertex / triangle counts of the world-baked mesh. Zero for
         // geometryless products. Mesh-complexity fingerprint.
         Field::new("vertex_count", DataType::UInt32, false),
@@ -523,9 +631,15 @@ fn build_rep_batch(
         {
             let s = segments.values();
             for seg in &r.segments {
-                s.field_builder::<StringBuilder>(0).unwrap().append_value(&seg.source);
-                s.field_builder::<UInt32Builder>(1).unwrap().append_value(seg.index_start);
-                s.field_builder::<UInt32Builder>(2).unwrap().append_value(seg.triangle_count);
+                s.field_builder::<StringBuilder>(0)
+                    .unwrap()
+                    .append_value(&seg.source);
+                s.field_builder::<UInt32Builder>(1)
+                    .unwrap()
+                    .append_value(seg.index_start);
+                s.field_builder::<UInt32Builder>(2)
+                    .unwrap()
+                    .append_value(seg.triangle_count);
                 s.append(true);
             }
             segments.append(true);
@@ -616,8 +730,7 @@ fn build_instance_batch(
     let mut volume_prism_bound_m3 = Float32Builder::with_capacity(n);
     let mut volume_reliable = BooleanBuilder::with_capacity(n);
     let mut volume_method = StringBuilder::with_capacity(n, n * 8);
-    let mut source_model =
-        StringBuilder::with_capacity(n, n * source_model_value.len().max(1));
+    let mut source_model = StringBuilder::with_capacity(n, n * source_model_value.len().max(1));
 
     for r in records {
         ifc_id.append_value(r.ifc_id);
@@ -654,8 +767,12 @@ fn build_instance_batch(
         {
             let m = materials.values();
             for entry in &r.materials {
-                m.field_builder::<StringBuilder>(0).unwrap().append_value(entry.role);
-                m.field_builder::<Int32Builder>(1).unwrap().append_value(entry.layer_index);
+                m.field_builder::<StringBuilder>(0)
+                    .unwrap()
+                    .append_value(entry.role);
+                m.field_builder::<Int32Builder>(1)
+                    .unwrap()
+                    .append_value(entry.layer_index);
                 append_opt(
                     m.field_builder::<StringBuilder>(2).unwrap(),
                     entry.name.as_deref(),
@@ -674,6 +791,9 @@ fn build_instance_batch(
                     Some(v) => fr.append_value(v),
                     None => fr.append_null(),
                 }
+                m.field_builder::<StringBuilder>(6)
+                    .unwrap()
+                    .append_value(entry.source);
                 m.append(true);
             }
             materials.append(true);
@@ -682,8 +802,12 @@ fn build_instance_batch(
         {
             let p = psets.values();
             for entry in &r.psets {
-                p.field_builder::<StringBuilder>(0).unwrap().append_value(&entry.set_name);
-                p.field_builder::<StringBuilder>(1).unwrap().append_value(&entry.name);
+                p.field_builder::<StringBuilder>(0)
+                    .unwrap()
+                    .append_value(&entry.set_name);
+                p.field_builder::<StringBuilder>(1)
+                    .unwrap()
+                    .append_value(&entry.name);
                 append_opt(
                     p.field_builder::<StringBuilder>(2).unwrap(),
                     entry.value.as_deref(),
@@ -692,7 +816,9 @@ fn build_instance_batch(
                     p.field_builder::<StringBuilder>(3).unwrap(),
                     entry.value_type.as_deref(),
                 );
-                p.field_builder::<StringBuilder>(4).unwrap().append_value(&entry.source);
+                p.field_builder::<StringBuilder>(4)
+                    .unwrap()
+                    .append_value(&entry.source);
                 p.append(true);
             }
             psets.append(true);
@@ -701,19 +827,27 @@ fn build_instance_batch(
         {
             let q = quantities.values();
             for entry in &r.quantities {
-                q.field_builder::<StringBuilder>(0).unwrap().append_value(&entry.set_name);
-                q.field_builder::<StringBuilder>(1).unwrap().append_value(&entry.name);
+                q.field_builder::<StringBuilder>(0)
+                    .unwrap()
+                    .append_value(&entry.set_name);
+                q.field_builder::<StringBuilder>(1)
+                    .unwrap()
+                    .append_value(&entry.name);
                 append_opt(
                     q.field_builder::<StringBuilder>(2).unwrap(),
                     entry.value.as_deref(),
                 );
-                q.field_builder::<StringBuilder>(3).unwrap().append_value(&entry.quantity_type);
+                q.field_builder::<StringBuilder>(3)
+                    .unwrap()
+                    .append_value(&entry.quantity_type);
                 let u = q.field_builder::<UInt64Builder>(4).unwrap();
                 match entry.unit_step_id {
                     Some(v) => u.append_value(v),
                     None => u.append_null(),
                 }
-                q.field_builder::<StringBuilder>(5).unwrap().append_value(&entry.source);
+                q.field_builder::<StringBuilder>(5)
+                    .unwrap()
+                    .append_value(&entry.source);
                 q.append(true);
             }
             quantities.append(true);
@@ -746,6 +880,9 @@ fn build_instance_batch(
                     c.field_builder::<StringBuilder>(5).unwrap(),
                     entry.source.as_deref(),
                 );
+                c.field_builder::<StringBuilder>(6)
+                    .unwrap()
+                    .append_value(entry.assignment_source);
                 c.append(true);
             }
             classifications.append(true);
@@ -773,10 +910,18 @@ fn build_instance_batch(
         {
             let s = surfaces.values();
             for face in &r.surfaces {
-                s.field_builder::<Float32Builder>(0).unwrap().append_value(face.area_m2);
-                s.field_builder::<Float32Builder>(1).unwrap().append_value(face.nx);
-                s.field_builder::<Float32Builder>(2).unwrap().append_value(face.ny);
-                s.field_builder::<Float32Builder>(3).unwrap().append_value(face.nz);
+                s.field_builder::<Float32Builder>(0)
+                    .unwrap()
+                    .append_value(face.area_m2);
+                s.field_builder::<Float32Builder>(1)
+                    .unwrap()
+                    .append_value(face.nx);
+                s.field_builder::<Float32Builder>(2)
+                    .unwrap()
+                    .append_value(face.ny);
+                s.field_builder::<Float32Builder>(3)
+                    .unwrap()
+                    .append_value(face.nz);
                 s.append(true);
             }
             surfaces.append(true);
@@ -845,9 +990,7 @@ fn list_struct_fields(schema: &SchemaRef, list_col: &str) -> Fields {
     match field.data_type() {
         DataType::List(inner) => match inner.data_type() {
             DataType::Struct(fields) => fields.clone(),
-            other => panic!(
-                "internal: {list_col} list item is not a struct: {other:?}"
-            ),
+            other => panic!("internal: {list_col} list item is not a struct: {other:?}"),
         },
         other => panic!("internal: {list_col} is not a List: {other:?}"),
     }
@@ -865,4 +1008,82 @@ fn append_xyz(b: &mut FixedSizeListBuilder<Float32Builder>, xyz: [f32; 3]) {
     b.values().append_value(xyz[1]);
     b.values().append_value(xyz[2]);
     b.append(true);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Header-only IFC: enough for `Bundle::build`, zero products.
+    const MINI_IFC: &str = "ISO-10303-21;\nHEADER;\nFILE_DESCRIPTION((''),'2;1');\n\
+FILE_NAME('t','',(''),(''),'','','');\nFILE_SCHEMA(('IFC4'));\nENDSEC;\nDATA;\n\
+ENDSEC;\nEND-ISO-10303-21;\n";
+
+    fn scratch_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "ifcfast-psink-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn rows_stream_into_staging_and_publish_only_on_finish() {
+        // GH #151: while the pass is running the previous substrate must
+        // still be the one on disk.
+        let dir = scratch_dir("stage");
+        let rep = dir.join("representations.parquet");
+        let inst = dir.join("instances.parquet");
+        std::fs::write(&rep, b"OLD-REP").unwrap();
+        std::fs::write(&inst, b"OLD-INST").unwrap();
+
+        let bundle = Bundle::build(MINI_IFC.as_bytes());
+        let sink = ParquetSink::create_in_dir(&dir, &bundle, "mini").expect("create");
+        assert_eq!(std::fs::read(&rep).unwrap(), b"OLD-REP".to_vec());
+        assert_eq!(std::fs::read(&inst).unwrap(), b"OLD-INST".to_vec());
+        assert!(temp_sibling_path(&rep).exists(), "rep staging file open");
+        assert!(temp_sibling_path(&inst).exists(), "inst staging file open");
+
+        sink.finish().expect("finish");
+        assert_ne!(
+            std::fs::read(&rep).unwrap(),
+            b"OLD-REP".to_vec(),
+            "finish must publish the new file"
+        );
+        assert!(!temp_sibling_path(&rep).exists(), "staging renamed away");
+        assert!(!temp_sibling_path(&inst).exists(), "staging renamed away");
+    }
+
+    #[test]
+    fn failed_open_cleans_staging_and_keeps_the_previous_bundle() {
+        let dir = scratch_dir("fail");
+        let rep = dir.join("representations.parquet");
+        let inst = dir.join("instances.parquet");
+        std::fs::write(&rep, b"OLD-REP").unwrap();
+        std::fs::write(&inst, b"OLD-INST").unwrap();
+        // Block the instances staging path so the *second* create fails,
+        // after the first staging file already exists.
+        std::fs::create_dir(temp_sibling_path(&inst)).unwrap();
+
+        let bundle = Bundle::build(MINI_IFC.as_bytes());
+        let err = match ParquetSink::create_in_dir(&dir, &bundle, "mini") {
+            Ok(_) => panic!("second staging create must fail"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("create"),
+            "error must name the failing create: {err}"
+        );
+        assert!(
+            !temp_sibling_path(&rep).exists(),
+            "the staging file we did open must be removed"
+        );
+        assert_eq!(std::fs::read(&rep).unwrap(), b"OLD-REP".to_vec());
+        assert_eq!(std::fs::read(&inst).unwrap(), b"OLD-INST".to_vec());
+    }
 }

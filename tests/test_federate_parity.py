@@ -318,13 +318,32 @@ def test_federate_rejects_non_bundle_dir(disjoint_bundles, tmp_path):
 
 
 def test_clash_scalar_rejects_on_collision(disjoint_bundles):
+    """A BARE path carries no federation intent — `on_collision` there is
+    a caller mistake and stays loud."""
     a, _ = disjoint_bundles
     with pytest.raises(ValueError, match="on_collision"):
         ifcfast.clash(a, write_parquet=False, on_collision="fail")
-    # A single-element list has nothing to federate either — an
-    # explicit policy must not be silently swallowed.
-    with pytest.raises(ValueError, match="on_collision"):
-        ifcfast.clash([a], write_parquet=False, on_collision="dedup")
+
+
+def test_clash_single_element_list_accepts_on_collision(disjoint_bundles):
+    """GH #162: the list form carries federation intent, and the
+    docstring promises `[a]` behaves like `a`.
+
+    With one source there is no second bundle for a guid to collide
+    with, so every policy is vacuously satisfied — the policy is
+    APPLIED and never fires, which is not the same as being swallowed
+    (`on_collision="fail"` on a two-bundle federation with no collisions
+    doesn't raise either). Pre-GH #162 this raised, so a caller
+    federating a variable-length list had to special-case len == 1.
+    """
+    a, _ = disjoint_bundles
+    for policy in ("warn", "fail", "dedup"):
+        df = ifcfast.clash([a], write_parquet=False, on_collision=policy)
+        assert df is not None
+    # The bare-path form of the same bundle agrees on the result.
+    assert len(ifcfast.clash([a], write_parquet=False)) == len(
+        ifcfast.clash(a, write_parquet=False)
+    )
 
 
 def test_clash_rejects_unknown_or_malformed_reference_only(

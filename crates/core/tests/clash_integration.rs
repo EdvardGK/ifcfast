@@ -149,7 +149,10 @@ fn near_miss_walls_only_clash_with_tolerance() {
 
     // 0 tolerance — no pairs.
     let hard = run_clash(&out_dir, &ClashOptions::default()).unwrap();
-    assert!(hard.pairs.is_empty(), "near-miss walls should not hard-clash");
+    assert!(
+        hard.pairs.is_empty(),
+        "near-miss walls should not hard-clash"
+    );
 
     // The cross-section ends at x=500 mm (wall A: centered on origin,
     // half-width 500). Wall B's placement is at x=1500 mm, its cross-
@@ -166,8 +169,7 @@ fn near_miss_walls_only_clash_with_tolerance() {
     assert_eq!(with_tol.pairs.len(), 1, "expected one clearance pair");
     assert_eq!(with_tol.pairs[0].kind, ClashKind::Clearance);
     assert!(
-        with_tol.pairs[0].min_distance_m > 0.0
-            && with_tol.pairs[0].min_distance_m <= 0.6,
+        with_tol.pairs[0].min_distance_m > 0.0 && with_tol.pairs[0].min_distance_m <= 0.6,
         "expected positive clearance ≤ 0.6 m, got {}",
         with_tol.pairs[0].min_distance_m
     );

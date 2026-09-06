@@ -25,7 +25,7 @@ use parry3d::shape::TriMesh;
 
 fn bake_world(local: &[f32], m: &[f32; 16]) -> Vec<f32> {
     let mut out = Vec::with_capacity(local.len());
-    for v in local.chunks_exact(3) {
+    for v in local.as_chunks::<3>().0 {
         let (x, y, z) = (v[0], v[1], v[2]);
         out.push(m[0] * x + m[4] * y + m[8] * z + m[12]);
         out.push(m[1] * x + m[5] * y + m[9] * z + m[13]);

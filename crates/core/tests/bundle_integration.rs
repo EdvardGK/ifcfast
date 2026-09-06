@@ -102,7 +102,10 @@ fn end_to_end_writes_wall_and_space_with_aggregate_storey() {
     // Read the instances table back.
     let batches = read_parquet(&out_dir.join("instances.parquet"));
     let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
-    assert!(total_rows >= 2, "expected ≥2 instance rows, got {total_rows}");
+    assert!(
+        total_rows >= 2,
+        "expected ≥2 instance rows, got {total_rows}"
+    );
 
     // Collect everything into per-column maps for easier asserts.
     let mut guids: Vec<String> = Vec::new();
@@ -137,10 +140,12 @@ fn end_to_end_writes_wall_and_space_with_aggregate_storey() {
         for i in 0..batch.num_rows() {
             guids.push(g.value(i).to_string());
             classes.push(c.value(i).to_string());
-            storey_names
-                .push(if s.is_null(i) { None } else { Some(s.value(i).to_string()) });
-            rep_ids
-                .push(if r.is_null(i) { None } else { Some(r.value(i)) });
+            storey_names.push(if s.is_null(i) {
+                None
+            } else {
+                Some(s.value(i).to_string())
+            });
+            rep_ids.push(if r.is_null(i) { None } else { Some(r.value(i)) });
         }
     }
 
@@ -203,9 +208,7 @@ fn psets_propagate_into_instance_payload() {
             let prop_names = pset_struct.column(1).as_string::<i32>();
             let values = pset_struct.column(2).as_string_opt::<i32>().unwrap();
             for j in 0..pset_struct.len() {
-                if set_names.value(j) == "Pset_WallCommon"
-                    && prop_names.value(j) == "IsExternal"
-                {
+                if set_names.value(j) == "Pset_WallCommon" && prop_names.value(j) == "IsExternal" {
                     assert!(!values.is_null(j));
                     assert_eq!(values.value(j), "True");
                     found = true;
@@ -213,7 +216,10 @@ fn psets_propagate_into_instance_payload() {
             }
         }
     }
-    assert!(found, "Pset_WallCommon.IsExternal=True missing from wall instance");
+    assert!(
+        found,
+        "Pset_WallCommon.IsExternal=True missing from wall instance"
+    );
 }
 
 #[test]
@@ -368,8 +374,7 @@ fn fingerprint_columns_carry_centroid_and_counts() {
     assert!(wt > 0, "wall must have triangles, got {wt}");
 
     let s = space.expect("space row");
-    let (smin, smax, scen, sp, sv, st) =
-        (s.bmin, s.bmax, s.centroid, s.placement, s.verts, s.tris);
+    let (smin, smax, scen, sp, sv, st) = (s.bmin, s.bmax, s.centroid, s.placement, s.verts, s.tris);
     // Geometryless: bbox collapsed to origin.
     assert_eq!(smin, [0.0, 0.0, 0.0]);
     assert_eq!(smax, [0.0, 0.0, 0.0]);

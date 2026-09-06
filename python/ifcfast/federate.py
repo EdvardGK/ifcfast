@@ -57,12 +57,28 @@ def _read(bundle_dir: Path, table: str) -> pa.Table:
     return pq.read_table(f)
 
 
-def _unit_scale(t: pa.Table) -> str:
+def _unit_scale(t: pa.Table) -> tuple[float, str]:
+    """``(value, raw)`` for the bundle's ``ifcfast.unit_scale`` metadata.
+
+    The raw string is what the sidecar records; the float is what the
+    mixed-unit check compares. Comparing the STRINGS (pre-GH #162)
+    rejected ``"0.001"`` against ``"1e-3"`` — the same millimetre
+    substrate, written by two ifcfast versions with different float
+    formatting — as "mixed units".
+    """
     meta = t.schema.metadata or {}
     scale = meta.get(b"ifcfast.unit_scale")
     if scale is None:
         raise ValueError("bundle parquet missing ifcfast.unit_scale metadata")
-    return scale.decode()
+    raw = scale.decode()
+    try:
+        value = float(raw)
+    except ValueError:
+        raise ValueError(
+            f"bundle parquet has a non-numeric ifcfast.unit_scale "
+            f"metadata value {raw!r}"
+        ) from None
+    return value, raw
 
 
 def _offset_rep_id(t: pa.Table, offset: int) -> pa.Table:
@@ -131,10 +147,12 @@ def federate(
         ``{"sources": [...], "unit_scale": str, "rep_id_offsets":
         {stem: int}, "n_instances": int, "n_representations": int,
         "guid_collisions": [...], "guid_source": {guid: stem},
-        "on_collision": str, "reference_only": [...]}``.
+        "on_collision": str, "reference_only": [...],
+        "source_stats": {stem: {table: [size_bytes, mtime_ns]}}}``.
 
     Raises:
-        ValueError: fewer than two bundles, duplicate bundle dir names,
+        ValueError: ``out_dir`` is one of the input bundles,
+            fewer than two bundles, duplicate bundle dir names,
             mismatched schemas (re-bundle all sources with the same
             ifcfast version), mixed ``unit_scale`` across sources,
             unknown ``on_collision`` / ``reference_only`` values, or
@@ -170,6 +188,19 @@ def federate(
             f"federated bundles {stems}"
         )
     out_dir = Path(out_dir)
+    # GH #162: `federate([a, b], a)` used to overwrite constituent a's
+    # instances/representations parquets with the MERGED tables — the
+    # source bundle is destroyed, and every later federation that reads
+    # it silently double-counts. Checked before any write, on resolved
+    # paths (`a/../a`, symlinks, and `.` all normalise here).
+    resolved_out = out_dir.resolve()
+    for d in bundle_dirs:
+        if d.resolve() == resolved_out:
+            raise ValueError(
+                f"out_dir {out_dir} is one of the input bundles ({d}); "
+                f"federating into a constituent would overwrite its "
+                f"parquets with the merged tables. Pick a fresh directory."
+            )
     out_dir.mkdir(parents=True, exist_ok=True)
 
     inst_parts: list[pa.Table] = []
@@ -178,22 +209,30 @@ def federate(
     collisions: list[str] = []
     offsets: dict[str, int] = {}
     next_offset = 0
-    scales: set[str] = set()
-    schema0 = None
+    scales: set[float] = set()
+    scale_raw: list[str] = []
+    schemas0: dict[str, pa.Schema] = {}
 
     for d in bundle_dirs:
         stem = d.name
         inst = _read(d, "instances")
         rep = _read(d, "representations")
-        scales.add(_unit_scale(inst))
-        scales.add(_unit_scale(rep))
-        if schema0 is None:
-            schema0 = inst.schema
-        elif inst.schema != schema0:
-            raise ValueError(
-                f"{d}: instances schema differs from {bundle_dirs[0]} — "
-                "re-bundle all sources with the same ifcfast version"
-            )
+        for t in (inst, rep):
+            value, raw = _unit_scale(t)
+            scales.add(value)
+            scale_raw.append(raw)
+        # GH #162: BOTH tables are schema-checked. Checking only
+        # `instances` let a representations mismatch through to
+        # `pa.concat_tables`, which reports it as an opaque
+        # "Schema at index 1 was different" with no bundle named.
+        for name, t in (("instances", inst), ("representations", rep)):
+            if name not in schemas0:
+                schemas0[name] = t.schema
+            elif t.schema != schemas0[name]:
+                raise ValueError(
+                    f"{d}: {name} schema differs from {bundle_dirs[0]} — "
+                    "re-bundle all sources with the same ifcfast version"
+                )
 
         keep_mask: list[bool] = []
         for g in inst.column("guid").to_pylist():
@@ -214,7 +253,7 @@ def federate(
 
     if len(scales) != 1:
         raise ValueError(
-            f"unit_scale differs across bundles ({sorted(scales)}); "
+            f"unit_scale differs across bundles ({sorted(set(scale_raw))}); "
             "cannot federate mixed-unit substrates"
         )
     if collisions:
@@ -250,7 +289,10 @@ def federate(
 
     sidecar = {
         "sources": [str(d) for d in bundle_dirs],
-        "unit_scale": next(iter(scales)),
+        # Raw metadata string of the first constituent — all sources
+        # agree numerically (checked above), and the string is what
+        # downstream consumers compare against a bundle's own metadata.
+        "unit_scale": scale_raw[0],
         "rep_id_offsets": offsets,
         "n_instances": merged_inst.num_rows,
         "n_representations": merged_rep.num_rows,
@@ -258,6 +300,13 @@ def federate(
         "guid_source": guid_source,
         "on_collision": on_collision,
         "reference_only": sorted(reference_only),
+        # GH #162: (size, mtime_ns) per constituent parquet, so a cache
+        # hit on the content-keyed federation dir can be REVALIDATED the
+        # way the parse cache revalidates a manifest. The fingerprint
+        # below samples head/tail 4 MB only; a same-size edit confined to
+        # the middle of a >8 MB parquet keeps the key and would otherwise
+        # serve a merge of bytes that no longer exist.
+        "source_stats": {d.name: _bundle_stats(d) for d in bundle_dirs},
     }
     # Written LAST: its presence marks the merge complete (the clash()
     # federation cache treats a dir without it as a torn write).
@@ -291,6 +340,46 @@ def _bundle_fingerprint(h, d: Path) -> None:
                 h.update(fh.read(_FP_SAMPLE_BYTES))
 
 
+def _bundle_stats(d: Path) -> dict[str, list[int]]:
+    """``{table: [size_bytes, mtime_ns]}`` for one constituent bundle."""
+    out: dict[str, list[int]] = {}
+    for table in _TABLES:
+        st = (d / f"{table}.parquet").stat()
+        out[table] = [st.st_size, st.st_mtime_ns]
+    return out
+
+
+def federation_cache_stale(sidecar: dict, bundle_dirs: list[Path]) -> bool:
+    """True when a cached federation no longer describes the live bundles.
+
+    The federation cache key is content-derived (size + head/tail 4 MB
+    samples), which is deliberately blind to a plain ``touch`` — but
+    equally blind to a same-size edit in the MIDDLE of a >8 MB parquet.
+    The parse cache solves the identical problem by recording
+    ``(size_bytes, mtime_ns)`` in its manifest and re-checking it against
+    the live stat (``cache._source_matches``); this is that check for
+    federations (GH #162).
+
+    A sidecar written before ``source_stats`` existed is stale by
+    definition — it carries no evidence, and the whole point is to stop
+    serving merges we cannot vouch for. Cost is one re-federate.
+    """
+    recorded = sidecar.get("source_stats")
+    if not isinstance(recorded, dict):
+        return True
+    if set(recorded) != {d.name for d in bundle_dirs}:
+        return True
+    for d in bundle_dirs:
+        try:
+            live = _bundle_stats(d)
+        except OSError:
+            return True
+        # JSON round-trips the pairs as lists; normalise before compare.
+        if {k: list(v) for k, v in recorded[d.name].items()} != live:
+            return True
+    return False
+
+
 def federation_cache_dir(
     bundle_dirs: list[Path], on_collision: str = "warn"
 ) -> Path:
@@ -313,4 +402,4 @@ def federation_cache_dir(
     return cache_root() / "federated" / h.hexdigest()[:16]
 
 
-__all__ = ["federate", "federation_cache_dir"]
+__all__ = ["federate", "federation_cache_dir", "federation_cache_stale"]

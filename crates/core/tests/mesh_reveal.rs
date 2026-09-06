@@ -95,7 +95,12 @@ fn boolean_clipping_emits_both_operands_as_segments() {
     let (meshes, stats) = mesh_ifc(BOOLEAN_CLIPPING_IFC.as_bytes());
 
     // Exactly one product (the wall) should mesh.
-    assert_eq!(meshes.len(), 1, "expected one ProductMesh for the wall, got {}", meshes.len());
+    assert_eq!(
+        meshes.len(),
+        1,
+        "expected one ProductMesh for the wall, got {}",
+        meshes.len()
+    );
     let wall = &meshes[0];
     assert_eq!(wall.entity, "IfcWall");
 
@@ -107,31 +112,41 @@ fn boolean_clipping_emits_both_operands_as_segments() {
         2,
         "expected two segments for IfcBooleanClippingResult, got {} ({:?})",
         wall.segments.len(),
-        wall.segments.iter().map(|s| s.source.as_str()).collect::<Vec<_>>(),
+        wall.segments
+            .iter()
+            .map(|s| s.source.as_str())
+            .collect::<Vec<_>>(),
     );
     // Compound tag: "boolean_<role>|<leaf>" — both the structural role
     // and the underlying representation type must be preserved.
     let tags: Vec<&str> = wall.segments.iter().map(|s| s.source.as_str()).collect();
     assert!(
         tags.iter().any(|t| t.starts_with("boolean_first_operand")),
-        "missing boolean_first_operand prefix: {:?}", tags
+        "missing boolean_first_operand prefix: {:?}",
+        tags
     );
     assert!(
         tags.iter().any(|t| t.starts_with("boolean_second_operand")),
-        "missing boolean_second_operand prefix: {:?}", tags
+        "missing boolean_second_operand prefix: {:?}",
+        tags
     );
     // The leaf representation type must come through too (both
     // operands are IfcExtrudedAreaSolid).
     assert!(
         tags.iter().all(|t| t.ends_with("|extrusion")),
-        "expected compound tags ending in |extrusion: {:?}", tags
+        "expected compound tags ending in |extrusion: {:?}",
+        tags
     );
 
     // Each segment must have a positive triangle count (the dispatcher
     // actually tessellated both operands).
     for seg in &wall.segments {
-        assert!(seg.index_count > 0 && seg.index_count % 3 == 0,
-            "segment {:?} has bad index_count {}", seg.source, seg.index_count);
+        assert!(
+            seg.index_count > 0 && seg.index_count % 3 == 0,
+            "segment {:?} has bad index_count {}",
+            seg.source,
+            seg.index_count
+        );
     }
 
     // Segments must cover the entire indices buffer with no gaps.
@@ -144,8 +159,12 @@ fn boolean_clipping_emits_both_operands_as_segments() {
 
     // Stats must report both operand sources via the compound key.
     let by_src = &stats.by_source;
-    assert!(by_src.keys().any(|k| k.starts_with("boolean_first_operand")));
-    assert!(by_src.keys().any(|k| k.starts_with("boolean_second_operand")));
+    assert!(by_src
+        .keys()
+        .any(|k| k.starts_with("boolean_first_operand")));
+    assert!(by_src
+        .keys()
+        .any(|k| k.starts_with("boolean_second_operand")));
 }
 
 #[test]
@@ -160,7 +179,8 @@ fn unhandled_representation_appears_as_labeled_bucket() {
     assert!(
         count >= 1,
         "expected stats.by_source['{}'] >= 1, got {:?}",
-        unhandled_key, stats.by_source
+        unhandled_key,
+        stats.by_source
     );
 }
 
@@ -214,7 +234,8 @@ fn boolean_over_halfspace_preserves_both_facts() {
     // The wall's bulk volume — first operand, leaf = extrusion.
     assert!(
         tags.contains(&"boolean_first_operand|extrusion"),
-        "wall bulk volume should surface as boolean_first_operand|extrusion, got {:?}", tags
+        "wall bulk volume should surface as boolean_first_operand|extrusion, got {:?}",
+        tags
     );
     // The clip volume — second operand, leaf = halfspace_bounded:*.
     // Since v0.4.32 the halfspace tag carries an `:agree` / `:disagree`
@@ -257,7 +278,8 @@ fn source_tags_set_is_documented() {
     ] {
         assert!(
             documented.contains(&required),
-            "MeshFragment::source_tags() missing {:?}", required
+            "MeshFragment::source_tags() missing {:?}",
+            required
         );
     }
 }
@@ -399,13 +421,15 @@ fn revolved_area_solid_full_revolution_volume_within_tolerance() {
         tags
     );
     assert!(
-        !stats.by_source.contains_key("unhandled:IFCREVOLVEDAREASOLID"),
+        !stats
+            .by_source
+            .contains_key("unhandled:IFCREVOLVEDAREASOLID"),
         "revolved handler did not consume IFCREVOLVEDAREASOLID; stats: {:?}",
         stats.by_source
     );
 
     let mut volume_x6: f32 = 0.0;
-    for tri in ring.indices.chunks_exact(3) {
+    for tri in ring.indices.as_chunks::<3>().0 {
         let (a, b, c) = (tri[0] as usize, tri[1] as usize, tri[2] as usize);
         let ax = ring.vertices[a * 3];
         let ay = ring.vertices[a * 3 + 1];
@@ -416,13 +440,10 @@ fn revolved_area_solid_full_revolution_volume_within_tolerance() {
         let cx = ring.vertices[c * 3];
         let cy = ring.vertices[c * 3 + 1];
         let cz = ring.vertices[c * 3 + 2];
-        volume_x6 += ax * (by * cz - bz * cy)
-            + ay * (bz * cx - bx * cz)
-            + az * (bx * cy - by * cx);
+        volume_x6 += ax * (by * cz - bz * cy) + ay * (bz * cx - bx * cz) + az * (bx * cy - by * cx);
     }
     let volume = (volume_x6 / 6.0).abs();
-    let expected =
-        std::f32::consts::PI * (300.0_f32.powi(2) - 200.0_f32.powi(2)) * 500.0;
+    let expected = std::f32::consts::PI * (300.0_f32.powi(2) - 200.0_f32.powi(2)) * 500.0;
     let ratio = volume / expected;
     assert!(
         ratio > 0.85 && ratio < 1.05,
@@ -437,10 +458,8 @@ fn revolved_area_solid_full_revolution_volume_within_tolerance() {
 fn csg_primitives_tessellate_to_per_type_tags() {
     let (meshes, stats) = mesh_ifc(CSG_PRIMITIVES_IFC.as_bytes());
 
-    let by_guid_prefix: std::collections::HashMap<&str, &_core::mesh::ProductMesh> = meshes
-        .iter()
-        .map(|m| (&m.guid[..6], m))
-        .collect();
+    let by_guid_prefix: std::collections::HashMap<&str, &_core::mesh::ProductMesh> =
+        meshes.iter().map(|m| (&m.guid[..6], m)).collect();
 
     let expected: &[(&str, &str)] = &[
         ("Block0", "csg_block"),
@@ -463,7 +482,7 @@ fn csg_primitives_tessellate_to_per_type_tags() {
             tags
         );
         assert!(
-            !m.indices.is_empty() && m.indices.len() % 3 == 0,
+            !m.indices.is_empty() && m.indices.len().is_multiple_of(3),
             "{}: empty or non-triangular index buffer",
             guid_prefix
         );
@@ -502,7 +521,7 @@ fn csg_block_dimensions_match_input() {
     let mut xmax = f32::NEG_INFINITY;
     let mut ymax = f32::NEG_INFINITY;
     let mut zmax = f32::NEG_INFINITY;
-    for chunk in block.vertices.chunks_exact(3) {
+    for chunk in block.vertices.as_chunks::<3>().0 {
         xmin = xmin.min(chunk[0]);
         ymin = ymin.min(chunk[1]);
         zmin = zmin.min(chunk[2]);
@@ -513,8 +532,13 @@ fn csg_block_dimensions_match_input() {
     let ex = (xmax - xmin - 100.0).abs();
     let ey = (ymax - ymin - 200.0).abs();
     let ez = (zmax - zmin - 300.0).abs();
-    assert!(ex < 1e-3 && ey < 1e-3 && ez < 1e-3,
-        "block AABB extents wrong: got ({}, {}, {})", xmax-xmin, ymax-ymin, zmax-zmin);
+    assert!(
+        ex < 1e-3 && ey < 1e-3 && ez < 1e-3,
+        "block AABB extents wrong: got ({}, {}, {})",
+        xmax - xmin,
+        ymax - ymin,
+        zmax - zmin
+    );
 }
 
 #[test]
@@ -537,7 +561,7 @@ fn csg_sphere_volume_within_tessellation_tolerance() {
     // Signed-tetrahedra volume via divergence theorem, same kernel
     // ProductStats uses.
     let mut volume_x6: f32 = 0.0;
-    for tri in sphere.indices.chunks_exact(3) {
+    for tri in sphere.indices.as_chunks::<3>().0 {
         let (a, b, c) = (tri[0] as usize, tri[1] as usize, tri[2] as usize);
         let ax = sphere.vertices[a * 3];
         let ay = sphere.vertices[a * 3 + 1];
@@ -548,9 +572,7 @@ fn csg_sphere_volume_within_tessellation_tolerance() {
         let cx = sphere.vertices[c * 3];
         let cy = sphere.vertices[c * 3 + 1];
         let cz = sphere.vertices[c * 3 + 2];
-        volume_x6 += ax * (by * cz - bz * cy)
-            + ay * (bz * cx - bx * cz)
-            + az * (bx * cy - by * cx);
+        volume_x6 += ax * (by * cz - bz * cy) + ay * (bz * cx - bx * cz) + az * (bx * cy - by * cx);
     }
     let volume = (volume_x6 / 6.0).abs();
     let expected: f32 = 4.0 / 3.0 * std::f32::consts::PI * 75.0 * 75.0 * 75.0;
@@ -586,7 +608,9 @@ fn geometric_curve_set_surfaces_as_curve_set_not_unhandled() {
         tags
     );
     assert!(
-        !stats.by_source.contains_key("unhandled:IFCGEOMETRICCURVESET"),
+        !stats
+            .by_source
+            .contains_key("unhandled:IFCGEOMETRICCURVESET"),
         "curve_set handler did not consume IFCGEOMETRICCURVESET; stats: {:?}",
         stats.by_source
     );
@@ -606,7 +630,7 @@ fn geometric_curve_set_surfaces_as_curve_set_not_unhandled() {
     // the cross-product magnitude. A real surface would produce a
     // non-trivial sum here.
     let mut area_x2: f32 = 0.0;
-    for tri in ann.indices.chunks_exact(3) {
+    for tri in ann.indices.as_chunks::<3>().0 {
         let (a, b, c) = (tri[0] as usize, tri[1] as usize, tri[2] as usize);
         let ax = ann.vertices[a * 3];
         let ay = ann.vertices[a * 3 + 1];
@@ -705,8 +729,7 @@ fn geometryless_products_silent_drop_unless_sink_opts_in() {
     // "no_representation" bucket as IfcSpace #10). That noise is a
     // pre-existing scope cut, tracked separately; this test focuses on
     // the silent-drop fix.
-    let (legacy_meshes, legacy_stats) =
-        mesh_ifc(GEOMETRYLESS_PRODUCTS_IFC.as_bytes());
+    let (legacy_meshes, legacy_stats) = mesh_ifc(GEOMETRYLESS_PRODUCTS_IFC.as_bytes());
     assert_eq!(
         legacy_meshes.len(),
         0,
@@ -717,8 +740,7 @@ fn geometryless_products_silent_drop_unless_sink_opts_in() {
     assert_eq!(legacy_stats.products_meshed, 0);
     assert_eq!(legacy_stats.products_emitted_geometryless, 0);
     assert_eq!(
-        legacy_stats.products_seen,
-        legacy_stats.products_deferred,
+        legacy_stats.products_seen, legacy_stats.products_deferred,
         "every product seen must be accounted for in deferred"
     );
     // Reveal-all stance: each silent-drop reason is credited to its own
@@ -728,7 +750,11 @@ fn geometryless_products_silent_drop_unless_sink_opts_in() {
     // IfcSpace #10 (no Representation) plus any top-level rep items
     // the permissive filter let through — at least 1.
     assert!(
-        *legacy_stats.by_source.get("no_representation").unwrap_or(&0) >= 1,
+        *legacy_stats
+            .by_source
+            .get("no_representation")
+            .unwrap_or(&0)
+            >= 1,
         "no_representation bucket must include IfcSpace #10"
     );
 
@@ -738,8 +764,7 @@ fn geometryless_products_silent_drop_unless_sink_opts_in() {
     let opt_in_stats = mesh_ifc_streaming(GEOMETRYLESS_PRODUCTS_IFC.as_bytes(), &mut sink);
     assert_eq!(opt_in_stats.products_meshed, 0);
     assert_eq!(
-        opt_in_stats.products_emitted_geometryless,
-        opt_in_stats.products_deferred,
+        opt_in_stats.products_emitted_geometryless, opt_in_stats.products_deferred,
         "opt-in sink must receive every deferred product"
     );
     assert_eq!(sink.products.len(), opt_in_stats.products_deferred);
@@ -825,7 +850,12 @@ fn annular_pipe_with_circle_curves_meshes_with_bore() {
     use _core::mesh::qto;
 
     let (meshes, _stats) = mesh_ifc(ANNULAR_PIPE_IFC.as_bytes());
-    assert_eq!(meshes.len(), 1, "expected the pipe to mesh, got {} meshes", meshes.len());
+    assert_eq!(
+        meshes.len(),
+        1,
+        "expected the pipe to mesh, got {} meshes",
+        meshes.len()
+    );
     let pipe = &meshes[0];
     assert_eq!(pipe.entity, "IfcFlowSegment");
     // Pre-fix this was empty (IfcCircle dropped → profile None).
@@ -892,14 +922,20 @@ fn far_from_origin_box_collapses_in_world_but_not_local() {
 
     struct Cap(Vec<ProductMesh>);
     impl ProductSink for Cap {
-        fn on_product(&mut self, m: ProductMesh) { self.0.push(m); }
+        fn on_product(&mut self, m: ProductMesh) {
+            self.0.push(m);
+        }
     }
 
     // World frame: the box is baked at ~5e6 m → f32 collapse → the QTO
     // shape degenerates. This documents the bug (surface_count 0,
     // volume ~0).
     let mut world = Cap(Vec::new());
-    mesh_ifc_streaming_framed(FAR_FROM_ORIGIN_BOX_IFC.as_bytes(), &mut world, BakeFrame::World);
+    mesh_ifc_streaming_framed(
+        FAR_FROM_ORIGIN_BOX_IFC.as_bytes(),
+        &mut world,
+        BakeFrame::World,
+    );
     assert_eq!(world.0.len(), 1);
     let qw = qto::compute(&world.0[0].vertices, &world.0[0].indices, 1.0);
     assert_eq!(
@@ -911,7 +947,11 @@ fn far_from_origin_box_collapses_in_world_but_not_local() {
     // Local frame: rotation applied, large translation dropped → the
     // 0.1 m box keeps full precision. Correct QTO: 6 faces, 0.001 m³.
     let mut local = Cap(Vec::new());
-    mesh_ifc_streaming_framed(FAR_FROM_ORIGIN_BOX_IFC.as_bytes(), &mut local, BakeFrame::Local);
+    mesh_ifc_streaming_framed(
+        FAR_FROM_ORIGIN_BOX_IFC.as_bytes(),
+        &mut local,
+        BakeFrame::Local,
+    );
     assert_eq!(local.0.len(), 1);
     let ql = qto::compute(&local.0[0].vertices, &local.0[0].indices, 1.0);
     assert_eq!(ql.surface_count, 6, "local-frame box should have 6 faces");
@@ -953,7 +993,9 @@ fn far_from_origin_box_collapses_in_world_but_not_local() {
     }
     let shifted: Vec<f32> = local.0[0]
         .vertices
-        .chunks_exact(3)
+        .as_chunks::<3>()
+        .0
+        .iter()
         .flat_map(|c| {
             [
                 (c[0] as f64 + off[0]) as f32,
@@ -1018,7 +1060,9 @@ fn far_faceset_with_baked_world_coords_meshes_intact() {
 
     struct Cap(Vec<ProductMesh>);
     impl ProductSink for Cap {
-        fn on_product(&mut self, m: ProductMesh) { self.0.push(m); }
+        fn on_product(&mut self, m: ProductMesh) {
+            self.0.push(m);
+        }
     }
 
     // Local frame is what point_cloud()/meshes() use. Without the
@@ -1058,14 +1102,87 @@ fn far_faceset_with_baked_world_coords_meshes_intact() {
     // themselves can't be held in f32, but they round-trip in f64 — the
     // shape information is preserved.)
     let anchor = m.mesh_anchor;
-    for k in 0..3 {
+    for (k, a) in anchor.iter().enumerate() {
         assert!(
-            (anchor[k] - 50_000_000.0).abs() < 1e-3,
+            (a - 50_000_000.0).abs() < 1e-3,
             "mesh_anchor[{}] = {} should be ~5e7 in f64",
             k,
-            anchor[k],
+            a,
         );
     }
+}
+
+/// GH #167: the substrate re-derives world geometry as
+/// `world_transform * parts[i].instance_transform * local_vertices`.
+/// `local_vertices` are relative to the item's `rep_origin`, so that
+/// rebase has to ride on the part transform — otherwise every consumer
+/// of `parts` (bundle shared-rep rows, the clash engine, glTF
+/// instancing) places a far-origin faceset/brep `rep_origin` short of
+/// where the baked `vertices` put it. Checked at a moderate magnitude
+/// (8e4, where f32 still resolves millimetres) so the assertion is
+/// tight; the 5e7 fixture is checked loosely (f32 quantum ~4 m there)
+/// to pin the magnitude-class of the bug rather than its precision.
+#[test]
+fn parts_transform_reconstructs_baked_local_vertices() {
+    use _core::mesh::{mesh_ifc_streaming_framed, BakeFrame, ProductMesh, ProductSink};
+    use glam::{DMat4, DVec3};
+
+    struct Cap(Vec<ProductMesh>);
+    impl ProductSink for Cap {
+        fn on_product(&mut self, m: ProductMesh) {
+            self.0.push(m);
+        }
+    }
+
+    fn worst_reconstruction_error(ifc: &str) -> f64 {
+        let mut cap = Cap(Vec::new());
+        mesh_ifc_streaming_framed(ifc.as_bytes(), &mut cap, BakeFrame::Local);
+        assert_eq!(cap.0.len(), 1, "one product expected");
+        let m = &cap.0[0];
+        assert!(!m.parts.is_empty(), "product must carry parts");
+        let world = DMat4::from_cols_array(&std::array::from_fn(|i| m.world_transform[i] as f64));
+        let anchor = DVec3::new(m.mesh_anchor[0], m.mesh_anchor[1], m.mesh_anchor[2]);
+        let mut worst = 0.0_f64;
+        for part in &m.parts {
+            let inst =
+                DMat4::from_cols_array(&std::array::from_fn(|i| part.instance_transform[i] as f64));
+            let full = world * inst;
+            // The part's vertices were appended to the combined buffer
+            // at `base`, and its indices offset by `base` — recover it
+            // as the smallest index inside the part's index range.
+            let range =
+                (part.index_start as usize)..((part.index_start + part.index_count) as usize);
+            let base = *m.indices[range].iter().min().expect("part has indices") as usize;
+            for (li, chunk) in part.local_vertices.as_chunks::<3>().0.iter().enumerate() {
+                let p = DVec3::new(chunk[0] as f64, chunk[1] as f64, chunk[2] as f64);
+                let via_parts = full.transform_point3(p);
+                let bi = (base + li) * 3;
+                let baked_world = DVec3::new(
+                    m.vertices[bi] as f64,
+                    m.vertices[bi + 1] as f64,
+                    m.vertices[bi + 2] as f64,
+                ) + anchor;
+                worst = worst.max((via_parts - baked_world).length());
+            }
+        }
+        worst
+    }
+
+    // Moderate magnitude: G55-class site coordinates (8e4 mm).
+    let moderate = FAR_FACESET_BOX_IFC.replace("50000000.", "80000.");
+    let err = worst_reconstruction_error(&moderate);
+    assert!(
+        err < 1e-3,
+        "parts transform must reproduce the baked vertices at 8e4 (worst error {err})"
+    );
+
+    // Extreme magnitude: only the magnitude class is asserted — without
+    // the rep_origin fold the error is ~5e7, with it ~f32 quantum.
+    let err_far = worst_reconstruction_error(FAR_FACESET_BOX_IFC);
+    assert!(
+        err_far < 64.0,
+        "parts transform must land within f32 quantum at 5e7 (worst error {err_far})"
+    );
 }
 
 /// End-to-end style extraction (GH #3): a synthetic IFC4 wall with an
@@ -1114,7 +1231,9 @@ END-ISO-10303-21;
 fn styled_item_chain_populates_part_surface_color() {
     struct Cap(Vec<ProductMesh>);
     impl ProductSink for Cap {
-        fn on_product(&mut self, m: ProductMesh) { self.0.push(m); }
+        fn on_product(&mut self, m: ProductMesh) {
+            self.0.push(m);
+        }
     }
 
     let mut cap = Cap(Vec::new());
@@ -1198,19 +1317,26 @@ fn per_primitive_materials_split_two_styled_operands() {
 
     struct Cap(Vec<ProductMesh>);
     impl ProductSink for Cap {
-        fn on_product(&mut self, m: ProductMesh) { self.0.push(m); }
+        fn on_product(&mut self, m: ProductMesh) {
+            self.0.push(m);
+        }
     }
 
     let mut cap = Cap(Vec::new());
     mesh_ifc_streaming(TWO_STYLED_OPERANDS_IFC.as_bytes(), &mut cap);
-    let wall_idx = cap.0.iter().position(|m| m.entity == "IfcWall")
+    let wall_idx = cap
+        .0
+        .iter()
+        .position(|m| m.entity == "IfcWall")
         .expect("wall must reach the sink");
     assert!(
         cap.0[wall_idx].parts.len() >= 2,
         "wall should have ≥2 parts (host + cutter)"
     );
     // Both parts must carry an authored surface_color (one brick, one glass).
-    let colours: Vec<_> = cap.0[wall_idx].parts.iter()
+    let colours: Vec<_> = cap.0[wall_idx]
+        .parts
+        .iter()
         .filter_map(|p| p.surface_color)
         .collect();
     assert!(
@@ -1230,8 +1356,13 @@ fn per_primitive_materials_split_two_styled_operands() {
     let json_bytes = &buf[json_start..json_end];
     // Trim any trailing space padding.
     let json_str = std::str::from_utf8(
-        &json_bytes[..json_bytes.iter().rposition(|&b| b != b' ').map(|i| i+1).unwrap_or(0)]
-    ).expect("json utf-8");
+        &json_bytes[..json_bytes
+            .iter()
+            .rposition(|&b| b != b' ')
+            .map(|i| i + 1)
+            .unwrap_or(0)],
+    )
+    .expect("json utf-8");
 
     // Look for the wall mesh entry: walk the meshes array and find one
     // whose first primitive's material name is the brick hex `#b23326`
@@ -1244,7 +1375,8 @@ fn per_primitive_materials_split_two_styled_operands() {
         // Count `{"attributes"` openings up to the matching `]`.
         let after_marker = chunk_start + primitives_marker.len();
         // Find the matching `]` accounting for nested brackets.
-        let mut depth = 1; let mut idx = after_marker;
+        let mut depth = 1;
+        let mut idx = after_marker;
         let bytes = json_str.as_bytes();
         while idx < bytes.len() && depth > 0 {
             match bytes[idx] {
@@ -1252,7 +1384,9 @@ fn per_primitive_materials_split_two_styled_operands() {
                 b']' => depth -= 1,
                 _ => {}
             }
-            if depth == 0 { break; }
+            if depth == 0 {
+                break;
+            }
             idx += 1;
         }
         let primitives_chunk = &json_str[after_marker..idx];

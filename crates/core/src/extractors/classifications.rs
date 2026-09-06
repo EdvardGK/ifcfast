@@ -4,7 +4,8 @@
 //! → `IfcClassification`. Emits one row per (product, classification ref):
 //!
 //! ```text
-//! (guid, system_name, edition, identification, name, location, source)
+//! (guid, system_name, edition, identification, name, location, source,
+//!  assignment_source)
 //! ```
 //!
 //! Where:
@@ -14,6 +15,7 @@
 //!   `name`            — `IfcClassificationReference.Name` (human label, e.g. "Yttervegger")
 //!   `location`        — `IfcClassificationReference.Location` (URI to spec, often null)
 //!   `source`          — `IfcClassification.Source` (publisher / standards body)
+//!   `assignment_source` — "instance" | "type" (GH #165 type inheritance)
 //!
 //! Critical for Norwegian projects (NS 3451 → 4-digit / 6-digit building part
 //! codes) and Building Smart workflows (OmniClass + Uniformat tables).
@@ -36,6 +38,14 @@ pub struct ClassificationTable {
     pub name: Vec<Option<String>>,
     pub location: Vec<Option<String>>,
     pub source: Vec<Option<String>>,
+    /// `"instance"` when the classification was associated directly with
+    /// the product, `"type"` when it was inherited from the product's
+    /// `IfcTypeObject` via `IfcRelDefinesByType` (GH #165). Same values
+    /// and the same instance-wins rule as `psets.source`, but a
+    /// different COLUMN NAME: `source` is already taken here by
+    /// `IfcClassification.Source` (the publishing body), which is
+    /// unrelated provenance.
+    pub assignment_source: Vec<&'static str>,
 }
 
 impl ClassificationTable {
@@ -58,6 +68,12 @@ pub fn build(
     let mut systems: HashMap<u64, SystemRecord> = HashMap::with_capacity(64);
     let mut refs: HashMap<u64, RefRecord> = HashMap::with_capacity(1024);
     let mut rel_pairs: Vec<(u64, u64)> = Vec::with_capacity(4096);
+    // Type inheritance (GH #165), mirroring psets.rs: product step id →
+    // its IfcTypeObject, plus the set of type step ids so a rel whose
+    // RelatedObject is a type can be routed rather than dropped.
+    let mut product_to_type: HashMap<u64, u64> = HashMap::with_capacity(16_384);
+    let mut type_object_ids: std::collections::HashSet<u64> =
+        std::collections::HashSet::with_capacity(512);
 
     for (step_id, type_name, args) in table.iter() {
         if type_name.eq_ignore_ascii_case(b"IFCCLASSIFICATION") {
@@ -107,45 +123,146 @@ pub fn build(
             for obj_id in relateds {
                 rel_pairs.push((obj_id, relating));
             }
+        } else if type_name.eq_ignore_ascii_case(b"IFCRELDEFINESBYTYPE") {
+            // (GlobalId, OwnerHistory, Name, Description, RelatedObjects,
+            //  RelatingType) — the inheritance edge (GH #165). A
+            // classification bound to IfcWallType applies to every wall
+            // of that type; without this the occurrences reported none.
+            let fields = split_top_level_args(args);
+            let type_id = match fields.get(5).copied().map(parse_field) {
+                Some(Field::Ref(id)) => id,
+                _ => continue,
+            };
+            let relateds = match fields.get(4).copied().map(parse_field) {
+                Some(Field::List(body)) => parse_ref_list(body),
+                Some(Field::Ref(id)) => vec![id],
+                _ => continue,
+            };
+            for obj_id in relateds {
+                product_to_type.insert(obj_id, type_id);
+            }
+        } else if is_type_object(type_name) {
+            type_object_ids.insert(step_id);
         }
     }
 
     let mut out = ClassificationTable::default();
-    for (obj_step_id, relating_id) in rel_pairs {
-        let guid = match product_step_to_guid.get(&obj_step_id) {
-            Some(g) => g,
-            None => continue,
-        };
-        // The relating object can be either:
-        //  - IfcClassificationReference (most common — Edvard's pattern)
-        //  - IfcClassification directly (rarer)
-        if let Some(r) = refs.get(&relating_id) {
-            // Walk the ReferencedSource chain: a leaf reference can point at a
-            // parent *reference* (multi-level hierarchies — Uniclass tables,
-            // ArchiCAD/Solibri NS 3451 nested exports) instead of directly at
-            // the terminal IfcClassification. One-hop resolution dropped
-            // system_name/edition/source on those (issue #75). Follow parent_id
-            // through `refs` until a `systems` hit, depth-capped + cycle-guarded.
-            let system = resolve_system(relating_id, r, &refs, &systems);
-            out.guid.push(guid.clone());
-            out.system_name.push(system.and_then(|s| s.name.clone()));
-            out.edition.push(system.and_then(|s| s.edition.clone()));
-            out.identification.push(r.identification.clone());
-            out.name.push(r.name.clone());
-            out.location.push(r.location.clone());
-            out.source.push(system.and_then(|s| s.source.clone()));
-        } else if let Some(sys) = systems.get(&relating_id) {
-            out.guid.push(guid.clone());
-            out.system_name.push(sys.name.clone());
-            out.edition.push(sys.edition.clone());
-            out.identification.push(None);
-            out.name.push(None);
-            out.location.push(None);
-            out.source.push(sys.source.clone());
+
+    // (type_step_id → [relating_classification_ref]) — rel pairs whose
+    // RelatedObject is a type, which previously fell out of the loop at
+    // the `product_step_to_guid` miss.
+    let mut type_classifications: HashMap<u64, Vec<u64>> = HashMap::with_capacity(256);
+    // Instance wins on collision, as in psets.rs: a product with any
+    // directly associated classification inherits nothing from its type.
+    let mut has_instance_class: std::collections::HashSet<u64> =
+        std::collections::HashSet::with_capacity(product_step_to_guid.len());
+
+    // The two branches are independent on purpose — see the identical
+    // note in extractors/materials.rs: a caller's
+    // `product_step_to_guid` may also contain type objects, so "not a
+    // product" is not a reliable test for "is a type".
+    for (obj_step_id, relating_id) in &rel_pairs {
+        if type_object_ids.contains(obj_step_id) {
+            type_classifications
+                .entry(*obj_step_id)
+                .or_default()
+                .push(*relating_id);
+        }
+        if let Some(guid) = product_step_to_guid.get(obj_step_id) {
+            if emit_classification(&mut out, guid, *relating_id, &refs, &systems, "instance") {
+                has_instance_class.insert(*obj_step_id);
+            }
+        }
+    }
+
+    // Type-inheritance pass, sorted by product step id so row order is
+    // deterministic (the GH #152 trap, avoided by construction).
+    if !type_classifications.is_empty() && !product_to_type.is_empty() {
+        let mut inherit: Vec<(u64, u64)> = product_to_type
+            .iter()
+            .map(|(product, type_id)| (*product, *type_id))
+            .collect();
+        inherit.sort_unstable();
+        for (product_step_id, type_step_id) in &inherit {
+            if has_instance_class.contains(product_step_id) {
+                continue;
+            }
+            let guid = match product_step_to_guid.get(product_step_id) {
+                Some(g) => g,
+                None => continue,
+            };
+            let relating_ids = match type_classifications.get(type_step_id) {
+                Some(v) => v,
+                None => continue,
+            };
+            for relating_id in relating_ids {
+                emit_classification(&mut out, guid, *relating_id, &refs, &systems, "type");
+            }
         }
     }
 
     out
+}
+
+/// Push the row for one `RelatingClassification` ref. Returns whether a
+/// row was emitted (a ref that resolves to neither an
+/// IfcClassificationReference nor an IfcClassification emits nothing,
+/// exactly as before).
+fn emit_classification(
+    out: &mut ClassificationTable,
+    guid: &str,
+    relating_id: u64,
+    refs: &HashMap<u64, RefRecord>,
+    systems: &HashMap<u64, SystemRecord>,
+    assignment_source: &'static str,
+) -> bool {
+    // The relating object can be either:
+    //  - IfcClassificationReference (most common — Edvard's pattern)
+    //  - IfcClassification directly (rarer)
+    if let Some(r) = refs.get(&relating_id) {
+        // Walk the ReferencedSource chain: a leaf reference can point at a
+        // parent *reference* (multi-level hierarchies — Uniclass tables,
+        // ArchiCAD/Solibri NS 3451 nested exports) instead of directly at
+        // the terminal IfcClassification. One-hop resolution dropped
+        // system_name/edition/source on those (issue #75). Follow parent_id
+        // through `refs` until a `systems` hit, depth-capped + cycle-guarded.
+        let system = resolve_system(relating_id, r, refs, systems);
+        out.guid.push(guid.to_string());
+        out.system_name.push(system.and_then(|s| s.name.clone()));
+        out.edition.push(system.and_then(|s| s.edition.clone()));
+        out.identification.push(r.identification.clone());
+        out.name.push(r.name.clone());
+        out.location.push(r.location.clone());
+        out.source.push(system.and_then(|s| s.source.clone()));
+        out.assignment_source.push(assignment_source);
+        return true;
+    }
+    if let Some(sys) = systems.get(&relating_id) {
+        out.guid.push(guid.to_string());
+        out.system_name.push(sys.name.clone());
+        out.edition.push(sys.edition.clone());
+        out.identification.push(None);
+        out.name.push(None);
+        out.location.push(None);
+        out.source.push(sys.source.clone());
+        out.assignment_source.push(assignment_source);
+        return true;
+    }
+    false
+}
+
+/// Detect an IfcTypeObject / IfcXxxType subclass by entity-name suffix.
+/// Same rule as `extractors/psets.rs`, `extractors/quantities.rs`,
+/// `extractors/materials.rs` and `indexer::index`.
+fn is_type_object(t: &[u8]) -> bool {
+    let suffix_ok = t.len() > 7
+        && t[..3].eq_ignore_ascii_case(b"IFC")
+        && t[t.len() - 4..].eq_ignore_ascii_case(b"TYPE");
+    let ifc2x3_style =
+        t.eq_ignore_ascii_case(b"IFCDOORSTYLE") || t.eq_ignore_ascii_case(b"IFCWINDOWSTYLE");
+    let bare_base =
+        t.eq_ignore_ascii_case(b"IFCTYPEPRODUCT") || t.eq_ignore_ascii_case(b"IFCTYPEOBJECT");
+    suffix_ok || ifc2x3_style || bare_base
 }
 
 /// Maximum classification-hierarchy depth we'll walk. Real-world chains are
@@ -432,5 +549,77 @@ END-ISO-10303-21;
             .collect();
         assert_eq!(by_system.get("NS 3451"), Some(&"232.1"));
         assert_eq!(by_system.get("OmniClass"), Some(&"21-01 10 10"));
+    }
+}
+
+#[cfg(test)]
+mod inheritance_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    /// Only OCCURRENCES go into the product resolver — a type object is
+    /// not a product, which is precisely why its classification used to
+    /// be dropped (GH #165).
+    fn products_only(table: &crate::entity_table::EntityTable) -> HashMap<u64, String> {
+        let mut m = HashMap::new();
+        for (sid, t, args) in table.iter() {
+            if !t.eq_ignore_ascii_case(b"IFCWALL") {
+                continue;
+            }
+            if let Field::String(s) = parse_field(split_top_level_args(args)[0]) {
+                m.insert(sid, s);
+            }
+        }
+        m
+    }
+
+    const HEAD: &str = "ISO-10303-21;\nHEADER;\nFILE_DESCRIPTION((''),'2;1');\n\
+FILE_SCHEMA(('IFC4'));\nENDSEC;\nDATA;\n";
+
+    fn run(data: &str) -> ClassificationTable {
+        let buf = format!("{HEAD}{data}ENDSEC;\nEND-ISO-10303-21;\n");
+        let table = crate::entity_table::EntityTable::build(buf.as_bytes());
+        let products = products_only(&table);
+        build(&table, &products)
+    }
+
+    /// A classification bound to IfcWallType must reach every wall of
+    /// that type, tagged `assignment_source = "type"`.
+    #[test]
+    fn type_bound_classification_reaches_occurrences() {
+        let t = run(
+            "#10=IFCWALL('1Wall00000000000000001',$,'W',$,$,$,$,'t',.STANDARD.);\n\
+             #11=IFCWALL('1Wall00000000000000002',$,'W',$,$,$,$,'t',.STANDARD.);\n\
+             #40=IFCWALLTYPE('3Type00000000000000001',$,'WT',$,$,$,$,$,$,.STANDARD.);\n\
+             #41=IFCRELDEFINESBYTYPE('4Rel000000000000000001',$,$,$,(#10,#11),#40);\n\
+             #30=IFCCLASSIFICATION('Standard Norge','2022',$,'NS 3451');\n\
+             #31=IFCCLASSIFICATIONREFERENCE($,'232.1','Yttervegger',#30);\n\
+             #32=IFCRELASSOCIATESCLASSIFICATION('2Cls000000000000000001',$,$,$,(#40),#31);\n",
+        );
+        assert_eq!(t.len(), 2, "both occurrences inherit the type's code");
+        assert!(t.guid.contains(&"1Wall00000000000000001".to_string()));
+        assert!(t.guid.contains(&"1Wall00000000000000002".to_string()));
+        assert!(t.assignment_source.iter().all(|s| *s == "type"));
+        assert_eq!(t.identification[0].as_deref(), Some("232.1"));
+        assert_eq!(t.system_name[0].as_deref(), Some("NS 3451"));
+    }
+
+    /// A directly associated classification shadows the type's, and is
+    /// tagged `"instance"`.
+    #[test]
+    fn instance_classification_shadows_type() {
+        let t = run(
+            "#10=IFCWALL('1Wall00000000000000001',$,'W',$,$,$,$,'t',.STANDARD.);\n\
+             #40=IFCWALLTYPE('3Type00000000000000001',$,'WT',$,$,$,$,$,$,.STANDARD.);\n\
+             #41=IFCRELDEFINESBYTYPE('4Rel000000000000000001',$,$,$,(#10),#40);\n\
+             #30=IFCCLASSIFICATION('Standard Norge','2022',$,'NS 3451');\n\
+             #31=IFCCLASSIFICATIONREFERENCE($,'232.1','Yttervegger',#30);\n\
+             #33=IFCCLASSIFICATIONREFERENCE($,'233.9','Innervegger',#30);\n\
+             #32=IFCRELASSOCIATESCLASSIFICATION('2Cls000000000000000001',$,$,$,(#40),#31);\n\
+             #34=IFCRELASSOCIATESCLASSIFICATION('2Cls000000000000000002',$,$,$,(#10),#33);\n",
+        );
+        assert_eq!(t.len(), 1, "instance wins; no type row is emitted");
+        assert_eq!(t.identification[0].as_deref(), Some("233.9"));
+        assert_eq!(t.assignment_source[0], "instance");
     }
 }

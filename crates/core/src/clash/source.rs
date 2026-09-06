@@ -72,7 +72,10 @@ impl std::fmt::Display for SubstrateReadError {
             Self::MissingColumn(c) => write!(f, "missing required column `{c}`"),
             Self::UnexpectedColumnType(c) => write!(f, "column `{c}` has unexpected type"),
             Self::InconsistentBinary(c) => {
-                write!(f, "column `{c}` has malformed binary buffer (length not aligned)")
+                write!(
+                    f,
+                    "column `{c}` has malformed binary buffer (length not aligned)"
+                )
             }
         }
     }
@@ -208,11 +211,11 @@ pub fn read_representations(
                 return Err(SubstrateReadError::InconsistentBinary("indices_le"));
             }
             let mut vertices: Vec<f32> = Vec::with_capacity(vraw.len() / 4);
-            for c in vraw.chunks_exact(4) {
+            for c in vraw.as_chunks::<4>().0 {
                 vertices.push(f32::from_le_bytes([c[0], c[1], c[2], c[3]]) * unit_scale);
             }
             let mut indices: Vec<u32> = Vec::with_capacity(iraw.len() / 4);
-            for c in iraw.chunks_exact(4) {
+            for c in iraw.as_chunks::<4>().0 {
                 indices.push(u32::from_le_bytes([c[0], c[1], c[2], c[3]]));
             }
 
@@ -258,7 +261,13 @@ fn column_u64_opt(
         .downcast_ref::<UInt64Array>()
         .ok_or(SubstrateReadError::UnexpectedColumnType(name))?;
     Ok((0..arr.len())
-        .map(|i| if arr.is_null(i) { None } else { Some(arr.value(i)) })
+        .map(|i| {
+            if arr.is_null(i) {
+                None
+            } else {
+                Some(arr.value(i))
+            }
+        })
         .collect())
 }
 
@@ -353,4 +362,3 @@ fn column_fixed_f32(
     }
     Ok(out)
 }
-

@@ -10,7 +10,7 @@
 
 use std::collections::HashMap;
 
-use glam::Vec3;
+use glam::{DVec3, Vec3};
 
 use crate::entity_table::EntityTable;
 use crate::lexer::{parse_field, split_top_level_args, Field};
@@ -103,7 +103,25 @@ pub fn face_based_surface_model(table: &EntityTable, id: u64) -> Option<LocalMes
         };
         if let Some(m) = closed_shell(table, face_set_id) {
             let base = (combined.vertices.len() / 3) as u32;
-            combined.vertices.extend_from_slice(&m.vertices);
+            // GH #153: every shell is rebased against its own first
+            // point, so the raw vertex buffers are in different local
+            // frames. Adopt the first shell's `rep_origin` for the
+            // combined mesh and shift each later shell by the f64
+            // difference — small (all shells of one product are
+            // neighbours), so the f32 add is exact enough.
+            if combined.vertices.is_empty() {
+                combined.rep_origin = m.rep_origin;
+            }
+            let d = [
+                (m.rep_origin[0] - combined.rep_origin[0]) as f32,
+                (m.rep_origin[1] - combined.rep_origin[1]) as f32,
+                (m.rep_origin[2] - combined.rep_origin[2]) as f32,
+            ];
+            for c in m.vertices.as_chunks::<3>().0 {
+                combined.vertices.push(c[0] + d[0]);
+                combined.vertices.push(c[1] + d[1]);
+                combined.vertices.push(c[2] + d[2]);
+            }
             for &idx in &m.indices {
                 combined.indices.push(base + idx);
             }
@@ -135,7 +153,25 @@ pub fn shell_based_surface_model(table: &EntityTable, id: u64) -> Option<LocalMe
         };
         if let Some(m) = closed_shell(table, shell_id) {
             let base = (combined.vertices.len() / 3) as u32;
-            combined.vertices.extend_from_slice(&m.vertices);
+            // GH #153: every shell is rebased against its own first
+            // point, so the raw vertex buffers are in different local
+            // frames. Adopt the first shell's `rep_origin` for the
+            // combined mesh and shift each later shell by the f64
+            // difference — small (all shells of one product are
+            // neighbours), so the f32 add is exact enough.
+            if combined.vertices.is_empty() {
+                combined.rep_origin = m.rep_origin;
+            }
+            let d = [
+                (m.rep_origin[0] - combined.rep_origin[0]) as f32,
+                (m.rep_origin[1] - combined.rep_origin[1]) as f32,
+                (m.rep_origin[2] - combined.rep_origin[2]) as f32,
+            ];
+            for c in m.vertices.as_chunks::<3>().0 {
+                combined.vertices.push(c[0] + d[0]);
+                combined.vertices.push(c[1] + d[1]);
+                combined.vertices.push(c[2] + d[2]);
+            }
             for &idx in &m.indices {
                 combined.indices.push(base + idx);
             }
@@ -312,7 +348,7 @@ fn fan_triangulate(verts: &[u32], mesh: &mut LocalMesh) {
 /// map back to the original `mesh.vertices` indices. Winding is restored
 /// to match the outer loop's CCW-in-plane sense so the emitted triangles
 /// keep the face's outward normal.
-fn triangulate_face_with_holes(
+pub(crate) fn triangulate_face_with_holes(
     mesh: &mut LocalMesh,
     outer: &[u32],
     holes: &[Vec<u32>],
@@ -372,7 +408,7 @@ fn triangulate_face_with_holes(
     }
     // earcutr returns CCW triangles in the (u, v) plane; since (u, v, n)
     // is right-handed, that CCW sense already matches the face normal n.
-    for t in tris.chunks_exact(3) {
+    for t in tris.as_chunks::<3>().0 {
         mesh.indices.push(orig[t[0]]);
         mesh.indices.push(orig[t[1]]);
         mesh.indices.push(orig[t[2]]);
@@ -414,17 +450,40 @@ fn poly_loop_vertices(
             Some(p) => p,
             None => continue,
         };
+        // Far-origin rebase (GH #153) — the same contract `faceset.rs`
+        // applies to `IfcCartesianPointList3D`: parse in f64, subtract a
+        // representation-local origin, and only THEN downcast to f32.
+        // IFC2x3 breps routinely bake world coords straight into the
+        // `IfcCartesianPoint`s; at 6e8 the f32 ULP is ~32 mm, so packing
+        // the raw coordinate quantises the whole shell before the bake
+        // loop ever sees it. The offset rides on `LocalMesh.rep_origin`
+        // and the bake loop re-applies it through an f64 anchor
+        // (`mesh/mod.rs`: `effective_f64.transform_point3(rep_origin)`),
+        // so world placement is unchanged — only the precision improves.
+        //
+        // Origin = the FIRST point of the shell (not the bbox-min the
+        // point-list path can afford): the brep walk streams points face
+        // by face and never holds them all, and any point of the shell
+        // is equally valid as the rebase datum — the residual coords are
+        // bounded by the shell's own extent either way.
+        if mesh.vertices.is_empty() {
+            mesh.rep_origin = [p.x, p.y, p.z];
+        }
+        let d = p - DVec3::new(mesh.rep_origin[0], mesh.rep_origin[1], mesh.rep_origin[2]);
         let idx = (mesh.vertices.len() / 3) as u32;
-        mesh.vertices.push(p.x);
-        mesh.vertices.push(p.y);
-        mesh.vertices.push(p.z);
+        mesh.vertices.push(d.x as f32);
+        mesh.vertices.push(d.y as f32);
+        mesh.vertices.push(d.z as f32);
         vertex_cache.insert(pt_id, idx);
         out.push(idx);
     }
     out
 }
 
-fn cartesian_point(table: &EntityTable, id: u64) -> Option<Vec3> {
+/// An `IfcCartesianPoint` in **f64**. Parsed at full precision so the
+/// caller can rebase (GH #153) before the f32 downcast — an f32 parse
+/// here would already have quantised a world-coordinate brep.
+fn cartesian_point(table: &EntityTable, id: u64) -> Option<DVec3> {
     let (type_name, args) = table.get(id)?;
     if !type_name.eq_ignore_ascii_case(b"IFCCARTESIANPOINT") {
         return None;
@@ -434,14 +493,14 @@ fn cartesian_point(table: &EntityTable, id: u64) -> Option<Vec3> {
         Field::List(b) => b,
         _ => return None,
     };
-    let coords: Vec<f32> = split_top_level_args(body)
+    let coords: Vec<f64> = split_top_level_args(body)
         .into_iter()
         .filter_map(|f| match parse_field(f) {
-            Field::Number(n) => Some(n as f32),
+            Field::Number(n) => Some(n),
             _ => None,
         })
         .collect();
-    Some(Vec3::new(
+    Some(DVec3::new(
         *coords.first().unwrap_or(&0.0),
         *coords.get(1).unwrap_or(&0.0),
         *coords.get(2).unwrap_or(&0.0),
@@ -452,6 +511,123 @@ fn cartesian_point(table: &EntityTable, id: u64) -> Option<Vec3> {
 mod tests {
     use super::*;
 
+    /// GH #153 fixture: an IFC2x3-style `IfcFacetedBrep` with world
+    /// coordinates (6e8) baked straight into its `IfcCartesianPoint`s.
+    /// A tetrahedron with 1000-unit legs anchored at (6e8, 6e8, 0).
+    /// At 6e8 the f32 ULP is ~64 units, so packing the raw coordinate
+    /// quantises the 1000-unit legs into ~64-unit steps; the rebase
+    /// keeps them exact.
+    const FAR_ORIGIN_BREP_IFC: &str = r#"ISO-10303-21;
+HEADER;
+FILE_DESCRIPTION(('ViewDefinition [ReferenceView]'),'2;1');
+FILE_NAME('far.ifc','2026-09-06T00:00:00',('test'),('skiplum'),'ifcfast','ifcfast','');
+FILE_SCHEMA(('IFC2X3'));
+ENDSEC;
+DATA;
+#1=IFCCARTESIANPOINT((600000000.,600000000.,0.));
+#2=IFCCARTESIANPOINT((600001000.,600000000.,0.));
+#3=IFCCARTESIANPOINT((600000000.,600001000.,0.));
+#4=IFCCARTESIANPOINT((600000000.,600000000.,1000.));
+#10=IFCPOLYLOOP((#1,#3,#2));
+#11=IFCFACEOUTERBOUND(#10,.T.);
+#12=IFCFACE((#11));
+#20=IFCPOLYLOOP((#1,#2,#4));
+#21=IFCFACEOUTERBOUND(#20,.T.);
+#22=IFCFACE((#21));
+#30=IFCPOLYLOOP((#2,#3,#4));
+#31=IFCFACEOUTERBOUND(#30,.T.);
+#32=IFCFACE((#31));
+#40=IFCPOLYLOOP((#3,#1,#4));
+#41=IFCFACEOUTERBOUND(#40,.T.);
+#42=IFCFACE((#41));
+#50=IFCCLOSEDSHELL((#12,#22,#32,#42));
+#60=IFCFACETEDBREP(#50);
+#70=IFCSHELLBASEDSURFACEMODEL((#50));
+ENDSEC;
+END-ISO-10303-21;
+"#;
+
+    /// Per-axis (max - min) of the f32 vertex buffer.
+    fn vertex_spread(mesh: &LocalMesh) -> [f32; 3] {
+        let mut lo = [f32::INFINITY; 3];
+        let mut hi = [f32::NEG_INFINITY; 3];
+        for c in mesh.vertices.as_chunks::<3>().0 {
+            for (a, v) in c.iter().enumerate() {
+                lo[a] = lo[a].min(*v);
+                hi[a] = hi[a].max(*v);
+            }
+        }
+        [hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]]
+    }
+
+    /// The rebase contract (GH #153): with world coords baked into the
+    /// points, the f32 buffer must still resolve the 1000-unit legs to
+    /// better than 1e-3 relative, and `rep_origin` must carry the f64
+    /// offset the bake loop re-applies. Without the rebase the spread
+    /// quantises to ~64-unit steps (f32 ULP at 6e8) and this fails.
+    #[test]
+    fn faceted_brep_far_origin_preserves_vertex_spread() {
+        let table = EntityTable::build(FAR_ORIGIN_BREP_IFC.as_bytes());
+        let mesh = faceted_brep(&table, 60).expect("brep #60 meshes");
+
+        // The offset the bake loop re-applies is the shell's first point.
+        assert!((mesh.rep_origin[0] - 600000000.0).abs() < 1e-6);
+        assert!((mesh.rep_origin[1] - 600000000.0).abs() < 1e-6);
+        assert!(mesh.rep_origin[2].abs() < 1e-6);
+
+        let spread = vertex_spread(&mesh);
+        for (axis, got) in spread.iter().enumerate() {
+            assert!(
+                (got - 1000.0).abs() < 1.0,
+                "axis {axis}: expected a 1000-unit spread within 1e-3 \
+                 relative, got {got} (f32 collapse at 6e8?)",
+            );
+        }
+
+        // And the world reconstruction (rep_origin + vertex) still lands
+        // on the authored coordinates.
+        let mut max_err = 0.0_f64;
+        for c in mesh.vertices.as_chunks::<3>().0 {
+            let world = [
+                mesh.rep_origin[0] + c[0] as f64,
+                mesh.rep_origin[1] + c[1] as f64,
+                mesh.rep_origin[2] + c[2] as f64,
+            ];
+            let expected = [
+                [600000000.0, 600000000.0, 0.0],
+                [600001000.0, 600000000.0, 0.0],
+                [600000000.0, 600001000.0, 0.0],
+                [600000000.0, 600000000.0, 1000.0],
+            ];
+            let best = expected
+                .iter()
+                .map(|e| {
+                    (0..3)
+                        .map(|a| (world[a] - e[a]).abs())
+                        .fold(0.0_f64, f64::max)
+                })
+                .fold(f64::INFINITY, f64::min);
+            max_err = max_err.max(best);
+        }
+        assert!(max_err < 1.0, "world reconstruction off by {max_err}");
+    }
+
+    /// Same contract on the `IfcShellBasedSurfaceModel` path — it merges
+    /// per-shell meshes, so it must reconcile their `rep_origin`s too.
+    #[test]
+    fn shell_based_surface_model_far_origin_preserves_vertex_spread() {
+        let table = EntityTable::build(FAR_ORIGIN_BREP_IFC.as_bytes());
+        let mesh = shell_based_surface_model(&table, 70).expect("sbsm #70 meshes");
+        assert!((mesh.rep_origin[0] - 600000000.0).abs() < 1e-6);
+        let spread = vertex_spread(&mesh);
+        for (axis, got) in spread.iter().enumerate() {
+            assert!(
+                (got - 1000.0).abs() < 1.0,
+                "sbsm axis {axis}: expected 1000, got {got}",
+            );
+        }
+    }
+
     /// Total triangle area of a `LocalMesh` (signed → abs), summed over
     /// all triangles. For a single planar face this is the face area.
     fn tri_area(mesh: &LocalMesh) -> f32 {
@@ -460,7 +636,9 @@ mod tests {
             Vec3::new(mesh.vertices[b], mesh.vertices[b + 1], mesh.vertices[b + 2])
         };
         mesh.indices
-            .chunks_exact(3)
+            .as_chunks::<3>()
+            .0
+            .iter()
             .map(|t| 0.5 * (v(t[1]) - v(t[0])).cross(v(t[2]) - v(t[0])).length())
             .sum()
     }
@@ -536,12 +714,7 @@ mod tests {
         // the ratio instead of an absolute to stay projection-agnostic.
         let s = |x: f32, y: f32| [x, y, x]; // z=x tilt
         let outer_pts = [s(0.0, 0.0), s(1.0, 0.0), s(1.0, 1.0), s(0.0, 1.0)];
-        let hole_pts = [
-            s(0.4, 0.4),
-            s(0.4, 0.6),
-            s(0.6, 0.6),
-            s(0.6, 0.4),
-        ];
+        let hole_pts = [s(0.4, 0.4), s(0.4, 0.6), s(0.6, 0.6), s(0.6, 0.4)];
         let mut push = |p: &[[f32; 3]]| -> Vec<u32> {
             p.iter()
                 .map(|c| {

@@ -4,6 +4,8 @@ Authored 2026-06-05. Companion artefacts: `docs/2026-06-05_manifold-replacement-
 
 > **Direction update (2026-06-06).** This document has two layers. The **audit findings** (F1–F6), the **sequenced work plan** (W1–W17), and the **risks** below are unchanged and still load-bearing — they are the factual base. What flipped on 2026-06-06 is the **top-level decision** and the **feature-flag endgame**: the target is now **full retirement of `manifold-csg` from default builds in 2–3 months**, not "keep manifold this cycle." The TL;DR and "Feature flag strategy" sections below have been rewritten to reflect this; everything between is the original audit and remains accurate. Rationale for the flip lives in the [[manifold-replacement-direction]] memory and worklog `docs/worklog/2026-06-06-01-08_manifold-strategy-update-full-retirement-target.md`.
 
+> **Status note (2026-09-06, GH #164).** The 2–3 month retirement target set on 2026-06-06 has passed. As of v0.4.42 `csg` (manifold) is still in the default feature set and `prism-csg-fast` (W6/W9) is opt-in — see `crates/core/Cargo.toml`. Phase 1 landed the pure-Rust halfspace clip (GH #39) and the prism fast-path behind a flag; Phase 2/3 have not started. Treat the timeline below as historical; the direction (retire manifold from defaults, keep it opt-in) is unchanged and tracked under GH #58.
+
 ## TL;DR
 
 **Target: full retirement of `manifold-csg` from default builds in 2–3 months**, via a specialized IFC-CSG implementation across the IFC opening/host vocabulary, with manifold staying available behind an opt-in feature flag indefinitely as the long-tail escape hatch.

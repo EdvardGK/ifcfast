@@ -25,7 +25,10 @@ use _core::indexer;
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
-        eprintln!("usage: {} <path/to/file.ifc>", args.first().map(String::as_str).unwrap_or("ifcfast-bench"));
+        eprintln!(
+            "usage: {} <path/to/file.ifc>",
+            args.first().map(String::as_str).unwrap_or("ifcfast-bench")
+        );
         return ExitCode::from(2);
     }
 
@@ -44,6 +47,13 @@ fn main() -> ExitCode {
     let t_index = Instant::now();
     let idx = indexer::index(&mmap);
     let index_ms = t_index.elapsed().as_secs_f64() * 1000.0;
+    for w in &idx.warnings {
+        eprintln!("[ifcfast-bench] WARNING: {w}");
+    }
+    if let Some(err) = &idx.parse_error {
+        eprintln!("[ifcfast-bench] ERROR: truncated IFC: {err}");
+        return ExitCode::from(2);
+    }
 
     let size_mb = mmap.len() as f64 / 1_000_000.0;
     let throughput = if index_ms > 0.0 {
@@ -69,7 +79,10 @@ fn main() -> ExitCode {
     println!("contained_in:   {:>10}", idx.contained_in_child.len());
     println!("aggregates:     {:>10}", idx.aggregates_child.len());
     println!("storey_building:{:>10}", idx.storey_building_storey.len());
-    println!("type_counts:    {:>10}   distinct entities", idx.type_counts.len());
+    println!(
+        "type_counts:    {:>10}   distinct entities",
+        idx.type_counts.len()
+    );
     println!("throughput:     {throughput:>10.0} MB/s");
 
     if let Some(app) = &idx.authoring_app {

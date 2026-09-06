@@ -191,10 +191,7 @@ impl Plan {
         let mut forced_baked: Vec<usize> = Vec::new();
         for (i, mesh) in meshes.iter().enumerate() {
             if mesh.parts.len() == 1 && !mesh.vertices.is_empty() && !mesh.indices.is_empty() {
-                by_rep
-                    .entry(mesh.parts[0].rep_step_id)
-                    .or_default()
-                    .push(i);
+                by_rep.entry(mesh.parts[0].rep_step_id).or_default().push(i);
             } else {
                 forced_baked.push(i);
             }
@@ -216,7 +213,12 @@ impl Plan {
         baked.sort_unstable();
         // Order instance groups by their first member's input index so
         // the resulting glTF nodes have a stable, replay-friendly order.
-        instanced.sort_by_key(|g| g.member_indices.first().copied().unwrap_or(u64::MAX as usize));
+        instanced.sort_by_key(|g| {
+            g.member_indices
+                .first()
+                .copied()
+                .unwrap_or(u64::MAX as usize)
+        });
         Plan { baked, instanced }
     }
 }
@@ -292,11 +294,7 @@ struct InstancedViews {
 /// arrays) into one binary blob, aligned to 4 bytes between regions.
 fn pack_binary(meshes: &[ProductMesh], plan: &Plan) -> (Vec<u8>, BinaryLayout) {
     // Conservatively reserve. Over-estimates are cheap; re-allocs are not.
-    let baked_verts: usize = plan
-        .baked
-        .iter()
-        .map(|&i| meshes[i].vertices.len())
-        .sum();
+    let baked_verts: usize = plan.baked.iter().map(|&i| meshes[i].vertices.len()).sum();
     let baked_idx: usize = plan.baked.iter().map(|&i| meshes[i].indices.len()).sum();
     let inst_verts: usize = plan
         .instanced
@@ -394,13 +392,25 @@ fn pack_one_baked(mesh: &ProductMesh, bin: &mut Vec<u8>) -> BakedViews {
     // always 0, so 0*0 + translation = translation = the only
     // world value along that axis).
     let q_scale: [f32; 3] = [
-        if range[0] > 0.0 { range[0] / 65535.0 } else { 0.0 },
-        if range[1] > 0.0 { range[1] / 65535.0 } else { 0.0 },
-        if range[2] > 0.0 { range[2] / 65535.0 } else { 0.0 },
+        if range[0] > 0.0 {
+            range[0] / 65535.0
+        } else {
+            0.0
+        },
+        if range[1] > 0.0 {
+            range[1] / 65535.0
+        } else {
+            0.0
+        },
+        if range[2] > 0.0 {
+            range[2] / 65535.0
+        } else {
+            0.0
+        },
     ];
 
     let pos_offset = bin.len() as u32;
-    for chunk in mesh.vertices.chunks_exact(3) {
+    for chunk in mesh.vertices.as_chunks::<3>().0 {
         for k in 0..3 {
             let q: u16 = if range[k] > 0.0 {
                 // (v - min) / range * 65535, clamped to u16.
@@ -457,13 +467,25 @@ fn pack_one_local_quantized(
         if range[2] > 0.0 { 65535 } else { 0 },
     ];
     let q_scale: [f32; 3] = [
-        if range[0] > 0.0 { range[0] / 65535.0 } else { 0.0 },
-        if range[1] > 0.0 { range[1] / 65535.0 } else { 0.0 },
-        if range[2] > 0.0 { range[2] / 65535.0 } else { 0.0 },
+        if range[0] > 0.0 {
+            range[0] / 65535.0
+        } else {
+            0.0
+        },
+        if range[1] > 0.0 {
+            range[1] / 65535.0
+        } else {
+            0.0
+        },
+        if range[2] > 0.0 {
+            range[2] / 65535.0
+        } else {
+            0.0
+        },
     ];
 
     let pos_offset = bin.len() as u32;
-    for chunk in vertices.chunks_exact(3) {
+    for chunk in vertices.as_chunks::<3>().0 {
         for k in 0..3 {
             let q: u16 = if range[k] > 0.0 {
                 let f = ((chunk[k] - min[k]) / range[k] * 65535.0).round();
@@ -522,7 +544,7 @@ fn pack_indices(indices: &[u32], n_verts: u32, bin: &mut Vec<u8>) -> (u32, u32) 
 fn bbox(vertices: &[f32]) -> ([f32; 3], [f32; 3]) {
     let mut min = [f32::INFINITY; 3];
     let mut max = [f32::NEG_INFINITY; 3];
-    for chunk in vertices.chunks_exact(3) {
+    for chunk in vertices.as_chunks::<3>().0 {
         for k in 0..3 {
             let v = chunk[k];
             if v < min[k] {
@@ -719,17 +741,15 @@ fn build_json(
     //   `parts[k].surface_color` → `mesh.surface_color` → entity palette.
     let mut materials_list: Vec<[f32; 4]> = Vec::new();
     let mut color_dedup: HashMap<[u32; 4], usize> = HashMap::new();
-    let intern_color = |c: [f32; 4],
-                        list: &mut Vec<[f32; 4]>,
-                        dedup: &mut HashMap<[u32; 4], usize>|
-     -> usize {
-        let key = color_key(c);
-        *dedup.entry(key).or_insert_with(|| {
-            let idx = list.len();
-            list.push(c);
-            idx
-        })
-    };
+    let intern_color =
+        |c: [f32; 4], list: &mut Vec<[f32; 4]>, dedup: &mut HashMap<[u32; 4], usize>| -> usize {
+            let key = color_key(c);
+            *dedup.entry(key).or_insert_with(|| {
+                let idx = list.len();
+                list.push(c);
+                idx
+            })
+        };
 
     // Per-baked-product segment list: (byte_offset_in_idx_bv, n_indices, material_idx)
     // — emitted as N primitives + N indices accessors per product.
@@ -742,7 +762,7 @@ fn build_json(
             _ => 4u32,
         };
         let mut segs: Vec<(u32, u32, usize)> = Vec::new();
-        let use_segments = mesh.segments.len() > 0
+        let use_segments = !mesh.segments.is_empty()
             && !mesh.parts.is_empty()
             && mesh.parts.len() == mesh.segments.len();
         if use_segments {
@@ -1229,13 +1249,7 @@ fn push_accessor_indices(
     s.push_str(r#""}"#);
 }
 
-fn push_accessor_vec(
-    s: &mut String,
-    first: &mut bool,
-    bv_idx: u32,
-    count: u32,
-    vec_type: &str,
-) {
+fn push_accessor_vec(s: &mut String, first: &mut bool, bv_idx: u32, count: u32, vec_type: &str) {
     if !*first {
         s.push(',');
     }

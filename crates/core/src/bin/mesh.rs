@@ -70,13 +70,36 @@ fn main() -> ExitCode {
         open_ms, size_mb
     );
 
+    // GH #148: refuse a truncated DATA section before meshing a
+    // partial model. Index is re-run below for unit_scale; this early
+    // pass is cheap next to the mesh pass.
+    {
+        let idx = _core::indexer::index(&mmap);
+        for w in &idx.warnings {
+            eprintln!("[ifcfast-mesh] WARNING: {w}");
+        }
+        if let Some(err) = &idx.parse_error {
+            eprintln!("[ifcfast-mesh] ERROR: truncated IFC: {err}");
+            return ExitCode::from(2);
+        }
+    }
+
     let (meshes, stats) = mesh::mesh_ifc(&mmap);
 
-    eprintln!("[ifcfast-mesh] entity table     {:>8.1} ms", stats.entity_table_build_ms);
-    eprintln!("[ifcfast-mesh] mesh emission    {:>8.1} ms", stats.elapsed_ms);
+    eprintln!(
+        "[ifcfast-mesh] entity table     {:>8.1} ms",
+        stats.entity_table_build_ms
+    );
+    eprintln!(
+        "[ifcfast-mesh] mesh emission    {:>8.1} ms",
+        stats.elapsed_ms
+    );
     eprintln!("[ifcfast-mesh] products seen:    {}", stats.products_seen);
     eprintln!("[ifcfast-mesh] products meshed:  {}", stats.products_meshed);
-    eprintln!("[ifcfast-mesh] products deferred:{}", stats.products_deferred);
+    eprintln!(
+        "[ifcfast-mesh] products deferred:{}",
+        stats.products_deferred
+    );
     eprintln!("[ifcfast-mesh] triangles emitted:{}", stats.triangles);
     if !stats.by_source.is_empty() {
         eprintln!("[ifcfast-mesh] by source:");

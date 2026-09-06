@@ -58,7 +58,13 @@ fn item_local_composes_to_world_through_placement() {
         assert_eq!(w.indices, l.indices, "frames must not reorder topology");
 
         let mut worst = 0.0_f64;
-        for (wc, lc) in w.vertices.chunks_exact(3).zip(l.vertices.chunks_exact(3)) {
+        for (wc, lc) in w
+            .vertices
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .zip(l.vertices.as_chunks::<3>().0.iter())
+        {
             let mapped =
                 apply_placement(&w.world_transform, &w.world_origin, [lc[0], lc[1], lc[2]]);
             for k in 0..3 {
@@ -83,8 +89,14 @@ fn item_local_drops_placement_but_keeps_mapping() {
 
     // WallA sits at (10000, 5000, 2000): world and item-local must be
     // loudly apart — this is the double-placement trap GH #127 closes.
-    let wa_w = world.iter().find(|m| m.guid == "0LocalFrameWallA000001").unwrap();
-    let wa_l = local.iter().find(|m| m.guid == "0LocalFrameWallA000001").unwrap();
+    let wa_w = world
+        .iter()
+        .find(|m| m.guid == "0LocalFrameWallA000001")
+        .unwrap();
+    let wa_l = local
+        .iter()
+        .find(|m| m.guid == "0LocalFrameWallA000001")
+        .unwrap();
     let max_delta = wa_w
         .vertices
         .iter()
@@ -99,10 +111,15 @@ fn item_local_drops_placement_but_keeps_mapping() {
     // WallB's mapping LocalOrigin is (2000, 0, 0): the item-local mesh
     // must keep it (x extent reaches past 1500 mm), because the mapped
     // item IS the Body item — only the ObjectPlacement is dropped.
-    let wb_l = local.iter().find(|m| m.guid == "0LocalFrameWallB000001").unwrap();
+    let wb_l = local
+        .iter()
+        .find(|m| m.guid == "0LocalFrameWallB000001")
+        .unwrap();
     let max_x = wb_l
         .vertices
-        .chunks_exact(3)
+        .as_chunks::<3>()
+        .0
+        .iter()
         .map(|c| c[0])
         .fold(f32::MIN, f32::max);
     assert!(

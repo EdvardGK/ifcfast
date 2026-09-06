@@ -304,7 +304,12 @@ fn arbitrary_with_voids(table: &EntityTable, fields: &[&[u8]]) -> Option<Polygon
     let holes_field = fields.get(3).copied()?;
     let body = match parse_field(holes_field) {
         Field::List(b) => b,
-        _ => return Some(Polygon2D { outer, holes: vec![] }),
+        _ => {
+            return Some(Polygon2D {
+                outer,
+                holes: vec![],
+            })
+        }
     };
     // Holes are pushed as authored — `normalize_winding` at the `extract`
     // exit forces them CW by signed area. (A blind `reverse()` here was
@@ -356,9 +361,7 @@ fn curve_to_polyline(table: &EntityTable, curve_id: u64) -> Option<Vec<Vec2>> {
         // Revit MEP pipe (4 points + 2 IfcArcIndex semicircles)
         // collapses to a 4-sided prism — GH #48.
         if let Some(seg_body) = list_body(fields.get(1).copied()) {
-            if let Some(poly) =
-                crate::mesh::indexed_curve::eval_segments_2d(&raw_pts, seg_body)
-            {
+            if let Some(poly) = crate::mesh::indexed_curve::eval_segments_2d(&raw_pts, seg_body) {
                 return Some(poly);
             }
         }
@@ -472,7 +475,7 @@ fn conic_arc(
         fields.get(3).copied().map(parse_field),
         Some(Field::Enum(b"T"))
     );
-    let (start, end) = arc_span(a1, a2, sense);
+    let (start, end) = arc_span(a1, a2, sense)?;
     let sweep = (end - start).abs();
     let n = ((CURVE_SAMPLES as f32) * sweep / std::f32::consts::TAU)
         .ceil()
@@ -483,7 +486,10 @@ fn conic_arc(
             let t = start + (end - start) * (i as f32 / n as f32);
             let lx = a * t.cos();
             let ly = b * t.sin();
-            Vec2::new(center.x + cos * lx - sin * ly, center.y + sin * lx + cos * ly)
+            Vec2::new(
+                center.x + cos * lx - sin * ly,
+                center.y + sin * lx + cos * ly,
+            )
         })
         .collect();
     Some(pts)
@@ -611,7 +617,11 @@ fn parameter_value(raw: &[u8]) -> Option<f64> {
     if close <= open + 1 {
         return None;
     }
-    std::str::from_utf8(&raw[open + 1..close]).ok()?.trim().parse().ok()
+    std::str::from_utf8(&raw[open + 1..close])
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
 }
 
 /// Radians per authored plane-angle unit, for scaling `IfcParameterValue`
@@ -632,6 +642,19 @@ fn parameter_value(raw: &[u8]) -> Option<f64> {
 /// (both G55 files carry one) is ignored.
 fn resolve_plane_angle_scale(table: &EntityTable) -> f32 {
     const DEGREE: f32 = std::f32::consts::PI / 180.0;
+    resolve_plane_angle_scale_opt(table).unwrap_or(DEGREE)
+}
+
+/// The declared PLANEANGLEUNIT scale, or `None` when the file declares
+/// none. Split out from [`resolve_plane_angle_scale`] (GH #155) because
+/// the degrees-default above is a *trim-parameter* heuristic: an
+/// `IfcParameterValue` conic trim is ambiguous and authored in degrees
+/// in practice. A true `IfcPlaneAngleMeasure` (e.g.
+/// `IfcRevolvedAreaSolid.Angle`) is NOT ambiguous — the schema says it
+/// is in the declared unit, radians when undeclared — so that caller
+/// takes the `Option` and defaults to radians, which is also what
+/// ifcopenshell does.
+pub(crate) fn resolve_plane_angle_scale_opt(table: &EntityTable) -> Option<f32> {
     // The unit assignment can be the last entity in a multi-million-entry
     // file (G55_ARK: penultimate of ~2.8M), so use the table's memoized
     // lookup — one scan per model — rather than re-scanning per arc.
@@ -667,7 +690,7 @@ fn resolve_plane_angle_scale(table: &EntityTable) -> f32 {
                 uf.get(3).copied().map(parse_field),
                 Some(Field::Enum(b"RADIAN"))
             ) {
-                return 1.0;
+                return Some(1.0);
             }
         } else if utype.eq_ignore_ascii_case(b"IFCCONVERSIONBASEDUNIT") {
             // (Dimensions, UnitType, Name, ConversionFactor) → follow the
@@ -681,33 +704,48 @@ fn resolve_plane_angle_scale(table: &EntityTable) -> f32 {
                     let mf = split_top_level_args(margs);
                     if let Some(v) = mf.first().copied().and_then(parameter_value) {
                         if v.is_finite() && v > 0.0 {
-                            return v as f32;
+                            return Some(v as f32);
                         }
                     }
                 }
             }
         }
     }
-    DEGREE
+    None
 }
 
 /// Directed angular span `[start, end]` from `a1` to `a2`. `sense == true`
 /// sweeps CCW (increasing angle), `false` CW; a1 == a2 yields a full turn.
-fn arc_span(a1: f32, a2: f32, sense: bool) -> (f32, f32) {
+///
+/// `None` for non-finite input (GH #160). This used to be a
+/// `while e += TAU` walk, which never terminates once `|a1|` exceeds
+/// ~1.3e8 (TAU is below the f32 ULP there, so `e` stops advancing) and
+/// hangs outright on an infinite or NaN trim angle. The modular form
+/// below is O(1) and total.
+fn arc_span(a1: f32, a2: f32, sense: bool) -> Option<(f32, f32)> {
     use std::f32::consts::TAU;
     const EPS: f32 = 1e-6;
-    if sense {
-        let mut e = a2;
-        while e <= a1 + EPS {
-            e += TAU;
-        }
-        (a1, e)
+    if !a1.is_finite() || !a2.is_finite() {
+        return None;
+    }
+    // Distance to walk from a1, in the swept direction, modulo a full
+    // turn. A residue at (or within EPS of) zero means the trims
+    // coincide → a full revolution, matching the old loop's behaviour.
+    let mut delta = if sense {
+        (a2 - a1).rem_euclid(TAU)
     } else {
-        let mut e = a2;
-        while e >= a1 - EPS {
-            e -= TAU;
-        }
-        (a1, e)
+        (a1 - a2).rem_euclid(TAU)
+    };
+    if !delta.is_finite() {
+        return None;
+    }
+    if delta <= EPS {
+        delta = TAU;
+    }
+    if sense {
+        Some((a1, a1 + delta))
+    } else {
+        Some((a1, a1 - delta))
     }
 }
 
@@ -779,16 +817,26 @@ fn composite_curve(table: &EntityTable, fields: &[&[u8]]) -> Option<Vec<Vec2>> {
     };
     let mut out: Vec<Vec2> = Vec::new();
     for seg_field in split_top_level_args(body) {
+        // GH #154: EVERY failure below fails the WHOLE profile. The old
+        // `continue` skipped the segment and then closed the loop across
+        // the gap, producing a shape that is closed, plausible and wrong
+        // — and passes the QTO tripwires as `volume_reliable`. Failing
+        // here propagates `None` up through `extract` → the handler →
+        // `mesh_item`'s `single(None, …)`, which emits an `Unhandled`
+        // marker naming the item's IFC type. A visible hole in the
+        // output beats a silently-bridged solid.
         let seg_id = match parse_field(seg_field) {
             Field::Ref(id) => id,
-            _ => continue,
+            _ => return None,
         };
-        let (seg_type, seg_args) = match table.get(seg_id) {
-            Some(x) => x,
-            None => continue,
-        };
-        if !seg_type.eq_ignore_ascii_case(b"IFCCOMPOSITECURVESEGMENT") {
-            continue;
+        let (seg_type, seg_args) = table.get(seg_id)?;
+        // IfcReparametrisedCompositeCurveSegment is the one subtype; it
+        // adds ParamLength after the three inherited attributes, so the
+        // arg positions used below are identical.
+        if !seg_type.eq_ignore_ascii_case(b"IFCCOMPOSITECURVESEGMENT")
+            && !seg_type.eq_ignore_ascii_case(b"IFCREPARAMETRISEDCOMPOSITECURVESEGMENT")
+        {
+            return None;
         }
         // IfcCompositeCurveSegment(Transition, SameSense, ParentCurve)
         let seg_fields = split_top_level_args(seg_args);
@@ -798,12 +846,12 @@ fn composite_curve(table: &EntityTable, fields: &[&[u8]]) -> Option<Vec<Vec2>> {
         );
         let parent_id = match seg_fields.get(2).copied().map(parse_field) {
             Some(Field::Ref(id)) => id,
-            _ => continue,
+            _ => return None,
         };
-        let mut pts = match curve_to_polyline(table, parent_id) {
-            Some(p) => p,
-            None => continue,
-        };
+        // `curve_to_polyline` returns `None` for every curve subtype it
+        // cannot tessellate (B-spline, IfcOffsetCurve, unsampled conics,
+        // …) — the general case GH #123 left open.
+        let mut pts = curve_to_polyline(table, parent_id)?;
         if !same_sense {
             pts.reverse();
         }
@@ -894,11 +942,7 @@ fn cartesian_point_2d(table: &EntityTable, id: u64) -> Option<Vec2> {
 // Profile-local Position transform (2D)
 // ----------------------------------------------------------------------
 
-fn apply_profile_position(
-    table: &EntityTable,
-    fields: &[&[u8]],
-    poly: Polygon2D,
-) -> Polygon2D {
+fn apply_profile_position(table: &EntityTable, fields: &[&[u8]], poly: Polygon2D) -> Polygon2D {
     // Parametric profiles put Position at arg[2].
     let pos_id = match fields.get(2).copied().map(parse_field) {
         Some(Field::Ref(id)) => id,
@@ -1022,5 +1066,83 @@ fn ref_at(fields: &[&[u8]], idx: usize) -> Option<u64> {
     match parse_field(fields.get(idx)?) {
         Field::Ref(id) => Some(id),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod curve_tests {
+    use super::*;
+
+    /// Two composite curves over the same points: `#30` contains a
+    /// segment whose parent is a B-spline (`curve_to_polyline` cannot
+    /// tessellate it), `#31` is all polylines.
+    const COMPOSITE_IFC: &str = r#"ISO-10303-21;
+HEADER;
+FILE_DESCRIPTION(('ViewDefinition [ReferenceView]'),'2;1');
+FILE_NAME('cc.ifc','2026-09-06T00:00:00',('test'),('skiplum'),'ifcfast','ifcfast','');
+FILE_SCHEMA(('IFC4'));
+ENDSEC;
+DATA;
+#1=IFCCARTESIANPOINT((0.,0.));
+#2=IFCCARTESIANPOINT((10.,0.));
+#3=IFCCARTESIANPOINT((10.,10.));
+#4=IFCCARTESIANPOINT((0.,10.));
+#10=IFCPOLYLINE((#1,#2));
+#11=IFCBSPLINECURVEWITHKNOTS(3,(#2,#3,#4,#1),.UNSPECIFIED.,.F.,.F.,(4,4),(0.,1.),.UNSPECIFIED.);
+#12=IFCPOLYLINE((#2,#3,#4));
+#20=IFCCOMPOSITECURVESEGMENT(.CONTINUOUS.,.T.,#10);
+#21=IFCCOMPOSITECURVESEGMENT(.CONTINUOUS.,.T.,#11);
+#22=IFCCOMPOSITECURVESEGMENT(.CONTINUOUS.,.T.,#12);
+#30=IFCCOMPOSITECURVE((#20,#21),.F.);
+#31=IFCCOMPOSITECURVE((#20,#22),.F.);
+ENDSEC;
+END-ISO-10303-21;
+"#;
+
+    /// GH #154: a segment the kernel cannot tessellate fails the WHOLE
+    /// profile. The old `continue` closed the loop across the gap and
+    /// produced a plausible — and wrong — closed shape that passed the
+    /// QTO reliability tripwires.
+    #[test]
+    fn untessellatable_segment_fails_the_whole_composite_curve() {
+        let table = EntityTable::build(COMPOSITE_IFC.as_bytes());
+        assert!(
+            curve_to_polyline(&table, 30).is_none(),
+            "a B-spline segment must fail the composite curve, not be bridged"
+        );
+    }
+
+    /// The all-polyline composite still resolves — the fail-loud change
+    /// does not reject valid input.
+    #[test]
+    fn all_polyline_composite_curve_still_resolves() {
+        let table = EntityTable::build(COMPOSITE_IFC.as_bytes());
+        let pts = curve_to_polyline(&table, 31).expect("polyline composite resolves");
+        assert_eq!(pts.len(), 4, "got {pts:?}");
+    }
+
+    /// GH #160: `arc_span` is modular and total.
+    #[test]
+    fn arc_span_is_modular_and_total() {
+        use std::f32::consts::{PI, TAU};
+        let (s, e) = arc_span(0.0, PI, true).unwrap();
+        assert!((s - 0.0).abs() < 1e-5 && (e - PI).abs() < 1e-5);
+        // Coincident trims → a full turn, in both senses.
+        let (_, e) = arc_span(1.0, 1.0, true).unwrap();
+        assert!((e - (1.0 + TAU)).abs() < 1e-4);
+        let (_, e) = arc_span(1.0, 1.0, false).unwrap();
+        assert!((e - (1.0 - TAU)).abs() < 1e-4);
+        // CCW to a *smaller* angle wraps forward by a full turn.
+        let (_, e) = arc_span(0.0, -PI, true).unwrap();
+        assert!((e - PI).abs() < 1e-4, "got {e}");
+        // CW to a *larger* angle wraps backward.
+        let (_, e) = arc_span(0.0, PI, false).unwrap();
+        assert!((e + PI).abs() < 1e-4, "got {e}");
+        // Non-finite input is rejected, never looped on.
+        assert!(arc_span(f32::INFINITY, 0.0, true).is_none());
+        assert!(arc_span(0.0, f32::NAN, true).is_none());
+        // A huge angle terminates (the old `while e += TAU` never did:
+        // TAU is below the f32 ULP at this magnitude).
+        assert!(arc_span(2.0e8, 2.0e8, true).is_some());
     }
 }

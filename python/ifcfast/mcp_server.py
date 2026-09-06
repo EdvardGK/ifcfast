@@ -31,6 +31,7 @@ underlying parquet cache makes hot reloads cheap across sessions too.
 from __future__ import annotations
 
 import os
+from collections import OrderedDict
 from pathlib import Path
 from typing import Optional
 
@@ -51,7 +52,16 @@ mcp = FastMCP(
 
 
 # In-process model cache so repeated tool calls don't re-parse.
-_open_models: dict[str, ifcfast.Model] = {}
+#
+# Bounded (GH #162): every entry pins a fully-parsed Model — tier-1
+# index, relationship frames, and any data layer a tool touched. An
+# unbounded dict meant a long-lived MCP session that walked a directory
+# of models held every one of them until the process exited. `close()`
+# existed but nothing obliged an agent to call it. LRU by last USE (not
+# last open), evicted oldest-first; the on-disk parquet cache makes a
+# re-open of an evicted model cheap.
+_MAX_OPEN_MODELS = 8
+_open_models: "OrderedDict[str, ifcfast.Model]" = OrderedDict()
 
 
 def _resolve(path: str, *, strict: bool = True) -> ifcfast.Model:
@@ -82,6 +92,10 @@ def _resolve(path: str, *, strict: bool = True) -> ifcfast.Model:
     if m is None:
         m = ifcfast.open(p, strict=strict)
         _open_models[p] = m
+        while len(_open_models) > _MAX_OPEN_MODELS:
+            _open_models.popitem(last=False)  # evict least-recently-used
+    else:
+        _open_models.move_to_end(p)
     return m
 
 
@@ -207,9 +221,14 @@ def parent(path: str, guid: str) -> Optional[str]:
 
 
 @mcp.tool()
-def children(path: str, guid: str) -> list[str]:
-    """Unified direct children of ``guid``."""
-    return _resolve(path).children(guid)
+def children(path: str, guid: str, limit: int = 200) -> list[str]:
+    """Unified direct children of ``guid``.
+
+    Capped at ``limit`` (default 200), like every other tool here. A
+    result of exactly ``limit`` items means there are probably more —
+    re-query with a higher ``limit``.
+    """
+    return _resolve(path).children(guid)[:limit]
 
 
 @mcp.tool()
@@ -219,9 +238,16 @@ def ancestors(path: str, guid: str) -> list[str]:
 
 
 @mcp.tool()
-def descendants(path: str, guid: str) -> list[str]:
-    """BFS over the unified-children tree under ``guid``."""
-    return _resolve(path).descendants(guid)
+def descendants(path: str, guid: str, limit: int = 200) -> list[str]:
+    """BFS over the unified-children tree under ``guid``.
+
+    Capped at ``limit`` (default 200) — BFS from a building or project
+    guid otherwise returns every product in the model in one tool
+    response (GH #162). A result of exactly ``limit`` items means there
+    are probably more; re-query with a higher ``limit``, or walk down
+    one level at a time with :func:`children`.
+    """
+    return _resolve(path).descendants(guid)[:limit]
 
 
 @mcp.tool()
@@ -237,9 +263,15 @@ def building_of(path: str, guid: str) -> Optional[str]:
 
 
 @mcp.tool()
-def products_in(path: str, parent_guid: str) -> list[str]:
-    """All product guids under ``parent_guid`` (BFS, filtered to products)."""
-    return _resolve(path).products_in(parent_guid)
+def products_in(path: str, parent_guid: str, limit: int = 200) -> list[str]:
+    """All product guids under ``parent_guid`` (BFS, filtered to products).
+
+    Capped at ``limit`` (default 200); a storey on a real model holds
+    thousands (GH #162). A result of exactly ``limit`` items means there
+    are probably more — re-query with a higher ``limit``, or use
+    ``by_type`` / ``preview("products")`` for bulk listing.
+    """
+    return _resolve(path).products_in(parent_guid)[:limit]
 
 
 @mcp.tool()
@@ -325,6 +357,32 @@ def materials(
 
 
 @mcp.tool()
+def classifications(
+    path: str,
+    guid: Optional[str] = None,
+    system_name: Optional[str] = None,
+    identification: Optional[str] = None,
+    limit: int = 200,
+) -> list[dict]:
+    """Classification-reference rows (NS 3451, OmniClass, Uniclass, …).
+
+    Long-format rows: ``guid`` / ``system_name`` / ``edition`` /
+    ``identification`` (the code) / ``name`` / ``location`` /
+    ``source``. Filter by element ``guid``, ``system_name`` (e.g.
+    ``"NS 3451"``) and/or ``identification``. Completes the psets /
+    quantities / materials set (GH #163). Returns up to ``limit`` rows.
+    """
+    df = _resolve(path).classifications
+    if guid is not None:
+        df = df[df["guid"] == guid]
+    if system_name is not None:
+        df = df[df["system_name"] == system_name]
+    if identification is not None:
+        df = df[df["identification"] == identification]
+    return _records(df, limit)
+
+
+@mcp.tool()
 def product_card(path: str, guid: str, limit: int = 200) -> Optional[dict]:
     """Everything about one element in a single call.
 
@@ -386,15 +444,15 @@ def close(path: str) -> bool:
 @mcp.resource("ifcfast://agents-guide")
 def agents_guide() -> str:
     """The full AGENTS.md guide — agent onboarding, decision tree,
-    performance budget, conventions."""
-    candidates = [
-        Path(__file__).parent.parent.parent / "AGENTS.md",
-        Path(__file__).parent / "AGENTS.md",
-    ]
-    for p in candidates:
-        if p.exists():
-            return p.read_text(encoding="utf-8")
-    return ifcfast.system_prompt()
+    performance budget, conventions.
+
+    Raises ``FileNotFoundError`` when the packaged guide is missing.
+    It used to fall back to the ~60-line ``system_prompt()`` with no
+    signal (GH #157) — an agent that asked for the full contract got a
+    summary and could not tell. On the one surface this project exists
+    for, a loud failure beats a plausible-looking short answer.
+    """
+    return ifcfast.agents_guide()
 
 
 # ----------------------------------------------------------------------

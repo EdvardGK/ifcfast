@@ -80,6 +80,9 @@ pub struct MaterialEntry {
     /// 0..1 weight). `None` for all other roles. See
     /// [`crate::extractors::materials::MaterialTable::fraction`].
     pub fraction: Option<f64>,
+    /// Provenance: "instance" (bound directly to the product) or
+    /// "type" (inherited via IfcRelDefinesByType). GH #165.
+    pub source: &'static str,
 }
 
 /// One quantity (length/area/volume/count) on a product.
@@ -106,6 +109,10 @@ pub struct ClassificationEntry {
     pub name: Option<Arc<str>>,
     pub location: Option<Arc<str>>,
     pub source: Option<Arc<str>>,
+    /// Provenance of the association: "instance" or "type". Named
+    /// `assignment_source` because `source` on this table is
+    /// `IfcClassification.Source` (the publisher). GH #165.
+    pub assignment_source: &'static str,
 }
 
 /// Per-product semantic snapshot, paired with geometry by the sink.
@@ -136,6 +143,13 @@ pub struct ProductSemantics {
 /// All semantic data the streaming converter needs, pre-built once and
 /// looked up by product GUID during the mesh pass.
 pub struct Bundle {
+    /// GH #148: `Some` when the DATA walk stopped early — the bundle
+    /// would describe a PARTIAL model. Callers must refuse to publish
+    /// (lib.rs raises `IfcfastError`; `ifcfast-bundle` exits non-zero).
+    pub parse_error: Option<String>,
+    /// Non-fatal anomalies from the index + entity-table passes
+    /// (unit resolution, missing FILE_SCHEMA, duplicate ids).
+    pub warnings: Vec<String>,
     pub schema: String,
     pub project_name: Option<String>,
     pub authoring_app: Option<String>,
@@ -180,10 +194,7 @@ fn intern(cache: &mut HashMap<String, Arc<str>>, s: String) -> Arc<str> {
     a
 }
 
-fn intern_opt(
-    cache: &mut HashMap<String, Arc<str>>,
-    s: Option<String>,
-) -> Option<Arc<str>> {
+fn intern_opt(cache: &mut HashMap<String, Arc<str>>, s: Option<String>) -> Option<Arc<str>> {
     s.map(|v| intern(cache, v))
 }
 
@@ -201,6 +212,12 @@ impl Bundle {
     pub fn build(buf: &[u8]) -> Self {
         let table = EntityTable::build(buf);
         let mut idx = indexer::index(buf);
+        let parse_error = idx
+            .parse_error
+            .clone()
+            .or_else(|| table.scan_error().map(str::to_string));
+        let mut warnings = std::mem::take(&mut idx.warnings);
+        warnings.extend(table.warnings().iter().cloned());
 
         // Step-id -> guid for every IfcRoot-derived entity, used by
         // every extractor and by the storey/type lookups below.
@@ -255,8 +272,7 @@ impl Bundle {
 
         // Product step_id -> aggregate parent step_id. IfcRelAggregates
         // child->parent (e.g. an assembly's parts -> the assembly).
-        let mut agg_parent: HashMap<u64, u64> =
-            HashMap::with_capacity(idx.aggregates_child.len());
+        let mut agg_parent: HashMap<u64, u64> = HashMap::with_capacity(idx.aggregates_child.len());
         for (child, parent) in idx
             .aggregates_child
             .iter()
@@ -333,16 +349,14 @@ impl Bundle {
             // wall's storey, a stair flight the stair's). See GH #88 — this
             // makes the denormalised `storey_guid` agree with the graph
             // walk that `m.products_in(storey)` performs.
-            let storey_sid =
-                resolve_storey_sid(sid, &contained_in, &agg_parent, &storey_ids);
+            let storey_sid = resolve_storey_sid(sid, &contained_in, &agg_parent, &storey_ids);
             let storey_guid = storey_sid.and_then(|s| step_to_guid.get(&s).cloned());
             let storey_name = storey_sid
                 .and_then(|s| storey_name_by_id.get(&s).cloned())
                 .map(|s| intern(&mut str_cache, s));
 
             let agg_parent_sid = agg_parent.get(&sid).copied();
-            let aggregates_parent_guid =
-                agg_parent_sid.and_then(|s| step_to_guid.get(&s).cloned());
+            let aggregates_parent_guid = agg_parent_sid.and_then(|s| step_to_guid.get(&s).cloned());
 
             let type_sid = product_type.get(&sid).copied();
             let (type_guid, type_name) = match type_sid.and_then(|s| type_info.get(&s).cloned()) {
@@ -409,18 +423,25 @@ impl Bundle {
             .zip(mat_table.material_name)
             .zip(mat_table.layer_thickness_mm)
             .zip(mat_table.category)
-            .zip(mat_table.fraction);
-        for ((((((guid, role), layer_index), material_name), thickness_mm), category), fraction) in
-            mat_iter
+            .zip(mat_table.fraction)
+            .zip(mat_table.source);
+        for (
+            ((((((guid, role), layer_index), material_name), thickness_mm), category), fraction),
+            source,
+        ) in mat_iter
         {
-            materials_by_guid.entry(guid).or_default().push(MaterialEntry {
-                role,
-                layer_index,
-                name: intern_opt(&mut str_cache, material_name),
-                thickness_mm,
-                category: intern_opt(&mut str_cache, category),
-                fraction,
-            });
+            materials_by_guid
+                .entry(guid)
+                .or_default()
+                .push(MaterialEntry {
+                    role,
+                    layer_index,
+                    name: intern_opt(&mut str_cache, material_name),
+                    thickness_mm,
+                    category: intern_opt(&mut str_cache, category),
+                    fraction,
+                    source,
+                });
         }
 
         let mut quantities_by_guid: HashMap<String, Vec<QuantityEntry>> = HashMap::new();
@@ -449,8 +470,7 @@ impl Bundle {
                 });
         }
 
-        let mut classifications_by_guid: HashMap<String, Vec<ClassificationEntry>> =
-            HashMap::new();
+        let mut classifications_by_guid: HashMap<String, Vec<ClassificationEntry>> = HashMap::new();
         let cls_iter = cls_table
             .guid
             .into_iter()
@@ -459,9 +479,12 @@ impl Bundle {
             .zip(cls_table.identification)
             .zip(cls_table.name)
             .zip(cls_table.location)
-            .zip(cls_table.source);
-        for ((((((guid, system_name), edition), identification), name), location), source) in
-            cls_iter
+            .zip(cls_table.source)
+            .zip(cls_table.assignment_source);
+        for (
+            ((((((guid, system_name), edition), identification), name), location), source),
+            assignment_source,
+        ) in cls_iter
         {
             classifications_by_guid
                 .entry(guid)
@@ -473,6 +496,7 @@ impl Bundle {
                     name: intern_opt(&mut str_cache, name),
                     location: intern_opt(&mut str_cache, location),
                     source: intern_opt(&mut str_cache, source),
+                    assignment_source,
                 });
         }
 
@@ -481,6 +505,8 @@ impl Bundle {
         drop(str_cache);
 
         Self {
+            parse_error,
+            warnings,
             schema: idx.schema,
             project_name: idx.project_name,
             authoring_app: idx.authoring_app,
@@ -503,7 +529,9 @@ impl Bundle {
         let core = self.by_guid.get(guid);
         ProductSemantics {
             ifc_id: core.map(|c| c.ifc_id).unwrap_or(0),
-            class: core.map(|c| Arc::clone(&c.class)).unwrap_or_else(empty_arc_str),
+            class: core
+                .map(|c| Arc::clone(&c.class))
+                .unwrap_or_else(empty_arc_str),
             source_class: core
                 .map(|c| Arc::clone(&c.source_class))
                 .unwrap_or_else(empty_arc_str),
@@ -640,14 +668,12 @@ fn resolve_storey_sid(
             continue;
         }
         // No containment edge — follow the aggregation parent.
-        match agg_parent.get(&cur).copied() {
-            Some(parent) => {
-                if storey_ids.contains(&parent) {
-                    return Some(parent);
-                }
-                cur = parent;
+        {
+            let parent = agg_parent.get(&cur).copied()?;
+            if storey_ids.contains(&parent) {
+                return Some(parent);
             }
-            None => return None,
+            cur = parent;
         }
     }
 }

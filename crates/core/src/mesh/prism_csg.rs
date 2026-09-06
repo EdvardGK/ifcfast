@@ -264,10 +264,17 @@ impl SweepFrame {
 
     /// Project this prism's own profile onto `(e1, e2)` → `Polygon2D`.
     fn project_profile(&self, p: &PrismParams) -> Polygon2D {
-        let f = |v: &Vec2| self.project_point(transform_point(&p.local_xform, Vec3::new(v.x, v.y, 0.0)));
+        let f = |v: &Vec2| {
+            self.project_point(transform_point(&p.local_xform, Vec3::new(v.x, v.y, 0.0)))
+        };
         Polygon2D {
             outer: p.profile.outer.iter().map(f).collect(),
-            holes: p.profile.holes.iter().map(|h| h.iter().map(f).collect()).collect(),
+            holes: p
+                .profile
+                .holes
+                .iter()
+                .map(|h| h.iter().map(f).collect())
+                .collect(),
         }
     }
 
@@ -361,13 +368,7 @@ mod tests {
         let mut v6 = 0.0_f64;
         for t in m.indices.chunks_exact(3) {
             let (a, b, c) = (t[0] as usize, t[1] as usize, t[2] as usize);
-            let p = |i: usize| {
-                (
-                    v[i * 3] as f64,
-                    v[i * 3 + 1] as f64,
-                    v[i * 3 + 2] as f64,
-                )
-            };
+            let p = |i: usize| (v[i * 3] as f64, v[i * 3 + 1] as f64, v[i * 3 + 2] as f64);
             let (ax, ay, az) = p(a);
             let (bx, by, bz) = p(b);
             let (cx, cy, cz) = p(c);
@@ -413,7 +414,10 @@ mod tests {
         let cutter = z_prism(rect_profile(1.0, 1.0), 3.0, Vec3::new(20.0, 0.0, 0.0));
         let mesh = expect_cut(subtract(&host, &cutter));
         let vol = signed_volume(&mesh);
-        assert!((vol - 48.0).abs() < 1e-3, "volume {vol}, expected 48 (host)");
+        assert!(
+            (vol - 48.0).abs() < 1e-3,
+            "volume {vol}, expected 48 (host)"
+        );
     }
 
     #[test]
@@ -421,7 +425,10 @@ mod tests {
         // Cutter sits entirely above the host along the sweep axis.
         let host = z_prism(rect_profile(4.0, 4.0), 3.0, Vec3::ZERO);
         let cutter = z_prism(rect_profile(1.0, 1.0), 2.0, Vec3::new(0.0, 0.0, 5.0));
-        assert!(matches!(subtract(&host, &cutter), PrismCsgOutcome::Unchanged));
+        assert!(matches!(
+            subtract(&host, &cutter),
+            PrismCsgOutcome::Unchanged
+        ));
     }
 
     #[test]
@@ -437,7 +444,10 @@ mod tests {
         // not a through-cut → NotParametric (manifold fallback).
         let host = z_prism(rect_profile(4.0, 4.0), 3.0, Vec3::ZERO);
         let cutter = z_prism(rect_profile(1.0, 1.0), 1.5, Vec3::ZERO);
-        assert!(matches!(subtract(&host, &cutter), PrismCsgOutcome::NotParametric));
+        assert!(matches!(
+            subtract(&host, &cutter),
+            PrismCsgOutcome::NotParametric
+        ));
     }
 
     #[test]
@@ -446,7 +456,10 @@ mod tests {
         // Cutter swept along a rotated axis (45° about X) → not parallel.
         let mut cutter = z_prism(rect_profile(1.0, 1.0), 3.0, Vec3::ZERO);
         cutter.local_xform = Mat4::from_rotation_x(std::f32::consts::FRAC_PI_4);
-        assert!(matches!(subtract(&host, &cutter), PrismCsgOutcome::NotParametric));
+        assert!(matches!(
+            subtract(&host, &cutter),
+            PrismCsgOutcome::NotParametric
+        ));
     }
 
     #[test]
@@ -454,7 +467,10 @@ mod tests {
         let host = z_prism(rect_profile(4.0, 4.0), 3.0, Vec3::ZERO);
         let mut cutter = z_prism(rect_profile(1.0, 1.0), 3.0, Vec3::ZERO);
         cutter.dir = Vec3::new(0.3, 0.0, 1.0).normalize(); // oblique
-        assert!(matches!(subtract(&host, &cutter), PrismCsgOutcome::NotParametric));
+        assert!(matches!(
+            subtract(&host, &cutter),
+            PrismCsgOutcome::NotParametric
+        ));
     }
 
     #[test]
@@ -507,7 +523,10 @@ mod tests {
         let mesh = expect_cut(subtract(&host, &cutter));
         let vol = signed_volume(&mesh);
         assert!(vol.is_finite(), "F3 collapse: non-finite volume");
-        assert!((vol - 45.0).abs() < 1e-3, "far-origin rebase volume {vol}, expected 45");
+        assert!(
+            (vol - 45.0).abs() < 1e-3,
+            "far-origin rebase volume {vol}, expected 45"
+        );
     }
 
     #[test]

@@ -14,9 +14,7 @@ use std::sync::Arc;
 
 use crate::geom::{self, AabbF32};
 
-use super::source::{
-    self, InstanceRow, RepresentationRow, SubstrateReadError,
-};
+use super::source::{self, InstanceRow, RepresentationRow, SubstrateReadError};
 
 /// Per-pair clash classification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -87,7 +85,7 @@ const NON_PHYSICAL_CLASSES: &[&str] = &[
 ];
 
 fn is_non_physical(class: &str) -> bool {
-    NON_PHYSICAL_CLASSES.iter().any(|c| *c == class)
+    NON_PHYSICAL_CLASSES.contains(&class)
 }
 
 /// Detect a same-family MEP joint: one side ends with `"Fitting"`,
@@ -97,10 +95,7 @@ fn is_non_physical(class: &str) -> bool {
 fn is_same_family_joint(class_a: &str, class_b: &str) -> bool {
     let (a_prefix, a_is_fitting) = split_mep_class(class_a);
     let (b_prefix, b_is_fitting) = split_mep_class(class_b);
-    match (a_prefix, b_prefix) {
-        (Some(pa), Some(pb)) if pa == pb && a_is_fitting != b_is_fitting => true,
-        _ => false,
-    }
+    matches!((a_prefix, b_prefix), (Some(pa), Some(pb)) if pa == pb && a_is_fitting != b_is_fitting)
 }
 
 /// Splits an MEP class into `(family_prefix, is_fitting)`. Returns
@@ -164,7 +159,9 @@ pub struct ClashPair {
 pub struct ClashOptions {
     /// Soft-clash band, in metres. `0.0` means "hard clashes only";
     /// positive values also emit `Clearance` pairs whose meshes are
-    /// within that distance of each other.
+    /// within that distance of each other. Must be finite and >= 0 —
+    /// [`run`] rejects anything else rather than quietly shrinking the
+    /// broad phase (GH #161).
     pub tolerance_m: f32,
     /// If set, only emit pairs where at least one side matches one of
     /// these classes (after the substrate's `class` normalisation —
@@ -205,22 +202,89 @@ pub struct ClashReport {
     /// Candidate pairs from broad-phase that were dropped because at
     /// least one side's mesh wouldn't build (e.g. degenerate
     /// representation). Surfaced rather than swallowed.
+    ///
+    /// Always equals `narrow_phase_residual_details.len()`; kept as its
+    /// own field because it is the long-standing stats key.
     pub narrow_phase_residuals: usize,
+    /// One entry per residual, naming BOTH sides and why the pair never
+    /// reached the narrow phase (GH #161). An anonymous count told an
+    /// agent chasing GH #145 (MEP terminal / damper / silencer misses)
+    /// nothing about which elements went missing; these rows do.
+    /// Ordered by candidate-pair order, so the list is deterministic
+    /// across runs and thread counts.
+    pub narrow_phase_residual_details: Vec<NarrowPhaseResidual>,
+}
+
+/// A candidate pair that broad-phase admitted but narrow-phase could
+/// never test, with the identity of both sides and the cause.
+#[derive(Debug, Clone)]
+pub struct NarrowPhaseResidual {
+    pub ifc_id_a: u64,
+    pub ifc_id_b: u64,
+    pub guid_a: String,
+    pub guid_b: String,
+    pub class_a: String,
+    pub class_b: String,
+    pub source_model_a: String,
+    pub source_model_b: String,
+    /// Which side failed to produce a world mesh: `"a"`, `"b"`,
+    /// `"both"`, or `"unknown"` (a cache miss, which should not happen).
+    pub side: &'static str,
+    /// Human-readable cause, e.g.
+    /// `"a: mesh build (rep #4711, 0 tris): index buffer empty…"`.
+    pub reason: String,
+}
+
+/// Build the residual record for a pair whose mesh cache lookup failed
+/// on one or both sides.
+fn residual_for(
+    a: &InstanceRow,
+    b: &InstanceRow,
+    reason_a: Option<&str>,
+    reason_b: Option<&str>,
+) -> NarrowPhaseResidual {
+    let side = match (reason_a.is_some(), reason_b.is_some()) {
+        (true, true) => "both",
+        (true, false) => "a",
+        (false, true) => "b",
+        (false, false) => "unknown",
+    };
+    let reason = match (reason_a, reason_b) {
+        (Some(ra), Some(rb)) => format!("a: {ra}; b: {rb}"),
+        (Some(ra), None) => format!("a: {ra}"),
+        (None, Some(rb)) => format!("b: {rb}"),
+        (None, None) => "world mesh missing from the cache".to_string(),
+    };
+    NarrowPhaseResidual {
+        ifc_id_a: a.ifc_id,
+        ifc_id_b: b.ifc_id,
+        guid_a: a.guid.clone(),
+        guid_b: b.guid.clone(),
+        class_a: a.class.clone(),
+        class_b: b.class.clone(),
+        source_model_a: a.source_model.clone(),
+        source_model_b: b.source_model.clone(),
+        side,
+        reason,
+    }
 }
 
 #[derive(Debug)]
 pub enum ClashError {
     Read(SubstrateReadError),
-    MeshBuild(geom::MeshBuildError),
     NarrowPhase(geom::NarrowPhaseError),
+    /// A caller-supplied option the engine refuses to guess about
+    /// (GH #161) — e.g. a negative or NaN `tolerance_m`, which silently
+    /// SHRINKS every broad-phase AABB and drops genuine hard clashes.
+    InvalidOptions(String),
 }
 
 impl std::fmt::Display for ClashError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Read(e) => write!(f, "substrate read: {e}"),
-            Self::MeshBuild(e) => write!(f, "mesh build: {e}"),
             Self::NarrowPhase(e) => write!(f, "narrow phase: {e}"),
+            Self::InvalidOptions(m) => write!(f, "invalid options: {m}"),
         }
     }
 }
@@ -256,6 +320,28 @@ pub fn run(
     reps: &HashMap<u64, RepresentationRow>,
     options: &ClashOptions,
 ) -> Result<ClashReport, ClashError> {
+    // Fail loudly on a tolerance the pipeline cannot honour (GH #161).
+    // A negative value SHRINKS every broad-phase AABB, so genuine hard
+    // clashes vanish before narrow phase while `tolerance_m > 0.0`
+    // stays false and the hard path still runs — a plausible, silently
+    // incomplete report. NaN poisons every expanded AABB instead:
+    // zero pairs, zero warnings.
+    if !options.tolerance_m.is_finite() || options.tolerance_m < 0.0 {
+        return Err(ClashError::InvalidOptions(format!(
+            "tolerance_m must be finite and >= 0, got {}",
+            options.tolerance_m
+        )));
+    }
+
+    // One anchor for the whole run (GH #156): every mesh AND every
+    // broad-phase box is expressed relative to it, so the f32 mantissa
+    // spends its bits on the model's extent instead of on its distance
+    // from the survey origin. Per-pair anchors would be tighter still,
+    // but they would force a re-bake per pair — pairs vastly outnumber
+    // instances, and the bake is the narrow phase's fixed cost — so the
+    // scene anchor is what keeps ONE bake per instance.
+    let anchor = scene_anchor(instances);
+
     // Build the broad-phase input. Skip geometryless products — they
     // have no rep to narrow-phase against. The broad-phase id is the
     // index into `instances`, so the narrow-phase loop can re-lookup
@@ -269,8 +355,8 @@ pub fn run(
         }
         boxes.push(AabbF32 {
             id: idx as u32,
-            min: inst.bbox_min,
-            max: inst.bbox_max,
+            min: rebase_point(inst.bbox_min, anchor),
+            max: rebase_point(inst.bbox_max, anchor),
         });
     }
 
@@ -280,9 +366,7 @@ pub fn run(
     // geometry work so filtered candidates never cost a mesh build.
     let candidate_pairs: Vec<(u32, u32)> = candidate_pairs
         .into_iter()
-        .filter(|&(a, b)| {
-            class_filter_ok(&instances[a as usize], &instances[b as usize], options)
-        })
+        .filter(|&(a, b)| class_filter_ok(&instances[a as usize], &instances[b as usize], options))
         .collect();
 
     // Materialise world-coord TriMeshes once per instance that shows up
@@ -291,18 +375,15 @@ pub fn run(
     // sharing per-rep BVHs across instances — see module docs for the
     // rationale. Arc so both sides of a pair borrow concurrently.
     use rayon::prelude::*;
-    let mut ids: Vec<u32> = candidate_pairs
-        .iter()
-        .flat_map(|&(a, b)| [a, b])
-        .collect();
+    let mut ids: Vec<u32> = candidate_pairs.iter().flat_map(|&(a, b)| [a, b]).collect();
     ids.sort_unstable();
     ids.dedup();
-    let mesh_cache: HashMap<u32, Option<Arc<parry3d::shape::TriMesh>>> = ids
+    let mesh_cache: HashMap<u32, Result<Arc<parry3d::shape::TriMesh>, String>> = ids
         .par_iter()
         .map(|&idx| {
             (
                 idx,
-                build_world_trimesh(&instances[idx as usize], reps).map(Arc::new),
+                build_world_trimesh(&instances[idx as usize], reps, anchor).map(Arc::new),
             )
         })
         .collect();
@@ -321,18 +402,25 @@ pub fn run(
     // exact query's band verdict despite that jitter.
     enum Outcome {
         Pair(ClashPair),
-        Residual,
+        Residual(NarrowPhaseResidual),
         Skip,
     }
     let outcomes: Vec<Result<Outcome, ClashError>> = candidate_pairs
         .par_iter()
         .map(|&(id_a, id_b)| {
-            let (mesh_a, mesh_b) = match (
-                mesh_cache.get(&id_a).and_then(|m| m.as_ref()),
-                mesh_cache.get(&id_b).and_then(|m| m.as_ref()),
-            ) {
-                (Some(a), Some(b)) => (a, b),
-                _ => return Ok(Outcome::Residual),
+            let (mesh_a, mesh_b) = match (mesh_cache.get(&id_a), mesh_cache.get(&id_b)) {
+                (Some(Ok(a)), Some(Ok(b))) => (a, b),
+                // At least one side has no world mesh. Record WHO and
+                // WHY rather than incrementing an anonymous counter
+                // (GH #161).
+                (ra, rb) => {
+                    return Ok(Outcome::Residual(residual_for(
+                        &instances[id_a as usize],
+                        &instances[id_b as usize],
+                        ra.and_then(|r| r.as_ref().err()).map(|s| s.as_str()),
+                        rb.and_then(|r| r.as_ref().err()).map(|s| s.as_str()),
+                    )));
+                }
             };
 
             let distance = if options.tolerance_m > 0.0 {
@@ -340,9 +428,7 @@ pub fn run(
                 // magnitude above the f32 bound-rounding slack at
                 // building-scale coords, negligible extra pass-through.
                 let pad = (options.tolerance_m * 0.05).max(0.005);
-                if geom::min_distance_within(mesh_a, mesh_b, options.tolerance_m + pad)
-                    .is_none()
-                {
+                if geom::min_distance_within(mesh_a, mesh_b, options.tolerance_m + pad).is_none() {
                     return Ok(Outcome::Skip);
                 }
                 geom::min_distance(mesh_a, mesh_b)?
@@ -380,12 +466,12 @@ pub fn run(
         })
         .collect();
 
-    let mut narrow_phase_residuals = 0usize;
+    let mut residuals: Vec<NarrowPhaseResidual> = Vec::new();
     let mut pairs: Vec<ClashPair> = Vec::new();
     for outcome in outcomes {
         match outcome? {
             Outcome::Pair(p) => pairs.push(p),
-            Outcome::Residual => narrow_phase_residuals += 1,
+            Outcome::Residual(r) => residuals.push(r),
             Outcome::Skip => {}
         }
     }
@@ -393,13 +479,56 @@ pub fn run(
     Ok(ClashReport {
         pairs,
         geometryless_skipped,
-        narrow_phase_residuals,
+        narrow_phase_residuals: residuals.len(),
+        narrow_phase_residual_details: residuals,
     })
+}
+
+/// Component-wise min of every geometry-carrying instance's world AABB,
+/// in f64 — the run's rebase anchor (GH #156). Falls back to the origin
+/// when nothing has geometry. Instance bboxes are f32, hence exact in
+/// f64, so the rebase subtraction itself introduces no error.
+///
+/// A model spanning millions of metres is still beyond f32's reach in
+/// ANY single-anchor scheme; this fixes the common case, where the whole
+/// model sits far from the origin but is itself only hundreds of metres
+/// across.
+fn scene_anchor(instances: &[InstanceRow]) -> [f64; 3] {
+    let mut anchor = [f64::INFINITY; 3];
+    for inst in instances {
+        if inst.rep_id.is_none() {
+            continue;
+        }
+        for (slot, &b) in anchor.iter_mut().zip(inst.bbox_min.iter()) {
+            let v = b as f64;
+            if v.is_finite() && v < *slot {
+                *slot = v;
+            }
+        }
+    }
+    for a in anchor.iter_mut() {
+        if !a.is_finite() {
+            *a = 0.0;
+        }
+    }
+    anchor
+}
+
+/// Rebase one f32 point onto the run anchor, subtracting in f64.
+fn rebase_point(p: [f32; 3], anchor: [f64; 3]) -> [f32; 3] {
+    [
+        (p[0] as f64 - anchor[0]) as f32,
+        (p[1] as f64 - anchor[1]) as f32,
+        (p[2] as f64 - anchor[2]) as f32,
+    ]
 }
 
 fn class_filter_ok(a: &InstanceRow, b: &InstanceRow, options: &ClashOptions) -> bool {
     if !options.include_classes.is_empty() {
-        let hit = options.include_classes.iter().any(|c| c == &a.class || c == &b.class);
+        let hit = options
+            .include_classes
+            .iter()
+            .any(|c| c == &a.class || c == &b.class);
         if !hit {
             return false;
         }
@@ -416,51 +545,43 @@ fn class_filter_ok(a: &InstanceRow, b: &InstanceRow, options: &ClashOptions) -> 
     true
 }
 
-/// Build the world-coord `TriMesh` for one instance. Returns `None` if
-/// the rep is missing from the representations map or if the mesh
-/// failed to build — caller treats both as residuals.
+/// Build the anchored world-coord `TriMesh` for one instance. Returns
+/// the reason as an `Err` when the rep is missing from the
+/// representations map or the mesh won't build — the caller turns that
+/// into a named residual instead of an anonymous count (GH #161).
 fn build_world_trimesh(
     inst: &InstanceRow,
     reps: &HashMap<u64, RepresentationRow>,
-) -> Option<parry3d::shape::TriMesh> {
-    let rep_id = inst.rep_id?;
-    let rep = reps.get(&rep_id)?;
+    anchor: [f64; 3],
+) -> Result<parry3d::shape::TriMesh, String> {
+    let rep_id = inst
+        .rep_id
+        .ok_or_else(|| "instance carries no rep_id".to_string())?;
+    let rep = reps
+        .get(&rep_id)
+        .ok_or_else(|| format!("rep #{rep_id} missing from representations.parquet"))?;
 
     let world_vertices: Vec<f32> = if rep.source_kind == "composite" {
         // Composite reps already carry world-baked vertices and the
-        // instance transform is identity. Pass through unchanged.
-        rep.vertices.clone()
+        // instance transform is identity — only the anchor rebase
+        // applies.
+        geom::rebase_world(&rep.vertices, anchor)
     } else {
         // shared_or_direct: rep vertices are local-frame. Apply the
-        // instance's column-major 4×4 transform per-vertex to bake
-        // world coordinates. Allocates a fresh vertex buffer — fine
-        // for v1; a parry isometry-aware narrow-phase API can lift
-        // this allocation later.
-        bake_world(&rep.vertices, &inst.transform)
+        // instance's column-major 4×4 transform per-vertex, in f64,
+        // and land the result in the anchored frame. Allocates a fresh
+        // vertex buffer — fine for v1; a parry isometry-aware
+        // narrow-phase API can lift this allocation later.
+        geom::bake_world(&rep.vertices, &inst.transform, anchor)
     };
 
-    geom::build_trimesh(&world_vertices, &rep.indices).ok()
-}
-
-/// Apply a column-major 4×4 affine matrix to a `[x, y, z, x, y, z, …]`
-/// vertex buffer. Treats the matrix as a true 4×4 (includes any scale
-/// the placement chain carried) — IFC placements are normally pure
-/// rotation+translation but we don't assume that here.
-fn bake_world(local: &[f32], m: &[f32; 16]) -> Vec<f32> {
-    let mut out = Vec::with_capacity(local.len());
-    for v in local.chunks_exact(3) {
-        let x = v[0];
-        let y = v[1];
-        let z = v[2];
-        // Column-major indexing: m[col * 4 + row]
-        let wx = m[0] * x + m[4] * y + m[8] * z + m[12];
-        let wy = m[1] * x + m[5] * y + m[9] * z + m[13];
-        let wz = m[2] * x + m[6] * y + m[10] * z + m[14];
-        out.push(wx);
-        out.push(wy);
-        out.push(wz);
-    }
-    out
+    geom::build_trimesh(&world_vertices, &rep.indices).map_err(|e| {
+        format!(
+            "mesh build (rep #{rep_id}, {} verts, {} tris): {e}",
+            world_vertices.len() / 3,
+            rep.indices.len() / 3
+        )
+    })
 }
 
 #[cfg(test)]
@@ -469,22 +590,12 @@ mod tests {
 
     fn unit_cube_local() -> (Vec<f32>, Vec<u32>) {
         let v: Vec<f32> = vec![
-            0.0, 0.0, 0.0,
-            1.0, 0.0, 0.0,
-            1.0, 1.0, 0.0,
-            0.0, 1.0, 0.0,
-            0.0, 0.0, 1.0,
-            1.0, 0.0, 1.0,
-            1.0, 1.0, 1.0,
-            0.0, 1.0, 1.0,
+            0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 1.0, 0.0,
+            1.0, 1.0, 1.0, 1.0, 0.0, 1.0, 1.0,
         ];
         let i: Vec<u32> = vec![
-            0, 2, 1, 0, 3, 2,
-            4, 5, 6, 4, 6, 7,
-            0, 1, 5, 0, 5, 4,
-            2, 3, 7, 2, 7, 6,
-            1, 2, 6, 1, 6, 5,
-            0, 4, 7, 0, 7, 3,
+            0, 2, 1, 0, 3, 2, 4, 5, 6, 4, 6, 7, 0, 1, 5, 0, 5, 4, 2, 3, 7, 2, 7, 6, 1, 2, 6, 1, 6,
+            5, 0, 4, 7, 0, 7, 3,
         ];
         (v, i)
     }
@@ -506,7 +617,12 @@ mod tests {
         m
     }
 
-    fn make_instance(idx: u64, rep_id: u64, transform: [f32; 16], bbox_origin: [f32; 3]) -> InstanceRow {
+    fn make_instance(
+        idx: u64,
+        rep_id: u64,
+        transform: [f32; 16],
+        bbox_origin: [f32; 3],
+    ) -> InstanceRow {
         InstanceRow {
             ifc_id: idx,
             guid: format!("g{idx}"),
@@ -515,7 +631,11 @@ mod tests {
             rep_id: Some(rep_id),
             transform,
             bbox_min: bbox_origin,
-            bbox_max: [bbox_origin[0] + 1.0, bbox_origin[1] + 1.0, bbox_origin[2] + 1.0],
+            bbox_max: [
+                bbox_origin[0] + 1.0,
+                bbox_origin[1] + 1.0,
+                bbox_origin[2] + 1.0,
+            ],
         }
     }
 
@@ -704,16 +824,31 @@ mod tests {
 
     #[test]
     fn categorise_covering_either_side_is_insulation() {
-        assert_eq!(categorise("Covering", "PipeSegment"), ClashCategory::Insulation);
+        assert_eq!(
+            categorise("Covering", "PipeSegment"),
+            ClashCategory::Insulation
+        );
         assert_eq!(categorise("Wall", "Covering"), ClashCategory::Insulation);
-        assert_eq!(categorise("Covering", "Covering"), ClashCategory::Insulation);
+        assert_eq!(
+            categorise("Covering", "Covering"),
+            ClashCategory::Insulation
+        );
     }
 
     #[test]
     fn categorise_same_family_fitting_segment_is_connection() {
-        assert_eq!(categorise("PipeFitting", "PipeSegment"), ClashCategory::Connection);
-        assert_eq!(categorise("PipeSegment", "PipeFitting"), ClashCategory::Connection);
-        assert_eq!(categorise("DuctFitting", "DuctSegment"), ClashCategory::Connection);
+        assert_eq!(
+            categorise("PipeFitting", "PipeSegment"),
+            ClashCategory::Connection
+        );
+        assert_eq!(
+            categorise("PipeSegment", "PipeFitting"),
+            ClashCategory::Connection
+        );
+        assert_eq!(
+            categorise("DuctFitting", "DuctSegment"),
+            ClashCategory::Connection
+        );
         assert_eq!(
             categorise("CableCarrierFitting", "CableCarrierSegment"),
             ClashCategory::Connection,
@@ -723,16 +858,28 @@ mod tests {
     #[test]
     fn categorise_cross_family_fitting_segment_is_clash() {
         // Different MEP families colliding is a real clash, not a joint.
-        assert_eq!(categorise("PipeFitting", "DuctSegment"), ClashCategory::Clash);
-        assert_eq!(categorise("DuctFitting", "PipeSegment"), ClashCategory::Clash);
+        assert_eq!(
+            categorise("PipeFitting", "DuctSegment"),
+            ClashCategory::Clash
+        );
+        assert_eq!(
+            categorise("DuctFitting", "PipeSegment"),
+            ClashCategory::Clash
+        );
     }
 
     #[test]
     fn categorise_fitting_fitting_or_segment_segment_is_clash() {
         // Two fittings (or two segments) of the same family meeting is
         // NOT a complementary joint — leave as default clash.
-        assert_eq!(categorise("PipeFitting", "PipeFitting"), ClashCategory::Clash);
-        assert_eq!(categorise("PipeSegment", "PipeSegment"), ClashCategory::Clash);
+        assert_eq!(
+            categorise("PipeFitting", "PipeFitting"),
+            ClashCategory::Clash
+        );
+        assert_eq!(
+            categorise("PipeSegment", "PipeSegment"),
+            ClashCategory::Clash
+        );
     }
 
     #[test]
@@ -740,9 +887,15 @@ mod tests {
         // Annotation + Covering should be non_physical, not insulation —
         // the annotation involvement is the dominant non-actionable
         // signal.
-        assert_eq!(categorise("Annotation", "Covering"), ClashCategory::NonPhysical);
+        assert_eq!(
+            categorise("Annotation", "Covering"),
+            ClashCategory::NonPhysical
+        );
         assert_eq!(categorise("Grid", "Wall"), ClashCategory::NonPhysical);
-        assert_eq!(categorise("Space", "PipeSegment"), ClashCategory::NonPhysical);
+        assert_eq!(
+            categorise("Space", "PipeSegment"),
+            ClashCategory::NonPhysical
+        );
         assert_eq!(
             categorise("OpeningElement", "Wall"),
             ClashCategory::NonPhysical,
@@ -854,5 +1007,234 @@ mod tests {
                 "surviving pairs must involve the active model"
             );
         }
+    }
+
+    // ---- GH #161: option validation + named residuals ------------------
+
+    #[test]
+    fn non_finite_or_negative_tolerance_is_rejected() {
+        let (v, i) = unit_cube_local();
+        let mut reps = HashMap::new();
+        reps.insert(
+            100u64,
+            RepresentationRow {
+                rep_id: 100,
+                source_kind: "shared_or_direct".to_string(),
+                vertices: v,
+                indices: i,
+            },
+        );
+        let instances = vec![
+            make_instance(1, 100, identity(), [0.0, 0.0, 0.0]),
+            make_instance(2, 100, translate(0.5, 0.0, 0.0), [0.5, 0.0, 0.0]),
+        ];
+        for bad in [-0.01f32, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let err = run(
+                &instances,
+                &reps,
+                &ClashOptions {
+                    tolerance_m: bad,
+                    ..ClashOptions::default()
+                },
+            )
+            .expect_err("a tolerance the pipeline cannot honour must fail loudly");
+            assert!(
+                matches!(err, ClashError::InvalidOptions(_)),
+                "expected InvalidOptions, got {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn narrow_phase_residuals_name_both_sides_and_the_reason() {
+        let (v, i) = unit_cube_local();
+        let mut reps = HashMap::new();
+        reps.insert(
+            100u64,
+            RepresentationRow {
+                rep_id: 100,
+                source_kind: "shared_or_direct".to_string(),
+                vertices: v.clone(),
+                indices: i,
+            },
+        );
+        // A rep with no triangles — the kernel cannot build it.
+        reps.insert(
+            101u64,
+            RepresentationRow {
+                rep_id: 101,
+                source_kind: "shared_or_direct".to_string(),
+                vertices: v,
+                indices: Vec::new(),
+            },
+        );
+
+        let mut a = make_instance(1, 100, identity(), [0.0, 0.0, 0.0]);
+        a.class = "Wall".to_string();
+        let mut b = make_instance(2, 101, translate(0.5, 0.0, 0.0), [0.5, 0.0, 0.0]);
+        b.class = "AirTerminal".to_string();
+
+        let report = run(&[a, b], &reps, &ClashOptions::default()).unwrap();
+        assert!(report.pairs.is_empty());
+        assert_eq!(report.narrow_phase_residuals, 1);
+        assert_eq!(
+            report.narrow_phase_residual_details.len(),
+            report.narrow_phase_residuals
+        );
+        let r = &report.narrow_phase_residual_details[0];
+        assert_eq!((r.ifc_id_a, r.ifc_id_b), (1, 2));
+        assert_eq!(r.class_a, "Wall");
+        assert_eq!(r.class_b, "AirTerminal");
+        assert_eq!(r.side, "b", "only side B failed to build");
+        assert!(
+            r.reason.contains("rep #101"),
+            "the reason must name the offending rep: {}",
+            r.reason
+        );
+    }
+
+    #[test]
+    fn missing_representation_is_a_named_residual() {
+        let (v, i) = unit_cube_local();
+        let mut reps = HashMap::new();
+        reps.insert(
+            100u64,
+            RepresentationRow {
+                rep_id: 100,
+                source_kind: "shared_or_direct".to_string(),
+                vertices: v,
+                indices: i,
+            },
+        );
+        // Instance b points at a rep_id the substrate never wrote.
+        let a = make_instance(1, 100, identity(), [0.0, 0.0, 0.0]);
+        let b = make_instance(2, 777, translate(0.5, 0.0, 0.0), [0.5, 0.0, 0.0]);
+
+        let report = run(&[a, b], &reps, &ClashOptions::default()).unwrap();
+        assert_eq!(report.narrow_phase_residuals, 1);
+        let r = &report.narrow_phase_residual_details[0];
+        assert_eq!(r.side, "b");
+        assert!(
+            r.reason.contains("rep #777"),
+            "the reason must name the missing rep: {}",
+            r.reason
+        );
+    }
+
+    // ---- GH #156: far-origin f32 quantisation --------------------------
+
+    /// The unit cube scaled to `size` and shifted `offset_x` along X, in
+    /// the REP-LOCAL frame.
+    fn cube_scaled(size: f32, offset_x: f32) -> (Vec<f32>, Vec<u32>) {
+        let (v, i) = unit_cube_local();
+        let scaled: Vec<f32> = v
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .flat_map(|c| [c[0] * size + offset_x, c[1] * size, c[2] * size])
+            .collect();
+        (scaled, i)
+    }
+
+    fn make_instance_bbox(
+        idx: u64,
+        rep_id: u64,
+        transform: [f32; 16],
+        bbox_min: [f32; 3],
+        bbox_max: [f32; 3],
+    ) -> InstanceRow {
+        InstanceRow {
+            ifc_id: idx,
+            guid: format!("g{idx}"),
+            class: "Wall".to_string(),
+            source_model: String::new(),
+            rep_id: Some(rep_id),
+            transform,
+            bbox_min,
+            bbox_max,
+        }
+    }
+
+    #[test]
+    fn clearance_distance_is_invariant_under_a_site_coordinate_shift() {
+        // Two 100 mm boxes, 25 mm apart. The gap lives in the rep-local
+        // frame — exactly how a far-origin model is authored: one large
+        // placement translation, small local geometry — so the f32
+        // transform is bit-identical between the near and far runs and
+        // only the bake can lose the millimetres. In absolute f32 world
+        // coordinates one ULP at 6.7e6 m is ~0.5 m, so the pre-#156
+        // engine collapsed both boxes onto each other.
+        let (va, ia) = cube_scaled(0.1, 0.0);
+        let (vb, ib) = cube_scaled(0.1, 0.125);
+        let mut reps = HashMap::new();
+        reps.insert(
+            300u64,
+            RepresentationRow {
+                rep_id: 300,
+                source_kind: "shared_or_direct".to_string(),
+                vertices: va,
+                indices: ia,
+            },
+        );
+        reps.insert(
+            301u64,
+            RepresentationRow {
+                rep_id: 301,
+                source_kind: "shared_or_direct".to_string(),
+                vertices: vb,
+                indices: ib,
+            },
+        );
+        let opts = ClashOptions {
+            tolerance_m: 0.05,
+            ..ClashOptions::default()
+        };
+
+        let near = vec![
+            make_instance_bbox(1, 300, identity(), [0.0, 0.0, 0.0], [0.1, 0.1, 0.1]),
+            make_instance_bbox(2, 301, identity(), [0.125, 0.0, 0.0], [0.225, 0.1, 0.1]),
+        ];
+        let near_report = run(&near, &reps, &opts).unwrap();
+        assert_eq!(near_report.pairs.len(), 1, "near pair must be found");
+        let d_near = near_report.pairs[0].min_distance_m;
+        assert!(
+            (d_near - 0.025).abs() < 1e-5,
+            "25 mm gap at the origin, got {d_near}"
+        );
+
+        // Same geometry, moved to (6.7e6, 5e5, 100) m.
+        let o = [6.7e6f32, 5.0e5, 100.0];
+        let m = translate(o[0], o[1], o[2]);
+        let far = vec![
+            make_instance_bbox(1, 300, m, o, [o[0] + 0.1, o[1] + 0.1, o[2] + 0.1]),
+            make_instance_bbox(
+                2,
+                301,
+                m,
+                [o[0] + 0.125, o[1], o[2]],
+                [o[0] + 0.225, o[1] + 0.1, o[2] + 0.1],
+            ),
+        ];
+        let far_report = run(&far, &reps, &opts).unwrap();
+        assert_eq!(far_report.pairs.len(), 1, "far pair must still be found");
+        let d_far = far_report.pairs[0].min_distance_m;
+        assert!(
+            (d_far - d_near).abs() < 1e-6,
+            "distance must be translation-invariant: near {d_near}, far {d_far}"
+        );
+    }
+
+    #[test]
+    fn scene_anchor_is_the_min_of_geometry_carrying_bboxes() {
+        let mut geometryless =
+            make_instance_bbox(9, 100, identity(), [-1.0e6, 0.0, 0.0], [-1.0e6, 0.0, 0.0]);
+        geometryless.rep_id = None;
+        let instances = vec![
+            make_instance_bbox(1, 100, identity(), [10.0, 20.0, 30.0], [11.0, 21.0, 31.0]),
+            make_instance_bbox(2, 100, identity(), [5.0, 25.0, 35.0], [6.0, 26.0, 36.0]),
+            geometryless,
+        ];
+        assert_eq!(scene_anchor(&instances), [5.0, 20.0, 30.0]);
+        assert_eq!(scene_anchor(&[]), [0.0, 0.0, 0.0]);
     }
 }

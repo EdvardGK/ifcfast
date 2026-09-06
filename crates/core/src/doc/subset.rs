@@ -36,8 +36,8 @@
 use std::collections::HashMap;
 
 use super::emit::{emit_subset, EmitStats};
-use super::rel_rules::{field_span, parse_rel, rule_for};
 use super::refs::reachable_closure;
+use super::rel_rules::{field_span, parse_rel, rule_for};
 use super::Doc;
 
 /// One relationship's static reference sets, parsed once up front so the

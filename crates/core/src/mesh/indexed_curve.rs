@@ -83,8 +83,7 @@ pub fn eval_segments_2d(pts: &[Vec2], segments_raw: &[u8]) -> Option<Vec<Vec2>> 
             let p1 = *pts.get(indices[0].checked_sub(1)?)?;
             let mid = *pts.get(indices[1].checked_sub(1)?)?;
             let p3 = *pts.get(indices[2].checked_sub(1)?)?;
-            let samples =
-                arc_samples_2d(p1, mid, p3).unwrap_or_else(|| vec![p1, p3]);
+            let samples = arc_samples_2d(p1, mid, p3).unwrap_or_else(|| vec![p1, p3]);
             append_dedup_2d(&mut out, &samples);
         } else if name.eq_ignore_ascii_case(b"IFCLINEINDEX") {
             if indices.len() < 2 {
@@ -99,8 +98,7 @@ pub fn eval_segments_2d(pts: &[Vec2], segments_raw: &[u8]) -> Option<Vec<Vec2>> 
             return None;
         }
     }
-    if out.len() > 2
-        && (*out.first().unwrap() - *out.last().unwrap()).length_squared() < EPS_DEDUP
+    if out.len() > 2 && (*out.first().unwrap() - *out.last().unwrap()).length_squared() < EPS_DEDUP
     {
         out.pop();
     }
@@ -146,8 +144,7 @@ pub fn eval_segments_3d(pts: &[Vec3], segments_raw: &[u8]) -> Option<Vec<Vec3>> 
             let p1 = *pts.get(indices[0].checked_sub(1)?)?;
             let mid = *pts.get(indices[1].checked_sub(1)?)?;
             let p3 = *pts.get(indices[2].checked_sub(1)?)?;
-            let samples =
-                arc_samples_3d(p1, mid, p3).unwrap_or_else(|| vec![p1, p3]);
+            let samples = arc_samples_3d(p1, mid, p3).unwrap_or_else(|| vec![p1, p3]);
             append_dedup_3d(&mut out, &samples);
         } else if name.eq_ignore_ascii_case(b"IFCLINEINDEX") {
             if indices.len() < 2 {
@@ -162,8 +159,7 @@ pub fn eval_segments_3d(pts: &[Vec3], segments_raw: &[u8]) -> Option<Vec<Vec3>> 
             return None;
         }
     }
-    if out.len() > 2
-        && (*out.first().unwrap() - *out.last().unwrap()).length_squared() < EPS_DEDUP
+    if out.len() > 2 && (*out.first().unwrap() - *out.last().unwrap()).length_squared() < EPS_DEDUP
     {
         out.pop();
     }
@@ -320,8 +316,7 @@ mod tests {
 
     #[test]
     fn parse_typed_inline_lineindex_with_whitespace() {
-        let (name, body) =
-            parse_typed_inline(b"  IFCLINEINDEX( (1, 2, 3, 4) )  ").unwrap();
+        let (name, body) = parse_typed_inline(b"  IFCLINEINDEX( (1, 2, 3, 4) )  ").unwrap();
         assert_eq!(name, b"IFCLINEINDEX");
         // body keeps inner whitespace; parse_field handles it.
         assert!(body.starts_with(b" "));
@@ -374,8 +369,8 @@ mod tests {
             assert!(p.y >= -1e-4);
         }
         // Endpoints match.
-        assert!((pts.first().unwrap() - &Vec2::new(1.0, 0.0)).length() < 1e-4);
-        assert!((pts.last().unwrap() - &Vec2::new(-1.0, 0.0)).length() < 1e-4);
+        assert!((pts.first().unwrap() - Vec2::new(1.0, 0.0)).length() < 1e-4);
+        assert!((pts.last().unwrap() - Vec2::new(-1.0, 0.0)).length() < 1e-4);
     }
 
     #[test]
@@ -450,8 +445,7 @@ mod tests {
             Vec2::new(9.0, 1.0),
             Vec2::new(0.0, 1.0),
         ];
-        let segs =
-            b"IFCLINEINDEX((1,2)),IFCARCINDEX((2,3,4)),IFCLINEINDEX((4,5,1))";
+        let segs = b"IFCLINEINDEX((1,2)),IFCARCINDEX((2,3,4)),IFCLINEINDEX((4,5,1))";
         let polyline = eval_segments_2d(&pts, segs).unwrap();
         // Two corners + arc samples + start/end ≈ 1 (start) + 1 (arc end)
         // + 16/4=4 arc interior + 1 (corner) + 1 (close) = ~8 points.

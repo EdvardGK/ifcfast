@@ -88,9 +88,15 @@ fn reveal_all_emits_both_operand_segments() {
         mesh.segments.len() >= 2,
         "expected >=2 segments (host + opening), got {}: {:?}",
         mesh.segments.len(),
-        mesh.segments.iter().map(|s| s.source.as_str()).collect::<Vec<_>>()
+        mesh.segments
+            .iter()
+            .map(|s| s.source.as_str())
+            .collect::<Vec<_>>()
     );
-    let has_host = mesh.segments.iter().any(|s| s.source.contains("boolean_first_operand"));
+    let has_host = mesh
+        .segments
+        .iter()
+        .any(|s| s.source.contains("boolean_first_operand"));
     let has_cutter = mesh
         .segments
         .iter()
@@ -127,8 +133,7 @@ fn cut_openings_produces_single_segment_and_reduced_volume() {
     );
     assert_eq!(mesh.segments[0].source, "cut_openings");
 
-    let m = csg::build_manifold(&mesh.vertices, &mesh.indices)
-        .expect("post-cut wall is manifold");
+    let m = csg::build_manifold(&mesh.vertices, &mesh.indices).expect("post-cut wall is manifold");
     let volume_m3 = m.volume() * mm3_to_m3;
     let expected = 0.4_f64;
     assert!(
@@ -208,7 +213,7 @@ fn halfspace_clip_with_agreement_false_keeps_lower_half() {
     );
     // Bbox check: surviving half must be z ∈ [0, 1500].
     let mut zmax = f32::NEG_INFINITY;
-    for chunk in mesh.vertices.chunks_exact(3) {
+    for chunk in mesh.vertices.as_chunks::<3>().0 {
         zmax = zmax.max(chunk[2]);
     }
     assert!(zmax <= 1510.0, "upper half should be gone, got zmax={zmax}");
@@ -300,7 +305,12 @@ fn deep_bcr_with_three_halfspaces_cuts_correctly() {
         .products
         .into_iter()
         .find(|m| m.entity == "IfcWall")
-        .unwrap_or_else(|| panic!("deep-clipped wall must reach the sink; got entities: {:?}", entities));
+        .unwrap_or_else(|| {
+            panic!(
+                "deep-clipped wall must reach the sink; got entities: {:?}",
+                entities
+            )
+        });
 
     // The fixture is authored in millimetres (`.MILLI.`), so the cut
     // must run with the matching `unit_scale` (0.001) — the value the
@@ -377,8 +387,14 @@ END-ISO-10303-21;
     let before_idx = mesh.indices.clone();
     let outcome = apply(&mut mesh, 1.0);
     assert_eq!(outcome, Outcome::Passthrough);
-    assert_eq!(mesh.vertices, before_verts, "passthrough must not mutate verts");
-    assert_eq!(mesh.indices, before_idx, "passthrough must not mutate indices");
+    assert_eq!(
+        mesh.vertices, before_verts,
+        "passthrough must not mutate verts"
+    );
+    assert_eq!(
+        mesh.indices, before_idx,
+        "passthrough must not mutate indices"
+    );
 }
 
 // ---------- Cross-product IfcRelVoidsElement (GH #21) ----------
@@ -460,21 +476,14 @@ fn cross_product_voids_reveal_all_emits_both_products() {
     let mut sink = CaptureSink {
         products: Vec::new(),
     };
-    let _ = mesh_ifc_streaming(
-        WALL_WITH_CROSS_PRODUCT_OPENING.as_bytes(),
-        &mut sink,
-    );
-    let entities: Vec<&str> = sink
-        .products
-        .iter()
-        .map(|m| m.entity.as_str())
-        .collect();
+    let _ = mesh_ifc_streaming(WALL_WITH_CROSS_PRODUCT_OPENING.as_bytes(), &mut sink);
+    let entities: Vec<&str> = sink.products.iter().map(|m| m.entity.as_str()).collect();
     assert!(
-        entities.iter().any(|e| *e == "IfcWall"),
+        entities.contains(&"IfcWall"),
         "reveal-all must keep the wall; got {entities:?}",
     );
     assert!(
-        entities.iter().any(|e| *e == "IfcOpeningElement"),
+        entities.contains(&"IfcOpeningElement"),
         "reveal-all must keep the opening as a separate product; got {entities:?}",
     );
 }
@@ -507,13 +516,19 @@ fn cross_product_voids_fold_subtracts_opening_volume() {
             Routed::PassThrough(m) => passthrough.push(m),
         }
     }
-    assert_eq!(suppressed, 1, "the opening must be suppressed (cutter, not visible)");
+    assert_eq!(
+        suppressed, 1,
+        "the opening must be suppressed (cutter, not visible)"
+    );
     assert_eq!(held, 1, "the wall must be held for the fold");
     assert!(
         passthrough.is_empty(),
         "no products should pass through in this minimal fixture, got {} entities: {:?}",
         passthrough.len(),
-        passthrough.iter().map(|m| m.entity.as_str()).collect::<Vec<_>>(),
+        passthrough
+            .iter()
+            .map(|m| m.entity.as_str())
+            .collect::<Vec<_>>(),
     );
 
     // Flush — fold the wall with its arrived openings. `None` table →
@@ -653,7 +668,9 @@ fn polygonal_bounded_uses_base_surface_position_normal() {
     //   keep where -1*(Pz - 2500) > 0 → Pz < 2500.
     // So we keep the lower 2500 mm of the wall. Volume = 1000 × 200
     // × 2500 = 5e8 mm³ = 0.5 m³.
-    let mut sink = CaptureSink { products: Vec::new() };
+    let mut sink = CaptureSink {
+        products: Vec::new(),
+    };
     let _ = mesh_ifc_streaming(WALL_DIVERGING_POSITION_HALFSPACE.as_bytes(), &mut sink);
     let mut mesh = sink
         .products
@@ -675,7 +692,7 @@ fn polygonal_bounded_uses_base_surface_position_normal() {
     );
     // Bbox: top of the kept body is z ≈ 2500.
     let mut zmax = f32::NEG_INFINITY;
-    for chunk in mesh.vertices.chunks_exact(3) {
+    for chunk in mesh.vertices.as_chunks::<3>().0 {
         zmax = zmax.max(chunk[2]);
     }
     assert!(zmax <= 2510.0, "upper half should be gone, zmax = {zmax}");
@@ -750,7 +767,9 @@ fn chain_encoding_carries_outer_role_through_nested_boolean() {
     // was dropped by `retag`'s `role.unwrap_or(new_role)` innermost-wins
     // semantics, and `is_cutter` would mis-classify the door as a host
     // segment.
-    let mut sink = CaptureSink { products: Vec::new() };
+    let mut sink = CaptureSink {
+        products: Vec::new(),
+    };
     let _ = mesh_ifc_streaming(NESTED_BOOLEAN_CUTTER.as_bytes(), &mut sink);
     let mesh = sink
         .products
@@ -776,7 +795,11 @@ fn chain_encoding_carries_outer_role_through_nested_boolean() {
             && !links.contains(&"boolean_second_operand")
             && links.last().copied() == Some("extrusion")
     });
-    assert!(has_wall, "wall fragment chain must be host-only, got: {:?}", chains);
+    assert!(
+        has_wall,
+        "wall fragment chain must be host-only, got: {:?}",
+        chains
+    );
 
     let has_door_with_outer_cutter = chains.iter().any(|c| {
         let links: Vec<&str> = c.split('|').collect();
@@ -795,8 +818,11 @@ fn chain_encoding_carries_outer_role_through_nested_boolean() {
     );
 
     let has_handle = chains.iter().any(|c| {
-        let n = c.split('|').filter(|l| *l == "boolean_second_operand").count();
-        n >= 2 && c.split('|').last() == Some("extrusion")
+        let n = c
+            .split('|')
+            .filter(|l| *l == "boolean_second_operand")
+            .count();
+        n >= 2 && c.split('|').next_back() == Some("extrusion")
     });
     assert!(
         has_handle,
@@ -909,7 +935,7 @@ fn signed_mesh_volume(vertices: &[f32], indices: &[u32]) -> f64 {
             vertices[b + 2] as f64,
         )
     };
-    for t in indices.chunks_exact(3) {
+    for t in indices.as_chunks::<3>().0 {
         let (ax, ay, az) = p(t[0]);
         let (bx, by, bz) = p(t[1]);
         let (cx, cy, cz) = p(t[2]);
@@ -922,10 +948,7 @@ fn signed_mesh_volume(vertices: &[f32], indices: &[u32]) -> f64 {
 /// prism path), route every product through a fresh `CrossProductCut`,
 /// and flush with the given table option. Returns the single folded
 /// host's `(net_volume_m3, outcome)`. Source units are mm → m³ via 1e-9.
-fn fold_one_host(
-    buf: &[u8],
-    table: Option<&_core::entity_table::EntityTable>,
-) -> (f64, Outcome) {
+fn fold_one_host(buf: &[u8], table: Option<&_core::entity_table::EntityTable>) -> (f64, Outcome) {
     use _core::mesh::{mesh_ifc_streaming_framed, BakeFrame};
 
     let idx = indexer::index(buf);
@@ -949,7 +972,11 @@ fn through_cut_manifold_fold_matches_analytic() {
     // Default-build coverage of the through-cut fixture via the manifold
     // fold (table = None). 0.60 − 0.09 = 0.51 m³.
     let (vol, outcome) = fold_one_host(WALL_WITH_THROUGH_CUT_OPENING.as_bytes(), None);
-    assert_eq!(outcome, Outcome::Cut, "manifold fold must cut the through-opening");
+    assert_eq!(
+        outcome,
+        Outcome::Cut,
+        "manifold fold must cut the through-opening"
+    );
     assert!(
         (vol - 0.51).abs() < 0.02,
         "manifold through-cut volume {vol} m³, expected ~0.51",
@@ -970,7 +997,11 @@ fn through_cut_prism_path_matches_manifold() {
     let (manifold_vol, manifold_outcome) = fold_one_host(buf, None);
     let (prism_vol, prism_outcome) = fold_one_host(buf, Some(&table));
 
-    assert_eq!(prism_outcome, Outcome::Cut, "prism path must cut the through-opening");
+    assert_eq!(
+        prism_outcome,
+        Outcome::Cut,
+        "prism path must cut the through-opening"
+    );
     assert_eq!(manifold_outcome, Outcome::Cut);
     assert!(
         (prism_vol - 0.51).abs() < 0.02,
@@ -994,7 +1025,11 @@ fn z_pocket_opening_falls_back_to_manifold() {
     let buf = WALL_WITH_CROSS_PRODUCT_OPENING.as_bytes();
     let table = EntityTable::build(buf);
     let (vol, outcome) = fold_one_host(buf, Some(&table));
-    assert_eq!(outcome, Outcome::Cut, "pocket must still cut via manifold fallback");
+    assert_eq!(
+        outcome,
+        Outcome::Cut,
+        "pocket must still cut via manifold fallback"
+    );
     assert!(
         (vol - 0.40).abs() < 0.02,
         "pocket fallback volume {vol} m³, expected ~0.40",
@@ -1325,7 +1360,11 @@ fn two_tight_bounded_halfspaces_both_apply() {
         "fixture must carry two bounded-halfspace payloads",
     );
     let outcome = apply(&mut mesh, 1.0);
-    assert_eq!(outcome, Outcome::Cut, "two bounded halfspaces must cut the wall");
+    assert_eq!(
+        outcome,
+        Outcome::Cut,
+        "two bounded halfspaces must cut the wall"
+    );
     let vol = manifold_volume_m3(&mesh);
     assert!(
         (vol - 0.40).abs() < 0.02,
@@ -1337,12 +1376,8 @@ fn two_tight_bounded_halfspaces_both_apply() {
     let host = axis_box([-500.0, -100.0, 0.0], [500.0, 100.0, 3000.0]);
     let cut1 = axis_box([-150.0, -100.0, 0.0], [150.0, 100.0, 2000.0]);
     let cut2 = axis_box([250.0, -100.0, 0.0], [450.0, 100.0, 2000.0]);
-    let (ov, oi) = csg::subtract_many(
-        &host.0,
-        &host.1,
-        &[(&cut1.0, &cut1.1), (&cut2.0, &cut2.1)],
-    )
-    .expect("oracle subtract must succeed");
+    let (ov, oi) = csg::subtract_many(&host.0, &host.1, &[(&cut1.0, &cut1.1), (&cut2.0, &cut2.1)])
+        .expect("oracle subtract must succeed");
     let oracle = csg::build_manifold(&ov, &oi).expect("oracle is manifold");
     let oracle_vol = oracle.volume() * 1.0e-9_f64;
     assert!(
@@ -1415,7 +1450,11 @@ END-ISO-10303-21;
 #[test]
 fn bounded_halfspace_missing_host_is_uncut() {
     let mut mesh = capture_wall_from(WALL_WITH_BOUNDED_HALFSPACE_MISSING_HOST);
-    assert_eq!(mesh.bounded_halfspaces.len(), 1, "fixture carries one payload");
+    assert_eq!(
+        mesh.bounded_halfspaces.len(),
+        1,
+        "fixture carries one payload"
+    );
     let _ = apply(&mut mesh, 1.0);
     let vol = manifold_volume_m3(&mesh);
     assert!(
@@ -1491,9 +1530,17 @@ END-ISO-10303-21;
 #[test]
 fn oversized_bounded_halfspace_falls_back_via_payload_plane() {
     let mut mesh = capture_wall_from(WALL_WITH_OVERSIZED_BOUNDED_HALFSPACE);
-    assert_eq!(mesh.bounded_halfspaces.len(), 1, "fixture carries one payload");
+    assert_eq!(
+        mesh.bounded_halfspaces.len(),
+        1,
+        "fixture carries one payload"
+    );
     let outcome = apply(&mut mesh, 1.0);
-    assert_eq!(outcome, Outcome::Cut, "oversized bounded halfspace still cuts");
+    assert_eq!(
+        outcome,
+        Outcome::Cut,
+        "oversized bounded halfspace still cuts"
+    );
     let vol = manifold_volume_m3(&mesh);
     assert!(
         (vol - 0.20).abs() < 0.02,
@@ -1506,21 +1553,12 @@ fn oversized_bounded_halfspace_falls_back_via_payload_plane() {
 #[cfg(feature = "prism-csg-fast")]
 fn axis_box(min: [f32; 3], max: [f32; 3]) -> (Vec<f32>, Vec<u32>) {
     let v: Vec<f32> = vec![
-        min[0], min[1], min[2],
-        max[0], min[1], min[2],
-        max[0], max[1], min[2],
-        min[0], max[1], min[2],
-        min[0], min[1], max[2],
-        max[0], min[1], max[2],
-        max[0], max[1], max[2],
-        min[0], max[1], max[2],
+        min[0], min[1], min[2], max[0], min[1], min[2], max[0], max[1], min[2], min[0], max[1],
+        min[2], min[0], min[1], max[2], max[0], min[1], max[2], max[0], max[1], max[2], min[0],
+        max[1], max[2],
     ];
     let i: Vec<u32> = vec![
-        0, 2, 1, 0, 3, 2,
-        4, 5, 6, 4, 6, 7,
-        0, 1, 5, 0, 5, 4,
-        2, 3, 7, 2, 7, 6,
-        1, 2, 6, 1, 6, 5,
+        0, 2, 1, 0, 3, 2, 4, 5, 6, 4, 6, 7, 0, 1, 5, 0, 5, 4, 2, 3, 7, 2, 7, 6, 1, 2, 6, 1, 6, 5,
         0, 4, 7, 0, 7, 3,
     ];
     (v, i)

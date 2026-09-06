@@ -235,7 +235,10 @@ pub fn polygonal_bounded_halfspace(
     if outer.len() < 3 {
         return None;
     }
-    let polygon = Polygon2D { outer, holes: Vec::new() };
+    let polygon = Polygon2D {
+        outer,
+        holes: Vec::new(),
+    };
     // Slab orientation follows the **de-facto** IFC convention — what
     // ifcopenshell, Revit and web-ifc all do, which is the OPPOSITE of
     // the literal reading of the IFC4 doc text for `AgreementFlag`. See
@@ -354,7 +357,10 @@ pub fn halfspace_solid(table: &EntityTable, id: u64) -> Option<(LocalMesh, bool)
         Vec2::new(e, e),
         Vec2::new(-e, e),
     ];
-    let polygon = Polygon2D { outer: square, holes: Vec::new() };
+    let polygon = Polygon2D {
+        outer: square,
+        holes: Vec::new(),
+    };
     // De-facto IFC convention — see `polygonal_bounded_halfspace` above
     // for the citation chain (ifcopenshell `!AgreementFlag` flip + OCCT
     // `BRepPrimAPI_MakeHalfSpace`). Net mapping:
@@ -456,12 +462,8 @@ fn bounded_curve_points(table: &EntityTable, id: u64) -> Option<Vec<Vec2>> {
         // Evaluate IfcArcIndex / IfcLineIndex segments when present —
         // otherwise booleans on curved profiles collapse to polygonal
         // chords (GH #48).
-        if let Some(Field::List(seg_body)) =
-            fields.get(1).copied().map(parse_field)
-        {
-            if let Some(poly) =
-                crate::mesh::indexed_curve::eval_segments_2d(&raw_pts, seg_body)
-            {
+        if let Some(Field::List(seg_body)) = fields.get(1).copied().map(parse_field) {
+            if let Some(poly) = crate::mesh::indexed_curve::eval_segments_2d(&raw_pts, seg_body) {
                 if poly.len() >= 3 {
                     return Some(poly);
                 }
@@ -638,9 +640,15 @@ END-ISO-10303-21;
     #[test]
     fn second_operand_role_maps_operator() {
         // DIFFERENCE (and the clipping-result default) → cutter tag.
-        assert_eq!(second_operand_role(Some(b".DIFFERENCE.")), "boolean_second_operand");
+        assert_eq!(
+            second_operand_role(Some(b".DIFFERENCE.")),
+            "boolean_second_operand"
+        );
         // UNION / INTERSECTION get their own non-cutter tags.
-        assert_eq!(second_operand_role(Some(b".UNION.")), "boolean_union_operand");
+        assert_eq!(
+            second_operand_role(Some(b".UNION.")),
+            "boolean_union_operand"
+        );
         assert_eq!(
             second_operand_role(Some(b".INTERSECTION.")),
             "boolean_intersection_operand"
@@ -649,6 +657,9 @@ END-ISO-10303-21;
         // overwhelmingly common case, and the pre-W4 behaviour.
         assert_eq!(second_operand_role(None), "boolean_second_operand");
         assert_eq!(second_operand_role(Some(b"$")), "boolean_second_operand");
-        assert_eq!(second_operand_role(Some(b".WAT.")), "boolean_second_operand");
+        assert_eq!(
+            second_operand_role(Some(b".WAT.")),
+            "boolean_second_operand"
+        );
     }
 }

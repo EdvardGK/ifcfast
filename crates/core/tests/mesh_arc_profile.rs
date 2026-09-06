@@ -70,7 +70,7 @@ END-ISO-10303-21;
 /// Signed-tetra divergence volume over the whole mesh, f64 accumulation.
 fn signed_volume(vertices: &[f32], faces: &[u32]) -> f64 {
     let mut acc = 0.0_f64;
-    for tri in faces.chunks_exact(3) {
+    for tri in faces.as_chunks::<3>().0 {
         let p = |i: u32| {
             let b = i as usize * 3;
             (

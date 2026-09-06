@@ -46,3 +46,9 @@ Thumbs.db
 node_modules/
 /package.json
 /package-lock.json
+
+# Browser-automation session dumps + ad-hoc screenshots (GH #164)
+.playwright-mcp/
+/*.jpeg
+/*.jpg
+/*.png

@@ -52,11 +52,34 @@ pub struct EntityTable<'a> {
     /// on first request via `unit_assignment_id`, tied to this table's
     /// lifetime so it can never go stale across models.
     unit_assignment: OnceLock<Option<u64>>,
+    /// Non-`None` when the DATA walk did NOT end legitimately — a stray
+    /// byte mid-stream, an unterminated final record, or a missing
+    /// `DATA;` marker (GH #148). The table then describes a PARTIAL
+    /// model. Read it via [`EntityTable::scan_error`]; it is also
+    /// printed to stderr at build time so the loss is never silent even
+    /// for callers that don't check.
+    scan_error: Option<String>,
+    warnings: Vec<String>,
 }
 
 impl<'a> EntityTable<'a> {
     pub fn build(buf: &'a [u8]) -> Self {
-        let data_start = data_section_start(buf).unwrap_or(0);
+        // A missing `DATA;` marker is not "start at zero and hope" — it
+        // means we could not locate the entity stream at all. Scanning
+        // from 0 keeps bare record-list fixtures working, but the
+        // condition is recorded rather than swallowed (GH #148).
+        let (data_start, mut scan_error) = match data_section_start(buf) {
+            Some(s) => (s, None),
+            None => (
+                0,
+                Some(
+                    "no `DATA;` section marker found — scanning from byte 0. \
+                     If this is an IFC file it is malformed or truncated in \
+                     its header; entity coverage is not trustworthy."
+                        .to_string(),
+                ),
+            ),
+        };
         let data_end = endsec_position(buf, data_start);
 
         // Capacity hint based on observation: roughly 1 entity per ~110 bytes
@@ -65,7 +88,15 @@ impl<'a> EntityTable<'a> {
         let mut entries: HashMap<u64, EntityRefs> = HashMap::with_capacity(cap_hint);
         let mut order: Vec<u64> = Vec::with_capacity(cap_hint);
 
-        for_each_record(buf, data_start, data_end, |rec| {
+        // Duplicate STEP ids are illegal per ISO-10303-21 but do occur
+        // in hand-merged files. Policy (GH #159): `entries` keeps the
+        // LAST record for the id, `order` keeps the id exactly once at
+        // its FIRST appearance, so `iter()` visits every id once and
+        // agrees with `get()`. The shadowed record is real data loss, so
+        // it is counted and warned about instead of vanishing.
+        let mut duplicate_ids: Vec<u64> = Vec::new();
+
+        let stop = for_each_record(buf, data_start, data_end, |rec| {
             // SAFETY: rec.type_name and rec.args are sub-slices of `buf` from
             // the same `for_each_record` walk, so their bytes are addressable
             // via offset arithmetic from `buf.as_ptr()`.
@@ -88,15 +119,52 @@ impl<'a> EntityTable<'a> {
                 .is_none()
             {
                 order.push(rec.id);
+            } else if duplicate_ids.len() < 16 {
+                duplicate_ids.push(rec.id);
             }
         });
+
+        if let Some(msg) = stop.describe() {
+            // A garbage byte / unterminated record beats a missing
+            // `DATA;` as the headline problem — it is the one that
+            // silently truncated the model.
+            scan_error = Some(msg);
+        }
+        let mut warnings: Vec<String> = Vec::new();
+        if !duplicate_ids.is_empty() {
+            warnings.push(format!(
+                "[ifcfast] WARNING: duplicate STEP ids in the DATA section \
+                 (first {}: {:?}). The LAST record wins for each id; the \
+                 earlier one(s) are not readable. Duplicate ids are illegal \
+                 per ISO-10303-21.",
+                duplicate_ids.len(),
+                duplicate_ids
+            ));
+        }
 
         Self {
             buf,
             entries,
             order,
             unit_assignment: OnceLock::new(),
+            scan_error,
+            warnings,
         }
+    }
+
+    /// Why the DATA walk did not end legitimately, if it didn't. `Some`
+    /// means this table describes a PARTIAL model — callers building a
+    /// substrate / QTO / clash result from it are publishing a truncated
+    /// answer and should refuse (GH #148).
+    pub fn scan_error(&self) -> Option<&str> {
+        self.scan_error.as_deref()
+    }
+
+    /// Non-fatal anomalies seen while building the table (today:
+    /// duplicate STEP ids). Collected, never printed — surfaced through
+    /// the extractor result dicts and `Bundle.warnings`.
+    pub fn warnings(&self) -> &[String] {
+        &self.warnings
     }
 
     /// Id of the first `IfcUnitAssignment` in the DATA section, memoized so

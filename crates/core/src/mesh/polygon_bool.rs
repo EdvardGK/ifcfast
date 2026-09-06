@@ -161,12 +161,20 @@ pub fn shape_from_polygon2d(p: &Polygon2D) -> Shape {
 pub fn polygon2d_from_shape(s: &Shape) -> Polygon2D {
     let outer = s
         .first()
-        .map(|c| c.iter().map(|p| Vec2::new(p[0] as f32, p[1] as f32)).collect())
+        .map(|c| {
+            c.iter()
+                .map(|p| Vec2::new(p[0] as f32, p[1] as f32))
+                .collect()
+        })
         .unwrap_or_default();
     let holes = s
         .iter()
         .skip(1)
-        .map(|c| c.iter().map(|p| Vec2::new(p[0] as f32, p[1] as f32)).collect())
+        .map(|c| {
+            c.iter()
+                .map(|p| Vec2::new(p[0] as f32, p[1] as f32))
+                .collect()
+        })
         .collect();
     Polygon2D { outer, holes }
 }
@@ -194,7 +202,11 @@ mod tests {
         let out = difference(&subj, &[cut]);
         assert_eq!(out.len(), 1, "one connected shape");
         assert_eq!(out[0].len(), 2, "outer + one hole");
-        assert!((net_area(&out[0]) - 84.0).abs() < 1e-6, "area = {}", net_area(&out[0]));
+        assert!(
+            (net_area(&out[0]) - 84.0).abs() < 1e-6,
+            "area = {}",
+            net_area(&out[0])
+        );
     }
 
     #[test]
@@ -208,7 +220,11 @@ mod tests {
         let out = difference(&subj, &[cut]);
         assert_eq!(out.len(), 1, "disjoint cutter → subject unchanged");
         assert_eq!(out[0].len(), 2, "the subject's own hole must survive");
-        assert!((net_area(&out[0]) - 96.0).abs() < 1e-6, "area = {}", net_area(&out[0]));
+        assert!(
+            (net_area(&out[0]) - 96.0).abs() < 1e-6,
+            "area = {}",
+            net_area(&out[0])
+        );
     }
 
     #[test]
@@ -221,7 +237,11 @@ mod tests {
         let out = difference(&subj, &[c1, c2]);
         assert_eq!(out.len(), 1);
         // union(c1,c2) = 16 + 16 − 4 = 28 ; remaining = 100 − 28 = 72.
-        assert!((net_area(&out[0]) - 72.0).abs() < 1e-6, "area = {}", net_area(&out[0]));
+        assert!(
+            (net_area(&out[0]) - 72.0).abs() < 1e-6,
+            "area = {}",
+            net_area(&out[0])
+        );
     }
 
     #[test]
@@ -242,14 +262,26 @@ mod tests {
         let cut: Shape = vec![rect(3.0, 3.0, 7.0, 7.0)];
         let out = difference(&subj, &[cut]);
         assert_eq!(out.len(), 1);
-        assert!((net_area(&out[0]) - 84.0).abs() < 1e-6, "area = {}", net_area(&out[0]));
+        assert!(
+            (net_area(&out[0]) - 84.0).abs() < 1e-6,
+            "area = {}",
+            net_area(&out[0])
+        );
     }
 
     #[test]
     fn polygon2d_conversion_round_trips() {
         let p = Polygon2D {
-            outer: vec![Vec2::new(0.0, 0.0), Vec2::new(4.0, 0.0), Vec2::new(4.0, 4.0)],
-            holes: vec![vec![Vec2::new(1.0, 1.0), Vec2::new(2.0, 1.0), Vec2::new(2.0, 2.0)]],
+            outer: vec![
+                Vec2::new(0.0, 0.0),
+                Vec2::new(4.0, 0.0),
+                Vec2::new(4.0, 4.0),
+            ],
+            holes: vec![vec![
+                Vec2::new(1.0, 1.0),
+                Vec2::new(2.0, 1.0),
+                Vec2::new(2.0, 2.0),
+            ]],
         };
         let s = shape_from_polygon2d(&p);
         assert_eq!(s.len(), 2);

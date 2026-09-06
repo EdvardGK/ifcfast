@@ -13,7 +13,7 @@
 //! defaults to (0,0,1)), `RefDirection` (X, defaults to (1,0,0)). Y is
 //! computed as `axis × ref_direction` after Gram-Schmidt orthogonalisation.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use glam::{DMat4, DVec3, DVec4, Mat4, Vec3, Vec4};
 
@@ -35,6 +35,18 @@ use crate::lexer::{parse_field, split_top_level_args, Field};
 pub struct PlacementResolver<'a> {
     table: &'a EntityTable<'a>,
     cache: HashMap<u64, DMat4>,
+    /// Placements currently on the resolve stack — the cycle guard.
+    /// The cache alone cannot serve as one: it is written only AFTER
+    /// `resolve` returns, so a `PlacementRelTo` loop recursed forever
+    /// and blew the stack (a SIGSEGV the PyO3 panic wrapper cannot
+    /// catch). GH #160.
+    in_progress: HashSet<u64>,
+    /// Number of `PlacementRelTo` cycles broken. Non-zero means some
+    /// element is placed at an arbitrary point of its own loop.
+    cycles: u32,
+    /// Number of `IfcGridPlacement`s encountered. Not resolvable here —
+    /// see [`PlacementResolver::resolve`].
+    grid_placements: u32,
 }
 
 impl<'a> PlacementResolver<'a> {
@@ -42,7 +54,22 @@ impl<'a> PlacementResolver<'a> {
         Self {
             table,
             cache: HashMap::with_capacity(2048),
+            in_progress: HashSet::new(),
+            cycles: 0,
+            grid_placements: 0,
         }
+    }
+
+    /// How many `PlacementRelTo` cycles this resolver broke. Surfaced
+    /// into the mesh stats so a cyclic file is visible as a fact rather
+    /// than as elements mysteriously stacked at the world origin.
+    pub fn cycle_count(&self) -> u32 {
+        self.cycles
+    }
+
+    /// How many `IfcGridPlacement`s this resolver could not resolve.
+    pub fn grid_placement_count(&self) -> u32 {
+        self.grid_placements
     }
 
     /// Resolve an `IfcLocalPlacement` step_id to a world matrix (f64).
@@ -50,7 +77,16 @@ impl<'a> PlacementResolver<'a> {
         if let Some(&m) = self.cache.get(&placement_id) {
             return m;
         }
+        // Cycle guard (GH #160): mark the placement in-progress BEFORE
+        // recursing. A re-entry on the same id is a `PlacementRelTo`
+        // loop; break it with identity, count it, and do NOT cache the
+        // identity (the outer frame caches the real composed result).
+        if !self.in_progress.insert(placement_id) {
+            self.cycles = self.cycles.saturating_add(1);
+            return DMat4::IDENTITY;
+        }
         let m = self.resolve(placement_id);
+        self.in_progress.remove(&placement_id);
         self.cache.insert(placement_id, m);
         m
     }
@@ -70,11 +106,19 @@ impl<'a> PlacementResolver<'a> {
             Some(x) => x,
             None => return DMat4::IDENTITY,
         };
-        // Only IfcLocalPlacement uses (PlacementRelTo, RelativePlacement)
-        // — but defensive: handle Ifc{Local,}Placement subtypes by name.
-        if !type_name.eq_ignore_ascii_case(b"IFCLOCALPLACEMENT")
-            && !type_name.eq_ignore_ascii_case(b"IFCGRIDPLACEMENT")
-        {
+        // GH #160: `IfcGridPlacement` is NOT an `IfcLocalPlacement`. Its
+        // attributes are (PlacementLocation: IfcVirtualGridIntersection,
+        // PlacementRefDirection), so reading them at the LocalPlacement
+        // arg positions resolved to identity — i.e. the element silently
+        // landed at the world origin. Resolving it properly needs the
+        // grid axes (an `IfcGrid` walk + curve intersection), which this
+        // module does not do; until it does, treat it as unhandled and
+        // COUNT it so the fact reaches the stats instead of vanishing.
+        if type_name.eq_ignore_ascii_case(b"IFCGRIDPLACEMENT") {
+            self.grid_placements = self.grid_placements.saturating_add(1);
+            return DMat4::IDENTITY;
+        }
+        if !type_name.eq_ignore_ascii_case(b"IFCLOCALPLACEMENT") {
             return DMat4::IDENTITY;
         }
         let fields = split_top_level_args(args);
@@ -144,10 +188,18 @@ pub fn axis_placement_3d_f64(table: &EntityTable, id: u64) -> DMat4 {
     };
 
     let z = axis_z.unwrap_or(DVec3::Z).normalize_or_zero();
-    let z = if z.length_squared() < 1e-12 { DVec3::Z } else { z };
+    let z = if z.length_squared() < 1e-12 {
+        DVec3::Z
+    } else {
+        z
+    };
     let mut x = ref_x.unwrap_or(DVec3::X);
     x = (x - z * x.dot(z)).normalize_or_zero();
-    let x = if x.length_squared() < 1e-12 { DVec3::X } else { x };
+    let x = if x.length_squared() < 1e-12 {
+        DVec3::X
+    } else {
+        x
+    };
     let y = z.cross(x);
 
     DMat4::from_cols(
@@ -231,20 +283,14 @@ pub fn axis_placement_3d_from_id(table: &EntityTable, id: u64) -> Mat4 {
         .unwrap_or(Vec3::ZERO);
 
     let (axis_z, ref_x) = if is_3d {
-        let z = fields
-            .get(1)
-            .copied()
-            .and_then(|f| match parse_field(f) {
-                Field::Ref(did) => direction(table, did),
-                _ => None,
-            });
-        let x = fields
-            .get(2)
-            .copied()
-            .and_then(|f| match parse_field(f) {
-                Field::Ref(did) => direction(table, did),
-                _ => None,
-            });
+        let z = fields.get(1).copied().and_then(|f| match parse_field(f) {
+            Field::Ref(did) => direction(table, did),
+            _ => None,
+        });
+        let x = fields.get(2).copied().and_then(|f| match parse_field(f) {
+            Field::Ref(did) => direction(table, did),
+            _ => None,
+        });
         (z, x)
     } else {
         // 2D: only RefDirection at arg[1]; Z stays world-up.
@@ -260,10 +306,18 @@ pub fn axis_placement_3d_from_id(table: &EntityTable, id: u64) -> Mat4 {
     };
 
     let z = axis_z.unwrap_or(Vec3::Z).normalize_or_zero();
-    let z = if z.length_squared() < 1e-12 { Vec3::Z } else { z };
+    let z = if z.length_squared() < 1e-12 {
+        Vec3::Z
+    } else {
+        z
+    };
     let mut x = ref_x.unwrap_or(Vec3::X);
     x = (x - z * x.dot(z)).normalize_or_zero();
-    let x = if x.length_squared() < 1e-12 { Vec3::X } else { x };
+    let x = if x.length_squared() < 1e-12 {
+        Vec3::X
+    } else {
+        x
+    };
     let y = z.cross(x);
 
     Mat4::from_cols(
@@ -325,4 +379,55 @@ fn direction(table: &EntityTable, id: u64) -> Option<Vec3> {
 /// Identity transform helper.
 pub fn identity() -> Mat4 {
     Mat4::IDENTITY
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `#10 -> #11 -> #10`: a `PlacementRelTo` cycle. Pre-fix this
+    /// recursed until the stack died (SIGSEGV — uncatchable by the PyO3
+    /// panic wrapper). GH #160.
+    const CYCLIC_PLACEMENT_IFC: &str = r#"ISO-10303-21;
+HEADER;
+FILE_DESCRIPTION(('ViewDefinition [ReferenceView]'),'2;1');
+FILE_NAME('cyc.ifc','2026-09-06T00:00:00',('test'),('skiplum'),'ifcfast','ifcfast','');
+FILE_SCHEMA(('IFC4'));
+ENDSEC;
+DATA;
+#1=IFCCARTESIANPOINT((1.,2.,3.));
+#2=IFCAXIS2PLACEMENT3D(#1,$,$);
+#10=IFCLOCALPLACEMENT(#11,#2);
+#11=IFCLOCALPLACEMENT(#10,#2);
+#20=IFCVIRTUALGRIDINTERSECTION((#30,#31),$);
+#30=IFCGRIDAXIS('A',$,.T.);
+#31=IFCGRIDAXIS('1',$,.T.);
+#40=IFCGRIDPLACEMENT(#20,$);
+ENDSEC;
+END-ISO-10303-21;
+"#;
+
+    #[test]
+    fn cyclic_placement_terminates_and_is_counted() {
+        let table = EntityTable::build(CYCLIC_PLACEMENT_IFC.as_bytes());
+        let mut r = PlacementResolver::new(&table);
+        // Must return, not overflow the stack.
+        let m = r.world(10);
+        assert!(m.is_finite());
+        assert!(
+            r.cycle_count() >= 1,
+            "the broken cycle must be counted, got {}",
+            r.cycle_count()
+        );
+    }
+
+    #[test]
+    fn grid_placement_is_unhandled_not_misparsed() {
+        let table = EntityTable::build(CYCLIC_PLACEMENT_IFC.as_bytes());
+        let mut r = PlacementResolver::new(&table);
+        let m = r.world(40);
+        // Identity, but *flagged* — not a silent world-origin landing.
+        assert_eq!(m, DMat4::IDENTITY);
+        assert_eq!(r.grid_placement_count(), 1);
+    }
 }

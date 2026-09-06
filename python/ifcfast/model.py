@@ -255,10 +255,24 @@ class Model:
     # than a silently non-unique key column.
     duplicate_step_ids: int = field(default=0)
 
+    # GH #148/#149: non-fatal anomalies the native indexer collected
+    # (unit resolution, missing FILE_SCHEMA, duplicate ids). Never
+    # printed by the library; read them here or in ``summary()``.
+    # Persisted in the index cache so a cache hit reports the same list.
+    warnings: list[str] = field(default_factory=list)
+
     # All of these are typed as Optional[pandas.DataFrame] in practice;
     # using `object` keeps the import-graph cheap (model.py shouldn't
     # force pandas at import time).
     _products_df: Optional["object"] = field(repr=False, default=None)
+    # Derived view of `_products_list` for callers who want a DataFrame
+    # on a COLD-PARSE model. Kept separate from `_products_df` (GH #162):
+    # `_products_df` means "the DataFrame is the tier-1 source of truth"
+    # and every filter/lookup switches to the row-wise pandas path when
+    # it is set. Memoising the derived frame there made one `products_df`
+    # / `spaces_df` access silently downgrade `filter()` and `__iter__`
+    # to `iterrows()` for the rest of the model's life.
+    _products_df_view: Optional["object"] = field(repr=False, default=None)
     _guid_index: Optional[dict[str, int]] = field(repr=False, default=None)
     _data_layers: Optional["object"] = field(repr=False, default=None)
     _contained_in_df: Optional["object"] = field(repr=False, default=None)
@@ -484,23 +498,32 @@ class Model:
 
     @property
     def products_df(self):
-        """Tier-1 index as a pandas DataFrame (built on demand)."""
+        """Tier-1 index as a pandas DataFrame (built on demand).
+
+        On a cache-hit model this IS the tier-1 store and is returned
+        as-is. On a cold-parse model the frame is built from the
+        ``ProductRow`` list and memoised separately — accessing it does
+        not change how :meth:`filter` / ``iter(model)`` traverse
+        (GH #162).
+        """
         import pandas as pd
         from dataclasses import asdict
 
         if self._products_df is not None:
             return self._products_df
+        if self._products_df_view is not None:
+            return self._products_df_view
         if self._products_list:
-            self._products_df = pd.DataFrame(
+            self._products_df_view = pd.DataFrame(
                 [asdict(p) for p in self._products_list]
             )
         else:
-            self._products_df = pd.DataFrame(
+            self._products_df_view = pd.DataFrame(
                 columns=[
                     f.name for f in ProductRow.__dataclass_fields__.values()
                 ]
             )
-        return self._products_df
+        return self._products_df_view
 
     # ------------------------------------------------------------------
     # Lazy data layers
@@ -1858,6 +1881,7 @@ class Model:
             # collapsed (last-wins). A loud flag instead of a silently
             # non-unique key column.
             "duplicate_step_ids": self.duplicate_step_ids,
+            "warnings": list(self.warnings),
         }
 
     @property
@@ -2183,7 +2207,22 @@ class Model:
             return df.head(n).to_dict(orient="records")
         if table in {"psets", "quantities", "materials", "classifications", "drift", "segments"}:
             df = getattr(self, table)  # triggers extract for data layers
-            if df is None or len(df) == 0:
+            if df is None:
+                # GH #162: `None` means the layer could not be PRODUCED
+                # (drift/segments need the `mesh` Cargo feature); `[]`
+                # meant "the model has none of these". Returning `[]` for
+                # both lost the distinction, and an agent reading it
+                # concluded the model has no drift — the opposite of the
+                # truth. `drift_unavailable` on the data layers is the
+                # same signal; surface it instead of flattening it.
+                raise ValueError(
+                    f"{table!r} is unavailable on this build: the native "
+                    f"core was compiled without the `mesh` feature, so no "
+                    f"drift/segments layer can be produced. This is NOT "
+                    f"'the model has none' — reinstall a wheel built with "
+                    f"mesh support."
+                )
+            if len(df) == 0:
                 return []
             rows = []
             for row in df.head(n).to_dict(orient="records"):
@@ -2401,9 +2440,25 @@ def open_ifc(
         try:
             _cache.write_index(model)
         except Exception as exc:
-            import sys
-
-            print(f"[ifcfast] cache write failed: {exc}", file=sys.stderr)
+            # GH #158: a bare print bypassed the single loud-failure
+            # channel — invisible to `warnings.catch_warnings`,
+            # swallowed by a caller that redirects stderr, and
+            # unfilterable. Routed through `_strict_signal` instead.
+            #
+            # Deliberately the WARN arm regardless of `strict`: the
+            # strict contract is "a wrong NUMBER must stop the
+            # pipeline", and a failed cache write produces no numbers at
+            # all — the parse already succeeded and `model` is correct.
+            # The only consequence is that the next open re-parses. A
+            # read-only HOME or a full disk must not turn every
+            # `ifcfast.open()` into a hard failure.
+            _strict_signal(
+                f"cache write failed for {p}: {type(exc).__name__}: {exc}. "
+                f"The parse succeeded and the returned model is complete; "
+                f"the next open will re-parse instead of hitting the "
+                f"cache. Pass write_cache=False to stop trying.",
+                strict=False,
+            )
 
     return model
 
@@ -2461,11 +2516,15 @@ def _signal_unresolved_unit(model: Model, p: Path, strict: bool) -> None:
         return
     if _lengthunit_declared(p):
         model.unit_resolved = False
+        # GH #149: the native indexer says WHY (unknown SI prefix,
+        # broken conversion chain, inconsistent SI name) — surface it.
+        detail = "; ".join(w for w in model.warnings if "unit" in w.lower())
         _strict_signal(
-            f"IFC file declares a LENGTHUNIT that could not be resolved "
-            f"(broken IfcConversionBasedUnit / IfcMeasureWithUnit chain); "
+            f"IFC file declares a LENGTHUNIT that could not be resolved; "
             f"unit_scale is None and every derived length is in unknown "
-            f"units: {p}. Pass strict=False to downgrade this to a warning.",
+            f"units: {p}."
+            + (f" Indexer: {detail}" if detail else "")
+            + " Pass strict=False to downgrade this to a warning.",
             strict,
         )
     else:
@@ -2798,6 +2857,7 @@ def _index_native(
         type_counts=type_counts,
         parse_seconds=time.time() - started,
         duplicate_step_ids=duplicate_step_ids,
+        warnings=[str(w) for w in (raw.get("warnings") or [])],
         _contained_in_df=contained_in_df,
         _aggregates_df=aggregates_df,
         _storey_building_df=storey_building_df,

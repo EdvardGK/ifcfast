@@ -118,6 +118,20 @@ _COUNT_PARENT_TYPES = frozenset({
     "IfcEnergyConversionDevice", "IfcDistributionControlElement",
 })
 
+# Supertypes that make a descendant LINEAR / MEASURE when the entity
+# itself isn't named in the explicit sets. Hoisted out of
+# `classify_by_name` (they used to be inline literals) so
+# `cache._classifier_signature` can fold them into the cache signature
+# — a change here re-classifies elements and must invalidate the cache
+# (GH #158).
+_LINEAR_PARENT_TYPES = frozenset({"IfcFlowSegment"})
+
+# IFC4/IFC2X3 root the bulk built elements at IfcBuildingElement;
+# IFC4X3 renamed that supertype to IfcBuiltElement, so the walk must
+# accept either (IfcKerb, IfcPavement, IfcCourse, … chain through
+# IfcBuiltElement and would otherwise fall through to SKIP).
+_MEASURE_PARENT_TYPES = frozenset({"IfcBuildingElement", "IfcBuiltElement"})
+
 
 # Cached ancestor chains per (entity, schema) — built once by walking
 # the static `SUPERTYPE` table that ships with the wheel. No live IFC
@@ -316,12 +330,8 @@ def classify_by_name(entity: str, schema: str = "IFC4") -> ElementMode:
     for p in ancestors:
         if p in _COUNT_PARENT_TYPES:
             return ElementMode.COUNT
-        if p == "IfcFlowSegment":
+        if p in _LINEAR_PARENT_TYPES:
             return ElementMode.LINEAR
-        # IFC4/IFC2X3 root the bulk built elements at IfcBuildingElement;
-        # IFC4X3 renamed that supertype to IfcBuiltElement, so the walk
-        # must accept either (IfcKerb, IfcPavement, IfcCourse, … chain
-        # through IfcBuiltElement and would otherwise fall through to SKIP).
-        if p in ("IfcBuildingElement", "IfcBuiltElement"):
+        if p in _MEASURE_PARENT_TYPES:
             return ElementMode.MEASURE
     return ElementMode.SKIP

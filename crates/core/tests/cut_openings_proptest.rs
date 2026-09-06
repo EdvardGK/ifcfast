@@ -58,9 +58,7 @@ struct Box3 {
 
 impl Box3 {
     fn volume(&self) -> f64 {
-        (self.max[0] - self.min[0])
-            * (self.max[1] - self.min[1])
-            * (self.max[2] - self.min[2])
+        (self.max[0] - self.min[0]) * (self.max[1] - self.min[1]) * (self.max[2] - self.min[2])
     }
 
     /// Closed-form `volume(self ∩ other)` over the AABB. Returns 0 if
@@ -208,7 +206,7 @@ fn identity_mat4_cols() -> [f32; 16] {
 /// For a closed outward-CCW mesh this returns the enclosed volume.
 fn signed_volume(verts: &[f32], indices: &[u32]) -> f64 {
     let mut v6: f64 = 0.0;
-    for tri in indices.chunks_exact(3) {
+    for tri in indices.as_chunks::<3>().0 {
         let (ai, bi, ci) = (tri[0] as usize, tri[1] as usize, tri[2] as usize);
         let (ax, ay, az) = (
             verts[ai * 3] as f64,
@@ -225,9 +223,7 @@ fn signed_volume(verts: &[f32], indices: &[u32]) -> f64 {
             verts[ci * 3 + 1] as f64,
             verts[ci * 3 + 2] as f64,
         );
-        v6 += ax * (by * cz - bz * cy)
-            + ay * (bz * cx - bx * cz)
-            + az * (bx * cy - by * cx);
+        v6 += ax * (by * cz - bz * cy) + ay * (bz * cx - bx * cz) + az * (bx * cy - by * cx);
     }
     v6 / 6.0
 }
@@ -238,7 +234,7 @@ fn signed_volume(verts: &[f32], indices: &[u32]) -> f64 {
 fn is_closed_manifold(indices: &[u32]) -> bool {
     use std::collections::HashMap;
     let mut edges: HashMap<(u32, u32), u32> = HashMap::new();
-    for tri in indices.chunks_exact(3) {
+    for tri in indices.as_chunks::<3>().0 {
         for (a, b) in [(tri[0], tri[1]), (tri[1], tri[2]), (tri[2], tri[0])] {
             let key = if a < b { (a, b) } else { (b, a) };
             *edges.entry(key).or_insert(0) += 1;
@@ -299,16 +295,23 @@ fn cutter_box_strategy(host: Box3) -> impl Strategy<Value = Box3> {
                 host_centre[2] + oz * host_half[2],
             ];
             Box3 {
-                min: [centre[0] - sx / 2.0, centre[1] - sy / 2.0, centre[2] - sz / 2.0],
-                max: [centre[0] + sx / 2.0, centre[1] + sy / 2.0, centre[2] + sz / 2.0],
+                min: [
+                    centre[0] - sx / 2.0,
+                    centre[1] - sy / 2.0,
+                    centre[2] - sz / 2.0,
+                ],
+                max: [
+                    centre[0] + sx / 2.0,
+                    centre[1] + sy / 2.0,
+                    centre[2] + sz / 2.0,
+                ],
             }
         })
 }
 
 fn prism_pair_strategy() -> impl Strategy<Value = (Box3, Box3)> {
-    host_box_strategy().prop_flat_map(|host| {
-        cutter_box_strategy(host).prop_map(move |cutter| (host, cutter))
-    })
+    host_box_strategy()
+        .prop_flat_map(|host| cutter_box_strategy(host).prop_map(move |cutter| (host, cutter)))
 }
 
 /// Strict-containment generator: every emitted cutter is inside the
@@ -344,8 +347,16 @@ fn contained_pair_strategy() -> impl Strategy<Value = (Box3, Box3)> {
                     host.min[2] + cs[2] / 2.0 + oz * (host_extents[2] - cs[2]),
                 ];
                 let cutter = Box3 {
-                    min: [centre[0] - cs[0] / 2.0, centre[1] - cs[1] / 2.0, centre[2] - cs[2] / 2.0],
-                    max: [centre[0] + cs[0] / 2.0, centre[1] + cs[1] / 2.0, centre[2] + cs[2] / 2.0],
+                    min: [
+                        centre[0] - cs[0] / 2.0,
+                        centre[1] - cs[1] / 2.0,
+                        centre[2] - cs[2] / 2.0,
+                    ],
+                    max: [
+                        centre[0] + cs[0] / 2.0,
+                        centre[1] + cs[1] / 2.0,
+                        centre[2] + cs[2] / 2.0,
+                    ],
                 };
                 (host, cutter)
             })

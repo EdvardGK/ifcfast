@@ -118,7 +118,10 @@ mod tests {
         // the band can never exceed a physical millimetre.
         let km = on_plane_eps(1000.0);
         assert!(km < 1.0e-3 && km > 0.0, "km eps = {km} (want sub-1e-3)");
-        assert!((km - 1.0e-6).abs() < 1e-12, "km eps = {km} (want 1e-6 = 1 mm)");
+        assert!(
+            (km - 1.0e-6).abs() < 1e-12,
+            "km eps = {km} (want 1e-6 = 1 mm)"
+        );
     }
 
     #[test]

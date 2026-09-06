@@ -93,7 +93,8 @@ pub fn block(table: &EntityTable, id: u64) -> Option<LocalMesh> {
     // Bottom (z=0), top (z=Z), and four sides.
     let f = |i: u32| base + i;
     let q = |mesh: &mut LocalMesh, a, b, c, d| {
-        mesh.indices.extend_from_slice(&[f(a), f(b), f(c), f(a), f(c), f(d)]);
+        mesh.indices
+            .extend_from_slice(&[f(a), f(b), f(c), f(a), f(c), f(d)]);
     };
     q(&mut mesh, 0, 3, 2, 1); // bottom (normal -Z)
     q(&mut mesh, 4, 5, 6, 7); // top    (normal +Z)
@@ -128,7 +129,11 @@ pub fn right_circular_cylinder(table: &EntityTable, id: u64) -> Option<LocalMesh
     }
     for i in 0..n {
         let theta = (i as f32) * 2.0 * PI / (n as f32);
-        local.push(Vec3::new(radius * theta.cos(), radius * theta.sin(), height));
+        local.push(Vec3::new(
+            radius * theta.cos(),
+            radius * theta.sin(),
+            height,
+        ));
     }
     local.push(Vec3::new(0.0, 0.0, 0.0));
     local.push(Vec3::new(0.0, 0.0, height));
@@ -175,8 +180,8 @@ pub fn right_circular_cone(table: &EntityTable, id: u64) -> Option<LocalMesh> {
         let theta = (i as f32) * 2.0 * PI / (n as f32);
         local.push(Vec3::new(radius * theta.cos(), radius * theta.sin(), 0.0));
     }
-    local.push(Vec3::new(0.0, 0.0, 0.0));     // bottom centre
-    local.push(Vec3::new(0.0, 0.0, height));  // apex
+    local.push(Vec3::new(0.0, 0.0, 0.0)); // bottom centre
+    local.push(Vec3::new(0.0, 0.0, height)); // apex
 
     let mut mesh = LocalMesh::new();
     let base = push_transformed_vertices(&mut mesh, &local, &position);
@@ -287,7 +292,8 @@ pub fn rectangular_pyramid(table: &EntityTable, id: u64) -> Option<LocalMesh> {
     let v = |i: u32| base + i;
 
     // Base, normal -Z (CW from above).
-    mesh.indices.extend_from_slice(&[v(0), v(3), v(2), v(0), v(2), v(1)]);
+    mesh.indices
+        .extend_from_slice(&[v(0), v(3), v(2), v(0), v(2), v(1)]);
     // Four side triangles to the apex.
     mesh.indices.extend_from_slice(&[v(0), v(1), v(4)]);
     mesh.indices.extend_from_slice(&[v(1), v(2), v(4)]);

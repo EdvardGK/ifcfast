@@ -52,10 +52,7 @@ impl PsetTable {
 /// Build the property table given an entity-table and a step_id → guid
 /// resolver for the products you care about (typically the products
 /// the indexer already extracted).
-pub fn build(
-    table: &EntityTable,
-    product_step_to_guid: &HashMap<u64, String>,
-) -> PsetTable {
+pub fn build(table: &EntityTable, product_step_to_guid: &HashMap<u64, String>) -> PsetTable {
     // Pass 1: collect IfcPropertySet records (id → (name, prop_ids))
     //         and IfcPropertySingleValue records (id → Prop).
     let mut psets: HashMap<u64, (String, Vec<u64>)> = HashMap::with_capacity(2048);
@@ -97,7 +94,14 @@ pub fn build(
             let fields = split_top_level_args(args);
             let name = string_at(&fields, 0).unwrap_or_default();
             let (val_str, val_type) = parse_nominal_value(fields.get(2).copied());
-            props.insert(step_id, Prop { name, value: val_str, value_type: val_type });
+            props.insert(
+                step_id,
+                Prop {
+                    name,
+                    value: val_str,
+                    value_type: val_type,
+                },
+            );
         } else if type_name.eq_ignore_ascii_case(b"IFCPROPERTYENUMERATEDVALUE")
             || type_name.eq_ignore_ascii_case(b"IFCPROPERTYLISTVALUE")
         {
@@ -114,9 +118,15 @@ pub fn build(
             // they surface alongside IfcPropertySingleValue properties.
             let fields = split_top_level_args(args);
             let name = string_at(&fields, 0).unwrap_or_default();
-            let (val_str, val_type) =
-                parse_value_list(fields.get(2).copied());
-            props.insert(step_id, Prop { name, value: val_str, value_type: val_type });
+            let (val_str, val_type) = parse_value_list(fields.get(2).copied());
+            props.insert(
+                step_id,
+                Prop {
+                    name,
+                    value: val_str,
+                    value_type: val_type,
+                },
+            );
         } else if type_name.eq_ignore_ascii_case(b"IFCPROPERTYBOUNDEDVALUE") {
             // (Name, Description, UpperBoundValue, LowerBoundValue, Unit, SetPointValue)
             // Three optional IfcValues. Format: "lower..upper" if both
@@ -128,12 +138,22 @@ pub fn build(
             // silently dropped from psets.
             let fields = split_top_level_args(args);
             let name = string_at(&fields, 0).unwrap_or_default();
-            let (upper_val, upper_type) =
-                parse_nominal_value(fields.get(2).copied());
+            let (upper_val, upper_type) = parse_nominal_value(fields.get(2).copied());
             let (lower_val, _) = parse_nominal_value(fields.get(3).copied());
             let (setpoint_val, _) = parse_nominal_value(fields.get(5).copied());
-            let val_str = format_bounded(lower_val.as_deref(), upper_val.as_deref(), setpoint_val.as_deref());
-            props.insert(step_id, Prop { name, value: val_str, value_type: upper_type });
+            let val_str = format_bounded(
+                lower_val.as_deref(),
+                upper_val.as_deref(),
+                setpoint_val.as_deref(),
+            );
+            props.insert(
+                step_id,
+                Prop {
+                    name,
+                    value: val_str,
+                    value_type: upper_type,
+                },
+            );
         } else if type_name.eq_ignore_ascii_case(b"IFCPROPERTYTABLEVALUE") {
             // (Name, Description, DefiningValues, DefinedValues,
             //  Expression, DefiningUnit, DefinedUnit, CurveInterpolation)
@@ -151,8 +171,7 @@ pub fn build(
             let fields = split_top_level_args(args);
             let name = string_at(&fields, 0).unwrap_or_default();
             let defining_vals = parse_value_list_raw(fields.get(2).copied());
-            let (defined_vals, defined_type) =
-                parse_value_list_with_each(fields.get(3).copied());
+            let (defined_vals, defined_type) = parse_value_list_with_each(fields.get(3).copied());
             let val_str = if defining_vals.is_empty() && defined_vals.is_empty() {
                 None
             } else {
@@ -171,7 +190,14 @@ pub fn build(
                     Some(pairs.join(", "))
                 }
             };
-            props.insert(step_id, Prop { name, value: val_str, value_type: defined_type });
+            props.insert(
+                step_id,
+                Prop {
+                    name,
+                    value: val_str,
+                    value_type: defined_type,
+                },
+            );
         } else if type_name.eq_ignore_ascii_case(b"IFCCOMPLEXPROPERTY") {
             // (Name, Description, UsageName, HasProperties)
             // Note: IfcComplexProperty does NOT inherit IfcRoot — no
@@ -324,7 +350,18 @@ pub fn build(
     // a file with no IfcTypeObjects or no IfcRelDefinesByType has
     // nothing to inherit.
     if !type_psets.is_empty() && !product_to_type.is_empty() {
-        for (product_step_id, type_step_id) in &product_to_type {
+        // Sort by product step id before emitting. Iterating the
+        // HashMap directly leaked std's per-process RandomState seeding
+        // into the ROW ORDER of the type-inherited half of the table —
+        // two runs on the same file produced the same rows in a
+        // different order, which the bitwise parity gates read as drift
+        // (GH #152).
+        let mut inherit: Vec<(u64, u64)> = product_to_type
+            .iter()
+            .map(|(product, type_id)| (*product, *type_id))
+            .collect();
+        inherit.sort_unstable();
+        for (product_step_id, type_step_id) in &inherit {
             let guid = match product_step_to_guid.get(product_step_id) {
                 Some(g) => g.as_str(),
                 None => continue,
@@ -576,14 +613,14 @@ fn is_type_object(t: &[u8]) -> bool {
     let suffix_ok = t.len() > 7
         && t[..3].eq_ignore_ascii_case(b"IFC")
         && t[t.len() - 4..].eq_ignore_ascii_case(b"TYPE");
-    let ifc2x3_style = t.eq_ignore_ascii_case(b"IFCDOORSTYLE")
-        || t.eq_ignore_ascii_case(b"IFCWINDOWSTYLE");
+    let ifc2x3_style =
+        t.eq_ignore_ascii_case(b"IFCDOORSTYLE") || t.eq_ignore_ascii_case(b"IFCWINDOWSTYLE");
     // Bare base classes `IfcTypeProduct` / `IfcTypeObject` are non-abstract
     // and emitted by Revit for types with no schema-specific `*Type`
     // subtype; they end in `PRODUCT` / `OBJECT`, miss the suffix check, and
     // would silently drop their inherited psets. See #69.
-    let bare_base = t.eq_ignore_ascii_case(b"IFCTYPEPRODUCT")
-        || t.eq_ignore_ascii_case(b"IFCTYPEOBJECT");
+    let bare_base =
+        t.eq_ignore_ascii_case(b"IFCTYPEPRODUCT") || t.eq_ignore_ascii_case(b"IFCTYPEOBJECT");
     suffix_ok || ifc2x3_style || bare_base
 }
 
@@ -778,11 +815,7 @@ fn scalar_to_string(raw: &[u8]) -> Option<String> {
         Field::Enum(e) => Some(std::str::from_utf8(e).ok()?.to_string()),
         Field::Ref(id) => Some(format!("#{}", id)),
         Field::Null | Field::Star => None,
-        Field::List(_) | Field::Other(_) => Some(
-            std::str::from_utf8(trimmed)
-                .ok()?
-                .to_string(),
-        ),
+        Field::List(_) | Field::Other(_) => Some(std::str::from_utf8(trimmed).ok()?.to_string()),
     }
 }
 
@@ -885,7 +918,6 @@ fn relating_def_typed_wrapper_refs(bytes: &[u8]) -> Vec<u64> {
         _ => Vec::new(),
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -1169,9 +1201,7 @@ END-ISO-10303-21;
         let t = run(&buf);
         assert_eq!(t.len(), 2, "expected 2 leaf rows, got {}", t.len());
         let by_name: std::collections::HashMap<&str, &str> = (0..t.len())
-            .filter_map(|i| {
-                t.value[i].as_deref().map(|v| (t.prop_name[i].as_str(), v))
-            })
+            .filter_map(|i| t.value[i].as_deref().map(|v| (t.prop_name[i].as_str(), v)))
             .collect();
         assert_eq!(by_name.get("ProfileGeometry.Width"), Some(&"200"));
         assert_eq!(by_name.get("ProfileGeometry.Height"), Some(&"400"));
@@ -1340,7 +1370,12 @@ END-ISO-10303-21;
 "#,
         );
         let t = run(&buf);
-        assert_eq!(t.len(), 1, "instance must shadow type, got {} rows", t.len());
+        assert_eq!(
+            t.len(),
+            1,
+            "instance must shadow type, got {} rows",
+            t.len()
+        );
         assert_eq!(t.value[0].as_deref(), Some("Hilti"));
         assert_eq!(t.source[0], "instance");
     }
@@ -1397,8 +1432,7 @@ END-ISO-10303-21;
         // products must inherit the type's psets. This is the bulk
         // case on real exports — one IfcWallType backing 200 wall
         // instances.
-        let buf = format!(
-            r#"ISO-10303-21;
+        let buf = r#"ISO-10303-21;
 HEADER;
 FILE_DESCRIPTION(('ViewDefinition [ReferenceView]'),'2;1');
 FILE_NAME('psets_test.ifc','2026-05-26T00:00:00',('test'),('test'),'ifcfast','ifcfast','');
@@ -1420,11 +1454,10 @@ DATA;
 ENDSEC;
 END-ISO-10303-21;
 "#
-        );
+        .to_string();
         let t = run(&buf);
         assert_eq!(t.len(), 2);
-        let guids: std::collections::HashSet<&str> =
-            t.guid.iter().map(String::as_str).collect();
+        let guids: std::collections::HashSet<&str> = t.guid.iter().map(String::as_str).collect();
         assert!(guids.contains("1Wall00000000000000001"));
         assert!(guids.contains("1Wall00000000000000002"));
         for i in 0..t.len() {
@@ -1533,8 +1566,7 @@ END-ISO-10303-21;
         // The indexer's TypeObject classifier has a special case for
         // them; the pset extractor must mirror it or 100% of door/window
         // typing leaks silently on the IFC2x3 long-tail.
-        let buf = format!(
-            r#"ISO-10303-21;
+        let buf = r#"ISO-10303-21;
 HEADER;
 FILE_DESCRIPTION(('ViewDefinition [CoordinationView]'),'2;1');
 FILE_NAME('psets_test.ifc','2026-05-26T00:00:00',('test'),('test'),'ifcfast','ifcfast','');
@@ -1554,8 +1586,7 @@ DATA;
 #33=IFCRELDEFINESBYTYPE('6RelType000000000000001',$,$,$,(#10),#32);
 ENDSEC;
 END-ISO-10303-21;
-"#
-        );
+"#.to_string();
         let t = run(&buf);
         assert_eq!(t.len(), 1);
         assert_eq!(t.guid[0], "1Door00000000000000001");

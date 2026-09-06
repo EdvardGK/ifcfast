@@ -126,7 +126,8 @@ fn transformation_operator_matrix(table: &EntityTable, id: u64) -> Mat4 {
         None => return Mat4::IDENTITY,
     };
     let is_3d = type_name.eq_ignore_ascii_case(b"IFCCARTESIANTRANSFORMATIONOPERATOR3D");
-    let is_3d_non = type_name.eq_ignore_ascii_case(b"IFCCARTESIANTRANSFORMATIONOPERATOR3DNONUNIFORM");
+    let is_3d_non =
+        type_name.eq_ignore_ascii_case(b"IFCCARTESIANTRANSFORMATIONOPERATOR3DNONUNIFORM");
     if !is_3d && !is_3d_non {
         return Mat4::IDENTITY;
     }
@@ -166,7 +167,9 @@ fn transformation_operator_matrix(table: &EntityTable, id: u64) -> Mat4 {
     let axis2 = read_dir(1).unwrap_or(Vec3::Y).normalize_or_zero();
     let origin = read_pt(2);
     let scale = read_num(3, 1.0);
-    let axis3 = read_dir(4).unwrap_or(axis1.cross(axis2)).normalize_or_zero();
+    let axis3 = read_dir(4)
+        .unwrap_or(axis1.cross(axis2))
+        .normalize_or_zero();
     let (s1, s2, s3) = if is_3d_non {
         (scale, read_num(5, scale), read_num(6, scale))
     } else {

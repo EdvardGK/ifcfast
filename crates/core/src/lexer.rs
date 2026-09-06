@@ -165,13 +165,70 @@ fn skip_ws_and_comments(buf: &[u8], mut i: usize, end: usize) -> usize {
     }
 }
 
+/// Why a [`for_each_record`] walk stopped.
+///
+/// Pre-GH-#148 the walk broke out of its loop on *any* byte that didn't
+/// start a record and told nobody. A single stray byte mid-DATA (the
+/// canonical case: a doubled `;;` written by a broken exporter) silently
+/// truncated the model — every later entity vanished and the index /
+/// QTO / clash pipeline ran to completion on a partial file at exit 0.
+/// The walk now reports *why* it stopped so callers can refuse a
+/// truncated parse instead of publishing it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScanEnd {
+    /// Walked to `end` with nothing left to read. Normal termination
+    /// when `end` is the `ENDSEC` position handed in by
+    /// [`endsec_position`].
+    Exhausted,
+    /// Stopped on a bare `ENDSEC` token — the legitimate section end.
+    Endsec,
+    /// Stopped on a byte that starts neither a record (`#`) nor
+    /// `ENDSEC`. `offset` is absolute in `buf`.
+    Garbage { offset: usize, byte: u8 },
+    /// A record started at `offset` but no terminating `;` was found
+    /// before `end` — a cut-off final record.
+    Unterminated { offset: usize },
+}
+
+impl ScanEnd {
+    /// `true` for the two legitimate endings.
+    pub fn is_clean(&self) -> bool {
+        matches!(self, ScanEnd::Exhausted | ScanEnd::Endsec)
+    }
+
+    /// Human-readable diagnosis for a non-clean ending, `None` when the
+    /// walk finished legitimately.
+    pub fn describe(&self) -> Option<String> {
+        match self {
+            ScanEnd::Exhausted | ScanEnd::Endsec => None,
+            ScanEnd::Garbage { offset, byte } => Some(format!(
+                "DATA section record stream stopped at byte offset {offset}: \
+                 found {:?} (0x{byte:02X}) where a record (`#`) or `ENDSEC` \
+                 was expected. Every entity after this offset was NOT parsed \
+                 — the model is truncated (a doubled `;;` or a stray byte \
+                 written mid-stream is the usual cause).",
+                *byte as char
+            )),
+            ScanEnd::Unterminated { offset } => Some(format!(
+                "DATA section record starting at byte offset {offset} has no \
+                 terminating `;` before the end of the section — the model is \
+                 truncated at that record."
+            )),
+        }
+    }
+}
+
 /// Iterate over every entity record in `buf[start..end]`.
 ///
-/// `callback` receives one [`Record`] per instance. The iterator is
-/// resilient to malformed records: it logs nothing and just skips
-/// anything between two `;` that doesn't match the `#<id> = TYPE(...)`
-/// shape.
-pub fn for_each_record<'a, F>(buf: &'a [u8], start: usize, end: usize, mut callback: F)
+/// `callback` receives one [`Record`] per instance. Malformed records
+/// that still frame correctly (a `#…;` span that doesn't match
+/// `#<id> = TYPE(...)`) are skipped silently — they cost nothing and
+/// carry nothing. A byte that isn't the start of a record at all STOPS
+/// the walk, and the returned [`ScanEnd`] says whether that stop was
+/// legitimate (`ENDSEC`) or garbage (GH #148). Callers that index a
+/// whole model MUST check it; ignoring the return value re-introduces
+/// the silent-truncation bug.
+pub fn for_each_record<'a, F>(buf: &'a [u8], start: usize, end: usize, mut callback: F) -> ScanEnd
 where
     F: FnMut(Record<'a>),
 {
@@ -187,15 +244,26 @@ where
         }
         // Records must begin with `#`.
         if buf[pos] != b'#' {
-            // Could be ENDSEC; etc. Bail out of the DATA loop entirely
-            // — a non-`#`, non-comment start indicates we've left the
-            // entity stream.
-            break;
+            // Two very different situations share this branch: the
+            // section legitimately ended (`ENDSEC`), or the file is
+            // corrupt from here on. Tell them apart and report.
+            return if is_endsec_at(buf, pos, end) {
+                ScanEnd::Endsec
+            } else {
+                ScanEnd::Garbage {
+                    offset: pos,
+                    byte: buf[pos],
+                }
+            };
         }
         let record_start = pos;
         let term = match find_record_end(buf, pos, end) {
             Some(t) => t,
-            None => break,
+            None => {
+                return ScanEnd::Unterminated {
+                    offset: record_start,
+                }
+            }
         };
         // Parse the record header: #<digits> = TYPE
         if let Some(rec) = parse_record(&buf[record_start..term]) {
@@ -207,6 +275,17 @@ where
         }
         pos = term + 1; // step past the `;`
     }
+    ScanEnd::Exhausted
+}
+
+/// Does a bare `ENDSEC` token start at `pos`? Callers use this to tell
+/// a legitimate section end from garbage. Case-insensitive because
+/// ISO-10303-21 keywords are uppercase by spec but a handful of
+/// exporters lowercase them.
+#[inline]
+fn is_endsec_at(buf: &[u8], pos: usize, end: usize) -> bool {
+    const ENDSEC: &[u8] = b"ENDSEC";
+    pos + ENDSEC.len() <= end && buf[pos..pos + ENDSEC.len()].eq_ignore_ascii_case(ENDSEC)
 }
 
 /// Like [`for_each_record`], but reports each record's absolute byte
@@ -301,27 +380,25 @@ fn find_record_end(buf: &[u8], start: usize, end: usize) -> Option<usize> {
         // memchr3 jumps to the next byte that matters for framing: `;`
         // (record terminator), `'` (string start), or `/` (possible
         // `/* */` comment start). memchr is SIMD-accelerated on x86.
-        match memchr3(b';', b'\'', b'/', &buf[i..limit]) {
-            Some(off) => {
-                let abs = i + off;
-                match buf[abs] {
-                    b';' => return Some(abs),
-                    b'\'' => {
-                        i = skip_quoted_string(buf, abs + 1, limit);
-                    }
-                    b'/' => {
-                        // Only `/*` opens a comment; a lone `/` (e.g. a
-                        // path or division in a value) is an ordinary byte.
-                        if abs + 1 < limit && buf[abs + 1] == b'*' {
-                            i = skip_block_comment(buf, abs + 2, limit);
-                        } else {
-                            i = abs + 1;
-                        }
-                    }
-                    _ => unreachable!(),
+        {
+            let off = memchr3(b';', b'\'', b'/', &buf[i..limit])?;
+            let abs = i + off;
+            match buf[abs] {
+                b';' => return Some(abs),
+                b'\'' => {
+                    i = skip_quoted_string(buf, abs + 1, limit);
                 }
+                b'/' => {
+                    // Only `/*` opens a comment; a lone `/` (e.g. a
+                    // path or division in a value) is an ordinary byte.
+                    if abs + 1 < limit && buf[abs + 1] == b'*' {
+                        i = skip_block_comment(buf, abs + 2, limit);
+                    } else {
+                        i = abs + 1;
+                    }
+                }
+                _ => unreachable!(),
             }
-            None => return None,
         }
     }
     None
@@ -434,7 +511,7 @@ fn parse_record(record: &[u8]) -> Option<(u64, &[u8], &[u8])> {
             // Find the matching `/*` opener scanning left.
             let mut k = j - 2;
             let mut found = false;
-            while k >= args_start + 1 {
+            while k > args_start {
                 if record[k - 1] == b'/' && record[k] == b'*' {
                     j = k - 1;
                     found = true;
@@ -837,6 +914,69 @@ mod tests {
             vec![(1, "IFCWALL".into()), (2, "IFCSLAB".into())],
             "normal two-record file must parse both records"
         );
+    }
+
+    /// GH #148: a doubled `;;` mid-DATA used to break the record loop
+    /// with no signal at all — every later entity vanished and the
+    /// caller saw a clean, partial parse. The walk must now report
+    /// `Garbage` at the stray byte.
+    #[test]
+    fn doubled_semicolon_reports_truncation() {
+        let src = format!(
+            "{HEADER}DATA;\n\
+             #1=IFCWALL('g1',$,$);\n\
+             #2=IFCSLAB('g2',$,$);;\n\
+             #3=IFCBEAM('g3',$,$);\n\
+             ENDSEC;\nEND-ISO-10303-21;\n"
+        );
+        let buf = src.as_bytes();
+        let start = super::data_section_start(buf).expect("DATA; present");
+        let end = endsec_position(buf, start);
+        let mut ids = Vec::new();
+        let stop = for_each_record(buf, start, end, |rec| ids.push(rec.id));
+        // Records before the stray byte still parse …
+        assert_eq!(ids, vec![1, 2]);
+        // … and the walk says loudly that it stopped on garbage.
+        match &stop {
+            super::ScanEnd::Garbage { offset, byte } => {
+                assert_eq!(*byte, b';');
+                assert_eq!(buf[*offset], b';');
+            }
+            other => panic!("expected Garbage, got {other:?}"),
+        }
+        assert!(!stop.is_clean());
+        assert!(stop.describe().unwrap().contains("truncated"));
+    }
+
+    /// The legitimate endings must stay clean: a walk that runs to the
+    /// `ENDSEC` boundary, and one handed the whole buffer so it reads
+    /// the `ENDSEC` token itself.
+    #[test]
+    fn clean_endings_are_not_reported_as_garbage() {
+        let src = format!("{HEADER}DATA;\n#1=IFCWALL('g1',$,$);\nENDSEC;\nEND-ISO-10303-21;\n");
+        let buf = src.as_bytes();
+        let start = super::data_section_start(buf).expect("DATA; present");
+        let end = endsec_position(buf, start);
+        assert_eq!(
+            for_each_record(buf, start, end, |_| {}),
+            super::ScanEnd::Exhausted
+        );
+        // Walking past the section boundary stops ON `ENDSEC`, not on garbage.
+        assert_eq!(
+            for_each_record(buf, start, buf.len(), |_| {}),
+            super::ScanEnd::Endsec
+        );
+    }
+
+    /// A final record cut mid-stream (no `;`) is truncation, not an end.
+    #[test]
+    fn unterminated_final_record_reports_truncation() {
+        let src = format!("{HEADER}DATA;\n#1=IFCWALL('g1',$,$);\n#2=IFCSLAB('g2',$,$");
+        let buf = src.as_bytes();
+        let start = super::data_section_start(buf).expect("DATA; present");
+        let stop = for_each_record(buf, start, buf.len(), |_| {});
+        assert!(matches!(stop, super::ScanEnd::Unterminated { .. }));
+        assert!(stop.describe().unwrap().contains("truncated"));
     }
 
     #[test]

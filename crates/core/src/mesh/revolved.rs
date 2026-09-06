@@ -6,7 +6,7 @@
 //!     SweptArea: IfcProfileDef,         -- profile in position-local XY
 //!     Position : IfcAxis2Placement3D,   -- local frame
 //!     Axis     : IfcAxis1Placement,     -- rotation axis in Position's frame
-//!     Angle    : IfcPlaneAngleMeasure)  -- radians
+//!     Angle    : IfcPlaneAngleMeasure)  -- in the project's PLANEANGLEUNIT
 //! ```
 //!
 //! The profile is rotated around `Axis` (a 3D line = point + unit
@@ -73,20 +73,40 @@ pub fn revolved_area_solid(table: &EntityTable, id: u64) -> Option<LocalMesh> {
         _ => return None,
     };
 
-    let angle: f32 = match fields.get(3).copied().map(parse_field) {
+    let raw_angle: f32 = match fields.get(3).copied().map(parse_field) {
         Some(Field::Number(n)) => n as f32,
         _ => return None,
     };
-    if angle.abs() < 1e-6 {
+    if !raw_angle.is_finite() {
         return None;
     }
+    // GH #155: `Angle` is an `IfcPlaneAngleMeasure` — expressed in the
+    // project's PLANEANGLEUNIT, NOT raw radians. A file declaring
+    // `IfcConversionBasedUnit(.PLANEANGLEUNIT., 'DEGREE', …)` and
+    // `Angle = 360.` means one full turn; consuming it as radians swept
+    // ~57 revolutions and produced a 1834-step mesh. Undeclared → 1.0
+    // (radians), the schema default and what ifcopenshell uses; the
+    // degrees-default in `profile::resolve_plane_angle_scale` is a
+    // heuristic for *ambiguous trim parameters* only and must not leak
+    // into a declared measure.
+    let angle_scale = profile::resolve_plane_angle_scale_opt(table).unwrap_or(1.0);
+    let scaled = raw_angle * angle_scale;
+    if !scaled.is_finite() || scaled.abs() < 1e-6 {
+        return None;
+    }
+    // A revolution beyond a full turn is geometrically meaningless (the
+    // solid closes on itself) and, unclamped, is an OOM vector: the step
+    // count below scales linearly with the angle. Clamp, don't reject —
+    // a slightly-over-2π authored angle is still a full revolution.
+    let angle = scaled.clamp(-TAU, TAU);
 
     // Number of angular steps. Min 4 even for very small angles so
     // a curved surface is recognisable. Scales linearly with angle
-    // up to MAX_ANGULAR_STEPS for a full revolution.
+    // up to MAX_ANGULAR_STEPS for a full revolution — and is HARD
+    // CAPPED there (GH #155): the linear scale is not a bound.
     let n_steps = ((MAX_ANGULAR_STEPS as f32) * angle.abs() / TAU)
         .round()
-        .max(MIN_ANGULAR_STEPS as f32) as usize;
+        .clamp(MIN_ANGULAR_STEPS as f32, MAX_ANGULAR_STEPS as f32) as usize;
     let dtheta = angle / n_steps as f32;
     let needs_caps = (angle.abs() - TAU).abs() > FULL_REVOLUTION_EPSILON;
 
@@ -99,8 +119,8 @@ pub fn revolved_area_solid(table: &EntityTable, id: u64) -> Option<LocalMesh> {
 
     // Build rings: a ring is one rotated copy of the profile boundary
     // (outer + holes concatenated, in the same order each ring).
-    let ring_vertex_count = polygon.outer.len()
-        + polygon.holes.iter().map(|h| h.len()).sum::<usize>();
+    let ring_vertex_count =
+        polygon.outer.len() + polygon.holes.iter().map(|h| h.len()).sum::<usize>();
     let n_rings = n_steps + 1;
     let mut ring_starts: Vec<u32> = Vec::with_capacity(n_rings);
 
@@ -118,13 +138,25 @@ pub fn revolved_area_solid(table: &EntityTable, id: u64) -> Option<LocalMesh> {
     // *away* from the axis if the profile is on the +X side.
     let mut loop_offset: usize = 0;
     let outer_len = polygon.outer.len();
-    emit_side_ribbon(&mut mesh, &ring_starts, loop_offset, outer_len, dtheta < 0.0);
+    emit_side_ribbon(
+        &mut mesh,
+        &ring_starts,
+        loop_offset,
+        outer_len,
+        dtheta < 0.0,
+    );
     loop_offset += outer_len;
     for hole in &polygon.holes {
         let hole_len = hole.len();
         // Holes wound opposite to outer in 2D → flip the side
         // winding so their inward-facing ribbons still face out.
-        emit_side_ribbon(&mut mesh, &ring_starts, loop_offset, hole_len, dtheta >= 0.0);
+        emit_side_ribbon(
+            &mut mesh,
+            &ring_starts,
+            loop_offset,
+            hole_len,
+            dtheta >= 0.0,
+        );
         loop_offset += hole_len;
     }
 
@@ -136,7 +168,7 @@ pub fn revolved_area_solid(table: &EntityTable, id: u64) -> Option<LocalMesh> {
         let last = ring_starts[n_steps];
         // Start cap: wound so its outward normal points opposite the
         // sweep direction (≈ -dθ × profile-plane-normal).
-        for tri in triangulation.chunks_exact(3) {
+        for tri in triangulation.as_chunks::<3>().0 {
             // Reverse winding so the start cap faces away from the
             // material side.
             mesh.indices.push(first + tri[2] as u32);
@@ -144,7 +176,7 @@ pub fn revolved_area_solid(table: &EntityTable, id: u64) -> Option<LocalMesh> {
             mesh.indices.push(first + tri[0] as u32);
         }
         // End cap: forward winding.
-        for tri in triangulation.chunks_exact(3) {
+        for tri in triangulation.as_chunks::<3>().0 {
             mesh.indices.push(last + tri[0] as u32);
             mesh.indices.push(last + tri[1] as u32);
             mesh.indices.push(last + tri[2] as u32);
@@ -317,3 +349,103 @@ fn triangulate(polygon: &Polygon2D) -> Vec<usize> {
 
 // Keep `PI` import warning-free if a future tweak drops the usage.
 const _: f32 = PI;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `IfcRevolvedAreaSolid` with `Angle = 360.` in a file that declares
+    /// PLANEANGLEUNIT = DEGREE (the GH #155 fixture). One full turn.
+    const DEGREE_REVOLVE_IFC: &str = r#"ISO-10303-21;
+HEADER;
+FILE_DESCRIPTION(('ViewDefinition [ReferenceView]'),'2;1');
+FILE_NAME('rev.ifc','2026-09-06T00:00:00',('test'),('skiplum'),'ifcfast','ifcfast','');
+FILE_SCHEMA(('IFC4'));
+ENDSEC;
+DATA;
+#1=IFCSIUNIT(*,.LENGTHUNIT.,.MILLI.,.METRE.);
+#2=IFCSIUNIT(*,.PLANEANGLEUNIT.,$,.RADIAN.);
+#4=IFCMEASUREWITHUNIT(IFCPLANEANGLEMEASURE(0.017453292519943295),#2);
+#5=IFCCONVERSIONBASEDUNIT(#9,.PLANEANGLEUNIT.,'DEGREE',#4);
+#6=IFCUNITASSIGNMENT((#1,#5));
+#9=IFCDIMENSIONALEXPONENTS(0,0,0,0,0,0,0);
+#10=IFCRECTANGLEPROFILEDEF(.AREA.,'r',$,100.,200.);
+#11=IFCCARTESIANPOINT((0.,0.,0.));
+#12=IFCAXIS2PLACEMENT3D(#11,$,$);
+#13=IFCCARTESIANPOINT((500.,0.,0.));
+#14=IFCDIRECTION((0.,1.,0.));
+#15=IFCAXIS1PLACEMENT(#13,#14);
+#20=IFCREVOLVEDAREASOLID(#10,#12,#15,360.);
+ENDSEC;
+END-ISO-10303-21;
+"#;
+
+    /// Same solid, same sweep, authored in a RADIAN-declared file.
+    const RADIAN_REVOLVE_IFC: &str = r#"ISO-10303-21;
+HEADER;
+FILE_DESCRIPTION(('ViewDefinition [ReferenceView]'),'2;1');
+FILE_NAME('rev.ifc','2026-09-06T00:00:00',('test'),('skiplum'),'ifcfast','ifcfast','');
+FILE_SCHEMA(('IFC4'));
+ENDSEC;
+DATA;
+#1=IFCSIUNIT(*,.LENGTHUNIT.,.MILLI.,.METRE.);
+#2=IFCSIUNIT(*,.PLANEANGLEUNIT.,$,.RADIAN.);
+#6=IFCUNITASSIGNMENT((#1,#2));
+#10=IFCRECTANGLEPROFILEDEF(.AREA.,'r',$,100.,200.);
+#11=IFCCARTESIANPOINT((0.,0.,0.));
+#12=IFCAXIS2PLACEMENT3D(#11,$,$);
+#13=IFCCARTESIANPOINT((500.,0.,0.));
+#14=IFCDIRECTION((0.,1.,0.));
+#15=IFCAXIS1PLACEMENT(#13,#14);
+#20=IFCREVOLVEDAREASOLID(#10,#12,#15,6.283185307179586);
+ENDSEC;
+END-ISO-10303-21;
+"#;
+
+    /// GH #155: `Angle = 360.` under PLANEANGLEUNIT = DEGREE is ONE full
+    /// turn, not 360 radians (~57 turns). The consequences are visible in
+    /// the ring count: a 4-vertex profile swept in at most
+    /// `MAX_ANGULAR_STEPS` steps gives `(32 + 1) * 4 = 132` vertices.
+    /// Consuming the 360 as radians produced 1834 steps → 7340 vertices.
+    #[test]
+    fn degree_declared_full_turn_is_one_revolution() {
+        let table = EntityTable::build(DEGREE_REVOLVE_IFC.as_bytes());
+        let mesh = revolved_area_solid(&table, 20).expect("revolve #20 meshes");
+        assert_eq!(
+            mesh.vertices.len() / 3,
+            (MAX_ANGULAR_STEPS + 1) * 4,
+            "step count not capped at one full revolution",
+        );
+        // A full revolution closes on itself → no end caps. With the raw
+        // 360-radian read the sweep is not a multiple of 2π and caps are
+        // emitted, so this also pins the unit conversion itself.
+        let ribbon_tris = MAX_ANGULAR_STEPS * 4 * 2;
+        assert_eq!(
+            mesh.indices.len() / 3,
+            ribbon_tris,
+            "full revolution must not emit end caps",
+        );
+    }
+
+    /// The same sweep authored in radians produces the same mesh — the
+    /// scale is read from the file, not guessed.
+    #[test]
+    fn radian_declared_full_turn_matches_degree_declared() {
+        let deg = EntityTable::build(DEGREE_REVOLVE_IFC.as_bytes());
+        let rad = EntityTable::build(RADIAN_REVOLVE_IFC.as_bytes());
+        let a = revolved_area_solid(&deg, 20).expect("degree revolve meshes");
+        let b = revolved_area_solid(&rad, 20).expect("radian revolve meshes");
+        assert_eq!(a.vertices.len(), b.vertices.len());
+        assert_eq!(a.indices, b.indices);
+    }
+
+    /// A garbage angle is clamped, not obeyed: the step count stays
+    /// bounded (the OOM vector in GH #155).
+    #[test]
+    fn absurd_angle_is_clamped_to_one_turn() {
+        let src = RADIAN_REVOLVE_IFC.replace("6.283185307179586", "1000000.");
+        let table = EntityTable::build(src.as_bytes());
+        let mesh = revolved_area_solid(&table, 20).expect("clamped revolve meshes");
+        assert_eq!(mesh.vertices.len() / 3, (MAX_ANGULAR_STEPS + 1) * 4);
+    }
+}

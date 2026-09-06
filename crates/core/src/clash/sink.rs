@@ -32,6 +32,8 @@ use parquet::arrow::ArrowWriter;
 use parquet::basic::{Compression, ZstdLevel};
 use parquet::file::properties::WriterProperties;
 
+use crate::bundle::parquet_sink::temp_sibling_path;
+
 use super::engine::ClashPair;
 
 fn build_clash_schema() -> Schema {
@@ -51,10 +53,36 @@ fn build_clash_schema() -> Schema {
 }
 
 /// Write the report's pairs to `path` (e.g. `<bundle>/clashes.parquet`).
-/// Overwrites any existing file. Writes zero rows when `pairs` is
-/// empty — the file is still created so downstream queries can join
-/// against it unconditionally.
+/// Writes zero rows when `pairs` is empty — the file is still created so
+/// downstream queries can join against it unconditionally.
+///
+/// Atomic (GH #151): rows stream into a `<name>.tmp.<pid>` sibling and
+/// the file is renamed over `path` only after a clean close. A failure
+/// anywhere removes the staging file and leaves the previous report
+/// exactly as it was — never a readable-but-truncated replacement.
 pub fn write_clashes_parquet(path: &Path, pairs: &[ClashPair]) -> parquet::errors::Result<()> {
+    let tmp = temp_sibling_path(path);
+    match write_staged(&tmp, pairs) {
+        Ok(()) => match std::fs::rename(&tmp, path) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp);
+                Err(parquet::errors::ParquetError::General(format!(
+                    "publish {}: {e}",
+                    path.display()
+                )))
+            }
+        },
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
+}
+
+/// The whole write, against the staging path. Every failure path leaves
+/// cleanup to the caller.
+fn write_staged(path: &Path, pairs: &[ClashPair]) -> parquet::errors::Result<()> {
     let schema: SchemaRef = Arc::new(build_clash_schema());
 
     let file = File::create(path).map_err(|e| {
@@ -119,7 +147,63 @@ fn build_batch(schema: &SchemaRef, pairs: &[ClashPair]) -> parquet::errors::Resu
         Arc::new(distance.finish()),
     ];
 
-    RecordBatch::try_new(schema.clone(), columns).map_err(|e| {
-        parquet::errors::ParquetError::General(format!("clashes batch: {e}"))
-    })
+    RecordBatch::try_new(schema.clone(), columns)
+        .map_err(|e| parquet::errors::ParquetError::General(format!("clashes batch: {e}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn scratch_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "ifcfast-sink-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn successful_write_publishes_and_leaves_no_staging_file() {
+        let dir = scratch_dir("ok");
+        let path = dir.join("clashes.parquet");
+        write_clashes_parquet(&path, &[]).expect("write");
+        assert!(path.exists(), "report published");
+        assert!(
+            !temp_sibling_path(&path).exists(),
+            "staging file must be renamed away, not left behind"
+        );
+    }
+
+    #[test]
+    fn failed_write_leaves_the_previous_report_intact() {
+        // GH #151: the old failure mode replaced a good report with a
+        // truncated one. Publish a good file, then block the staging
+        // path with a directory so the write cannot even open it.
+        let dir = scratch_dir("fail");
+        let path = dir.join("clashes.parquet");
+        write_clashes_parquet(&path, &[]).expect("first write");
+        let before = std::fs::read(&path).expect("read published report");
+        assert!(!before.is_empty());
+
+        let tmp = temp_sibling_path(&path);
+        std::fs::create_dir(&tmp).expect("block the staging path");
+        let err = write_clashes_parquet(&path, &[]).expect_err("staging blocked → must fail");
+        assert!(
+            err.to_string().contains("create"),
+            "error must name the failing create: {err}"
+        );
+
+        assert_eq!(
+            std::fs::read(&path).expect("previous report still readable"),
+            before,
+            "a failed write must not touch the previously published report"
+        );
+    }
 }

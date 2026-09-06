@@ -71,7 +71,7 @@ impl AaBb {
         }
         let mut min = [f32::INFINITY; 3];
         let mut max = [f32::NEG_INFINITY; 3];
-        for chunk in vertices.chunks_exact(3) {
+        for chunk in vertices.as_chunks::<3>().0 {
             for k in 0..3 {
                 if chunk[k] < min[k] {
                     min[k] = chunk[k];
@@ -444,10 +444,7 @@ pub fn pair_split(
 
 fn identity_mat4_cols() -> [f32; 16] {
     [
-        1.0, 0.0, 0.0, 0.0,
-        0.0, 1.0, 0.0, 0.0,
-        0.0, 0.0, 1.0, 0.0,
-        0.0, 0.0, 0.0, 1.0,
+        1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
     ]
 }
 

@@ -114,10 +114,7 @@ fn check_step_trailer(buf: &[u8]) -> io::Result<()> {
     }
     let probe_start = buf.len().saturating_sub(TRAILER_PROBE_BYTES);
     let tail = &buf[probe_start..];
-    if tail
-        .windows(STEP_TRAILER.len())
-        .any(|w| w == STEP_TRAILER)
-    {
+    if tail.windows(STEP_TRAILER.len()).any(|w| w == STEP_TRAILER) {
         Ok(())
     } else {
         Err(io::Error::new(
@@ -186,9 +183,12 @@ pub fn decompress_ifczip(zip_bytes: &[u8]) -> io::Result<Vec<u8>> {
     // index avoids holding two mutable borrows on the archive.
     let mut best: Option<(usize, u64)> = None;
     for i in 0..archive.len() {
-        let f = archive
-            .by_index(i)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!(".ifczip entry {i}: {e}")))?;
+        let f = archive.by_index(i).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(".ifczip entry {i}: {e}"),
+            )
+        })?;
         let name = f.name().to_ascii_lowercase();
         if name.ends_with(".ifc") || name.ends_with(".step") || name.ends_with(".stp") {
             let size = f.size();
@@ -207,10 +207,23 @@ pub fn decompress_ifczip(zip_bytes: &[u8]) -> io::Result<Vec<u8>> {
     let mut entry = archive
         .by_index(idx)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!(".ifczip member: {e}")))?;
-    let mut buf = Vec::with_capacity(entry.size() as usize);
+    // Never trust the ZIP header's declared uncompressed size for the
+    // allocation: it is attacker- (or corruption-) controlled, and a
+    // member declaring 100 GB aborts the process on allocation failure
+    // rather than surfacing a catchable error (GH #159). Reserve a
+    // bounded hint and let `read_to_end` grow the buffer to whatever the
+    // inflate stream actually produces — a genuinely large member costs
+    // a few doublings, a lying header costs nothing.
+    let cap = (entry.size() as usize).min(MAX_ZIP_PREALLOC);
+    let mut buf = Vec::with_capacity(cap);
     entry.read_to_end(&mut buf)?;
     Ok(buf)
 }
+
+/// Upper bound on the up-front allocation for a decompressed `.ifczip`
+/// member. 64 MiB covers most real IFCs outright; larger ones grow
+/// geometrically from here.
+const MAX_ZIP_PREALLOC: usize = 64 * 1024 * 1024;
 
 /// Compress STEP bytes into a single-member `.ifczip` (ZIP/deflate)
 /// archive — the inverse of [`decompress_ifczip`], used by the write
@@ -246,9 +259,8 @@ mod tests {
         {
             let cursor = std::io::Cursor::new(&mut buf);
             let mut zw = zip::ZipWriter::new(cursor);
-            let opts: zip::write::SimpleFileOptions =
-                zip::write::SimpleFileOptions::default()
-                    .compression_method(zip::CompressionMethod::Deflated);
+            let opts: zip::write::SimpleFileOptions = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
             zw.start_file(name, opts).unwrap();
             zw.write_all(contents).unwrap();
             zw.finish().unwrap();
@@ -285,9 +297,8 @@ mod tests {
         {
             let cursor = std::io::Cursor::new(&mut buf);
             let mut zw = zip::ZipWriter::new(cursor);
-            let opts: zip::write::SimpleFileOptions =
-                zip::write::SimpleFileOptions::default()
-                    .compression_method(zip::CompressionMethod::Stored);
+            let opts: zip::write::SimpleFileOptions = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
             zw.start_file("notes.ifc", opts).unwrap();
             zw.write_all(small).unwrap();
             zw.start_file("model.ifc", opts).unwrap();
@@ -314,10 +325,8 @@ mod tests {
         let payload = b"ISO-10303-21;\nHEADER;\nENDSEC;\nEND-ISO-10303-21;\n";
         let archive = make_zip("model.ifc", payload);
 
-        let tmp = std::env::temp_dir().join(format!(
-            "ifcfast-source-test-{}.ifczip",
-            std::process::id()
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("ifcfast-source-test-{}.ifczip", std::process::id()));
         std::fs::write(&tmp, &archive).unwrap();
 
         let src = open(&tmp).expect("zip open");
@@ -325,10 +334,8 @@ mod tests {
         assert_eq!(src.as_bytes(), payload);
 
         // Plain IFC path also works → Mmap variant.
-        let plain = std::env::temp_dir().join(format!(
-            "ifcfast-source-test-{}.ifc",
-            std::process::id()
-        ));
+        let plain =
+            std::env::temp_dir().join(format!("ifcfast-source-test-{}.ifc", std::process::id()));
         std::fs::write(&plain, payload).unwrap();
         let src2 = open(&plain).expect("plain open");
         assert!(matches!(src2, IfcSource::Mmap(_)));
@@ -364,12 +371,9 @@ mod tests {
         // The whole point of GH #89: a direct `open` (the choke-point
         // every `_core.*` entry funnels through) must refuse a truncated
         // plain IFC, not just the Python `header()` wrapper.
-        let truncated =
-            b"ISO-10303-21;\nHEADER;\nENDSEC;\nDATA;\n#1=IFCWALL('g',$,$,$,$,$,$,$";
-        let tmp = std::env::temp_dir().join(format!(
-            "ifcfast-trunc-test-{}.ifc",
-            std::process::id()
-        ));
+        let truncated = b"ISO-10303-21;\nHEADER;\nENDSEC;\nDATA;\n#1=IFCWALL('g',$,$,$,$,$,$,$";
+        let tmp =
+            std::env::temp_dir().join(format!("ifcfast-trunc-test-{}.ifc", std::process::id()));
         std::fs::write(&tmp, truncated).unwrap();
         let err = match open(&tmp) {
             Ok(_) => panic!("truncated plain IFC must be refused at open"),
@@ -382,10 +386,8 @@ mod tests {
     #[test]
     fn open_accepts_terminated_plain_ifc() {
         let whole = b"ISO-10303-21;\nHEADER;\nENDSEC;\nDATA;\nENDSEC;\nEND-ISO-10303-21;\n";
-        let tmp = std::env::temp_dir().join(format!(
-            "ifcfast-whole-test-{}.ifc",
-            std::process::id()
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("ifcfast-whole-test-{}.ifc", std::process::id()));
         std::fs::write(&tmp, whole).unwrap();
         let src = open(&tmp).expect("terminated plain IFC opens");
         assert_eq!(src.as_bytes(), whole);

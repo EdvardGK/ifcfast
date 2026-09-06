@@ -21,9 +21,10 @@ use crate::mesh::extrusion::LocalMesh;
 /// anchor by the bake loop. For typical authoring (small local coords)
 /// this is `[0, 0, 0]` and behaviour is unchanged.
 fn bbox_min(pts: &[DVec3]) -> DVec3 {
-    pts.iter()
-        .copied()
-        .fold(DVec3::new(f64::INFINITY, f64::INFINITY, f64::INFINITY), |a, p| a.min(p))
+    pts.iter().copied().fold(
+        DVec3::new(f64::INFINITY, f64::INFINITY, f64::INFINITY),
+        |a, p| a.min(p),
+    )
 }
 
 /// Mesh an `IfcPolygonalFaceSet` (Archicad's primary export format).
@@ -83,26 +84,53 @@ pub fn polygonal_face_set(table: &EntityTable, id: u64) -> Option<LocalMesh> {
             Field::Ref(id) => id,
             _ => continue,
         };
-        let indices = match indexed_polygonal_face(table, face_id) {
+        let (indices, inner_loops) = match indexed_polygonal_face(table, face_id) {
             Some(v) => v,
             None => continue,
         };
         // Remap via PnIndex if present (both are 1-based; the IFC spec
         // says PnIndex maps face-local 1-based indices to coord-list
         // 1-based indices).
-        let mapped: Vec<u32> = if let Some(pn) = &pn_index {
-            indices
-                .iter()
-                .filter_map(|&i| pn.get((i as usize).saturating_sub(1)).copied())
-                .map(|v| v.saturating_sub(1))
-                .collect()
-        } else {
-            indices.iter().map(|&i| i.saturating_sub(1)).collect()
+        let remap = |raw: &[u32]| -> Vec<u32> {
+            if let Some(pn) = &pn_index {
+                raw.iter()
+                    .filter_map(|&i| pn.get((i as usize).saturating_sub(1)).copied())
+                    .map(|v| v.saturating_sub(1))
+                    .collect()
+            } else {
+                raw.iter().map(|&i| i.saturating_sub(1)).collect()
+            }
         };
-        // Fan-triangulate.
+        let mapped: Vec<u32> = remap(&indices[..]);
         if mapped.len() < 3 {
             continue;
         }
+        let holes: Vec<Vec<u32>> = inner_loops
+            .iter()
+            .map(|l| remap(&l[..]))
+            .filter(|l| l.len() >= 3)
+            .collect();
+
+        // GH #160: a face with declared voids is ear-clipped WITH its
+        // holes (same projection + earcut path the brep face walker
+        // uses) instead of fan-filled. Fan-filling a WithVoids face
+        // over-reports its area and, through the closed shell, its
+        // volume — silently, with the result still classified
+        // `volume_reliable`.
+        if !holes.is_empty() {
+            let in_range = |l: &[u32]| l.iter().all(|&i| (i as usize) < coords.len());
+            if in_range(&mapped[..])
+                && holes.iter().all(|h| in_range(&h[..]))
+                && crate::mesh::brep::triangulate_face_with_holes(&mut mesh, &mapped, &holes)
+            {
+                continue;
+            }
+            // Projection failed (degenerate face) or an index is out of
+            // range — fall through to the fan below so the face is at
+            // least present rather than dropped.
+        }
+
+        // Fan-triangulate the outer loop.
         for i in 1..(mapped.len() - 1) {
             // Validate indices fit the coords table.
             let a = mapped[0];
@@ -229,27 +257,109 @@ fn cartesian_point_list_3d(table: &EntityTable, id: u64) -> Option<Vec<DVec3>> {
     Some(pts)
 }
 
-fn indexed_polygonal_face(table: &EntityTable, id: u64) -> Option<Vec<u32>> {
+/// One face's index loops: the outer `CoordIndex` plus, for
+/// `IfcIndexedPolygonalFaceWithVoids`, every `InnerCoordIndices` loop
+/// (GH #160). Reading only the outer loop filled the voids — an
+/// Archicad polygonal faceset's penetrations came back solid, with no
+/// flag on the over-reported volume.
+fn indexed_polygonal_face(table: &EntityTable, id: u64) -> Option<(Vec<u32>, Vec<Vec<u32>>)> {
     let (type_name, args) = table.get(id)?;
     // IfcIndexedPolygonalFace OR IfcIndexedPolygonalFaceWithVoids
-    if !type_name.eq_ignore_ascii_case(b"IFCINDEXEDPOLYGONALFACE")
-        && !type_name.eq_ignore_ascii_case(b"IFCINDEXEDPOLYGONALFACEWITHVOIDS")
-    {
+    let with_voids = type_name.eq_ignore_ascii_case(b"IFCINDEXEDPOLYGONALFACEWITHVOIDS");
+    if !type_name.eq_ignore_ascii_case(b"IFCINDEXEDPOLYGONALFACE") && !with_voids {
         return None;
     }
     let fields = split_top_level_args(args);
-    // arg[0] = CoordIndex
+    // arg[0] = CoordIndex, arg[1] = InnerCoordIndices (WithVoids only)
     let body = match parse_field(fields.first()?) {
         Field::List(b) => b,
         _ => return None,
     };
-    Some(
-        split_top_level_args(body)
-            .into_iter()
-            .filter_map(|f| match parse_field(f) {
-                Field::Number(n) => Some(n as u32),
-                _ => None,
-            })
-            .collect(),
-    )
+    let outer: Vec<u32> = index_list(body);
+    let mut inner: Vec<Vec<u32>> = Vec::new();
+    if with_voids {
+        if let Some(Field::List(loops)) = fields.get(1).copied().map(parse_field) {
+            for lf in split_top_level_args(loops) {
+                if let Field::List(one) = parse_field(lf) {
+                    let l = index_list(one);
+                    if l.len() >= 3 {
+                        inner.push(l);
+                    }
+                }
+            }
+        }
+    }
+    Some((outer, inner))
+}
+
+/// Flat list of 1-based indices from a STEP list body.
+fn index_list(body: &[u8]) -> Vec<u32> {
+    split_top_level_args(body)
+        .into_iter()
+        .filter_map(|f| match parse_field(f) {
+            Field::Number(n) => Some(n as u32),
+            _ => None,
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A single 10×10 face with a centred 4×4 void, as
+    /// `IfcIndexedPolygonalFaceWithVoids`. Archicad's shape for a
+    /// penetration in a polygonal faceset.
+    const FACE_WITH_VOID_IFC: &str = r#"ISO-10303-21;
+HEADER;
+FILE_DESCRIPTION(('ViewDefinition [ReferenceView]'),'2;1');
+FILE_NAME('void.ifc','2026-09-06T00:00:00',('test'),('skiplum'),'ifcfast','ifcfast','');
+FILE_SCHEMA(('IFC4'));
+ENDSEC;
+DATA;
+#1=IFCCARTESIANPOINTLIST3D(((0.,0.,0.),(10.,0.,0.),(10.,10.,0.),(0.,10.,0.),(3.,3.,0.),(3.,7.,0.),(7.,7.,0.),(7.,3.,0.)));
+#2=IFCINDEXEDPOLYGONALFACEWITHVOIDS((1,2,3,4),((5,6,7,8)));
+#3=IFCPOLYGONALFACESET(#1,.F.,(#2),$);
+#4=IFCINDEXEDPOLYGONALFACE((1,2,3,4));
+#5=IFCPOLYGONALFACESET(#1,.F.,(#4),$);
+ENDSEC;
+END-ISO-10303-21;
+"#;
+
+    fn tri_area(mesh: &LocalMesh) -> f32 {
+        let v = |i: u32| -> glam::Vec3 {
+            let b = i as usize * 3;
+            glam::Vec3::new(mesh.vertices[b], mesh.vertices[b + 1], mesh.vertices[b + 2])
+        };
+        mesh.indices
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .map(|t| 0.5 * (v(t[1]) - v(t[0])).cross(v(t[2]) - v(t[0])).length())
+            .sum()
+    }
+
+    /// GH #160: `InnerCoordIndices` must be honoured. A 10×10 face with
+    /// a 4×4 void has area 84 — a fan over the outer loop alone gives
+    /// the 100 the pre-fix path reported, silently over-filling the
+    /// penetration.
+    #[test]
+    fn polygonal_face_with_voids_excludes_hole_area() {
+        let table = EntityTable::build(FACE_WITH_VOID_IFC.as_bytes());
+        let mesh = polygonal_face_set(&table, 3).expect("faceset #3 meshes");
+        let area = tri_area(&mesh);
+        assert!(
+            (area - 84.0).abs() < 1e-3,
+            "expected the void excluded (area 84), got {area}"
+        );
+    }
+
+    /// The plain `IfcIndexedPolygonalFace` path is untouched — still the
+    /// cheap fan, still the full 100.
+    #[test]
+    fn polygonal_face_without_voids_is_unchanged() {
+        let table = EntityTable::build(FACE_WITH_VOID_IFC.as_bytes());
+        let mesh = polygonal_face_set(&table, 5).expect("faceset #5 meshes");
+        assert!((tri_area(&mesh) - 100.0).abs() < 1e-3);
+    }
 }

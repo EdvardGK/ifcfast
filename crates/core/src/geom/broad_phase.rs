@@ -49,6 +49,15 @@ impl AabbF32 {
 /// Caller is responsible for any same-object dedup (passing an empty
 /// list, or one containing duplicate ids, is allowed — duplicates
 /// just produce self-pairs which can be filtered at the caller).
+///
+/// FRAME MATTERS (GH #156): the boxes are f32, so `tolerance` has to be
+/// resolvable at their magnitude. In absolute site coordinates (a
+/// ~6.7e6 m northing) one f32 ULP is ~0.5 m and a 25 mm expansion is a
+/// no-op — the clash engine therefore rebases every box onto a scene
+/// anchor before calling this. `tolerance` must also be finite and
+/// non-negative: a negative value shrinks every box (dropping genuine
+/// hard clashes) and NaN poisons every comparison. The engine rejects
+/// both up front rather than re-checking per box here.
 pub fn pairs_overlapping(boxes: &[AabbF32], tolerance: f32) -> Vec<(u32, u32)> {
     let n = boxes.len();
     if n < 2 {

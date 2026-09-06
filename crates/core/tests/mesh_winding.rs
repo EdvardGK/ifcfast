@@ -64,7 +64,7 @@ const HOLE_CW: &str = "(#50,#53,#52,#51,#50)";
 /// Signed-tetra divergence volume over the whole mesh, f64 accumulation.
 fn signed_volume(vertices: &[f32], faces: &[u32]) -> f64 {
     let mut acc = 0.0_f64;
-    for tri in faces.chunks_exact(3) {
+    for tri in faces.as_chunks::<3>().0 {
         let p = |i: u32| {
             let b = i as usize * 3;
             (
@@ -85,7 +85,7 @@ fn signed_volume(vertices: &[f32], faces: &[u32]) -> f64 {
 /// in each direction (mirrors the qto edge-pairing classifier).
 fn is_closed(faces: &[u32]) -> bool {
     let mut edges: HashMap<(u32, u32), i32> = HashMap::new();
-    for tri in faces.chunks_exact(3) {
+    for tri in faces.as_chunks::<3>().0 {
         for (a, b) in [(tri[0], tri[1]), (tri[1], tri[2]), (tri[2], tri[0])] {
             let key = (a.min(b), a.max(b));
             let dir = if a < b { 1 } else { -1 };
@@ -100,7 +100,11 @@ fn ring_case(outer: &str, hole: &str, label: &str) {
         .replace("{OUTER}", outer)
         .replace("{HOLE}", hole);
     let (meshes, _stats) = mesh_ifc(src.as_bytes());
-    assert_eq!(meshes.len(), 1, "{label}: expected exactly one product mesh");
+    assert_eq!(
+        meshes.len(),
+        1,
+        "{label}: expected exactly one product mesh"
+    );
     let m = &meshes[0];
     let vol = signed_volume(&m.vertices, &m.indices).abs();
     assert!(

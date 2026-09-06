@@ -27,7 +27,7 @@
 //! [`crate::mesh::ProductMesh::vertices`] is already world-baked so we
 //! consume it directly.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 /// One distinct planar surface on a product. The normal is the
 /// quantized direction (rounded to 0.1 per component, ~5.7° bin) so
@@ -218,11 +218,26 @@ pub fn compute(vertices: &[f32], indices: &[u32], unit_scale: f32) -> MeshQto {
     let mut xmax = f32::NEG_INFINITY;
     let mut ymax = f32::NEG_INFINITY;
     let mut zmax = f32::NEG_INFINITY;
-    for chunk in vertices.chunks_exact(3) {
+    for chunk in vertices.as_chunks::<3>().0 {
         let (x, y, z) = (chunk[0], chunk[1], chunk[2]);
-        if x < xmin { xmin = x; } if x > xmax { xmax = x; }
-        if y < ymin { ymin = y; } if y > ymax { ymax = y; }
-        if z < zmin { zmin = z; } if z > zmax { zmax = z; }
+        if x < xmin {
+            xmin = x;
+        }
+        if x > xmax {
+            xmax = x;
+        }
+        if y < ymin {
+            ymin = y;
+        }
+        if y > ymax {
+            ymax = y;
+        }
+        if z < zmin {
+            zmin = z;
+        }
+        if z > zmax {
+            zmax = z;
+        }
     }
     // Rebase origin (f64 to keep the subtraction exact at far georef).
     let (ox, oy, oz) = if xmin.is_finite() {
@@ -244,9 +259,13 @@ pub fn compute(vertices: &[f32], indices: &[u32], unit_scale: f32) -> MeshQto {
     // behavior. Falls back to a HashMap once the Vec grows past a
     // threshold (curved geometry with many tessellation wedges).
     let mut small_buckets: Vec<((i32, i32, i32), f32)> = Vec::with_capacity(16);
-    let mut overflow_buckets: HashMap<(i32, i32, i32), f32> = HashMap::new();
+    // GH #152: a `BTreeMap`, not a `HashMap` — the assembled surface
+    // list is emitted in map-iteration order for equal areas, and
+    // `RandomState` made that order differ per process run (phantom
+    // drift in the bitwise parity gates). Same rows, stable order.
+    let mut overflow_buckets: BTreeMap<(i32, i32, i32), f32> = BTreeMap::new();
 
-    for tri in indices.chunks_exact(3) {
+    for tri in indices.as_chunks::<3>().0 {
         let (a, b, c) = (tri[0] as usize, tri[1] as usize, tri[2] as usize);
         // Bounds check on the way in — the mesher writes these
         // ourselves but a corrupt iter would explode silently if we
@@ -274,8 +293,12 @@ pub fn compute(vertices: &[f32], indices: &[u32], unit_scale: f32) -> MeshQto {
         let cz = vertices[off_c + 2] as f64 - oz;
 
         // Triangle area + normal direction via the cross product.
-        let ux = bx - ax; let uy = by - ay; let uz = bz - az;
-        let vx = cx - ax; let vy = cy - ay; let vz = cz - az;
+        let ux = bx - ax;
+        let uy = by - ay;
+        let uz = bz - az;
+        let vx = cx - ax;
+        let vy = cy - ay;
+        let vz = cz - az;
         let nrx = uy * vz - uz * vy;
         let nry = uz * vx - ux * vz;
         let nrz = ux * vy - uy * vx;
@@ -292,9 +315,8 @@ pub fn compute(vertices: &[f32], indices: &[u32], unit_scale: f32) -> MeshQto {
         let area_raw_f = area_raw as f32;
 
         // Signed-tetrahedra divergence accumulator (f64; rebased coords).
-        volume_x6_raw += ax * (by * cz - bz * cy)
-                      + ay * (bz * cx - bx * cz)
-                      + az * (bx * cy - by * cx);
+        volume_x6_raw +=
+            ax * (by * cz - bz * cy) + ay * (bz * cx - bx * cz) + az * (bx * cy - by * cx);
 
         // Unit normal — used for orientation bucket + quantized key.
         // Direction only; f32 is ample for the 0.1-quantized bucket key.
@@ -335,7 +357,7 @@ pub fn compute(vertices: &[f32], indices: &[u32], unit_scale: f32) -> MeshQto {
                 if small_buckets.len() < 64 {
                     small_buckets.push((key, area_raw_f));
                 } else {
-                    // Migrate to HashMap once the linear scan gets expensive.
+                    // Migrate to the map once the linear scan gets expensive.
                     for (k, v) in small_buckets.drain(..) {
                         overflow_buckets.insert(k, v);
                     }
@@ -375,7 +397,18 @@ pub fn compute(vertices: &[f32], indices: &[u32], unit_scale: f32) -> MeshQto {
             })
             .collect()
     };
-    surfaces.sort_by(|a, b| b.area_m2.partial_cmp(&a.area_m2).unwrap_or(std::cmp::Ordering::Equal));
+    // Largest area first. Equal areas are broken by the quantized
+    // normal (lexicographic on nx, ny, nz) so the emitted order is a
+    // total order on the data, not an artefact of bucket iteration
+    // (GH #152).
+    surfaces.sort_by(|a, b| {
+        b.area_m2
+            .partial_cmp(&a.area_m2)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.nx.partial_cmp(&b.nx).unwrap_or(std::cmp::Ordering::Equal))
+            .then_with(|| a.ny.partial_cmp(&b.ny).unwrap_or(std::cmp::Ordering::Equal))
+            .then_with(|| a.nz.partial_cmp(&b.nz).unwrap_or(std::cmp::Ordering::Equal))
+    });
 
     // Noise floor for "smallest surface": 1 mm² = 1e-6 m². Smaller
     // entries get dropped from the scalar so the value isn't a stray
@@ -506,9 +539,21 @@ pub fn compute(vertices: &[f32], indices: &[u32], unit_scale: f32) -> MeshQto {
             // horizontal beam by its bounding slab. The extra two rasters
             // run only on the non-closed minority, so the closed hot path
             // is untouched.
-            let x_extent_raw = if xmin.is_finite() { (xmax - xmin).max(0.0) } else { 0.0 };
-            let y_extent_raw = if ymin.is_finite() { (ymax - ymin).max(0.0) } else { 0.0 };
-            let z_extent_raw = if zmin.is_finite() { (zmax - zmin).max(0.0) } else { 0.0 };
+            let x_extent_raw = if xmin.is_finite() {
+                (xmax - xmin).max(0.0)
+            } else {
+                0.0
+            };
+            let y_extent_raw = if ymin.is_finite() {
+                (ymax - ymin).max(0.0)
+            } else {
+                0.0
+            };
+            let z_extent_raw = if zmin.is_finite() {
+                (zmax - zmin).max(0.0)
+            } else {
+                0.0
+            };
 
             // A zero extent (planar mesh on that axis) collapses its prism
             // to 0 regardless of footprint, so skip the raster for it.
@@ -589,7 +634,9 @@ pub fn compute(vertices: &[f32], indices: &[u32], unit_scale: f32) -> MeshQto {
             // Winding predicts divergence from PHYSICAL volume, not from
             // the oracle. See `winding_gate_tests` below and GH #131 for
             // the evidence and the measured 6-row residue.
-            if upper > 0.0 && volume_mesh_m3 > 0.0 && !collapsed
+            if upper > 0.0
+                && volume_mesh_m3 > 0.0
+                && !collapsed
                 && volume_mesh_m3 <= upper * PRISM_TRIPWIRE_MARGIN
             {
                 // Open-shell mesh volume sits within its tight upper bound
@@ -679,7 +726,7 @@ fn footprint_raw(
     let cell_h = h / ny as f32;
     let mut covered = vec![false; nx * ny];
 
-    for tri in indices.chunks_exact(3) {
+    for tri in indices.as_chunks::<3>().0 {
         let ia = tri[0] as usize * 3;
         let ib = tri[1] as usize * 3;
         let ic = tri[2] as usize * 3;
@@ -775,7 +822,7 @@ fn point_in_triangle(
 /// construction. So this is a conservative classifier: false negatives
 /// (extra "open_shell" labels) are possible; false positives are not.
 pub(crate) fn is_closed_manifold(indices: &[u32]) -> bool {
-    if indices.len() < 9 || indices.len() % 3 != 0 {
+    if indices.len() < 9 || !indices.len().is_multiple_of(3) {
         return false;
     }
     // Capacity hint: ~3 directed edges per triangle, but with the
@@ -784,7 +831,7 @@ pub(crate) fn is_closed_manifold(indices: &[u32]) -> bool {
     // for a triangulated 2-manifold).
     let mut edges: std::collections::HashMap<(u32, u32), (u32, i32)> =
         std::collections::HashMap::with_capacity(indices.len() / 2);
-    for tri in indices.chunks_exact(3) {
+    for tri in indices.as_chunks::<3>().0 {
         let a = tri[0];
         let b = tri[1];
         let c = tri[2];
@@ -802,7 +849,9 @@ pub(crate) fn is_closed_manifold(indices: &[u32]) -> bool {
             entry.1 += sign;
         }
     }
-    edges.values().all(|&(unsigned, signed)| unsigned == 2 && signed == 0)
+    edges
+        .values()
+        .all(|&(unsigned, signed)| unsigned == 2 && signed == 0)
 }
 
 /// Does the shell wind coherently — every undirected edge either a
@@ -819,12 +868,12 @@ pub(crate) fn is_closed_manifold(indices: &[u32]) -> bool {
 /// Tolerance: ≤ 2 % bad edges still counts as coherent.
 #[allow(dead_code)]
 pub(crate) fn winding_coherent(indices: &[u32]) -> bool {
-    if indices.len() < 9 || indices.len() % 3 != 0 {
+    if indices.len() < 9 || !indices.len().is_multiple_of(3) {
         return false;
     }
     let mut edges: std::collections::HashMap<(u32, u32), (u32, i32)> =
         std::collections::HashMap::with_capacity(indices.len() / 2);
-    for tri in indices.chunks_exact(3) {
+    for tri in indices.as_chunks::<3>().0 {
         let (a, b, c) = (tri[0], tri[1], tri[2]);
         for &(u, v) in &[(a, b), (b, c), (c, a)] {
             if u == v {
@@ -869,7 +918,9 @@ pub(crate) fn winding_coherent(indices: &[u32]) -> bool {
 /// round-trip noise, never large enough to bridge a real sub-millimetre
 /// gap and false-close an open shell.
 pub(crate) fn welded_indices(vertices: &[f32], indices: &[u32], eps: f32) -> Vec<u32> {
-    if !(eps > 0.0) || vertices.len() < 3 {
+    // NaN-safe: a NaN eps must take the early return, not fall
+    // through into `1.0 / NaN`.
+    if eps.is_nan() || eps <= 0.0 || vertices.len() < 3 {
         return indices.to_vec();
     }
     let inv = 1.0_f64 / eps as f64;
@@ -913,29 +964,18 @@ mod tests {
     // 1 m². Total surface area 6 m², volume 1 m³.
     fn unit_cube_world() -> (Vec<f32>, Vec<u32>) {
         let v = vec![
-            -0.5, -0.5, -0.5,
-             0.5, -0.5, -0.5,
-             0.5,  0.5, -0.5,
-            -0.5,  0.5, -0.5,
-            -0.5, -0.5,  0.5,
-             0.5, -0.5,  0.5,
-             0.5,  0.5,  0.5,
-            -0.5,  0.5,  0.5,
+            -0.5, -0.5, -0.5, 0.5, -0.5, -0.5, 0.5, 0.5, -0.5, -0.5, 0.5, -0.5, -0.5, -0.5, 0.5,
+            0.5, -0.5, 0.5, 0.5, 0.5, 0.5, -0.5, 0.5, 0.5,
         ];
         // 12 triangles, two per face, wound CCW from outside.
         let i = vec![
             // bottom (z = -0.5, normal = -Z)
-            0, 2, 1,  0, 3, 2,
-            // top (z = +0.5, normal = +Z)
-            4, 5, 6,  4, 6, 7,
-            // -Y face
-            0, 1, 5,  0, 5, 4,
-            // +Y face
-            3, 7, 6,  3, 6, 2,
-            // -X face
-            0, 4, 7,  0, 7, 3,
-            // +X face
-            1, 2, 6,  1, 6, 5,
+            0, 2, 1, 0, 3, 2, // top (z = +0.5, normal = +Z)
+            4, 5, 6, 4, 6, 7, // -Y face
+            0, 1, 5, 0, 5, 4, // +Y face
+            3, 7, 6, 3, 6, 2, // -X face
+            0, 4, 7, 0, 7, 3, // +X face
+            1, 2, 6, 1, 6, 5,
         ];
         (v, i)
     }
@@ -944,8 +984,16 @@ mod tests {
     fn unit_cube_volume_and_area() {
         let (v, i) = unit_cube_world();
         let q = compute(&v, &i, 1.0);
-        assert!((q.volume_m3.abs() - 1.0).abs() < 1e-5, "got {}", q.volume_m3);
-        assert!((q.surface_area_m2 - 6.0).abs() < 1e-5, "got {}", q.surface_area_m2);
+        assert!(
+            (q.volume_m3.abs() - 1.0).abs() < 1e-5,
+            "got {}",
+            q.volume_m3
+        );
+        assert!(
+            (q.surface_area_m2 - 6.0).abs() < 1e-5,
+            "got {}",
+            q.surface_area_m2
+        );
         assert!((q.aabb_volume_m3 - 1.0).abs() < 1e-5);
     }
 
@@ -1007,7 +1055,7 @@ mod tests {
         let oy = 6.7e6_f32; // 6 700 km northing, metres
         let oz = 0.0_f32;
         let (mut v, i) = unit_cube_world(); // ±0.5 cube, 8 verts, 1 m side
-        for c in v.chunks_exact_mut(3) {
+        for c in v.as_chunks_mut::<3>().0 {
             c[0] += ox;
             c[1] += oy;
             c[2] += oz;
@@ -1034,10 +1082,20 @@ mod tests {
         // Same cube but expressed in mm: 1000 mm side, file authored
         // in mm so unit_scale = 0.001. Output must still be 1 m³.
         let (mut v, i) = unit_cube_world();
-        for x in v.iter_mut() { *x *= 1000.0; }
+        for x in v.iter_mut() {
+            *x *= 1000.0;
+        }
         let q = compute(&v, &i, 0.001);
-        assert!((q.volume_m3.abs() - 1.0).abs() < 1e-4, "got {}", q.volume_m3);
-        assert!((q.surface_area_m2 - 6.0).abs() < 1e-4, "got {}", q.surface_area_m2);
+        assert!(
+            (q.volume_m3.abs() - 1.0).abs() < 1e-4,
+            "got {}",
+            q.volume_m3
+        );
+        assert!(
+            (q.surface_area_m2 - 6.0).abs() < 1e-4,
+            "got {}",
+            q.surface_area_m2
+        );
     }
 
     #[test]
@@ -1065,8 +1123,7 @@ mod tests {
         // that direction. Keep going until we have collected enough unique
         // quantized keys to force overflow_buckets migration.
         let mut directions: Vec<(f32, f32, f32)> = Vec::new();
-        let mut seen: std::collections::HashSet<(i32, i32, i32)> =
-            std::collections::HashSet::new();
+        let mut seen: std::collections::HashSet<(i32, i32, i32)> = std::collections::HashSet::new();
         // 0.15 step on each axis gives a grid coarse enough that every cell
         // quantizes distinctly under the 0.1 scale, but fine enough to fill
         // a hemisphere with >64 entries.
@@ -1135,7 +1192,8 @@ mod tests {
         // Every triangle's normal quantizes to a distinct key by
         // construction, so surface_count must equal the input count.
         assert_eq!(
-            q.surface_count, directions.len() as u32,
+            q.surface_count,
+            directions.len() as u32,
             "surface_count: expected {}, got {}",
             directions.len(),
             q.surface_count
@@ -1173,13 +1231,8 @@ mod tests {
         // Two triangles forming a unit square at z=0. AABB has zero
         // depth so aabb_volume_m3 == 0 → degenerate (also true for
         // single annotations, drawn polylines, etc.).
-        let vertices: Vec<f32> = vec![
-            0.0, 0.0, 0.0,
-            1.0, 0.0, 0.0,
-            1.0, 1.0, 0.0,
-            0.0, 1.0, 0.0,
-        ];
-        let indices: Vec<u32> = vec![0, 1, 2,  0, 2, 3];
+        let vertices: Vec<f32> = vec![0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0, 0.0];
+        let indices: Vec<u32> = vec![0, 1, 2, 0, 2, 3];
         let q = compute(&vertices, &indices, 1.0);
         assert_eq!(q.mesh_quality, "degenerate");
         assert!(q.aabb_volume_m3 <= f32::EPSILON);
@@ -1205,28 +1258,40 @@ mod tests {
         // labels the box "open_shell".
         let offset = 10.0_f32;
         let v: Vec<f32> = vec![
-            offset + -0.5, offset + -0.5, offset + -0.5,
-            offset +  0.5, offset + -0.5, offset + -0.5,
-            offset +  0.5, offset +  0.5, offset + -0.5,
-            offset + -0.5, offset +  0.5, offset + -0.5,
-            offset + -0.5, offset + -0.5, offset +  0.5,
-            offset +  0.5, offset + -0.5, offset +  0.5,
-            offset +  0.5, offset +  0.5, offset +  0.5,
-            offset + -0.5, offset +  0.5, offset +  0.5,
+            offset + -0.5,
+            offset + -0.5,
+            offset + -0.5,
+            offset + 0.5,
+            offset + -0.5,
+            offset + -0.5,
+            offset + 0.5,
+            offset + 0.5,
+            offset + -0.5,
+            offset + -0.5,
+            offset + 0.5,
+            offset + -0.5,
+            offset + -0.5,
+            offset + -0.5,
+            offset + 0.5,
+            offset + 0.5,
+            offset + -0.5,
+            offset + 0.5,
+            offset + 0.5,
+            offset + 0.5,
+            offset + 0.5,
+            offset + -0.5,
+            offset + 0.5,
+            offset + 0.5,
         ];
         // Same wind order as unit_cube_world, with the BOTTOM face
         // (first two triangles) removed.
         let i: Vec<u32> = vec![
             // top
-            4, 5, 6,  4, 6, 7,
-            // -Y
-            0, 1, 5,  0, 5, 4,
-            // +Y
-            3, 7, 6,  3, 6, 2,
-            // -X
-            0, 4, 7,  0, 7, 3,
-            // +X
-            1, 2, 6,  1, 6, 5,
+            4, 5, 6, 4, 6, 7, // -Y
+            0, 1, 5, 0, 5, 4, // +Y
+            3, 7, 6, 3, 6, 2, // -X
+            0, 4, 7, 0, 7, 3, // +X
+            1, 2, 6, 1, 6, 5,
         ];
         let q = compute(&v, &i, 1.0);
         // AABB still 1.0 m³ — the missing face's vertices are still
@@ -1239,7 +1304,8 @@ mod tests {
             q.volume_m3.abs() <= q.aabb_volume_m3 * 1.001,
             "post-rebase the open box volume must sit within the AABB \
              (no more far-origin inflation): |volume_m3|={:.6}, aabb={:.6}",
-            q.volume_m3, q.aabb_volume_m3
+            q.volume_m3,
+            q.aabb_volume_m3
         );
         // Edge-pairing still classifies it open (bottom face missing).
         assert_eq!(q.mesh_quality, "open_shell");
@@ -1266,7 +1332,8 @@ mod tests {
             q.volume_m3.abs() < q.aabb_volume_m3 * 1.001,
             "test setup bug: case must have |volume|={:.6} <= aabb={:.6} \
              so the cheap heuristic misses it, forcing edge-pairing",
-            q.volume_m3.abs(), q.aabb_volume_m3
+            q.volume_m3.abs(),
+            q.aabb_volume_m3
         );
         assert_eq!(q.mesh_quality, "open_shell");
     }
@@ -1289,7 +1356,7 @@ mod tests {
         // Two triangles sharing all three vertices, wound the same
         // way — looks like a duplicate, contributes the same directed
         // edges twice. signed_count = ±2 on every edge → not closed.
-        let i = vec![0, 1, 2,  0, 1, 2];
+        let i = vec![0, 1, 2, 0, 1, 2];
         assert!(!is_closed_manifold(&i));
     }
 
@@ -1302,7 +1369,11 @@ mod tests {
         let q = compute(&v, &i, 1.0);
         assert!(q.volume_reliable);
         assert_eq!(q.volume_method, "mesh");
-        assert!((q.volume_best_m3 - 1.0).abs() < 1e-5, "got {}", q.volume_best_m3);
+        assert!(
+            (q.volume_best_m3 - 1.0).abs() < 1e-5,
+            "got {}",
+            q.volume_best_m3
+        );
         assert!(
             q.volume_prism_bound_m3.is_nan(),
             "reliable rows leave the prism bound uncomputed (NaN), got {}",
@@ -1396,34 +1467,41 @@ mod tests {
         // (~0.1 m³), against which the tiny mesh volume reads fill ~0.05.
         let v: Vec<f32> = vec![
             // pane (XZ @ y=0), ids 0..4
-            0.0, 0.0, 0.0,   2.0, 0.0, 0.0,   2.0, 0.0, 2.0,   0.0, 0.0, 2.0,
+            0.0, 0.0, 0.0, 2.0, 0.0, 0.0, 2.0, 0.0, 2.0, 0.0, 0.0, 2.0,
             // nub bottom ring (y=0), ids 4..8
-            0.0, 0.0, 0.0,   0.1, 0.0, 0.0,   0.1, 0.0, 0.1,   0.0, 0.0, 0.1,
+            0.0, 0.0, 0.0, 0.1, 0.0, 0.0, 0.1, 0.0, 0.1, 0.0, 0.0, 0.1,
             // nub top ring (y=0.5), ids 8..12
-            0.0, 0.5, 0.0,   0.1, 0.5, 0.0,   0.1, 0.5, 0.1,   0.0, 0.5, 0.1,
+            0.0, 0.5, 0.0, 0.1, 0.5, 0.0, 0.1, 0.5, 0.1, 0.0, 0.5, 0.1,
         ];
         let i: Vec<u32> = vec![
-            0, 1, 2,   0, 2, 3,            // pane
-            4, 5, 9,   4, 9, 8,            // nub -Z wall
-            5, 6, 10,  5, 10, 9,           // nub +X wall
-            6, 7, 11,  6, 11, 10,          // nub +Z wall
-            7, 4, 8,   7, 8, 11,           // nub -X wall
+            0, 1, 2, 0, 2, 3, // pane
+            4, 5, 9, 4, 9, 8, // nub -Z wall
+            5, 6, 10, 5, 10, 9, // nub +X wall
+            6, 7, 11, 6, 11, 10, // nub +Z wall
+            7, 4, 8, 7, 8, 11, // nub -X wall
         ];
         let q = compute(&v, &i, 1.0);
         eprintln!(
             "[#121] quality={} reliable={} method={} vol={} prism={} fill={:.4}",
-            q.mesh_quality, q.volume_reliable, q.volume_method,
-            q.volume_best_m3, q.volume_prism_bound_m3,
+            q.mesh_quality,
+            q.volume_reliable,
+            q.volume_method,
+            q.volume_best_m3,
+            q.volume_prism_bound_m3,
             q.volume_best_m3 / q.volume_prism_bound_m3,
         );
         assert_eq!(q.mesh_quality, "open_shell");
-        assert!(q.volume_reliable, "small-but-nonzero open-shell volume must stay trusted");
+        assert!(
+            q.volume_reliable,
+            "small-but-nonzero open-shell volume must stay trusted"
+        );
         assert_eq!(q.volume_method, "mesh_open");
         // The kept value is the mesh volume, NOT the inflated prism.
         assert!(
             (q.volume_best_m3 - q.volume_m3.abs()).abs() < 1e-6,
             "must keep the mesh value, got best={} mesh={}",
-            q.volume_best_m3, q.volume_m3.abs()
+            q.volume_best_m3,
+            q.volume_m3.abs()
         );
         // Regression guard: the fill ratio sits in the band (1e-3, 0.1) that
         // the OLD tripwire wrongly collapsed. If fill ever climbs to ≥0.1
@@ -1431,7 +1509,8 @@ mod tests {
         assert!(
             q.volume_best_m3 < q.volume_prism_bound_m3 * 0.1,
             "test must stay in the old mis-fire band (fill < 0.1): best={} prism={}",
-            q.volume_best_m3, q.volume_prism_bound_m3
+            q.volume_best_m3,
+            q.volume_prism_bound_m3
         );
     }
 
@@ -1451,16 +1530,14 @@ mod tests {
     fn footprint_raster_recovers_unit_square() {
         // Two triangles spanning the unit square at z=0..1; the XY
         // footprint must be ~1 m² to within grid quantization.
-        let v: Vec<f32> = vec![
-            0.0, 0.0, 0.0,
-            1.0, 0.0, 0.0,
-            1.0, 1.0, 1.0,
-            0.0, 1.0, 1.0,
-        ];
-        let i: Vec<u32> = vec![0, 1, 2,  0, 2, 3];
+        let v: Vec<f32> = vec![0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0, 1.0, 1.0];
+        let i: Vec<u32> = vec![0, 1, 2, 0, 2, 3];
         // XY projection (u=x=0, v=y=1).
         let fp = footprint_raw(&v, &i, 0, 1, 0.0, 1.0, 0.0, 1.0);
-        assert!((fp - 1.0).abs() < 1e-3, "footprint should be ~1 m², got {fp}");
+        assert!(
+            (fp - 1.0).abs() < 1e-3,
+            "footprint should be ~1 m², got {fp}"
+        );
     }
 
     #[test]
@@ -1474,20 +1551,20 @@ mod tests {
         let (lx, ly, lz) = (4.0_f32, 0.2_f32, 0.3_f32);
         // Eight box corners.
         let v: Vec<f32> = vec![
-            0.0, 0.0, 0.0,   lx, 0.0, 0.0,   lx, ly, 0.0,   0.0, ly, 0.0,
-            0.0, 0.0, lz,    lx, 0.0, lz,    lx, ly, lz,    0.0, ly, lz,
+            0.0, 0.0, 0.0, lx, 0.0, 0.0, lx, ly, 0.0, 0.0, ly, 0.0, 0.0, 0.0, lz, lx, 0.0, lz, lx,
+            ly, lz, 0.0, ly, lz,
         ];
         // Four side walls only (open top/bottom → open_shell, prism path).
         let i: Vec<u32> = vec![
-            0, 1, 5,  0, 5, 4,   // -Y wall
-            1, 2, 6,  1, 6, 5,   // +X wall
-            2, 3, 7,  2, 7, 6,   // +Y wall
-            3, 0, 4,  3, 4, 7,   // -X wall
+            0, 1, 5, 0, 5, 4, // -Y wall
+            1, 2, 6, 1, 6, 5, // +X wall
+            2, 3, 7, 2, 7, 6, // +Y wall
+            3, 0, 4, 3, 4, 7, // -X wall
         ];
         let q = compute(&v, &i, 1.0);
         let true_vol = lx * ly * lz; // 0.24
-        // The prism bound is a valid upper bound and tight for a box
-        // (every axis prism equals the true volume here).
+                                     // The prism bound is a valid upper bound and tight for a box
+                                     // (every axis prism equals the true volume here).
         assert!(
             q.volume_prism_bound_m3 >= true_vol - 1e-3,
             "prism must bound the true volume, got {} vs {true_vol}",
@@ -1554,10 +1631,17 @@ mod tests {
             "test setup: fragmented cube must look open under raw indices",
         );
         let q = compute(&v, &i, 1.0);
-        assert_eq!(q.mesh_quality, "closed", "welding must recover watertightness");
+        assert_eq!(
+            q.mesh_quality, "closed",
+            "welding must recover watertightness"
+        );
         assert!(q.volume_reliable);
         assert_eq!(q.volume_method, "mesh");
-        assert!((q.volume_best_m3 - 1.0).abs() < 1e-4, "got {}", q.volume_best_m3);
+        assert!(
+            (q.volume_best_m3 - 1.0).abs() < 1e-4,
+            "got {}",
+            q.volume_best_m3
+        );
     }
 
     #[test]
@@ -1572,7 +1656,11 @@ mod tests {
         let v_mm: Vec<f32> = v_m.iter().map(|c| c * 1000.0).collect();
         let q = compute(&v_mm, &i, 0.001);
         assert_eq!(q.mesh_quality, "closed");
-        assert!((q.volume_best_m3 - 1.0).abs() < 1e-4, "got {}", q.volume_best_m3);
+        assert!(
+            (q.volume_best_m3 - 1.0).abs() < 1e-4,
+            "got {}",
+            q.volume_best_m3
+        );
     }
 
     #[test]
@@ -1625,8 +1713,8 @@ mod tests {
         // to ~0. Prism = footprint(9 m²) × height(1 m) = 9 m³.
         let (s, h) = (3.0_f32, 1.0_f32);
         let v: Vec<f32> = vec![
-            0.0, 0.0, 0.0,  s, 0.0, 0.0,  s, s, 0.0,  0.0, s, 0.0, // 0..3 bottom ring
-            0.0, 0.0, h,    s, 0.0, h,    s, s, h,    0.0, s, h,    // 4..7 top ring
+            0.0, 0.0, 0.0, s, 0.0, 0.0, s, s, 0.0, 0.0, s, 0.0, // 0..3 bottom ring
+            0.0, 0.0, h, s, 0.0, h, s, s, h, 0.0, s, h, // 4..7 top ring
         ];
         // Four side walls (open top + bottom). Then the SAME walls with
         // reversed winding stacked on top → every directed contribution
@@ -1634,14 +1722,14 @@ mod tests {
         // area DOUBLES (the shell survives, W4-style) and the footprint
         // raster still sees the full 3×3 extent at full height.
         let walls: Vec<u32> = vec![
-            0, 1, 5,  0, 5, 4,   // -Y
-            1, 2, 6,  1, 6, 5,   // +X
-            2, 3, 7,  2, 7, 6,   // +Y
-            3, 0, 4,  3, 4, 7,   // -X
+            0, 1, 5, 0, 5, 4, // -Y
+            1, 2, 6, 1, 6, 5, // +X
+            2, 3, 7, 2, 7, 6, // +Y
+            3, 0, 4, 3, 4, 7, // -X
         ];
         let mut i = walls.clone();
         // Reversed-winding duplicate (swap 2nd/3rd of each triangle).
-        for tri in walls.chunks_exact(3) {
+        for tri in walls.as_chunks::<3>().0 {
             i.extend_from_slice(&[tri[0], tri[2], tri[1]]);
         }
         let q = compute(&v, &i, 1.0);
@@ -1700,15 +1788,30 @@ mod tests {
         fn push_box(
             v: &mut Vec<f32>,
             i: &mut Vec<u32>,
-            x0: f32, x1: f32, y0: f32, y1: f32, z0: f32, z1: f32,
+            x0: f32,
+            x1: f32,
+            y0: f32,
+            y1: f32,
+            z0: f32,
+            z1: f32,
         ) {
             let c = [
-                [x0, y0, z0], [x1, y0, z0], [x1, y1, z0], [x0, y1, z0],
-                [x0, y0, z1], [x1, y0, z1], [x1, y1, z1], [x0, y1, z1],
+                [x0, y0, z0],
+                [x1, y0, z0],
+                [x1, y1, z0],
+                [x0, y1, z0],
+                [x0, y0, z1],
+                [x1, y0, z1],
+                [x1, y1, z1],
+                [x0, y1, z1],
             ];
             let faces: [[usize; 4]; 6] = [
-                [0, 3, 2, 1], [4, 5, 6, 7], [0, 1, 5, 4],
-                [3, 7, 6, 2], [0, 4, 7, 3], [1, 2, 6, 5],
+                [0, 3, 2, 1],
+                [4, 5, 6, 7],
+                [0, 1, 5, 4],
+                [3, 7, 6, 2],
+                [0, 4, 7, 3],
+                [1, 2, 6, 5],
             ];
             for face in &faces {
                 let base = (v.len() / 3) as u32;
@@ -1776,20 +1879,38 @@ mod tests {
         // Left half [-h, -slit/2]: missing its +X face.
         // Right half [slit/2, h]: missing its -X face.
         fn push_open_box(
-            v: &mut Vec<f32>, i: &mut Vec<u32>,
-            x0: f32, x1: f32, y0: f32, y1: f32, z0: f32, z1: f32,
+            v: &mut Vec<f32>,
+            i: &mut Vec<u32>,
+            x0: f32,
+            x1: f32,
+            y0: f32,
+            y1: f32,
+            z0: f32,
+            z1: f32,
             skip: usize, // face index to omit
         ) {
             let c = [
-                [x0, y0, z0], [x1, y0, z0], [x1, y1, z0], [x0, y1, z0],
-                [x0, y0, z1], [x1, y0, z1], [x1, y1, z1], [x0, y1, z1],
+                [x0, y0, z0],
+                [x1, y0, z0],
+                [x1, y1, z0],
+                [x0, y1, z0],
+                [x0, y0, z1],
+                [x1, y0, z1],
+                [x1, y1, z1],
+                [x0, y1, z1],
             ];
             let faces: [[usize; 4]; 6] = [
-                [0, 3, 2, 1], [4, 5, 6, 7], [0, 1, 5, 4],
-                [3, 7, 6, 2], [0, 4, 7, 3], [1, 2, 6, 5],
+                [0, 3, 2, 1],
+                [4, 5, 6, 7],
+                [0, 1, 5, 4],
+                [3, 7, 6, 2],
+                [0, 4, 7, 3],
+                [1, 2, 6, 5],
             ];
             for (fi, face) in faces.iter().enumerate() {
-                if fi == skip { continue; }
+                if fi == skip {
+                    continue;
+                }
                 let base = (v.len() / 3) as u32;
                 for &corner in face {
                     v.extend_from_slice(&c[corner]);
@@ -1887,27 +2008,33 @@ mod tests {
         if !fragmented {
             // Shared-vertex closed box.
             let v = vec![
-                0.0, 0.0, 0.0,  sx, 0.0, 0.0,  sx, sy, 0.0,  0.0, sy, 0.0,
-                0.0, 0.0, sz,   sx, 0.0, sz,   sx, sy, sz,   0.0, sy, sz,
+                0.0, 0.0, 0.0, sx, 0.0, 0.0, sx, sy, 0.0, 0.0, sy, 0.0, 0.0, 0.0, sz, sx, 0.0, sz,
+                sx, sy, sz, 0.0, sy, sz,
             ];
             let i = vec![
-                0, 2, 1, 0, 3, 2,
-                4, 5, 6, 4, 6, 7,
-                0, 1, 5, 0, 5, 4,
-                3, 7, 6, 3, 6, 2,
-                0, 4, 7, 0, 7, 3,
-                1, 2, 6, 1, 6, 5,
+                0, 2, 1, 0, 3, 2, 4, 5, 6, 4, 6, 7, 0, 1, 5, 0, 5, 4, 3, 7, 6, 3, 6, 2, 0, 4, 7, 0,
+                7, 3, 1, 2, 6, 1, 6, 5,
             ];
             (v, i)
         } else {
             // Per-face fragmented (needs welding to close).
             let c = [
-                [0.0, 0.0, 0.0], [sx, 0.0, 0.0], [sx, sy, 0.0], [0.0, sy, 0.0],
-                [0.0, 0.0, sz], [sx, 0.0, sz], [sx, sy, sz], [0.0, sy, sz],
+                [0.0, 0.0, 0.0],
+                [sx, 0.0, 0.0],
+                [sx, sy, 0.0],
+                [0.0, sy, 0.0],
+                [0.0, 0.0, sz],
+                [sx, 0.0, sz],
+                [sx, sy, sz],
+                [0.0, sy, sz],
             ];
             let faces: [[usize; 4]; 6] = [
-                [0, 3, 2, 1], [4, 5, 6, 7], [0, 1, 5, 4],
-                [3, 7, 6, 2], [0, 4, 7, 3], [1, 2, 6, 5],
+                [0, 3, 2, 1],
+                [4, 5, 6, 7],
+                [0, 1, 5, 4],
+                [3, 7, 6, 2],
+                [0, 4, 7, 3],
+                [1, 2, 6, 5],
             ];
             let mut v = Vec::new();
             let mut i = Vec::new();
@@ -1932,9 +2059,16 @@ mod tests {
             q.mesh_quality, q.volume_reliable, q.volume_best_m3, q.volume_method
         );
         assert_eq!(q.mesh_quality, "closed");
-        assert!(q.volume_reliable, "a true 0.18 m³ thin slab must stay reliable");
+        assert!(
+            q.volume_reliable,
+            "a true 0.18 m³ thin slab must stay reliable"
+        );
         assert_eq!(q.volume_method, "mesh");
-        assert!((q.volume_best_m3 - 0.18).abs() < 1e-3, "got {}", q.volume_best_m3);
+        assert!(
+            (q.volume_best_m3 - 0.18).abs() < 1e-3,
+            "got {}",
+            q.volume_best_m3
+        );
     }
 
     #[test]
@@ -1950,10 +2084,16 @@ mod tests {
         let q = compute(&v, &i, 1.0);
         eprintln!(
             "[2a-frag] quality={} reliable={} vol={} method={} prism={}",
-            q.mesh_quality, q.volume_reliable, q.volume_best_m3, q.volume_method,
+            q.mesh_quality,
+            q.volume_reliable,
+            q.volume_best_m3,
+            q.volume_method,
             q.volume_prism_bound_m3
         );
-        assert!(q.volume_reliable, "thin slab (frag) must not be flagged unreliable");
+        assert!(
+            q.volume_reliable,
+            "thin slab (frag) must not be flagged unreliable"
+        );
         assert!(
             (q.volume_best_m3 - 0.18).abs() < 5e-3,
             "thin slab volume must be ~0.18 m³, got {}",
@@ -1974,13 +2114,22 @@ mod tests {
         // {x in [0,2], y in [0,1]} ∪ {x in [0,1], y in [1,2]}.
         // 6-vertex outline CCW: (0,0)(2,0)(2,1)(1,1)(1,2)(0,2).
         let outline = [
-            [0.0f32, 0.0], [2.0, 0.0], [2.0, 1.0], [1.0, 1.0], [1.0, 2.0], [0.0, 2.0],
+            [0.0f32, 0.0],
+            [2.0, 0.0],
+            [2.0, 1.0],
+            [1.0, 1.0],
+            [1.0, 2.0],
+            [0.0, 2.0],
         ];
         let n = outline.len();
         let mut v = Vec::new();
         // bottom ring z=0 (ids 0..n), top ring z=h (ids n..2n)
-        for p in &outline { v.extend_from_slice(&[p[0], p[1], 0.0]); }
-        for p in &outline { v.extend_from_slice(&[p[0], p[1], height]); }
+        for p in &outline {
+            v.extend_from_slice(&[p[0], p[1], 0.0]);
+        }
+        for p in &outline {
+            v.extend_from_slice(&[p[0], p[1], height]);
+        }
         let mut i = Vec::new();
         // Side walls.
         for k in 0..n {
@@ -2007,7 +2156,7 @@ mod tests {
             // Re-emit with per-triangle unique vertices to force welding.
             let mut fv = Vec::new();
             let mut fi = Vec::new();
-            for tri in i.chunks_exact(3) {
+            for tri in i.as_chunks::<3>().0 {
                 let base = (fv.len() / 3) as u32;
                 for &idx in tri {
                     let p = idx as usize;
@@ -2033,7 +2182,11 @@ mod tests {
         );
         assert_eq!(q.mesh_quality, "closed", "L-prism must be watertight");
         assert!(q.volume_reliable);
-        assert!((q.volume_best_m3 - 3.0).abs() < 1e-3, "got {}", q.volume_best_m3);
+        assert!(
+            (q.volume_best_m3 - 3.0).abs() < 1e-3,
+            "got {}",
+            q.volume_best_m3
+        );
     }
 
     #[test]
@@ -2047,7 +2200,10 @@ mod tests {
         let q = compute(&v, &i, 1.0);
         eprintln!(
             "[2b-frag] quality={} reliable={} vol={} method={} prism={}",
-            q.mesh_quality, q.volume_reliable, q.volume_best_m3, q.volume_method,
+            q.mesh_quality,
+            q.volume_reliable,
+            q.volume_best_m3,
+            q.volume_method,
             q.volume_prism_bound_m3
         );
         assert!(
@@ -2071,15 +2227,15 @@ mod winding_gate_tests {
     /// adjacent faces contribute 0; top contributes 1/3 of the closed 1).
     fn open_box() -> (Vec<f32>, Vec<u32>) {
         let v = vec![
-            0.0, 0.0, 0.0,  1.0, 0.0, 0.0,  1.0, 1.0, 0.0,  0.0, 1.0, 0.0,
-            0.0, 0.0, 1.0,  1.0, 0.0, 1.0,  1.0, 1.0, 1.0,  0.0, 1.0, 1.0,
+            0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 1.0, 0.0,
+            1.0, 1.0, 1.0, 1.0, 0.0, 1.0, 1.0,
         ];
         let i = vec![
-            0, 2, 1,  0, 3, 2, // bottom (-Z)
-            0, 1, 5,  0, 5, 4, // -Y
-            1, 2, 6,  1, 6, 5, // +X
-            2, 3, 7,  2, 7, 6, // +Y
-            3, 0, 4,  3, 4, 7, // -X
+            0, 2, 1, 0, 3, 2, // bottom (-Z)
+            0, 1, 5, 0, 5, 4, // -Y
+            1, 2, 6, 1, 6, 5, // +X
+            2, 3, 7, 2, 7, 6, // +Y
+            3, 0, 4, 3, 4, 7, // -X
         ];
         (v, i)
     }

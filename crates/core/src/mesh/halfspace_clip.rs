@@ -100,7 +100,7 @@ pub fn clip_by_plane(
     let nv = vertices.len() / 3;
     let mut dist: Vec<f32> = Vec::with_capacity(nv);
     let mut inside: Vec<bool> = Vec::with_capacity(nv);
-    for chunk in vertices.chunks_exact(3) {
+    for chunk in vertices.as_chunks::<3>().0 {
         let v = Vec3::new(chunk[0], chunk[1], chunk[2]);
         let d = (v - plane_point).dot(n);
         dist.push(d);
@@ -134,7 +134,7 @@ pub fn clip_by_plane(
     // viewed from `+plane_normal` (outside of the new closed mesh).
     let mut boundary: Vec<(u32, u32)> = Vec::new();
 
-    for tri in indices.chunks_exact(3) {
+    for tri in indices.as_chunks::<3>().0 {
         let a = tri[0];
         let b = tri[1];
         let c = tri[2];
@@ -162,22 +162,8 @@ pub fn clip_by_plane(
                     } else {
                         (c, a, b)
                     };
-                    let i_k_r1 = intersect(
-                        k,
-                        r1,
-                        &vertices,
-                        &dist,
-                        &mut out_v,
-                        &mut edge_cache,
-                    );
-                    let i_k_r2 = intersect(
-                        k,
-                        r2,
-                        &vertices,
-                        &dist,
-                        &mut out_v,
-                        &mut edge_cache,
-                    );
+                    let i_k_r1 = intersect(k, r1, vertices, &dist, &mut out_v, &mut edge_cache);
+                    let i_k_r2 = intersect(k, r2, vertices, &dist, &mut out_v, &mut edge_cache);
                     // New triangle (k, i_k_r1, i_k_r2) — CCW from
                     // outside, original winding preserved.
                     out_i.push(k);
@@ -199,22 +185,8 @@ pub fn clip_by_plane(
                     } else {
                         (a, b, c)
                     };
-                    let i_k1_r = intersect(
-                        k1,
-                        r,
-                        &vertices,
-                        &dist,
-                        &mut out_v,
-                        &mut edge_cache,
-                    );
-                    let i_k2_r = intersect(
-                        k2,
-                        r,
-                        &vertices,
-                        &dist,
-                        &mut out_v,
-                        &mut edge_cache,
-                    );
+                    let i_k1_r = intersect(k1, r, vertices, &dist, &mut out_v, &mut edge_cache);
+                    let i_k2_r = intersect(k2, r, vertices, &dist, &mut out_v, &mut edge_cache);
                     // Quad k1 → k2 → i_k2_r → i_k1_r → k1, split into
                     // two CCW triangles.
                     out_i.push(k1);
@@ -405,7 +377,7 @@ fn triangulate_cap_loop(
         Ok(t) => t,
         Err(_) => return,
     };
-    for tri in tris.chunks_exact(3) {
+    for tri in tris.as_chunks::<3>().0 {
         let a = loop_indices[tri[0]];
         let b = loop_indices[tri[1]];
         let c = loop_indices[tri[2]];
@@ -514,7 +486,7 @@ pub fn bounded_halfspace_cutter(
     // plus a margin so the boolean has clean through-overlap and never
     // leaves a coplanar-face sliver at the far cap.
     let mut s_max = f32::NEG_INFINITY;
-    for c in host_vertices.chunks_exact(3) {
+    for c in host_vertices.as_chunks::<3>().0 {
         let s = (Vec3::new(c[0], c[1], c[2]) - plane_point).dot(n);
         if s > s_max {
             s_max = s;
@@ -572,29 +544,19 @@ mod tests {
     /// CCW winding. The cube spans `[min, max]` on each axis.
     fn cube(min: Vec3, max: Vec3) -> (Vec<f32>, Vec<u32>) {
         let v = vec![
-            min.x, min.y, min.z,
-            max.x, min.y, min.z,
-            max.x, max.y, min.z,
-            min.x, max.y, min.z,
-            min.x, min.y, max.z,
-            max.x, min.y, max.z,
-            max.x, max.y, max.z,
-            min.x, max.y, max.z,
+            min.x, min.y, min.z, max.x, min.y, min.z, max.x, max.y, min.z, min.x, max.y, min.z,
+            min.x, min.y, max.z, max.x, min.y, max.z, max.x, max.y, max.z, min.x, max.y, max.z,
         ];
         let i = vec![
-            0, 2, 1, 0, 3, 2,
-            4, 5, 6, 4, 6, 7,
-            0, 1, 5, 0, 5, 4,
-            2, 3, 7, 2, 7, 6,
-            1, 2, 6, 1, 6, 5,
-            0, 4, 7, 0, 7, 3,
+            0, 2, 1, 0, 3, 2, 4, 5, 6, 4, 6, 7, 0, 1, 5, 0, 5, 4, 2, 3, 7, 2, 7, 6, 1, 2, 6, 1, 6,
+            5, 0, 4, 7, 0, 7, 3,
         ];
         (v, i)
     }
 
     fn signed_volume(verts: &[f32], idx: &[u32]) -> f32 {
         let mut sum = 0.0_f64;
-        for tri in idx.chunks_exact(3) {
+        for tri in idx.as_chunks::<3>().0 {
             let a = tri[0] as usize;
             let b = tri[1] as usize;
             let c = tri[2] as usize;
@@ -611,8 +573,13 @@ mod tests {
         // 1×1×1 cube at origin clipped by z=0.5 plane with normal +Z
         // (removes the upper half) → lower half remains, volume 0.5.
         let (v, i) = cube(Vec3::ZERO, Vec3::ONE);
-        let (cv, ci) =
-            clip_by_plane(&v, &i, Vec3::new(0.0, 0.0, 0.5), Vec3::Z, ON_PLANE_EPS_BASE_M);
+        let (cv, ci) = clip_by_plane(
+            &v,
+            &i,
+            Vec3::new(0.0, 0.0, 0.5),
+            Vec3::Z,
+            ON_PLANE_EPS_BASE_M,
+        );
         let vol = signed_volume(&cv, &ci);
         assert!(
             (vol - 0.5).abs() < 1e-4,
@@ -627,12 +594,20 @@ mod tests {
         // Plane at z=2, normal +Z → cube (z in [0,1]) is entirely
         // on the keep (negative) side. Passthrough.
         let (v, i) = cube(Vec3::ZERO, Vec3::ONE);
-        let (cv, ci) =
-            clip_by_plane(&v, &i, Vec3::new(0.0, 0.0, 2.0), Vec3::Z, ON_PLANE_EPS_BASE_M);
+        let (cv, ci) = clip_by_plane(
+            &v,
+            &i,
+            Vec3::new(0.0, 0.0, 2.0),
+            Vec3::Z,
+            ON_PLANE_EPS_BASE_M,
+        );
         assert_eq!(cv.len() / 3, v.len() / 3);
         assert_eq!(ci.len() / 3, i.len() / 3);
         let vol = signed_volume(&cv, &ci);
-        assert!((vol - 1.0).abs() < 1e-4, "vol should still be ~1, got {vol}");
+        assert!(
+            (vol - 1.0).abs() < 1e-4,
+            "vol should still be ~1, got {vol}"
+        );
     }
 
     #[test]
@@ -640,8 +615,13 @@ mod tests {
         // Plane at z=-1, normal +Z → cube (z in [0,1]) is entirely
         // on the remove (positive) side. Result empty.
         let (v, i) = cube(Vec3::ZERO, Vec3::ONE);
-        let (cv, ci) =
-            clip_by_plane(&v, &i, Vec3::new(0.0, 0.0, -1.0), Vec3::Z, ON_PLANE_EPS_BASE_M);
+        let (cv, ci) = clip_by_plane(
+            &v,
+            &i,
+            Vec3::new(0.0, 0.0, -1.0),
+            Vec3::Z,
+            ON_PLANE_EPS_BASE_M,
+        );
         assert!(cv.is_empty() && ci.is_empty(), "expected empty result");
     }
 
@@ -701,7 +681,7 @@ mod tests {
     fn axis_extent(verts: &[f32], axis: usize) -> (f32, f32) {
         let mut lo = f32::INFINITY;
         let mut hi = f32::NEG_INFINITY;
-        for c in verts.chunks_exact(3) {
+        for c in verts.as_chunks::<3>().0 {
             lo = lo.min(c[axis]);
             hi = hi.max(c[axis]);
         }
@@ -737,8 +717,14 @@ mod tests {
         let (xlo, xhi) = axis_extent(&cv, 0);
         let (ylo, yhi) = axis_extent(&cv, 1);
         let e = 1e-2;
-        assert!(xlo > -e && xlo < e, "cutter X starts at the boundary (0), got {xlo}");
-        assert!((xhi - 1.0).abs() < e, "cutter X ends at the boundary (1), got {xhi}");
+        assert!(
+            xlo > -e && xlo < e,
+            "cutter X starts at the boundary (0), got {xlo}"
+        );
+        assert!(
+            (xhi - 1.0).abs() < e,
+            "cutter X ends at the boundary (1), got {xhi}"
+        );
         assert!(ylo > -e && ylo < e, "cutter Y starts at 0, got {ylo}");
         assert!((yhi - 1.0).abs() < e, "cutter Y ends at 1, got {yhi}");
 
@@ -746,7 +732,10 @@ mod tests {
         // (3), covering the removed side; it must NOT dip to z = 0 (that
         // would remove host material below the plane).
         let (zlo, zhi) = axis_extent(&cv, 2);
-        assert!(zlo > 2.0 - 0.05 && zlo < 2.0 + 0.05, "cutter starts at the plane, got {zlo}");
+        assert!(
+            zlo > 2.0 - 0.05 && zlo < 2.0 + 0.05,
+            "cutter starts at the plane, got {zlo}"
+        );
         assert!(zhi >= 3.0 - 1e-3, "cutter reaches the host top, got {zhi}");
     }
 
@@ -792,12 +781,8 @@ mod tests {
             ON_PLANE_EPS_BASE_M,
         )
         .expect("cutter builds");
-        let (rv, ri) = crate::geom::csg::subtract_many(
-            &hv,
-            &hi,
-            &[(cv.as_slice(), ci.as_slice())],
-        )
-        .expect("subtract succeeds");
+        let (rv, ri) = crate::geom::csg::subtract_many(&hv, &hi, &[(cv.as_slice(), ci.as_slice())])
+            .expect("subtract succeeds");
         let vol = signed_volume(&rv, &ri).abs();
         assert!(
             (vol - 5.0).abs() < 5e-3,

@@ -147,7 +147,10 @@ mod tests {
     #[test]
     fn non_bmp_uses_x4_runs() {
         assert_eq!(encode_string("😀").unwrap(), r"'\X4\0001F600\X0\'");
-        assert_eq!(encode_string("😀👍").unwrap(), r"'\X4\0001F6000001F44D\X0\'");
+        assert_eq!(
+            encode_string("😀👍").unwrap(),
+            r"'\X4\0001F6000001F44D\X0\'"
+        );
         // Adjacent BMP / non-BMP switch runs instead of mixing widths.
         let enc = encode_string("æ😀å").unwrap();
         assert_eq!(enc, r"'\X2\00E6\X0\\X4\0001F600\X0\\X2\00E5\X0\'");

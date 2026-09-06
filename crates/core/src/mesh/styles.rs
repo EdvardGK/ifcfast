@@ -52,7 +52,9 @@ impl StyleIndex {
         // Done by step_id so later phases can index into it cheaply.
         let mut style_color: HashMap<u64, [f32; 4]> = HashMap::new();
         for &id in table.order() {
-            let Some((type_name, _args)) = table.get(id) else { continue };
+            let Some((type_name, _args)) = table.get(id) else {
+                continue;
+            };
             if type_name.eq_ignore_ascii_case(b"IFCSURFACESTYLE") {
                 if let Some(c) = resolve_surface_style(table, id) {
                     style_color.insert(id, c);
@@ -68,7 +70,9 @@ impl StyleIndex {
         // Walks two indirections (PSA → SurfaceStyle, or SurfaceStyle
         // directly per IFC4).
         for &id in table.order() {
-            let Some((type_name, args)) = table.get(id) else { continue };
+            let Some((type_name, args)) = table.get(id) else {
+                continue;
+            };
             if !type_name.eq_ignore_ascii_case(b"IFCSTYLEDITEM") {
                 continue;
             }
@@ -104,7 +108,9 @@ impl StyleIndex {
         // → Items[] → first IfcStyledItem → colour).
         let mut material_color: HashMap<u64, [f32; 4]> = HashMap::new();
         for &id in table.order() {
-            let Some((type_name, args)) = table.get(id) else { continue };
+            let Some((type_name, args)) = table.get(id) else {
+                continue;
+            };
             if !type_name.eq_ignore_ascii_case(b"IFCMATERIALDEFINITIONREPRESENTATION") {
                 continue;
             }
@@ -129,7 +135,9 @@ impl StyleIndex {
         // product step_ids). Only handles direct `IfcMaterial`; layered
         // / profile / usage materials are skipped here.
         for &id in table.order() {
-            let Some((type_name, args)) = table.get(id) else { continue };
+            let Some((type_name, args)) = table.get(id) else {
+                continue;
+            };
             if !type_name.eq_ignore_ascii_case(b"IFCRELASSOCIATESMATERIAL") {
                 continue;
             }
@@ -144,7 +152,9 @@ impl StyleIndex {
                 Some(Field::Ref(rid)) => rid,
                 _ => continue,
             };
-            let Some(&colour) = material_color.get(&relating) else { continue };
+            let Some(&colour) = material_color.get(&relating) else {
+                continue;
+            };
             for f in split_top_level_args(related_body) {
                 if let Field::Ref(prod_id) = parse_field(f) {
                     idx.product.insert(prod_id, colour);
@@ -251,7 +261,9 @@ fn first_surface_style_colour(
     style_color: &HashMap<u64, [f32; 4]>,
 ) -> Option<[f32; 4]> {
     for f in split_top_level_args(list_body) {
-        let Field::Ref(rid) = parse_field(f) else { continue };
+        let Field::Ref(rid) = parse_field(f) else {
+            continue;
+        };
         if let Some(c) = style_color.get(&rid).copied() {
             return Some(c);
         }
@@ -259,12 +271,8 @@ fn first_surface_style_colour(
         if let Some((t, args)) = table.get(rid) {
             if t.eq_ignore_ascii_case(b"IFCPRESENTATIONSTYLEASSIGNMENT") {
                 let inner = split_top_level_args(args);
-                if let Some(Field::List(body)) =
-                    inner.first().copied().map(parse_field)
-                {
-                    if let Some(c) =
-                        first_surface_style_colour(table, body, style_color)
-                    {
+                if let Some(Field::List(body)) = inner.first().copied().map(parse_field) {
+                    if let Some(c) = first_surface_style_colour(table, body, style_color) {
                         return Some(c);
                     }
                 }
@@ -284,8 +292,12 @@ fn first_styled_representation_colour(
     item_color: &HashMap<u64, [f32; 4]>,
 ) -> Option<[f32; 4]> {
     for f in split_top_level_args(list_body) {
-        let Field::Ref(rid) = parse_field(f) else { continue };
-        let Some((t, args)) = table.get(rid) else { continue };
+        let Field::Ref(rid) = parse_field(f) else {
+            continue;
+        };
+        let Some((t, args)) = table.get(rid) else {
+            continue;
+        };
         if !t.eq_ignore_ascii_case(b"IFCSTYLEDREPRESENTATION") {
             continue;
         }
@@ -297,7 +309,9 @@ fn first_styled_representation_colour(
             _ => continue,
         };
         for itf in split_top_level_args(items_body) {
-            let Field::Ref(styled_id) = parse_field(itf) else { continue };
+            let Field::Ref(styled_id) = parse_field(itf) else {
+                continue;
+            };
             // `IfcStyledItem.Item` was the keying ref in phase 2 — but
             // here the styled-item is _under_ the material's styled
             // rep, and its "Item" field is typically `$` (no inner
@@ -329,8 +343,7 @@ fn first_styled_representation_colour(
                                     {
                                         for psaf in split_top_level_args(body) {
                                             if let Field::Ref(ssid) = parse_field(psaf) {
-                                                if let Some(c) =
-                                                    resolve_surface_style(table, ssid)
+                                                if let Some(c) = resolve_surface_style(table, ssid)
                                                 {
                                                     style_color.insert(ssid, c);
                                                 }
@@ -341,9 +354,7 @@ fn first_styled_representation_colour(
                             }
                         }
                     }
-                    if let Some(c) =
-                        first_surface_style_colour(table, styles_body, &style_color)
-                    {
+                    if let Some(c) = first_surface_style_colour(table, styles_body, &style_color) {
                         return Some(c);
                     }
                 }
@@ -374,16 +385,18 @@ fn resolve_surface_style(table: &EntityTable, id: u64) -> Option<[f32; 4]> {
     // First Rendering wins; else first Shading.
     let mut shading_color: Option<[f32; 4]> = None;
     for f in split_top_level_args(elements_body) {
-        let Field::Ref(rid) = parse_field(f) else { continue };
-        let Some((t, _)) = table.get(rid) else { continue };
+        let Field::Ref(rid) = parse_field(f) else {
+            continue;
+        };
+        let Some((t, _)) = table.get(rid) else {
+            continue;
+        };
         if t.eq_ignore_ascii_case(b"IFCSURFACESTYLERENDERING") {
             if let Some(c) = resolve_surface_style_rendering(table, rid) {
                 return Some(c);
             }
-        } else if t.eq_ignore_ascii_case(b"IFCSURFACESTYLESHADING") {
-            if shading_color.is_none() {
-                shading_color = resolve_surface_style_shading(table, rid);
-            }
+        } else if t.eq_ignore_ascii_case(b"IFCSURFACESTYLESHADING") && shading_color.is_none() {
+            shading_color = resolve_surface_style_shading(table, rid);
         }
     }
     shading_color
@@ -393,10 +406,7 @@ fn resolve_surface_style(table: &EntityTable, id: u64) -> Option<[f32; 4]> {
 /// TransmissionColour?, DiffuseTransmissionColour?, ReflectionColour?,
 /// SpecularColour?, SpecularHighlight?, ReflectanceMethod)` — alpha is
 /// `1 - Transparency`. Out-of-range values are clamped.
-fn resolve_surface_style_rendering(
-    table: &EntityTable,
-    id: u64,
-) -> Option<[f32; 4]> {
+fn resolve_surface_style_rendering(table: &EntityTable, id: u64) -> Option<[f32; 4]> {
     let (_, args) = table.get(id)?;
     let fields = split_top_level_args(args);
     let colour_id = match fields.first().copied().map(parse_field) {
@@ -431,26 +441,33 @@ fn resolve_surface_style_shading(table: &EntityTable, id: u64) -> Option<[f32; 4
 
 /// `IfcColourRgb(Name, Red, Green, Blue)` — values in `[0, 1]`. Clamps
 /// out-of-range components defensively (some exporters write 0..255).
+///
+/// GH #160: the 0..255 rescale is a decision about the **colour**, not
+/// about each channel independently. Applied per channel,
+/// `IFCCOLOURRGB('x', 204., 102., 1.)` became `(0.8, 0.4, 1.0)` — the
+/// blue channel read as already-normalised and the colour came out a
+/// completely different hue. Read all three components first; if ANY of
+/// them is out of the 0..1 range, the whole triple is 0..255.
 fn resolve_colour_rgb(table: &EntityTable, id: u64) -> Option<[f32; 3]> {
     let (type_name, args) = table.get(id)?;
     if !type_name.eq_ignore_ascii_case(b"IFCCOLOURRGB") {
         return None;
     }
     let fields = split_top_level_args(args);
-    let mut comps = [0.0_f32; 3];
-    for i in 0..3 {
-        comps[i] = match fields.get(1 + i).copied().map(parse_field) {
-            Some(Field::Number(n)) => {
-                let v = n as f32;
-                if v > 1.5 {
-                    // Some authoring tools write 0..255 instead of 0..1.
-                    (v / 255.0).clamp(0.0, 1.0)
-                } else {
-                    v.clamp(0.0, 1.0)
-                }
-            }
+    let mut raw = [0.0_f32; 3];
+    for (i, r) in raw.iter_mut().enumerate() {
+        *r = match fields.get(1 + i).copied().map(parse_field) {
+            Some(Field::Number(n)) => n as f32,
             _ => return None,
         };
+    }
+    let byte_scale = raw.iter().any(|v| *v > 1.5);
+    let mut comps = raw;
+    for c in &mut comps {
+        if byte_scale {
+            *c /= 255.0;
+        }
+        *c = c.clamp(0.0, 1.0);
     }
     Some(comps)
 }
@@ -485,6 +502,45 @@ DATA;
 ENDSEC;
 END-ISO-10303-21;
 "#;
+
+    /// GH #160: the 0..255 rescale is per COLOUR. `(204., 102., 1.)`
+    /// is a byte-scale colour whose blue channel happens to be 1 — the
+    /// per-channel heuristic left it at 1.0 and turned a dark red into
+    /// magenta.
+    #[test]
+    fn byte_scale_colour_rescales_every_channel() {
+        let src = STYLED_IFC.replace(
+            "#100=IFCCOLOURRGB('TestRed',0.8,0.2,0.1);",
+            "#100=IFCCOLOURRGB('TestRed',204.,102.,1.);",
+        );
+        let table = EntityTable::build(src.as_bytes());
+        let idx = StyleIndex::build(&table);
+        let got = idx.item.get(&33).copied().expect("item #33 styled");
+        let want = [204.0 / 255.0, 102.0 / 255.0, 1.0 / 255.0];
+        for i in 0..3 {
+            assert!(
+                (got[i] - want[i]).abs() < 1e-5,
+                "channel {i}: got {got:?}, want {want:?}"
+            );
+        }
+    }
+
+    /// A normalised colour is untouched — including a channel at
+    /// exactly 1.0.
+    #[test]
+    fn normalised_colour_is_not_rescaled() {
+        let src = STYLED_IFC.replace(
+            "#100=IFCCOLOURRGB('TestRed',0.8,0.2,0.1);",
+            "#100=IFCCOLOURRGB('TestRed',0.8,0.4,1.);",
+        );
+        let table = EntityTable::build(src.as_bytes());
+        let idx = StyleIndex::build(&table);
+        let got = idx.item.get(&33).copied().expect("item #33 styled");
+        let want = [0.8_f32, 0.4, 1.0];
+        for i in 0..3 {
+            assert!((got[i] - want[i]).abs() < 1e-5, "channel {i}: got {got:?}");
+        }
+    }
 
     #[test]
     fn item_to_color_resolves_through_psa() {
@@ -566,9 +622,11 @@ END-ISO-10303-21;
         // Post-#55, idx.item[33] = the green RGBA.
         let table = EntityTable::build(STYLED_MAPPED_IFC.as_bytes());
         let idx = StyleIndex::build(&table);
-        let got = idx.item.get(&33).copied().expect(
-            "GH #55: colour authored on IfcMappedItem must reach inner extrusion #33",
-        );
+        let got = idx
+            .item
+            .get(&33)
+            .copied()
+            .expect("GH #55: colour authored on IfcMappedItem must reach inner extrusion #33");
         let want = [0.1_f32, 0.7, 0.2, 1.0];
         for i in 0..4 {
             assert!(
@@ -581,8 +639,7 @@ END-ISO-10303-21;
 
     #[test]
     fn colour_rgb_clamps_oversized() {
-        let buf = format!(
-            r#"ISO-10303-21;
+        let buf = r#"ISO-10303-21;
 HEADER;
 FILE_DESCRIPTION(('x'),'2;1');
 FILE_NAME('x.ifc','x',('x'),('x'),'x','x','');
@@ -602,8 +659,8 @@ DATA;
 #104=IFCSTYLEDITEM(#33,(#102),$);
 ENDSEC;
 END-ISO-10303-21;
-"#,
-        );
+"#
+        .to_string();
         let table = EntityTable::build(buf.as_bytes());
         let idx = StyleIndex::build(&table);
         let got = idx.item.get(&33).copied().expect("item #33 styled");

@@ -7,6 +7,88 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### 2026-09-06 review sweep (GH #147–#165)
+
+A full-codebase review filed nineteen issues and this sweep closes
+them. Cache schema 29 → 30.
+
+#### Fixed — correctness
+
+- **Truncated DATA sections are refused** (GH #148). A stray byte
+  (doubled `;;`) used to stop the record walk silently; every native
+  entry point now raises `IfcfastError` with the offset, `ifcfast-bundle`
+  exits 2.
+- **Unit scale never silently defaults to metres** (GH #149). Unknown SI
+  prefix / inconsistent SI name / broken conversion chain / missing
+  assignment each leave `unit_scale` unset with a reason on the new
+  `m.warnings`; the case-sensitive `IFCSIUNIT` compare is fixed.
+- **Cut-openings fallback strips the synthetic half-space slabs**
+  (GH #147) — a failed subtraction no longer sums a 20 000-unit tool
+  quad into `volume_m3`, the AABB and the glTF.
+- **IFC2x3 brep / shell-based surface models get the far-origin
+  `rep_origin` rebase** (GH #153) — the faceset fix from GH #52 now
+  covers the dominant 2x3 geometry path.
+- **Substrate shared-rep rows carry the item's `rep_origin`** (GH #167,
+  found by the clash oracle while gating #153): `parts[i].instance_transform`
+  now folds the rebase, so `instances.transform × representations.vertices_le`
+  reproduces the baked mesh. Before, every far-origin faceset (and, after
+  #153, every IFC2x3 brep) was placed `rep_origin` short in
+  `ifcfast.clash()` and in glTF instancing — on G55 the misplacement was
+  ~0.4–0.5 m and had already cost Solibri-truth pairs on polygonal
+  facesets before this sweep.
+- **Reveal-all restored** (GH #154): an unsupported profile inside a
+  multi-item Body and a composite curve with an untessellatable segment
+  now surface as `unhandled:` counters instead of vanishing / bridging.
+- **`IfcRevolvedAreaSolid.Angle` honours `PLANEANGLEUNIT`**, is clamped
+  to one turn and the step count is capped (GH #155).
+- **`mutate` translate/rotate keeps child placements attached**
+  (GH #150): copy-on-write fires only when another *product* shares the
+  placement, so a wall's openings move with it.
+- **Bundle and clash parquet writes are atomic** (GH #151): staged to
+  `<file>.tmp.<pid>` and renamed; a failure leaves the previous output
+  intact.
+- **Deterministic output order** (GH #152): voided-host flush, pset /
+  quantity type inheritance and QTO surface buckets no longer follow
+  `HashMap` iteration order.
+- **Clash narrow phase rebases to a scene f64 anchor** before f32
+  packing (GH #156); negative / NaN `tolerance_m` raise `ValueError`;
+  per-residual diagnostics in `df.attrs["narrow_phase_residual_details"]`
+  (GH #161).
+- Parse-core cluster (GH #159): minted GUID version nibble, `tag` no
+  longer reads `LongName` on spatial elements, header probe scans to
+  `DATA;` (was 64 KB), ifczip pre-allocation capped, IFC2x3
+  `IfcRoof` / `IfcSpace` `predefined_type` suppressed for ifcopenshell
+  parity, unrecognised `IfcQuantity*` emit an `unhandled:` marker row,
+  duplicate STEP ids warn.
+- Geometry cluster (GH #160): unit-scaled drift floor, negative
+  extrusion depth winding, sampler bounds, placement cycle guard and
+  `IfcGridPlacement` marker, manifold status check, polygonal-face
+  voids cut, per-colour 0–255 rescale, UTF-8-safe report truncation,
+  modular `arc_span`.
+- Python cluster (GH #157, #158, #162): `ifcfast://agents-guide` reads
+  the packaged `AGENTS.md` and raises if missing (was a silent
+  fallback); `system_prompt()` teaches the `volume_reliable` rule;
+  manifest writes take an advisory lock and refresh source stat; the
+  classifier signature covers the supertype map; cache-write failures
+  go through the strict channel; `federate()` refuses `out_dir` equal
+  to an input, checks the representations schema and revalidates its
+  cache fingerprint; CLI catches `IfcfastError`; MCP tree tools take
+  `limit` and the model cache is bounded.
+
+#### Added
+
+- **`materials.source` and `classifications.assignment_source`**
+  (`"instance"` / `"type"`) — both layers now inherit through
+  `IfcRelDefinesByType` like psets / quantities (GH #165).
+- **`m.warnings`** (also `summary()["warnings"]`, `index` CLI JSON):
+  the indexer's non-fatal anomaly list. Library code no longer prints.
+- MCP `classifications` tool; `ifcfast.agents_guide()`.
+- CI: `cargo fmt --check` + `cargo clippy -D warnings` lane (GH #164).
+
+#### Changed
+
+- `AGENTS.md` re-synced with the code (GH #163).
+
 ### Added — first-class federation (GH #50)
 
 - **`ifcfast.federate(bundles, out_dir, *, on_collision, reference_only)`** —

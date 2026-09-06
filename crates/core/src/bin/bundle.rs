@@ -56,7 +56,10 @@ fn main() -> ExitCode {
     let out_dir = if let Some(o) = args.get(2) {
         PathBuf::from(o)
     } else {
-        let stem = in_path.file_stem().map(|s| s.to_owned()).unwrap_or_default();
+        let stem = in_path
+            .file_stem()
+            .map(|s| s.to_owned())
+            .unwrap_or_default();
         let mut p = in_path.clone();
         p.set_file_name(format!("{}.bundle", stem.to_string_lossy()));
         p
@@ -88,17 +91,33 @@ fn main() -> ExitCode {
 
     let t_bundle = Instant::now();
     let bundle = Bundle::build(&mmap);
+    for w in &bundle.warnings {
+        eprintln!("[ifcfast-bundle] WARNING: {w}");
+    }
+    if let Some(err) = &bundle.parse_error {
+        eprintln!("[ifcfast-bundle] ERROR: refusing to bundle a truncated IFC: {err}");
+        return ExitCode::from(2);
+    }
     let bundle_ms = t_bundle.elapsed().as_secs_f64() * 1000.0;
     let sem = bundle.semantic_stats();
+    eprintln!("[ifcfast-bundle] semantic pre-pass {:>8.1} ms", bundle_ms);
     eprintln!(
-        "[ifcfast-bundle] semantic pre-pass {:>8.1} ms",
-        bundle_ms
+        "[ifcfast-bundle]   products indexed:    {}",
+        sem.products_indexed
     );
-    eprintln!("[ifcfast-bundle]   products indexed:    {}", sem.products_indexed);
     eprintln!("[ifcfast-bundle]   pset rows:           {}", sem.pset_rows);
-    eprintln!("[ifcfast-bundle]   material rows:       {}", sem.material_rows);
-    eprintln!("[ifcfast-bundle]   quantity rows:       {}", sem.quantity_rows);
-    eprintln!("[ifcfast-bundle]   classification rows: {}", sem.classification_rows);
+    eprintln!(
+        "[ifcfast-bundle]   material rows:       {}",
+        sem.material_rows
+    );
+    eprintln!(
+        "[ifcfast-bundle]   quantity rows:       {}",
+        sem.quantity_rows
+    );
+    eprintln!(
+        "[ifcfast-bundle]   classification rows: {}",
+        sem.classification_rows
+    );
 
     // Model identity stamped on every instance row (GH #50): the
     // source IFC's file stem, mirroring the PyO3 `bundle()` path.
@@ -132,10 +151,16 @@ fn main() -> ExitCode {
         return ExitCode::from(1);
     }
 
-    eprintln!("[ifcfast-bundle] entity table     {:>8.1} ms", stats.entity_table_build_ms);
+    eprintln!(
+        "[ifcfast-bundle] entity table     {:>8.1} ms",
+        stats.entity_table_build_ms
+    );
     eprintln!("[ifcfast-bundle] streaming mesh   {:>8.1} ms", stream_ms);
     eprintln!("[ifcfast-bundle] products seen:    {}", stats.products_seen);
-    eprintln!("[ifcfast-bundle] products meshed:  {}", stats.products_meshed);
+    eprintln!(
+        "[ifcfast-bundle] products meshed:  {}",
+        stats.products_meshed
+    );
     eprintln!("[ifcfast-bundle] instances written:{}", instances_written);
     eprintln!("[ifcfast-bundle] unique reps:      {}", reps_written);
     if instances_written > 0 && reps_written > 0 {
@@ -145,7 +170,10 @@ fn main() -> ExitCode {
             ratio
         );
     }
-    eprintln!("[ifcfast-bundle] products deferred:{}", stats.products_deferred);
+    eprintln!(
+        "[ifcfast-bundle] products deferred:{}",
+        stats.products_deferred
+    );
     eprintln!("[ifcfast-bundle] triangles emitted:{}", stats.triangles);
 
     let rep_path = out_dir.join("representations.parquet");

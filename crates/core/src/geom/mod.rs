@@ -36,7 +36,7 @@ pub mod narrow_phase;
 pub mod csg;
 
 pub use broad_phase::{pairs_overlapping, AabbF32};
-pub use mesh::{build_trimesh, MeshBuildError};
+pub use mesh::{bake_world, build_trimesh, rebase_world, MeshBuildError};
 pub use narrow_phase::{intersects, min_distance, min_distance_within, NarrowPhaseError};
 
 #[cfg(feature = "csg")]

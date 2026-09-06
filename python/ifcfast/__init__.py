@@ -57,6 +57,7 @@ Public API:
 * :func:`header` — parse only the STEP header (no full index).
 * :func:`example_path` — path to the bundled minimal IFC fixture.
 * :func:`system_prompt` — paste-into-agent description of the library.
+* :func:`agents_guide` — full text of the packaged ``AGENTS.md``.
 * :func:`bundle` — write the parquet substrate for one IFC.
 * :func:`federate` — merge N substrate bundles into one clash-able bundle.
 * :func:`clash` — clash detection against a bundle (or a list of them).
@@ -96,6 +97,7 @@ __all__ = [
     "Model",
     "ProductRow",
     "StoreyRow",
+    "agents_guide",
     "bundle",
     "cache",
     "classify",
@@ -153,6 +155,42 @@ def example_path() -> _Path:
     return _Path(__file__).parent / "data" / "minimal.ifc"
 
 
+#: The packaged copy of the repo-root ``AGENTS.md``. It lives under
+#: ``python/ifcfast/data/`` because that is the only tree maturin
+#: auto-packages into the WHEEL — a ``[tool.maturin] include`` entry for
+#: the repo-root file lands it at the wheel root (next to the package,
+#: not inside it), which is both unimportable and site-packages
+#: pollution. ``tests/test_agents_guide.py`` gates the copy against the
+#: root file byte-for-byte, so the two can never drift (GH #157).
+_AGENTS_MD = "AGENTS.md"
+
+
+def agents_guide() -> str:
+    """Full text of the packaged ``AGENTS.md`` — the agent contract.
+
+    The long-form guide `system_prompt()` summarises: decision tree,
+    substrate schema, clash surface, conventions, cost model. Backs the
+    ``ifcfast://agents-guide`` MCP resource.
+
+    Raises:
+        FileNotFoundError: the guide is not in the installed package.
+            Deliberately loud (GH #157) — the previous behaviour was to
+            fall back to the ~60-line `system_prompt()` with no signal,
+            so an agent that asked for the full contract got a summary
+            and had no way to tell.
+    """
+    p = _Path(__file__).parent / "data" / _AGENTS_MD
+    if not p.is_file():
+        raise FileNotFoundError(
+            f"packaged agent guide missing: {p}. The wheel is built "
+            f"wrong (python/ifcfast/data/{_AGENTS_MD} is package data) or "
+            f"the install is damaged — reinstall ifcfast. Falling back to "
+            f"system_prompt() would hand you a summary labelled as the "
+            f"full guide, so this fails instead."
+        )
+    return p.read_text(encoding="utf-8")
+
+
 def system_prompt() -> str:
     """Paste-into-agent description of the ``ifcfast`` library.
 
@@ -186,9 +224,16 @@ ifcfast is a speed-first companion to ifcopenshell, not a competitor:
 it goes fast and flags what it can't do reliably; ifcopenshell owns the
 heavy geometry kernel. Best practice is the hybrid pattern — run ifcfast
 on everything, then escalate only the rows it flags as unreliable
-(|volume_m3| > aabb_volume_m3) to ifcopenshell. The flagged set is tiny
-(~0.3% on a real model), so you keep the speed and get kernel-grade
-numbers exactly where needed. See examples/hybrid_qto_routing.py.
+(volume_reliable == False in mesh_qto) to ifcopenshell. Those rows
+already carry a min-over-three-axes prism fallback substituted into
+volume_m3. The flagged set is tiny (~0.3% on a real model), so you keep
+the speed and get kernel-grade numbers exactly where needed. Sum
+volume_m3 only over volume_reliable rows. See
+examples/hybrid_qto_routing.py.
+
+The full contract — decision tree, substrate schema, clash columns,
+conventions, cost model — is ifcfast.agents_guide() (the packaged
+AGENTS.md; the same text as the ifcfast://agents-guide MCP resource).
 
 Open and inspect:
     import ifcfast
@@ -198,52 +243,63 @@ Open and inspect:
     m.preview("psets", n=5)               # sample rows from any table
     m.types()                             # {entity_name: count}
     m.by_type("IfcWall")                  # rows for a type (+subtypes, case-insensitive)
+    m.product(guid)                       # one ProductRow, or None
     m.unit_scale / m.length_unit          # source-unit → metres factor + unit name
+    m.type_summary() / m.type_bank()      # type catalogue (TypeBank shape)
+    m.products_df / m.spaces_df / m.type_objects_df   # tier-1 tables as DataFrames
 
 Data layers (long-format pandas, lazy on first access):
-    m.psets / m.quantities / m.materials / m.classifications / m.drift
+    m.psets / m.quantities / m.materials / m.classifications
+    m.drift        # placement-vs-mesh report (SI columns)
+    m.segments     # per-representation-item rows behind drift
 
 Geometry (no CAD kernel required):
     m.meshes()                  # per-product triangles: (guid, entity, vertices, faces)
     m.mesh(guid)                # one product's mesh without tessellating the model
+    m.mesh(guid, frame="local") # LocalMesh: native-unit local coords + 4x4 placement
     m.iter_meshes() / m.iter_point_cloud()   # streaming variants (bounded memory)
     m.point_cloud(per_m2=1000)  # area-weighted surface samples + normals
-    m.mesh_qto()                # -> (products_df, per_surface_df); volume/area/orientation + planar surfaces
-    m.to_gltf("out.glb")        # viewer-ready glTF (cut_openings=True by default)
+    m.mesh_qto()                # -> (products_df, per_surface_df); volume/area/orientation
+    m.to_gltf("out.glb")        # viewer-ready glTF (cut_openings=True by default);
+                                # the only surface returning the cut_openings_* counters
     # meshes() / point_cloud() take unit="m"|"mm"|"cm"|"ft"|"in" (default metres)
 
 Writing (surgical, round-trippable):
     m.subset([guid, ...])                 # valid standalone IFC of those elements -> bytes
     m.hotswap(guid, vertices, triangles)  # swap one element's Body mesh -> bytes
-    # both take out_path=... to write a file and return a stats dict
-    # hotswap expects LOCAL-frame coords; m.meshes() vertices are WORLD-frame
+    m.mutate([{"op": "set_property", ...}])  # batch/atomic attribute + pset edits -> bytes
+    # all three take out_path=... to write a file and return a stats dict
+    # hotswap expects LOCAL-frame coords — m.mesh(guid, frame="local") is that frame
 
 Substrate + clash (GeoParquet, model-scale analysis):
     ifcfast.bundle(path, out_dir)         # representations/instances parquet substrate
     ifcfast.clash(bundle_dir)             # broad+narrow clash pass -> clashes.parquet
     ifcfast.clash([ark_dir, rib_dir])     # federates the bundles, then clashes them as one
     ifcfast.federate(dirs, out_dir)       # explicit N-bundle merge (+ federation.json)
+    # clash(): tolerance_m=, include_classes=, exclude_self_class=,
+    #          reference_only=, write_parquet=, on_collision=
     # cross-model pairs: df[df.source_model_a != df.source_model_b]
     # federated substrate join key: (guid, source_model) — bare guid/ifc_id may collide
-    # mesh_qto volume contract: SUM(volume_m3) only over volume_reliable rows
 
 Spatial-relationship graph:
-    m.contained_in / m.aggregates / m.storey_building   # DataFrames
+    m.contained_in / m.aggregates / m.storey_building / m.voids   # DataFrames
     m.parent(g) / m.children(g) / m.ancestors(g) / m.descendants(g)
     m.storey_of(g) / m.building_of(g) / m.products_in(parent_g)
+    m.spaces / m.type_objects                                     # tier-1 row lists
 
 All traversal methods return None / [] on unknown guids — they never
 raise. Filter ProductRow iteration via m.filter(entity=..., mode=...,
 storey_guid=...). Compare two models with m.diff(other_path).
+Recoverable native failures raise ifcfast.IfcfastError.
 
 CLI (all subcommands accept --json for machine output):
     ifcfast demo                  # showcase against the bundled IFC
     ifcfast index FILE            # tier-1 parse + counts
     ifcfast schema FILE           # full schema introspection
-    ifcfast types FILE            # type-first extraction (TypeBank shape)
+    ifcfast types FILE            # type-first extraction (--with-data/--samples)
     ifcfast extract FILE          # data layers
-    ifcfast drift FILE            # placement-vs-mesh drift report
-    ifcfast cache DIR             # inspect/clear the parse cache
+    ifcfast drift FILE            # placement-vs-mesh drift report (--top N)
+    ifcfast cache FILE            # inspect the parse cache for that FILE (--clear)
     ifcfast bundle FILE OUT_DIR   # write the parquet substrate
 
 For zero-network demos: ifcfast.open(ifcfast.example_path()).

@@ -106,7 +106,7 @@ pub fn sample(
     let mut tri_areas: Vec<f32> = Vec::with_capacity(n_tris);
     let mut total_area_raw: f32 = 0.0;
 
-    for tri in indices.chunks_exact(3) {
+    for tri in indices.as_chunks::<3>().0 {
         let area_raw = triangle_area_raw(vertices, tri[0], tri[1], tri[2]);
         total_area_raw += area_raw;
         tri_areas.push(area_raw);
@@ -157,21 +157,20 @@ pub fn sample(
         let b = indices[base + 1] as usize;
         let c = indices[base + 2] as usize;
 
-        let (ax, ay, az) = (
-            vertices[a * 3],
-            vertices[a * 3 + 1],
-            vertices[a * 3 + 2],
-        );
-        let (bx, by, bz) = (
-            vertices[b * 3],
-            vertices[b * 3 + 1],
-            vertices[b * 3 + 2],
-        );
-        let (cx, cy, cz) = (
-            vertices[c * 3],
-            vertices[c * 3 + 1],
-            vertices[c * 3 + 2],
-        );
+        // Same guard as `triangle_area_raw` (GH #160). Such a triangle
+        // carries zero area, so a valid mesh never reaches this branch
+        // and the emitted point count is unchanged; a malformed index
+        // buffer loses that one sample instead of panicking.
+        if (a * 3 + 2) >= vertices.len()
+            || (b * 3 + 2) >= vertices.len()
+            || (c * 3 + 2) >= vertices.len()
+        {
+            continue;
+        }
+
+        let (ax, ay, az) = (vertices[a * 3], vertices[a * 3 + 1], vertices[a * 3 + 2]);
+        let (bx, by, bz) = (vertices[b * 3], vertices[b * 3 + 1], vertices[b * 3 + 2]);
+        let (cx, cy, cz) = (vertices[c * 3], vertices[c * 3 + 1], vertices[c * 3 + 2]);
 
         // Barycentric sample via the standard sqrt-trick. Uniform
         // inside the triangle iff r1, r2 are iid U[0,1).
@@ -224,7 +223,11 @@ fn triangle_area_raw(verts: &[f32], a: u32, b: u32, c: u32) -> f32 {
     let off_a = a * 3;
     let off_b = b * 3;
     let off_c = c * 3;
-    if off_c + 2 >= verts.len() {
+    // GH #160: all THREE offsets need the check. Only `c` was guarded,
+    // so a triangle whose first or second index runs past the vertex
+    // buffer panicked two lines down — inside a PyO3 call, on nothing
+    // worse than a malformed index buffer.
+    if off_a + 2 >= verts.len() || off_b + 2 >= verts.len() || off_c + 2 >= verts.len() {
         return 0.0;
     }
     let ax = verts[off_a];
@@ -254,14 +257,28 @@ mod tests {
 
     /// Unit square at z=0, two triangles, total area 1.0 m².
     fn unit_square() -> (Vec<f32>, Vec<u32>) {
-        let v = vec![
-            0.0, 0.0, 0.0,
-            1.0, 0.0, 0.0,
-            1.0, 1.0, 0.0,
-            0.0, 1.0, 0.0,
-        ];
+        let v = vec![0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0, 0.0];
         let i = vec![0, 1, 2, 0, 2, 3];
         (v, i)
+    }
+
+    /// GH #160: an out-of-range index in the FIRST or SECOND slot of a
+    /// triangle used to panic (`triangle_area_raw` only guarded the
+    /// third). The bad triangle contributes zero area and the valid
+    /// geometry still samples.
+    #[test]
+    fn out_of_range_indices_do_not_panic() {
+        let (v, mut i) = unit_square();
+        // Append a triangle whose first two indices run past the buffer.
+        i.extend_from_slice(&[99, 98, 0]);
+        let pc = sample(&v, &i, 1.0, 100.0, 42);
+        // The malformed triangle carries no area, so the point budget is
+        // still driven by the valid 1 m² square.
+        assert!(!pc.is_empty());
+        for k in 0..pc.len() {
+            assert!(pc.x[k] >= 0.0 && pc.x[k] <= 1.0);
+            assert!(pc.y[k] >= 0.0 && pc.y[k] <= 1.0);
+        }
     }
 
     #[test]
@@ -296,7 +313,8 @@ mod tests {
             assert!(
                 (pc.nz[k] - 1.0).abs() < 1e-5,
                 "expected nz=1, got {} at sample {}",
-                pc.nz[k], k,
+                pc.nz[k],
+                k,
             );
             assert!(pc.nx[k].abs() < 1e-5);
             assert!(pc.ny[k].abs() < 1e-5);
@@ -328,7 +346,11 @@ mod tests {
                 diffs += 1;
             }
         }
-        assert!(diffs > a.len() / 4, "expected diverging outputs, got {diffs}/{}", a.len());
+        assert!(
+            diffs > a.len() / 4,
+            "expected diverging outputs, got {diffs}/{}",
+            a.len()
+        );
     }
 
     #[test]
@@ -360,13 +382,9 @@ mod tests {
         // one (area 50). The bigger triangle should receive ~99% of
         // the sample mass.
         let v = vec![
-            0.0, 0.0, 0.0,
-            1.0, 0.0, 0.0,
-            0.0, 1.0, 0.0,
+            0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0,
             // Second, bigger triangle 10 m away, area = 50
-            10.0, 0.0, 0.0,
-            20.0, 0.0, 0.0,
-            10.0, 10.0, 0.0,
+            10.0, 0.0, 0.0, 20.0, 0.0, 0.0, 10.0, 10.0, 0.0,
         ];
         let i = vec![0, 1, 2, 3, 4, 5];
         let pc = sample(&v, &i, 1.0, 1000.0, 42);

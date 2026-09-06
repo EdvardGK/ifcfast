@@ -54,10 +54,7 @@ impl QuantityTable {
     }
 }
 
-pub fn build(
-    table: &EntityTable,
-    product_step_to_guid: &HashMap<u64, String>,
-) -> QuantityTable {
+pub fn build(table: &EntityTable, product_step_to_guid: &HashMap<u64, String>) -> QuantityTable {
     // Pass 1: index IfcElementQuantity records and their physical quantity refs.
     //         Also index each physical-simple-quantity record.
     let mut qtos: HashMap<u64, (String, Vec<u64>)> = HashMap::with_capacity(1024);
@@ -69,8 +66,7 @@ pub fn build(
     // both nested members, surfacing nothing. We flatten in pass 2 with
     // dot-joined names (`Wrapper.Width`, `Wrapper.Height`), matching the
     // pset flattening convention so the data is revealed, not just marked.
-    let mut complex_quantities: HashMap<u64, (String, Vec<u64>)> =
-        HashMap::with_capacity(256);
+    let mut complex_quantities: HashMap<u64, (String, Vec<u64>)> = HashMap::with_capacity(256);
     let mut rel_pairs: Vec<(u64, u64)> = Vec::with_capacity(8192);
     // Project-default unit fallback (GH #43). Real-world Revit/ArchiCAD
     // exports almost always leave the per-quantity `Unit` slot as `$`
@@ -133,7 +129,38 @@ pub fn build(
             let value = number_at(&fields, 3).map(format_number);
             quantities.insert(
                 step_id,
-                Quantity { name, kind, value, unit_step_id: unit },
+                Quantity {
+                    name,
+                    kind: std::borrow::Cow::Borrowed(kind),
+                    value,
+                    unit_step_id: unit,
+                },
+            );
+        } else if is_unhandled_quantity(type_name) {
+            // Any IfcQuantity* class we don't have a parser for (today:
+            // IFC4X3's IfcQuantityNumber, plus whatever a future schema
+            // adds). Pre-fix these were dropped with no trace, so a
+            // consumer couldn't tell "the author wrote no quantity" from
+            // "ifcfast can't read this quantity". Mirrors the
+            // `unhandled:IFCXXX` marker row in extractors/psets.rs
+            // (GH #159): value stays null, quantity_type carries the
+            // marker, and the row is queryable.
+            let fields = split_top_level_args(args);
+            let name = string_at(&fields, 0).unwrap_or_default();
+            let marker = format!(
+                "unhandled:{}",
+                std::str::from_utf8(type_name)
+                    .map(|s| s.to_ascii_uppercase())
+                    .unwrap_or_else(|_| "IFCQUANTITY?".to_string())
+            );
+            quantities.insert(
+                step_id,
+                Quantity {
+                    name,
+                    kind: std::borrow::Cow::Owned(marker),
+                    value: None,
+                    unit_step_id: None,
+                },
             );
         } else if type_name.eq_ignore_ascii_case(b"IFCPHYSICALCOMPLEXQUANTITY") {
             // (Name, Description, HasQuantities, Discrimination, Quality,
@@ -242,9 +269,7 @@ pub fn build(
             // nested in an unresolved IfcConversionBasedUnit) are skipped,
             // so a stray duplicate can no longer shadow the real default
             // regardless of where it sits in the file (GH #76 item 4).
-            if let Some(assigned) =
-                step_ids.iter().find(|id| project_unit_refs.contains(id))
-            {
+            if let Some(assigned) = step_ids.iter().find(|id| project_unit_refs.contains(id)) {
                 project_default_unit.insert(canonical, *assigned);
             }
         }
@@ -301,7 +326,15 @@ pub fn build(
     // BOTH there's a product↔type relation AND at least one type
     // carries quantity refs.
     if !type_qtos.is_empty() && !product_to_type.is_empty() {
-        for (product_step_id, type_step_id) in &product_to_type {
+        // Sorted by product step id — see the identical note in
+        // extractors/psets.rs. HashMap iteration order is per-process
+        // random and was leaking into the emitted row order (GH #152).
+        let mut inherit: Vec<(u64, u64)> = product_to_type
+            .iter()
+            .map(|(product, type_id)| (*product, *type_id))
+            .collect();
+        inherit.sort_unstable();
+        for (product_step_id, type_step_id) in &inherit {
             let guid = match product_step_to_guid.get(product_step_id) {
                 Some(g) => g.as_str(),
                 None => continue,
@@ -371,7 +404,7 @@ fn emit_quantity(
     if let Some(q) = quantities.get(qid) {
         let name = join_name(prefix, &q.name);
         let unit = q.unit_step_id.or_else(|| {
-            unit_type_for_quantity_kind(q.kind)
+            unit_type_for_quantity_kind(&q.kind)
                 .and_then(|ut| project_default_unit.get(ut).copied())
         });
         out.guid.push(guid.to_string());
@@ -433,7 +466,7 @@ fn emit_quantity_dedup(
             return;
         }
         let unit = q.unit_step_id.or_else(|| {
-            unit_type_for_quantity_kind(q.kind)
+            unit_type_for_quantity_kind(&q.kind)
                 .and_then(|ut| project_default_unit.get(ut).copied())
         });
         out.guid.push(guid.to_string());
@@ -487,22 +520,40 @@ fn is_type_object(t: &[u8]) -> bool {
     let suffix_ok = t.len() > 7
         && t[..3].eq_ignore_ascii_case(b"IFC")
         && t[t.len() - 4..].eq_ignore_ascii_case(b"TYPE");
-    let ifc2x3_style = t.eq_ignore_ascii_case(b"IFCDOORSTYLE")
-        || t.eq_ignore_ascii_case(b"IFCWINDOWSTYLE");
+    let ifc2x3_style =
+        t.eq_ignore_ascii_case(b"IFCDOORSTYLE") || t.eq_ignore_ascii_case(b"IFCWINDOWSTYLE");
     // Bare base classes `IfcTypeProduct` / `IfcTypeObject` are non-abstract
     // and emitted by Revit for types with no schema-specific `*Type`
     // subtype; they end in `PRODUCT` / `OBJECT`, miss the suffix check, and
     // would silently drop their inherited quantities. See #69.
-    let bare_base = t.eq_ignore_ascii_case(b"IFCTYPEPRODUCT")
-        || t.eq_ignore_ascii_case(b"IFCTYPEOBJECT");
+    let bare_base =
+        t.eq_ignore_ascii_case(b"IFCTYPEPRODUCT") || t.eq_ignore_ascii_case(b"IFCTYPEOBJECT");
     suffix_ok || ifc2x3_style || bare_base
 }
 
 struct Quantity {
     name: String,
-    kind: &'static str,
+    /// The `quantity_type` column value. `Borrowed` for the six
+    /// recognised IfcQuantity* classes; `Owned` for the
+    /// `unhandled:IFCXXX` marker of a class we don't parse yet, so the
+    /// blind spot is visible without allocating on the hot path.
+    kind: std::borrow::Cow<'static, str>,
     value: Option<String>,
     unit_step_id: Option<u64>,
+}
+
+/// An `IfcQuantity*` entity that [`quantity_kind`] doesn't recognise.
+/// The `IFCQUANTITY` prefix is unique to `IfcPhysicalSimpleQuantity`
+/// leaves in the IFC schema family, which is what makes it a safe
+/// "did we miss a quantity class" probe — the exact mirror of
+/// `psets::is_unhandled_simple_property`'s `*VALUE` suffix rule.
+/// `IfcPhysicalComplexQuantity` does not start with `IFCQUANTITY` and
+/// is handled on its own path.
+fn is_unhandled_quantity(type_name: &[u8]) -> bool {
+    const PREFIX: &[u8] = b"IFCQUANTITY";
+    type_name.len() > PREFIX.len()
+        && type_name[..PREFIX.len()].eq_ignore_ascii_case(PREFIX)
+        && quantity_kind(type_name).is_none()
 }
 
 fn quantity_kind(type_name: &[u8]) -> Option<&'static str> {
@@ -891,8 +942,7 @@ END-ISO-10303-21;
         // IfcUnitAssignment. A QuantityWeight with null Unit has no
         // legitimate fallback target — stay None instead of
         // misattributing.
-        let buf = format!(
-            r#"ISO-10303-21;
+        let buf = r#"ISO-10303-21;
 HEADER;
 FILE_DESCRIPTION(('ViewDefinition [ReferenceView]'),'2;1');
 FILE_NAME('qto_test.ifc','2026-06-02T00:00:00',('test'),('test'),'ifcfast','ifcfast','');
@@ -912,7 +962,7 @@ DATA;
 ENDSEC;
 END-ISO-10303-21;
 "#
-        );
+        .to_string();
         let t = run(&buf);
         assert_eq!(t.len(), 1);
         assert_eq!(t.unit_step_id[0], None);
@@ -949,7 +999,12 @@ END-ISO-10303-21;
 "#,
         );
         let t = run(&buf);
-        assert_eq!(t.len(), 1, "expected one inherited quantity, got {}", t.len());
+        assert_eq!(
+            t.len(),
+            1,
+            "expected one inherited quantity, got {}",
+            t.len()
+        );
         assert_eq!(t.guid[0], "1Wall00000000000000001");
         assert_eq!(t.qto_name[0], "Qto_TypeBase");
         assert_eq!(t.quantity_name[0], "GrossWeight");
@@ -973,7 +1028,12 @@ END-ISO-10303-21;
 "#,
         );
         let t = run(&buf);
-        assert_eq!(t.len(), 1, "expected one inherited quantity, got {}", t.len());
+        assert_eq!(
+            t.len(),
+            1,
+            "expected one inherited quantity, got {}",
+            t.len()
+        );
         assert_eq!(t.guid[0], "1Wall00000000000000001");
         assert_eq!(t.qto_name[0], "Qto_TypeBase");
         assert_eq!(t.quantity_name[0], "GrossWeight");
@@ -1009,8 +1069,7 @@ END-ISO-10303-21;
         // IfcUnitAssignment supplies the SIUnit. Each inherited row
         // should still benefit from the GH #43 fallback so consumers
         // see usable unit_step_id values on a type-only qto.
-        let buf = format!(
-            r#"ISO-10303-21;
+        let buf = r#"ISO-10303-21;
 HEADER;
 FILE_DESCRIPTION(('ViewDefinition [ReferenceView]'),'2;1');
 FILE_NAME('qto_test.ifc','2026-06-02T00:00:00',('test'),('test'),'ifcfast','ifcfast','');
@@ -1033,11 +1092,10 @@ DATA;
 ENDSEC;
 END-ISO-10303-21;
 "#
-        );
+        .to_string();
         let t = run(&buf);
         assert_eq!(t.len(), 2);
-        let guids: std::collections::HashSet<&str> =
-            t.guid.iter().map(String::as_str).collect();
+        let guids: std::collections::HashSet<&str> = t.guid.iter().map(String::as_str).collect();
         assert!(guids.contains("1Wall00000000000000001"));
         assert!(guids.contains("1Wall00000000000000002"));
         for i in 0..t.len() {
@@ -1077,8 +1135,7 @@ END-ISO-10303-21;
         // IfcConversionBasedUnit). Pre-fix the last-write-wins map let #80
         // overwrite #3, then the membership filter dropped #80 (not
         // assigned) — leaving unit_step_id=None. The assigned #3 must win.
-        let buf = format!(
-            r#"ISO-10303-21;
+        let buf = r#"ISO-10303-21;
 HEADER;
 FILE_DESCRIPTION(('ViewDefinition [ReferenceView]'),'2;1');
 FILE_NAME('qto_test.ifc','2026-06-13T00:00:00',('test'),('test'),'ifcfast','ifcfast','');
@@ -1099,7 +1156,7 @@ DATA;
 ENDSEC;
 END-ISO-10303-21;
 "#
-        );
+        .to_string();
         let t = run(&buf);
         assert_eq!(t.len(), 1);
         // The assigned SIUnit #3 must resolve, not None and not #80.
@@ -1185,8 +1242,7 @@ END-ISO-10303-21;
         // a never-resolved IfcConversionBasedUnit). That SIUnit must
         // NOT silently become the project default — fallback stays
         // None.
-        let buf = format!(
-            r#"ISO-10303-21;
+        let buf = r#"ISO-10303-21;
 HEADER;
 FILE_DESCRIPTION(('ViewDefinition [ReferenceView]'),'2;1');
 FILE_NAME('qto_test.ifc','2026-06-02T00:00:00',('test'),('test'),'ifcfast','ifcfast','');
@@ -1205,12 +1261,77 @@ DATA;
 ENDSEC;
 END-ISO-10303-21;
 "#
-        );
+        .to_string();
         let t = run(&buf);
         assert_eq!(t.len(), 1);
         // SIUnit #3 exists but isn't referenced by any
         // IfcUnitAssignment, so it doesn't qualify as a project
         // default for fallback.
         assert_eq!(t.unit_step_id[0], None);
+    }
+}
+
+#[cfg(test)]
+mod unhandled_quantity_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    const BUF_HEAD: &str = "ISO-10303-21;\nHEADER;\nFILE_DESCRIPTION((''),'2;1');\n\
+FILE_SCHEMA(('IFC4'));\nENDSEC;\nDATA;\n\
+#10=IFCWALL('1Wall00000000000000001',$,'W',$,$,$,$,'t',.STANDARD.);\n";
+
+    fn run(data: &str) -> QuantityTable {
+        let buf = format!("{BUF_HEAD}{data}ENDSEC;\nEND-ISO-10303-21;\n");
+        let table = crate::entity_table::EntityTable::build(buf.as_bytes());
+        let mut step_to_guid: HashMap<u64, String> = HashMap::new();
+        for (sid, _t, args) in table.iter() {
+            let fields = split_top_level_args(args);
+            if let Some(first) = fields.first() {
+                if let Field::String(s) = parse_field(first) {
+                    if s.len() == 22 {
+                        step_to_guid.insert(sid, s);
+                    }
+                }
+            }
+        }
+        build(&table, &step_to_guid)
+    }
+
+    /// GH #159: an IfcQuantity* class we can't parse must surface a
+    /// marker row (mirroring psets.rs's `unhandled:IFCXXX`), not vanish.
+    /// A consumer has to be able to tell "no quantity authored" from
+    /// "ifcfast has a blind spot here".
+    #[test]
+    fn unrecognised_quantity_class_emits_marker_row() {
+        let t = run("#20=IFCQUANTITYAREA('NetArea',$,$,12.5);\n\
+             #21=IFCQUANTITYNUMBER('Pieces',$,$,7.);\n\
+             #24=IFCELEMENTQUANTITY('2Qto000000000000000001',$,'Qto_Test',$,$,(#20,#21));\n\
+             #25=IFCRELDEFINESBYPROPERTIES('3Rel000000000000000001',$,$,$,(#10),#24);\n");
+        assert_eq!(
+            t.len(),
+            2,
+            "both the known and the unknown quantity emit a row"
+        );
+        let i = t
+            .quantity_name
+            .iter()
+            .position(|n| n == "Pieces")
+            .expect("the unhandled quantity must still produce a row");
+        assert_eq!(t.quantity_type[i], "unhandled:IFCQUANTITYNUMBER");
+        assert_eq!(t.value[i], None, "an unparsed quantity has no value");
+        assert_eq!(t.unit_step_id[i], None);
+        // The recognised one is untouched.
+        let j = 1 - i;
+        assert_eq!(t.quantity_type[j], "Area");
+        assert_eq!(t.value[j].as_deref(), Some("12.5"));
+    }
+
+    #[test]
+    fn is_unhandled_quantity_rule() {
+        assert!(is_unhandled_quantity(b"IFCQUANTITYNUMBER"));
+        assert!(!is_unhandled_quantity(b"IFCQUANTITYAREA"));
+        assert!(!is_unhandled_quantity(b"IFCQUANTITY"));
+        assert!(!is_unhandled_quantity(b"IFCPHYSICALCOMPLEXQUANTITY"));
+        assert!(!is_unhandled_quantity(b"IFCELEMENTQUANTITY"));
     }
 }

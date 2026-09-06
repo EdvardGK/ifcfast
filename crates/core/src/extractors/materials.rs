@@ -6,7 +6,8 @@
 //! layer_index, category) entries.
 //!
 //! Output schema:
-//!     (guid, role, layer_index, material_name, layer_thickness_mm, category)
+//!     (guid, role, layer_index, material_name, layer_thickness_mm, category,
+//!      fraction, source)
 //!
 //! `role`:
 //!   `"direct"`       — `IfcMaterial` directly assigned
@@ -40,6 +41,15 @@ pub struct MaterialTable {
     /// (layers have `layer_thickness_mm` instead; direct / list /
     /// profile bindings don't have a per-row weight in the IFC schema).
     pub fraction: Vec<Option<f64>>,
+    /// `"instance"` for a material associated directly with the product
+    /// via `IfcRelAssociatesMaterial`, `"type"` for one inherited from
+    /// the product's `IfcTypeObject` (`IfcRelDefinesByType` →
+    /// RelatingType, itself the RelatedObject of an
+    /// `IfcRelAssociatesMaterial`). Same column name and same values as
+    /// `psets.source` / `quantities.source`, and the same
+    /// instance-wins-on-collision rule: a product with ANY directly
+    /// associated material inherits nothing from its type (GH #165).
+    pub source: Vec<&'static str>,
 }
 
 impl MaterialTable {
@@ -54,10 +64,16 @@ impl MaterialTable {
 
 /// Build the material table. `unit_scale` is the IFC project's
 /// linear-unit-to-metres factor as reported by the indexer (0.001 for
-/// millimetre files, 1.0 for metre files); pass `1.0` when no value is
-/// available — that's correct for the common case of an authored mm
-/// file with the SI unit declaration missing, and merely wrong by a
-/// fixed factor in the rare alternative.
+/// millimetre files, 1.0 for metre files).
+///
+/// When the indexer could not resolve a scale it reports `None`, and
+/// callers currently pass `1.0`. That is a GUESS, not a safe default:
+/// `1.0` claims the file is authored in metres, so on the far more
+/// common millimetre file every `layer_thickness_mm` comes out 1000×
+/// too large (a 200 mm layer reads as 200 000 mm). The indexer emits a
+/// loud warning in exactly that case — see `IndexedFile::warnings` and
+/// GH #149 — and consumers should treat the column as unusable rather
+/// than trust it silently.
 ///
 /// The `LayerThickness` IFC field carries a raw value in the project's
 /// linear unit. The output column is named `layer_thickness_mm` so we
@@ -96,6 +112,17 @@ pub fn build(
 
     // Collect rel-pairs: (related_object_step_ids, relating_material_ref)
     let mut rel_pairs: Vec<(u64, u64)> = Vec::with_capacity(8192);
+    // Type inheritance (GH #165) — the path psets.rs and quantities.rs
+    // have had since GH #36 / #45. `IfcRelAssociatesMaterial` very
+    // commonly binds the material to the *type* (IfcWallType) rather
+    // than to each occurrence; without this pass every occurrence of
+    // such a type reported ZERO materials, silently.
+    let mut product_to_type: HashMap<u64, u64> = HashMap::with_capacity(16_384);
+    // Step ids of IfcTypeObject / IfcXxxType entities, so a rel pair
+    // whose RelatedObject is a type can be routed to the inheritance
+    // map instead of being dropped for "not a product".
+    let mut type_object_ids: std::collections::HashSet<u64> =
+        std::collections::HashSet::with_capacity(512);
 
     for (step_id, type_name, args) in table.iter() {
         if type_name.eq_ignore_ascii_case(b"IFCMATERIAL") {
@@ -223,37 +250,160 @@ pub fn build(
             for obj_id in relateds {
                 rel_pairs.push((obj_id, relating));
             }
+        } else if type_name.eq_ignore_ascii_case(b"IFCRELDEFINESBYTYPE") {
+            // (GlobalId, OwnerHistory, Name, Description, RelatedObjects,
+            //  RelatingType). Same shape as the psets / quantities
+            // readers — fan out N products per relation (GH #165).
+            let fields = split_top_level_args(args);
+            let type_id = match fields.get(5).copied().map(parse_field) {
+                Some(Field::Ref(id)) => id,
+                _ => continue,
+            };
+            let relateds = match fields.get(4).copied().map(parse_field) {
+                Some(Field::List(body)) => parse_ref_list(body),
+                Some(Field::Ref(id)) => vec![id],
+                _ => continue,
+            };
+            for obj_id in relateds {
+                product_to_type.insert(obj_id, type_id);
+            }
+        } else if is_type_object(type_name) {
+            type_object_ids.insert(step_id);
         }
     }
 
+    let index = MaterialIndex {
+        materials,
+        layer_sets,
+        layer_set_usages,
+        layers,
+        material_lists,
+        constituent_sets,
+        constituents,
+        profile_sets,
+        profiles,
+    };
+
     let mut out = MaterialTable::default();
 
-    for (obj_step_id, relating_id) in rel_pairs {
-        let guid = match product_step_to_guid.get(&obj_step_id) {
-            Some(g) => g,
-            None => continue,
-        };
+    // (type_step_id → [relating_material_ref]). Filled from the rel
+    // pairs whose RelatedObject is a type rather than a product; those
+    // pairs used to fall out of the loop at the `product_step_to_guid`
+    // miss and take every occurrence's material with them.
+    let mut type_materials: HashMap<u64, Vec<u64>> = HashMap::with_capacity(256);
+    // Products that got at least one directly-associated material.
+    // Instance wins on collision, exactly as in psets.rs.
+    let mut has_instance_material: std::collections::HashSet<u64> =
+        std::collections::HashSet::with_capacity(product_step_to_guid.len());
 
-        // Resolve `relating_id` against each known material container type.
-        if let Some(mat) = materials.get(&relating_id) {
-            push_row(&mut out, guid, "direct", -1, mat.name.clone(), None, mat.category.clone(), None);
-            continue;
+    // Instance pass. The two branches are independent on purpose: some
+    // callers hand us a `product_step_to_guid` that also contains type
+    // objects (`lib.rs::build_guid_index` keys on "any IFC entity whose
+    // first attribute is a 22-char GUID"), so "not a product" is NOT a
+    // reliable test for "is a type". Route on the entity class instead,
+    // and keep emitting the type's own row where it was emitted before.
+    for (obj_step_id, relating_id) in &rel_pairs {
+        if type_object_ids.contains(obj_step_id) {
+            type_materials
+                .entry(*obj_step_id)
+                .or_default()
+                .push(*relating_id);
         }
-        if let Some(list) = material_lists.get(&relating_id) {
+        if let Some(guid) = product_step_to_guid.get(obj_step_id) {
+            index.emit(&mut out, guid, *relating_id, "instance");
+            has_instance_material.insert(*obj_step_id);
+        }
+        // Anything else (a group, a rel pointing at an entity we don't
+        // resolve) stays skipped, as before.
+    }
+
+    // Type-inheritance pass. Sorted by product step id so the emitted
+    // row order is deterministic — the HashMap-iteration determinism
+    // trap of GH #152, avoided here by construction.
+    if !type_materials.is_empty() && !product_to_type.is_empty() {
+        let mut inherit: Vec<(u64, u64)> = product_to_type
+            .iter()
+            .map(|(product, type_id)| (*product, *type_id))
+            .collect();
+        inherit.sort_unstable();
+        for (product_step_id, type_step_id) in &inherit {
+            if has_instance_material.contains(product_step_id) {
+                continue; // instance-declared material shadows the type's
+            }
+            let guid = match product_step_to_guid.get(product_step_id) {
+                Some(g) => g,
+                None => continue,
+            };
+            let relating_ids = match type_materials.get(type_step_id) {
+                Some(v) => v,
+                None => continue,
+            };
+            for relating_id in relating_ids {
+                index.emit(&mut out, guid, *relating_id, "type");
+            }
+        }
+    }
+
+    out
+}
+
+/// Every material-container map, so the resolution of one
+/// `RelatingMaterial` ref is written once and used by both the instance
+/// pass and the type-inheritance pass (GH #165).
+struct MaterialIndex {
+    materials: HashMap<u64, MaterialRecord>,
+    layer_sets: HashMap<u64, Vec<u64>>,
+    layer_set_usages: HashMap<u64, u64>,
+    layers: HashMap<u64, LayerRecord>,
+    material_lists: HashMap<u64, Vec<u64>>,
+    constituent_sets: HashMap<u64, Vec<u64>>,
+    constituents: HashMap<u64, ConstituentRecord>,
+    profile_sets: HashMap<u64, Vec<u64>>,
+    profiles: HashMap<u64, ConstituentRecord>,
+}
+
+impl MaterialIndex {
+    /// Resolve `relating_id` against each known material container type
+    /// and push the resulting row(s). Always emits at least one row —
+    /// an unresolvable ref becomes a `role = "unknown"` marker so the
+    /// association is visible rather than dropped.
+    fn emit(&self, out: &mut MaterialTable, guid: &str, relating_id: u64, source: &'static str) {
+        if let Some(mat) = self.materials.get(&relating_id) {
+            push_row(
+                out,
+                guid,
+                "direct",
+                -1,
+                mat.name.clone(),
+                None,
+                mat.category.clone(),
+                None,
+                source,
+            );
+            return;
+        }
+        if let Some(list) = self.material_lists.get(&relating_id) {
             for (i, mid) in list.iter().enumerate() {
-                if let Some(mat) = materials.get(mid) {
+                if let Some(mat) = self.materials.get(mid) {
                     push_row(
-                        &mut out, guid, "list", i as i32,
-                        mat.name.clone(), None, mat.category.clone(), None,
+                        out,
+                        guid,
+                        "list",
+                        i as i32,
+                        mat.name.clone(),
+                        None,
+                        mat.category.clone(),
+                        None,
+                        source,
                     );
                 }
             }
-            continue;
+            return;
         }
-        if let Some(constituent_ids) = constituent_sets.get(&relating_id) {
+        if let Some(constituent_ids) = self.constituent_sets.get(&relating_id) {
             for (i, cid) in constituent_ids.iter().enumerate() {
-                if let Some(c) = constituents.get(cid) {
-                    let mat = c.material_ref.and_then(|mid| materials.get(&mid));
+                if let Some(c) = self.constituents.get(cid) {
+                    let mat = c.material_ref.and_then(|mid| self.materials.get(&mid));
                     let name = c
                         .name_override
                         .clone()
@@ -263,24 +413,32 @@ pub fn build(
                         .clone()
                         .or_else(|| mat.and_then(|m| m.category.clone()));
                     push_row(
-                        &mut out, guid, "constituent", i as i32,
-                        name, None, category, c.fraction,
+                        out,
+                        guid,
+                        "constituent",
+                        i as i32,
+                        name,
+                        None,
+                        category,
+                        c.fraction,
+                        source,
                     );
                 }
             }
-            continue;
+            return;
         }
         // Profile-set lookup. The relating ref may point at an
         // IfcMaterialProfileSetUsage; the layer_set_usages map (now
         // doubling as "any *_Usage indirection") resolves through.
-        let pset_id = layer_set_usages
+        let pset_id = self
+            .layer_set_usages
             .get(&relating_id)
             .copied()
             .unwrap_or(relating_id);
-        if let Some(profile_ids) = profile_sets.get(&pset_id) {
+        if let Some(profile_ids) = self.profile_sets.get(&pset_id) {
             for (i, pid) in profile_ids.iter().enumerate() {
-                if let Some(p) = profiles.get(pid) {
-                    let mat = p.material_ref.and_then(|mid| materials.get(&mid));
+                if let Some(p) = self.profiles.get(pid) {
+                    let mat = p.material_ref.and_then(|mid| self.materials.get(&mid));
                     let name = p
                         .name_override
                         .clone()
@@ -290,22 +448,22 @@ pub fn build(
                         .clone()
                         .or_else(|| mat.and_then(|m| m.category.clone()));
                     push_row(
-                        &mut out, guid, "profile", i as i32,
-                        name, None, category, None,
+                        out, guid, "profile", i as i32, name, None, category, None, source,
                     );
                 }
             }
-            continue;
+            return;
         }
         // IfcMaterialLayerSetUsage → IfcMaterialLayerSet.
-        let lset_id = layer_set_usages
+        let lset_id = self
+            .layer_set_usages
             .get(&relating_id)
             .copied()
             .unwrap_or(relating_id);
-        if let Some(layer_ids) = layer_sets.get(&lset_id) {
+        if let Some(layer_ids) = self.layer_sets.get(&lset_id) {
             for (i, lid) in layer_ids.iter().enumerate() {
-                if let Some(layer) = layers.get(lid) {
-                    let mat = layer.material_ref.and_then(|mid| materials.get(&mid));
+                if let Some(layer) = self.layers.get(lid) {
+                    let mat = layer.material_ref.and_then(|mid| self.materials.get(&mid));
                     let name = layer
                         .name_override
                         .clone()
@@ -315,19 +473,39 @@ pub fn build(
                         .clone()
                         .or_else(|| mat.and_then(|m| m.category.clone()));
                     push_row(
-                        &mut out, guid, "layer", i as i32,
-                        name, layer.thickness_mm, category, None,
+                        out,
+                        guid,
+                        "layer",
+                        i as i32,
+                        name,
+                        layer.thickness_mm,
+                        category,
+                        None,
+                        source,
                     );
                 }
             }
-            continue;
+            return;
         }
-        // Unknown relating type (constituent set, profile set, etc.) — record
-        // the GUID with a placeholder so the row count reflects reality.
-        push_row(&mut out, guid, "unknown", -1, None, None, None, None);
+        // Unknown relating type — record the GUID with a placeholder so
+        // the row count reflects reality.
+        push_row(out, guid, "unknown", -1, None, None, None, None, source);
     }
+}
 
-    out
+/// Detect an IfcTypeObject / IfcXxxType subclass by entity-name suffix.
+/// Byte-for-byte the rule used by `extractors/psets.rs`,
+/// `extractors/quantities.rs` and `indexer::index`, so all four loops
+/// agree on what counts as a type.
+fn is_type_object(t: &[u8]) -> bool {
+    let suffix_ok = t.len() > 7
+        && t[..3].eq_ignore_ascii_case(b"IFC")
+        && t[t.len() - 4..].eq_ignore_ascii_case(b"TYPE");
+    let ifc2x3_style =
+        t.eq_ignore_ascii_case(b"IFCDOORSTYLE") || t.eq_ignore_ascii_case(b"IFCWINDOWSTYLE");
+    let bare_base =
+        t.eq_ignore_ascii_case(b"IFCTYPEPRODUCT") || t.eq_ignore_ascii_case(b"IFCTYPEOBJECT");
+    suffix_ok || ifc2x3_style || bare_base
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -340,6 +518,7 @@ fn push_row(
     thickness: Option<f64>,
     category: Option<String>,
     fraction: Option<f64>,
+    source: &'static str,
 ) {
     out.guid.push(guid.to_string());
     out.role.push(role);
@@ -348,6 +527,7 @@ fn push_row(
     out.layer_thickness_mm.push(thickness);
     out.category.push(category);
     out.fraction.push(fraction);
+    out.source.push(source);
 }
 
 struct MaterialRecord {
@@ -567,11 +747,8 @@ END-ISO-10303-21;
         assert!(names.contains("Concrete body"));
         assert!(names.contains("Rebar mass"));
         // Categories also override.
-        let cats: std::collections::HashSet<&str> = t
-            .category
-            .iter()
-            .filter_map(|c| c.as_deref())
-            .collect();
+        let cats: std::collections::HashSet<&str> =
+            t.category.iter().filter_map(|c| c.as_deref()).collect();
         assert!(cats.contains("Bulk"));
         assert!(cats.contains("Reinforcement"));
 
@@ -694,5 +871,93 @@ END-ISO-10303-21;
         // referenced IfcMaterial's Name + Category.
         assert_eq!(t.material_name[0].as_deref(), Some("Concrete C40/50"));
         assert_eq!(t.category[0].as_deref(), Some("Structural"));
+    }
+}
+
+#[cfg(test)]
+mod inheritance_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    /// Only OCCURRENCES are products. A type object is not, which is
+    /// exactly why a type-bound material used to vanish (GH #165).
+    fn products_only(table: &crate::entity_table::EntityTable) -> HashMap<u64, String> {
+        let mut m = HashMap::new();
+        for (sid, t, args) in table.iter() {
+            if !t.eq_ignore_ascii_case(b"IFCWALL") {
+                continue;
+            }
+            let fields = split_top_level_args(args);
+            if let Some(f) = fields.first() {
+                if let Field::String(s) = parse_field(f) {
+                    m.insert(sid, s);
+                }
+            }
+        }
+        m
+    }
+
+    const HEAD: &str = "ISO-10303-21;\nHEADER;\nFILE_DESCRIPTION((''),'2;1');\n\
+FILE_SCHEMA(('IFC4'));\nENDSEC;\nDATA;\n";
+
+    fn run(data: &str) -> MaterialTable {
+        let buf = format!("{HEAD}{data}ENDSEC;\nEND-ISO-10303-21;\n");
+        let table = crate::entity_table::EntityTable::build(buf.as_bytes());
+        let products = products_only(&table);
+        build(&table, &products, 0.001)
+    }
+
+    /// `IFCRELASSOCIATESMATERIAL(…,(#40),#22)` with #40 an IfcWallType:
+    /// every occurrence of that type must get the layer rows, tagged
+    /// `source = "type"`.
+    #[test]
+    fn type_bound_material_reaches_occurrences() {
+        let t = run(
+            "#10=IFCWALL('1Wall00000000000000001',$,'W',$,$,$,$,'t',.STANDARD.);\n\
+             #11=IFCWALL('1Wall00000000000000002',$,'W',$,$,$,$,'t',.STANDARD.);\n\
+             #40=IFCWALLTYPE('3Type00000000000000001',$,'WT',$,$,$,$,$,$,.STANDARD.);\n\
+             #41=IFCRELDEFINESBYTYPE('4Rel000000000000000001',$,$,$,(#10,#11),#40);\n\
+             #20=IFCMATERIAL('Concrete');\n\
+             #21=IFCMATERIALLAYER(#20,200.,$);\n\
+             #22=IFCMATERIALLAYERSET((#21),'WallSet');\n\
+             #30=IFCRELASSOCIATESMATERIAL('2Rel00000000000000001',$,$,$,(#40),#22);\n",
+        );
+        assert_eq!(t.len(), 2, "both occurrences inherit the type's material");
+        assert!(t.source.iter().all(|s| *s == "type"));
+        assert!(t
+            .material_name
+            .iter()
+            .all(|n| n.as_deref() == Some("Concrete")));
+        assert!((t.layer_thickness_mm[0].unwrap() - 200.0).abs() < 1e-9);
+    }
+
+    /// A directly associated material shadows the type's entirely.
+    #[test]
+    fn instance_material_shadows_type() {
+        let t = run(
+            "#10=IFCWALL('1Wall00000000000000001',$,'W',$,$,$,$,'t',.STANDARD.);\n\
+             #40=IFCWALLTYPE('3Type00000000000000001',$,'WT',$,$,$,$,$,$,.STANDARD.);\n\
+             #41=IFCRELDEFINESBYTYPE('4Rel000000000000000001',$,$,$,(#10),#40);\n\
+             #20=IFCMATERIAL('Concrete');\n\
+             #23=IFCMATERIAL('Brick');\n\
+             #30=IFCRELASSOCIATESMATERIAL('2Rel00000000000000001',$,$,$,(#40),#20);\n\
+             #31=IFCRELASSOCIATESMATERIAL('2Rel00000000000000002',$,$,$,(#10),#23);\n",
+        );
+        assert_eq!(t.len(), 1, "instance wins; no type row emitted");
+        assert_eq!(t.material_name[0].as_deref(), Some("Brick"));
+        assert_eq!(t.source[0], "instance");
+    }
+
+    /// Occurrence-only files must be untouched by the new pass.
+    #[test]
+    fn instance_only_file_unchanged() {
+        let t = run(
+            "#10=IFCWALL('1Wall00000000000000001',$,'W',$,$,$,$,'t',.STANDARD.);\n\
+             #20=IFCMATERIAL('Concrete');\n\
+             #30=IFCRELASSOCIATESMATERIAL('2Rel00000000000000001',$,$,$,(#10),#20);\n",
+        );
+        assert_eq!(t.len(), 1);
+        assert_eq!(t.role[0], "direct");
+        assert_eq!(t.source[0], "instance");
     }
 }

@@ -51,6 +51,24 @@ import pandas as pd
 from . import _core
 
 
+def _discard_federation(fed_dir: Path) -> None:
+    """Retire a stale federated-cache dir so it can be re-merged.
+
+    Moved aside first, then deleted: `os.replace` onto a non-empty
+    directory fails, so the publish-by-rename below needs the key dir
+    gone before it lands. Renaming out of the way is a single atomic
+    step — a concurrent reader either sees the old complete dir or a
+    missing one, never a half-emptied one.
+    """
+    stale = fed_dir.parent / f"{fed_dir.name}.stale-{os.getpid()}"
+    try:
+        os.replace(fed_dir, stale)
+    except OSError:
+        # Another process got there first; nothing to retire.
+        return
+    shutil.rmtree(stale, ignore_errors=True)
+
+
 def clash(
     bundle_dir: str | PathLike[str] | Sequence[str | PathLike[str]],
     *,
@@ -72,7 +90,8 @@ def clash(
             (``cache_root()/federated/<key>``, reused while the
             constituent parquets are unchanged) and clashed as one
             substrate. A single-element list behaves exactly like
-            passing that directory.
+            passing that directory (``on_collision`` is accepted and
+            vacuous — there is no second source to collide with).
         tolerance_m: clearance band, in metres. ``0.0`` (default) means
             "hard clashes only" — pairs whose meshes actually intersect.
             A positive value also emits ``kind="clearance"`` rows for
@@ -166,23 +185,37 @@ def clash(
         )
 
     if dirs is not None and len(dirs) >= 2:
-        from .federate import federate, federation_cache_dir
+        from .federate import (
+            federate,
+            federation_cache_dir,
+            federation_cache_stale,
+        )
 
         fed_dir = federation_cache_dir(dirs, on_collision)
         sidecar_path = fed_dir / "federation.json"
+        federation_sidecar = None
         if sidecar_path.is_file():
             # Cache hit — the key is content-derived, so the merge is
             # current. Re-apply the collision policy from the recorded
             # facts (a "fail" run must still fail on a dir cached by an
             # earlier "warn"-equivalent merge).
-            federation_sidecar = json.loads(sidecar_path.read_text())
-            if on_collision == "fail" and federation_sidecar["guid_collisions"]:
-                n = len(federation_sidecar["guid_collisions"])
-                raise ValueError(
-                    f"{n} guid(s) appear in more than one source "
-                    f"bundle; see {sidecar_path}"
-                )
-        else:
+            cached = json.loads(sidecar_path.read_text())
+            # GH #162: the key samples head/tail 4 MB, so it cannot see a
+            # same-size edit in the middle of a big parquet. The sidecar
+            # records each constituent's (size, mtime_ns); a mismatch is
+            # a MISS, exactly as in the parse cache — never serve a merge
+            # of bytes that no longer exist.
+            if federation_cache_stale(cached, dirs):
+                _discard_federation(fed_dir)
+            else:
+                federation_sidecar = cached
+                if on_collision == "fail" and cached["guid_collisions"]:
+                    n = len(cached["guid_collisions"])
+                    raise ValueError(
+                        f"{n} guid(s) appear in more than one source "
+                        f"bundle; see {sidecar_path}"
+                    )
+        if federation_sidecar is None:
             # Federate into a private temp dir and publish by rename so
             # parallel processes missing the cache simultaneously never
             # interleave writes into the shared key dir.
@@ -203,11 +236,17 @@ def clash(
         bundle_dir = fed_dir
     else:
         if dirs is not None:
+            # GH #162: a one-element list is documented to behave like
+            # passing that directory, and there is no second source for a
+            # guid to collide with — `on_collision` is vacuously
+            # satisfied, not an error. Only a BARE path (no list, no
+            # federation semantics at all) rejects it.
             bundle_dir = dirs[0]
-        if on_collision != "warn":
+        elif on_collision != "warn":
             raise ValueError(
                 "on_collision only applies when federating a list of "
-                "two or more bundles; got a single bundle dir"
+                "bundle dirs; got a single bundle path. Pass "
+                f"[{bundle_dir!r}] if you meant the list form."
             )
 
     bundle_dir = Path(bundle_dir)
@@ -275,6 +314,11 @@ def clash(
     )
     df.attrs["geometryless_skipped"] = int(d["geometryless_skipped"])
     df.attrs["narrow_phase_residuals"] = int(d["narrow_phase_residuals"])
+    # GH #161: per-residual diagnostics (ids, guids, classes, side,
+    # reason) — the list is empty when every candidate pair built.
+    df.attrs["narrow_phase_residual_details"] = list(
+        d.get("narrow_phase_residual_details", [])
+    )
     df.attrs["pair_count"] = int(d["pair_count"])
     df.attrs["tolerance_m"] = float(d["tolerance_m"])
     df.attrs["clash_ms"] = float(d["clash_ms"])

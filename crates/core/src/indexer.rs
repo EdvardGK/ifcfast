@@ -28,64 +28,144 @@ use crate::lexer::{
 /// permissive blacklist. See [`is_meshable_product`].
 pub(crate) const PRODUCT_TYPES: &[&[u8]] = &[
     // Walls
-    b"IFCWALL", b"IFCWALLSTANDARDCASE", b"IFCWALLELEMENTEDCASE", b"IFCCURTAINWALL",
+    b"IFCWALL",
+    b"IFCWALLSTANDARDCASE",
+    b"IFCWALLELEMENTEDCASE",
+    b"IFCCURTAINWALL",
     // Slabs / plates
-    b"IFCSLAB", b"IFCSLABSTANDARDCASE", b"IFCSLABELEMENTEDCASE", b"IFCPLATE",
+    b"IFCSLAB",
+    b"IFCSLABSTANDARDCASE",
+    b"IFCSLABELEMENTEDCASE",
+    b"IFCPLATE",
     b"IFCPLATESTANDARDCASE",
     // Structural members
-    b"IFCBEAM", b"IFCBEAMSTANDARDCASE", b"IFCCOLUMN", b"IFCCOLUMNSTANDARDCASE",
-    b"IFCMEMBER", b"IFCMEMBERSTANDARDCASE",
-    b"IFCFOOTING", b"IFCPILE",
+    b"IFCBEAM",
+    b"IFCBEAMSTANDARDCASE",
+    b"IFCCOLUMN",
+    b"IFCCOLUMNSTANDARDCASE",
+    b"IFCMEMBER",
+    b"IFCMEMBERSTANDARDCASE",
+    b"IFCFOOTING",
+    b"IFCPILE",
     // Openings / fenestration
-    b"IFCDOOR", b"IFCDOORSTANDARDCASE", b"IFCWINDOW", b"IFCWINDOWSTANDARDCASE",
-    b"IFCOPENINGELEMENT", b"IFCVOIDINGFEATURE", b"IFCSURFACEFEATURE",
+    b"IFCDOOR",
+    b"IFCDOORSTANDARDCASE",
+    b"IFCWINDOW",
+    b"IFCWINDOWSTANDARDCASE",
+    b"IFCOPENINGELEMENT",
+    b"IFCVOIDINGFEATURE",
+    b"IFCSURFACEFEATURE",
     // Stairs / ramps / rails
-    b"IFCSTAIR", b"IFCSTAIRFLIGHT", b"IFCRAMP", b"IFCRAMPFLIGHT",
-    b"IFCRAILING", b"IFCROOF",
+    b"IFCSTAIR",
+    b"IFCSTAIRFLIGHT",
+    b"IFCRAMP",
+    b"IFCRAMPFLIGHT",
+    b"IFCRAILING",
+    b"IFCROOF",
     // Covering / finish
     b"IFCCOVERING",
     // Generic
-    b"IFCBUILDINGELEMENTPROXY", b"IFCBUILDINGELEMENTPART",
-    b"IFCELEMENTASSEMBLY", b"IFCTRANSPORTELEMENT",
-    b"IFCANNOTATION", b"IFCVIRTUALELEMENT",
-    b"IFCDISCRETEACCESSORY", b"IFCFASTENER", b"IFCMECHANICALFASTENER",
-    b"IFCREINFORCINGBAR", b"IFCREINFORCINGMESH", b"IFCTENDON", b"IFCTENDONANCHOR",
+    b"IFCBUILDINGELEMENTPROXY",
+    b"IFCBUILDINGELEMENTPART",
+    b"IFCELEMENTASSEMBLY",
+    b"IFCTRANSPORTELEMENT",
+    b"IFCANNOTATION",
+    b"IFCVIRTUALELEMENT",
+    b"IFCDISCRETEACCESSORY",
+    b"IFCFASTENER",
+    b"IFCMECHANICALFASTENER",
+    b"IFCREINFORCINGBAR",
+    b"IFCREINFORCINGMESH",
+    b"IFCTENDON",
+    b"IFCTENDONANCHOR",
     // Distribution / MEP
-    b"IFCDISTRIBUTIONELEMENT", b"IFCDISTRIBUTIONFLOWELEMENT",
-    b"IFCDISTRIBUTIONCONTROLELEMENT", b"IFCDISTRIBUTIONPORT",
-    b"IFCFLOWFITTING", b"IFCFLOWSEGMENT", b"IFCFLOWTERMINAL",
-    b"IFCFLOWCONTROLLER", b"IFCFLOWMOVINGDEVICE", b"IFCFLOWSTORAGEDEVICE",
-    b"IFCFLOWTREATMENTDEVICE", b"IFCENERGYCONVERSIONDEVICE",
-    b"IFCPIPEFITTING", b"IFCPIPESEGMENT", b"IFCDUCTFITTING", b"IFCDUCTSEGMENT",
+    b"IFCDISTRIBUTIONELEMENT",
+    b"IFCDISTRIBUTIONFLOWELEMENT",
+    b"IFCDISTRIBUTIONCONTROLELEMENT",
+    b"IFCDISTRIBUTIONPORT",
+    b"IFCFLOWFITTING",
+    b"IFCFLOWSEGMENT",
+    b"IFCFLOWTERMINAL",
+    b"IFCFLOWCONTROLLER",
+    b"IFCFLOWMOVINGDEVICE",
+    b"IFCFLOWSTORAGEDEVICE",
+    b"IFCFLOWTREATMENTDEVICE",
+    b"IFCENERGYCONVERSIONDEVICE",
+    b"IFCPIPEFITTING",
+    b"IFCPIPESEGMENT",
+    b"IFCDUCTFITTING",
+    b"IFCDUCTSEGMENT",
     b"IFCDUCTSILENCER",
-    b"IFCCABLECARRIERFITTING", b"IFCCABLECARRIERSEGMENT",
-    b"IFCCABLEFITTING", b"IFCCABLESEGMENT",
-    b"IFCVALVE", b"IFCFLOWVALVE",
-    b"IFCSANITARYTERMINAL", b"IFCLIGHTFIXTURE", b"IFCOUTLET",
-    b"IFCSWITCHINGDEVICE", b"IFCELECTRICAPPLIANCE",
-    b"IFCELECTRICDISTRIBUTIONBOARD", b"IFCELECTRICFLOWSTORAGEDEVICE",
-    b"IFCAIRTERMINAL", b"IFCAIRTERMINALBOX", b"IFCDAMPER", b"IFCFILTER",
-    b"IFCBOILER", b"IFCBURNER", b"IFCCHILLER", b"IFCCOMPRESSOR",
-    b"IFCCONDENSER", b"IFCCOOLINGTOWER", b"IFCEVAPORATOR",
-    b"IFCFAN", b"IFCHEATEXCHANGER", b"IFCHUMIDIFIER",
-    b"IFCMOTORCONNECTION", b"IFCPUMP", b"IFCTANK", b"IFCUNITARYEQUIPMENT",
-    b"IFCSENSOR", b"IFCACTUATOR", b"IFCCONTROLLER", b"IFCALARM",
-    b"IFCFLOWMETER", b"IFCPROTECTIVEDEVICE", b"IFCPROTECTIVEDEVICETRIPPINGUNIT",
-    b"IFCJUNCTIONBOX", b"IFCCOMMUNICATIONSAPPLIANCE",
-    b"IFCAUDIOVISUALAPPLIANCE", b"IFCFIRESUPPRESSIONTERMINAL",
-    b"IFCMEDICALDEVICE", b"IFCMOBILETELECOMMUNICATIONSAPPLIANCE",
-    b"IFCSOLARDEVICE", b"IFCSTACKTERMINAL", b"IFCSPACEHEATER",
-    b"IFCWASTETERMINAL", b"IFCUNITARYCONTROLELEMENT",
+    b"IFCCABLECARRIERFITTING",
+    b"IFCCABLECARRIERSEGMENT",
+    b"IFCCABLEFITTING",
+    b"IFCCABLESEGMENT",
+    b"IFCVALVE",
+    b"IFCFLOWVALVE",
+    b"IFCSANITARYTERMINAL",
+    b"IFCLIGHTFIXTURE",
+    b"IFCOUTLET",
+    b"IFCSWITCHINGDEVICE",
+    b"IFCELECTRICAPPLIANCE",
+    b"IFCELECTRICDISTRIBUTIONBOARD",
+    b"IFCELECTRICFLOWSTORAGEDEVICE",
+    b"IFCAIRTERMINAL",
+    b"IFCAIRTERMINALBOX",
+    b"IFCDAMPER",
+    b"IFCFILTER",
+    b"IFCBOILER",
+    b"IFCBURNER",
+    b"IFCCHILLER",
+    b"IFCCOMPRESSOR",
+    b"IFCCONDENSER",
+    b"IFCCOOLINGTOWER",
+    b"IFCEVAPORATOR",
+    b"IFCFAN",
+    b"IFCHEATEXCHANGER",
+    b"IFCHUMIDIFIER",
+    b"IFCMOTORCONNECTION",
+    b"IFCPUMP",
+    b"IFCTANK",
+    b"IFCUNITARYEQUIPMENT",
+    b"IFCSENSOR",
+    b"IFCACTUATOR",
+    b"IFCCONTROLLER",
+    b"IFCALARM",
+    b"IFCFLOWMETER",
+    b"IFCPROTECTIVEDEVICE",
+    b"IFCPROTECTIVEDEVICETRIPPINGUNIT",
+    b"IFCJUNCTIONBOX",
+    b"IFCCOMMUNICATIONSAPPLIANCE",
+    b"IFCAUDIOVISUALAPPLIANCE",
+    b"IFCFIRESUPPRESSIONTERMINAL",
+    b"IFCMEDICALDEVICE",
+    b"IFCMOBILETELECOMMUNICATIONSAPPLIANCE",
+    b"IFCSOLARDEVICE",
+    b"IFCSTACKTERMINAL",
+    b"IFCSPACEHEATER",
+    b"IFCWASTETERMINAL",
+    b"IFCUNITARYCONTROLELEMENT",
     // Lights / lamps / additional MEP
-    b"IFCLAMP", b"IFCCOIL",
+    b"IFCLAMP",
+    b"IFCCOIL",
     // Survey / layout — IfcGrid is IfcProduct; IfcGridAxis is NOT
     b"IFCGRID",
     // Furnishings
-    b"IFCFURNISHINGELEMENT", b"IFCFURNITURE", b"IFCSYSTEMFURNITUREELEMENT",
+    b"IFCFURNISHINGELEMENT",
+    b"IFCFURNITURE",
+    b"IFCSYSTEMFURNITUREELEMENT",
     // Civil / structural
-    b"IFCEARTHWORKSCUT", b"IFCEARTHWORKSFILL", b"IFCEARTHWORKSELEMENT",
-    b"IFCKERB", b"IFCPAVEMENT", b"IFCRAIL", b"IFCROAD",
-    b"IFCBRIDGE", b"IFCBRIDGEPART", b"IFCMARINEFACILITY", b"IFCMARINEPART",
+    b"IFCEARTHWORKSCUT",
+    b"IFCEARTHWORKSFILL",
+    b"IFCEARTHWORKSELEMENT",
+    b"IFCKERB",
+    b"IFCPAVEMENT",
+    b"IFCRAIL",
+    b"IFCROAD",
+    b"IFCBRIDGE",
+    b"IFCBRIDGEPART",
+    b"IFCMARINEFACILITY",
+    b"IFCMARINEPART",
 ];
 
 /// Spatial structure types — separate output table.
@@ -105,41 +185,74 @@ const UNIT_ASSIGN_TYPE: &[u8] = b"IFCUNITASSIGNMENT";
 const VOIDS_ELEMENT_TYPE: &[u8] = b"IFCRELVOIDSELEMENT";
 const DEFINES_BY_TYPE_TYPE: &[u8] = b"IFCRELDEFINESBYTYPE";
 
+/// Why an `IfcSIUnit` could not be turned into a metres-per-unit
+/// factor. The two cases need opposite handling and used to be
+/// conflated (GH #149): a non-length unit is a normal `continue`, an
+/// unknown prefix is a *defect* that must never quietly become the base
+/// unit — mapping `.KILO.`-typo'd prefixes to 1.0 m is a 1000× error
+/// that looks like a valid answer downstream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SiScaleError {
+    /// Not a length unit at all (`RADIAN`, `SQUARE_METRE`, …).
+    NotLength,
+    /// A length unit whose `IfcSIPrefix` value we don't recognise.
+    UnknownPrefix,
+}
+
 /// SI prefix + name → metres-per-unit scale. `name` is an
 /// `IfcSIUnitName` enum value (e.g. `METRE`); `prefix` is an
-/// `IfcSIPrefix` enum value or `""` for no prefix. Returns `None` for
-/// a non-length unit name (so callers can `continue` past `RADIAN`,
-/// `SQUARE_METRE`, …).
+/// `IfcSIPrefix` enum value or `""` for no prefix.
 ///
 /// Note: FOOT / INCH are deliberately NOT handled here — they are not
 /// legal `IfcSIUnitName` values. Imperial length is declared via
 /// `IfcConversionBasedUnit`, resolved separately (GH #73).
-fn si_length_scale(prefix: &str, name: &str) -> Option<f64> {
+fn si_length_scale_checked(prefix: &str, name: &str) -> Result<f64, SiScaleError> {
     let base = match name {
         "METRE" | "METER" => 1.0,
-        _ => return None,
+        _ => return Err(SiScaleError::NotLength),
     };
-    let scale = match prefix {
-        "" => base,
-        "EXA" => base * 1e18,
-        "PETA" => base * 1e15,
-        "TERA" => base * 1e12,
-        "GIGA" => base * 1e9,
-        "MEGA" => base * 1e6,
-        "KILO" => base * 1e3,
-        "HECTO" => base * 1e2,
-        "DECA" => base * 10.0,
-        "DECI" => base * 1e-1,
-        "CENTI" => base * 1e-2,
-        "MILLI" => base * 1e-3,
-        "MICRO" => base * 1e-6,
-        "NANO" => base * 1e-9,
-        "PICO" => base * 1e-12,
-        "FEMTO" => base * 1e-15,
-        "ATTO" => base * 1e-18,
-        _ => base,
+    let multiplier = match prefix {
+        "" => 1.0,
+        "EXA" => 1e18,
+        "PETA" => 1e15,
+        "TERA" => 1e12,
+        "GIGA" => 1e9,
+        "MEGA" => 1e6,
+        "KILO" => 1e3,
+        "HECTO" => 1e2,
+        "DECA" => 10.0,
+        "DECI" => 1e-1,
+        "CENTI" => 1e-2,
+        "MILLI" => 1e-3,
+        "MICRO" => 1e-6,
+        "NANO" => 1e-9,
+        "PICO" => 1e-12,
+        "FEMTO" => 1e-15,
+        "ATTO" => 1e-18,
+        // NOT `base`. An unrecognised prefix is a parse failure, not
+        // "assume metres" (GH #149).
+        _ => return Err(SiScaleError::UnknownPrefix),
     };
-    Some(scale)
+    Ok(base * multiplier)
+}
+
+/// Convenience wrapper for the call sites that only need "did it
+/// resolve" — the conversion-based-unit base lookup, which already
+/// reports its own failure.
+fn si_length_scale(prefix: &str, name: &str) -> Option<f64> {
+    si_length_scale_checked(prefix, name).ok()
+}
+
+/// Emit a unit-resolution diagnostic through the single channel the
+/// indexer uses for them: loud on stderr (so a CLI / notebook user sees
+/// it immediately, matching the pre-existing conversion-unit policy)
+/// AND appended to the caller's collector so [`IndexedFile::warnings`]
+/// carries it to programmatic consumers (GH #149).
+/// Library code never prints: the message is collected on
+/// `IndexedFile.warnings`, which lib.rs hands to Python (`m.warnings`,
+/// `summary()["warnings"]`) and the Rust bins print themselves.
+fn warn_unit(collector: &mut Vec<String>, msg: String) {
+    collector.push(msg);
 }
 
 /// Parse a numeric value that may be wrapped in a defined-type
@@ -174,23 +287,43 @@ fn measure_number(raw: &[u8]) -> Option<f64> {
 ///   `IfcMeasureWithUnit(value, si_base)` → `value × si_scale(base)`
 ///   (GH #73; how imperial files declare FOOT / INCH).
 ///
-/// Returns `None` when no LENGTHUNIT is declared (caller defaults to
-/// metres). When a LENGTHUNIT *is* found but cannot be resolved (e.g. a
-/// conversion-based unit whose factor chain is broken), emits a loud
-/// `eprintln!` and returns `None` rather than silently implying metres
-/// — "fail loudly" is the house rule.
+/// Returns `None` when no LENGTHUNIT is declared or none could be
+/// resolved. Every failure mode — unknown SI prefix, broken
+/// conversion-factor chain, an assignment that yields no LENGTHUNIT at
+/// all, or no assignment in the file — goes through [`warn_unit`], so
+/// there is ONE policy: unresolved never silently means metres
+/// (GH #149). Warnings land on stderr and in `warnings` for the caller.
 fn resolve_length_scale(
     unit_assignment_refs: &[u64],
     si_units: &HashMap<u64, (String, String, String)>,
     conv_units: &HashMap<u64, (String, String, Option<u64>)>,
     measures: &HashMap<u64, (Option<f64>, Option<u64>)>,
+    warnings: &mut Vec<String>,
 ) -> Option<f64> {
     for unit_ref in unit_assignment_refs {
         // SI length unit (metric files).
         if let Some((ut, prefix, name)) = si_units.get(unit_ref) {
             if ut.eq_ignore_ascii_case("LENGTHUNIT") {
-                if let Some(scale) = si_length_scale(prefix, name) {
-                    return Some(scale);
+                match si_length_scale_checked(prefix, name) {
+                    Ok(scale) => return Some(scale),
+                    Err(SiScaleError::UnknownPrefix) => warn_unit(
+                        warnings,
+                        format!(
+                            "IfcSIUnit #{unit_ref} declares LENGTHUNIT with an \
+                             unrecognised IfcSIPrefix {prefix:?} (name {name:?}); \
+                             it cannot be converted to metres and is IGNORED \
+                             rather than treated as the un-prefixed base unit \
+                             (which would be wrong by a power of ten)."
+                        ),
+                    ),
+                    Err(SiScaleError::NotLength) => warn_unit(
+                        warnings,
+                        format!(
+                            "IfcSIUnit #{unit_ref} declares UnitType LENGTHUNIT but \
+                             an IfcSIUnitName of {name:?}, which is not a length \
+                             unit; the declaration is inconsistent and is IGNORED."
+                        ),
+                    ),
                 }
             }
             continue;
@@ -200,34 +333,60 @@ fn resolve_length_scale(
             if !ut.eq_ignore_ascii_case("LENGTHUNIT") {
                 continue;
             }
-            let resolved = factor_ref
-                .and_then(|fr| measures.get(&fr))
-                .and_then(|(value, base_ref)| {
-                    let v = (*value)?;
-                    let base_ref = (*base_ref)?;
-                    let (base_ut, base_prefix, base_name) = si_units.get(&base_ref)?;
-                    if !base_ut.eq_ignore_ascii_case("LENGTHUNIT") {
-                        return None;
-                    }
-                    let base_scale = si_length_scale(base_prefix, base_name)?;
-                    Some(v * base_scale)
-                });
+            let resolved =
+                factor_ref
+                    .and_then(|fr| measures.get(&fr))
+                    .and_then(|(value, base_ref)| {
+                        let v = (*value)?;
+                        let base_ref = (*base_ref)?;
+                        let (base_ut, base_prefix, base_name) = si_units.get(&base_ref)?;
+                        if !base_ut.eq_ignore_ascii_case("LENGTHUNIT") {
+                            return None;
+                        }
+                        let base_scale = si_length_scale(base_prefix, base_name)?;
+                        Some(v * base_scale)
+                    });
             match resolved {
                 Some(scale) => return Some(scale),
                 None => {
-                    eprintln!(
-                        "[ifcfast] WARNING: IfcConversionBasedUnit \
-                         (LENGTHUNIT, name={:?}, #{}) could not be resolved \
-                         to a metres-per-unit scale; its ConversionFactor → \
-                         IfcMeasureWithUnit → IfcSIUnit chain is missing or \
-                         malformed. unit_scale is left unset (consumers \
-                         default to metres, which is WRONG for this file).",
-                        conv_name, unit_ref
+                    warn_unit(
+                        warnings,
+                        format!(
+                            "IfcConversionBasedUnit (LENGTHUNIT, name={conv_name:?}, \
+                             #{unit_ref}) could not be resolved to a metres-per-unit \
+                             scale; its ConversionFactor → IfcMeasureWithUnit → \
+                             IfcSIUnit chain is missing or malformed. unit_scale is \
+                             left unset (consumers default to metres, which is WRONG \
+                             for this file)."
+                        ),
                     );
                     // Keep scanning: another LENGTHUNIT entry might resolve.
                 }
             }
         }
+    }
+    // Nothing resolved. Distinguish "the file never declared units" from
+    // "it declared them and we failed" — both leave unit_scale unset, but
+    // they are different defects and the reader needs to know which.
+    if unit_assignment_refs.is_empty() {
+        warn_unit(
+            warnings,
+            "no IfcUnitAssignment (or an empty one) was found in this file: \
+             the project's length unit is UNDECLARED. unit_scale is left \
+             unset; consumers that default to metres will be wrong by 1000× \
+             on a millimetre-authored file."
+                .to_string(),
+        );
+    } else {
+        warn_unit(
+            warnings,
+            format!(
+                "the IfcUnitAssignment lists {} unit(s) but none of them \
+                 resolved to a LENGTHUNIT metres-per-unit scale. unit_scale is \
+                 left unset; consumers that default to metres may be wrong.",
+                unit_assignment_refs.len()
+            ),
+        );
     }
     None
 }
@@ -254,13 +413,17 @@ pub(crate) fn extract_unit_scale(table: &crate::entity_table::EntityTable) -> Op
     let mut unit_assignment_refs: Vec<u64> = Vec::new();
 
     for (step_id, type_name, args) in table.iter() {
-        if type_name == SI_UNIT_TYPE {
+        // Case-insensitive, matching every other extractor. STEP keywords
+        // are uppercase by spec but not by universal practice, and a
+        // byte-exact compare here silently produced `unit_scale = None`
+        // (→ "assume metres") on lowercase-keyword files (GH #149).
+        if type_name.eq_ignore_ascii_case(SI_UNIT_TYPE) {
             let fields = split_top_level_args(args);
             let ut = enum_at(&fields, 1).unwrap_or_default();
             let prefix = enum_at(&fields, 2).unwrap_or_default();
             let name = enum_at(&fields, 3).unwrap_or_default();
             si_units.insert(step_id, (ut, prefix, name));
-        } else if type_name == CONVERSION_UNIT_TYPE {
+        } else if type_name.eq_ignore_ascii_case(CONVERSION_UNIT_TYPE) {
             // IfcConversionBasedUnit(Dimensions, UnitType, Name,
             // ConversionFactor) — UnitType at [1], Name (string) at [2],
             // ConversionFactor ref (→ IfcMeasureWithUnit) at [3].
@@ -269,7 +432,7 @@ pub(crate) fn extract_unit_scale(table: &crate::entity_table::EntityTable) -> Op
             let name = string_at(&fields, 2).unwrap_or_default();
             let factor_ref = ref_at(&fields, 3);
             conv_units.insert(step_id, (ut, name, factor_ref));
-        } else if type_name == MEASURE_WITH_UNIT_TYPE {
+        } else if type_name.eq_ignore_ascii_case(MEASURE_WITH_UNIT_TYPE) {
             // IfcMeasureWithUnit(ValueComponent, UnitComponent) — value
             // (often wrapped, e.g. IFCLENGTHMEASURE(0.3048)) at [0],
             // unit ref at [1].
@@ -277,7 +440,9 @@ pub(crate) fn extract_unit_scale(table: &crate::entity_table::EntityTable) -> Op
             let value = fields.first().and_then(|f| measure_number(f));
             let unit_ref = ref_at(&fields, 1);
             measures.insert(step_id, (value, unit_ref));
-        } else if type_name == UNIT_ASSIGN_TYPE && unit_assignment_refs.is_empty() {
+        } else if type_name.eq_ignore_ascii_case(UNIT_ASSIGN_TYPE)
+            && unit_assignment_refs.is_empty()
+        {
             let fields = split_top_level_args(args);
             if let Some(f) = fields.first() {
                 if let Field::List(body) = parse_field(f) {
@@ -287,7 +452,16 @@ pub(crate) fn extract_unit_scale(table: &crate::entity_table::EntityTable) -> Op
         }
     }
 
-    resolve_length_scale(&unit_assignment_refs, &si_units, &conv_units, &measures)
+    // This entry point has no IndexedFile to hang warnings on; the
+    // `warn_unit` stderr half still fires, which is the loud channel.
+    let mut warnings: Vec<String> = Vec::new();
+    resolve_length_scale(
+        &unit_assignment_refs,
+        &si_units,
+        &conv_units,
+        &measures,
+        &mut warnings,
+    )
 }
 
 /// Canonical "should the mesher walk this entity as a product?" check.
@@ -389,7 +563,7 @@ fn dispatch_map() -> &'static HashMap<&'static [u8], EntityKind> {
 #[derive(Default)]
 pub struct IndexedFile {
     // ----- Tier 0/1 manifest fields -----
-    pub schema: String,            // e.g. "IFC4" or "IFC2X3"
+    pub schema: String, // e.g. "IFC4" or "IFC2X3"
     pub project_name: Option<String>,
     pub authoring_app: Option<String>,
 
@@ -423,7 +597,6 @@ pub struct IndexedFile {
     // tuple allocation per row when these get marshalled into Python. On
     // very-MEP-heavy files (>100K relationships) that's the difference
     // between dozens and hundreds of ms in the PyO3 bridge.
-
     /// IfcRelContainedInSpatialStructure: parallel arrays of
     /// `(child_step_id[i], storey_step_id[i])`. Already filtered to
     /// storey-relating containment only.
@@ -466,6 +639,21 @@ pub struct IndexedFile {
 
     // ----- Length unit (metres per model unit). None means undetermined. -----
     pub unit_scale: Option<f64>,
+
+    /// Non-fatal defects found while indexing — an undeclared or
+    /// unresolvable length unit, an unknown SI prefix, a missing
+    /// FILE_SCHEMA (GH #149 / #159). Every entry was ALSO printed to
+    /// stderr when it was raised; this vector is the programmatic
+    /// channel for callers that want to surface or fail on them.
+    pub warnings: Vec<String>,
+
+    /// Set when the DATA walk did not end legitimately — a stray byte
+    /// mid-stream, an unterminated final record, or a missing `DATA;`
+    /// marker (GH #148). `Some` means EVERY table above is PARTIAL:
+    /// records after the offset named in the message were never read.
+    /// Callers must refuse to publish a substrate / QTO / clash result
+    /// built from such an index.
+    pub parse_error: Option<String>,
 }
 
 // ----------------------------------------------------------------------
@@ -476,8 +664,17 @@ fn extract_header(buf: &[u8]) -> (String, Option<String>) {
     let mut schema = String::new();
     let mut originating: Option<String> = None;
 
+    // Header search window: everything up to `DATA;`. The old fixed
+    // 64 KB cap silently lost FILE_SCHEMA on files with a long
+    // FILE_DESCRIPTION (federated exports list every discipline there),
+    // and losing FILE_SCHEMA means `is_ifc2x3 == false` — an IFC2X3
+    // file parsed with IFC4 attribute semantics, no error (GH #159).
+    // `data_section_start` is itself string- and comment-aware, so the
+    // window can never run past the real header.
+    let header_end = header_window_end(buf);
+
     // FILE_SCHEMA (('IFC4'));   /   FILE_SCHEMA (('IFC2X3')) ;
-    if let Some(start) = find_token(buf, b"FILE_SCHEMA") {
+    if let Some(start) = find_token(buf, b"FILE_SCHEMA", header_end) {
         if let Some(open) = find_byte(buf, start, b'(') {
             if let Some(close) = find_byte(buf, open + 1, b')') {
                 let s = &buf[open + 1..close];
@@ -494,7 +691,7 @@ fn extract_header(buf: &[u8]) -> (String, Option<String>) {
     }
 
     // FILE_NAME ('name', 'time_stamp', ('author',), ('org',), 'preprocessor_version', 'originating_system', 'authorisation');
-    if let Some(start) = find_token(buf, b"FILE_NAME") {
+    if let Some(start) = find_token(buf, b"FILE_NAME", header_end) {
         if let Some(open) = find_byte(buf, start, b'(') {
             // Find matching ')'.
             if let Some(close) = find_matching_paren(buf, open) {
@@ -519,15 +716,65 @@ fn find_byte(buf: &[u8], from: usize, target: u8) -> Option<usize> {
     memchr::memchr(target, &buf[from..]).map(|o| from + o)
 }
 
-fn find_token(buf: &[u8], needle: &[u8]) -> Option<usize> {
-    let limit = buf.len().min(64 * 1024); // header is at the start
-    let prefix = &buf[..limit];
+/// End of the HEADER search window: the start of the DATA section, or —
+/// when there is no `DATA;` marker at all (a header-only or truncated
+/// file) — the whole buffer capped at 1 MiB so a pathological input
+/// can't turn a header probe into a full-file scan.
+fn header_window_end(buf: &[u8]) -> usize {
+    data_section_start(buf).unwrap_or_else(|| buf.len().min(1024 * 1024))
+}
+
+/// Find `needle` as a HEADER keyword within `buf[..limit]`, returning
+/// the offset just past it.
+///
+/// String- and comment-aware: `FILE_NAME('... FILE_SCHEMA ...')` must
+/// not match inside the quoted value, and neither must a `/* */`
+/// banner. Also requires a token boundary before the match so
+/// `MY_FILE_SCHEMA` doesn't hit.
+fn find_token(buf: &[u8], needle: &[u8], limit: usize) -> Option<usize> {
+    let end = limit.min(buf.len());
     let mut i = 0;
-    while i + needle.len() <= prefix.len() {
-        if &prefix[i..i + needle.len()] == needle {
-            return Some(i + needle.len());
+    let mut prev: u8 = 0;
+    while i < end {
+        match buf[i] {
+            b'\'' => {
+                // Quoted string: inert. Skip to the closing quote,
+                // honouring the STEP `''` escape.
+                i += 1;
+                while i < end {
+                    if buf[i] == b'\'' {
+                        if i + 1 < end && buf[i + 1] == b'\'' {
+                            i += 2;
+                            continue;
+                        }
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+                prev = b'\'';
+            }
+            b'/' if i + 1 < end && buf[i + 1] == b'*' => {
+                i += 2;
+                while i + 1 < end && !(buf[i] == b'*' && buf[i + 1] == b'/') {
+                    i += 1;
+                }
+                i = (i + 2).min(end);
+                prev = b' ';
+            }
+            b => {
+                let boundary = !prev.is_ascii_alphanumeric() && prev != b'_';
+                if boundary
+                    && b == needle[0]
+                    && i + needle.len() <= end
+                    && &buf[i..i + needle.len()] == needle
+                {
+                    return Some(i + needle.len());
+                }
+                prev = b;
+                i += 1;
+            }
         }
-        i += 1;
     }
     None
 }
@@ -573,6 +820,17 @@ pub fn index(buf: &[u8]) -> IndexedFile {
 
     let (schema, originating) = extract_header(buf);
     out.schema = schema;
+    if out.schema.is_empty() {
+        // No FILE_SCHEMA means we don't know whether to apply IFC2X3 or
+        // IFC4 attribute semantics; we fall back to IFC4, which is a
+        // guess. Say so instead of pretending (GH #159).
+        let msg = "no FILE_SCHEMA found in the HEADER section — the schema \
+                   version is UNKNOWN and IFC4 attribute semantics are \
+                   assumed. On an IFC2X3 file that mis-reads trailing \
+                   attributes (predefined_type and friends)."
+            .to_string();
+        out.warnings.push(msg);
+    }
     if let Some(o) = originating {
         out.authoring_app = Some(o);
     }
@@ -596,7 +854,23 @@ pub fn index(buf: &[u8]) -> IndexedFile {
     // assignment in practice.
     let mut unit_assignment_refs: Vec<u64> = Vec::new();
 
-    let data_start = data_section_start(buf).unwrap_or(0);
+    // A missing `DATA;` marker is recorded, not swallowed (GH #148).
+    // We still scan from byte 0 so bare record-list fixtures keep
+    // working, but the caller is told the entity stream was never
+    // located — with `unwrap_or(0)` alone this produced zero records
+    // and exit 0.
+    let data_start = match data_section_start(buf) {
+        Some(s) => s,
+        None => {
+            out.parse_error = Some(
+                "no `DATA;` section marker found — scanning from byte 0. If \
+                 this is an IFC file it is malformed or truncated in its \
+                 header; entity coverage is not trustworthy."
+                    .to_string(),
+            );
+            0
+        }
+    };
     let data_end = endsec_position(buf, data_start);
 
     // Reused across every record — saves one Vec allocation per STEP
@@ -606,7 +880,7 @@ pub fn index(buf: &[u8]) -> IndexedFile {
     // Two-pass would let us resolve some refs, but a single pass is enough:
     // we only need step_id→guid maps that are built as we go, and downstream
     // (Python) does the final guid resolution for relationships.
-    for_each_record(buf, data_start, data_end, |rec| {
+    let scan_end = for_each_record(buf, data_start, data_end, |rec| {
         let t = rec.type_name;
         // Single-lookup dispatch. Hot-path miss (>99% of records on big
         // MEP files) is one HashMap probe; previously each miss walked
@@ -628,8 +902,7 @@ pub fn index(buf: &[u8]) -> IndexedFile {
                 // `RelatingType` of `IfcRelDefinesByType` on IFC2x3 files,
                 // so they must be classified as TypeObject here or 100% of
                 // door/window typing leaks silently on IFC2x3. See #18.
-                let suffix_ok =
-                    t.len() > 7 && t.starts_with(b"IFC") && t.ends_with(b"TYPE");
+                let suffix_ok = t.len() > 7 && t.starts_with(b"IFC") && t.ends_with(b"TYPE");
                 let ifc2x3_style = t == b"IFCDOORSTYLE" || t == b"IFCWINDOWSTYLE";
                 // Bare base classes: `IfcTypeProduct` / `IfcTypeObject` are
                 // non-abstract in both IFC2x3 and IFC4. Revit emits them as
@@ -777,10 +1050,9 @@ pub fn index(buf: &[u8]) -> IndexedFile {
                 // singletons (not lists) — one opening voids one host.
                 split_top_level_args_into(rec.args, &mut fields_buf);
                 if fields_buf.len() >= 6 {
-                    if let (Field::Ref(host), Field::Ref(opening)) = (
-                        parse_field(fields_buf[4]),
-                        parse_field(fields_buf[5]),
-                    ) {
+                    if let (Field::Ref(host), Field::Ref(opening)) =
+                        (parse_field(fields_buf[4]), parse_field(fields_buf[5]))
+                    {
                         out.voids_opening.push(opening);
                         out.voids_host.push(host);
                     }
@@ -821,6 +1093,14 @@ pub fn index(buf: &[u8]) -> IndexedFile {
         }
     });
 
+    // Surface a truncated record stream. A stray byte mid-DATA (the
+    // classic doubled `;;`) stops the walk; before GH #148 that was
+    // completely silent and every table below described a partial
+    // model at exit 0.
+    if let Some(msg) = scan_end.describe() {
+        out.parse_error = Some(msg);
+    }
+
     // Walk aggregates again to populate storey→building from rels whose
     // relating is an IfcBuilding. We have the building set now.
     for (child, parent) in out
@@ -848,8 +1128,15 @@ pub fn index(buf: &[u8]) -> IndexedFile {
     // IfcUnitAssignment.Units list for a LENGTHUNIT — either an
     // IfcSIUnit (metric) or an IfcConversionBasedUnit (imperial:
     // FOOT / INCH, GH #73) — and derive metres-per-unit.
-    out.unit_scale =
-        resolve_length_scale(&unit_assignment_refs, &si_units, &conv_units, &measures);
+    let mut unit_warnings: Vec<String> = Vec::new();
+    out.unit_scale = resolve_length_scale(
+        &unit_assignment_refs,
+        &si_units,
+        &conv_units,
+        &measures,
+        &mut unit_warnings,
+    );
+    out.warnings.append(&mut unit_warnings);
 
     out
 }
@@ -885,12 +1172,18 @@ fn extract_product(
 
     let name = string_at(fields, 2);
     let object_type = string_at(fields, 4);
-    // Tag is always the LAST positional argument that isn't an enum on
-    // IfcElement subtypes — but the safe, schema-agnostic move is to try
-    // arg[7]: that's the position for IfcElement.Tag, and on subtypes
-    // that don't inherit Tag (rare) we just get a non-string back and
-    // discard it.
-    let tag = string_at(fields, 7);
+    // Tag sits at arg[7] on IfcElement subtypes. The "we just get a
+    // non-string back and discard it" assumption holds only where arg[7]
+    // isn't a string on other branches of the hierarchy — and it FAILS
+    // on IfcSpatialStructureElement, where arg[7] is `LongName`, a
+    // perfectly good string. That produced `tag = "Kontor 3.04"` on
+    // every named IfcSpace (GH #159). Spatial elements have no Tag
+    // attribute at all in either schema, so the correct answer is None.
+    let tag = if is_spatial_structure_element(type_name) {
+        None
+    } else {
+        string_at(fields, 7)
+    };
 
     // PredefinedType is the LAST enum field on most IfcElement subtypes —
     // but in IFC2X3, several entities use the trailing slot for a
@@ -994,8 +1287,40 @@ fn is_predefined_type_unavailable_in_ifc2x3(entity: &[u8]) -> bool {
         b"IFCREINFORCINGBAR"          // trailing enum is BarRole
         | b"IFCSTAIR"                 // trailing enum is ShapeType (IFC4 adds PredefinedType)
         | b"IFCRAMP"                  // same as IfcStair
+        | b"IFCROOF"                  // trailing enum is ShapeType (IFC4 adds PredefinedType) — GH #159
+        | b"IFCSPACE"                 // see below — GH #159
         | b"IFCDISTRIBUTIONPORT"      // trailing enum is FlowDirection (IFC4 adds PredefinedType)
-        | b"IFCBUILDINGELEMENTPROXY"  // trailing enum is CompositionType (IFC4 adds PredefinedType)
+        | b"IFCBUILDINGELEMENTPROXY" // trailing enum is CompositionType (IFC4 adds PredefinedType)
+    )
+    // IFCSPACE, in detail. IFC2X3 IfcSpace ends
+    //   …, LongName(7), CompositionType(8), InteriorOrExteriorSpace(9),
+    //      ElevationWithFlooring(10: REAL, OPTIONAL)
+    // and has NO PredefinedType. IFC4 replaces attr 9 with PredefinedType.
+    // The walk-from-right reader skips a `$` ElevationWithFlooring (the
+    // overwhelmingly common case) and then takes the next enum — which on
+    // IFC2X3 is InteriorOrExteriorSpace, so every 2x3 space came out as
+    // predefined_type="INTERNAL"/"EXTERNAL". ifcopenshell returns None
+    // there because the attribute doesn't exist in the schema, so the
+    // suppression is what restores parity.
+}
+
+/// `IfcSpatialStructureElement` subtypes (plus the IFC4 spatial
+/// siblings). These carry `LongName` where `IfcElement` carries `Tag`,
+/// so the positional Tag read at arg[7] must be skipped for them
+/// (GH #159). Only entities that actually reach [`extract_product`]
+/// matter — today that is IfcSpace — but the full set is listed so a
+/// future dispatch change can't silently reintroduce the bug.
+fn is_spatial_structure_element(entity: &[u8]) -> bool {
+    matches!(
+        entity,
+        b"IFCSPACE"
+            | b"IFCSITE"
+            | b"IFCBUILDING"
+            | b"IFCBUILDINGSTOREY"
+            | b"IFCSPATIALZONE"
+            | b"IFCSPATIALSTRUCTUREELEMENT"
+            | b"IFCEXTERNALSPATIALELEMENT"
+            | b"IFCEXTERNALSPATIALSTRUCTUREELEMENT"
     )
 }
 
@@ -1038,7 +1363,6 @@ fn predefined_for_door_window(fields: &[&[u8]]) -> Option<String> {
     }
 }
 
-
 fn string_at(fields: &[&[u8]], idx: usize) -> Option<String> {
     let f = fields.get(idx)?;
     match parse_field(f) {
@@ -1050,160 +1374,178 @@ fn string_at(fields: &[&[u8]], idx: usize) -> Option<String> {
 /// All known STEP-uppercase → ifcopenshell-titlecase pairs. Exposed as
 /// a `&'static` slice so the lazy HashMap below can be built once.
 const ENTITY_NAME_PAIRS: &[(&[u8], &str)] = &[
-        // Walls
-        (b"IFCWALL", "IfcWall"),
-        (b"IFCWALLSTANDARDCASE", "IfcWallStandardCase"),
-        (b"IFCWALLELEMENTEDCASE", "IfcWallElementedCase"),
-        (b"IFCCURTAINWALL", "IfcCurtainWall"),
-        // Slabs / plates
-        (b"IFCSLAB", "IfcSlab"),
-        (b"IFCSLABSTANDARDCASE", "IfcSlabStandardCase"),
-        (b"IFCSLABELEMENTEDCASE", "IfcSlabElementedCase"),
-        (b"IFCPLATE", "IfcPlate"),
-        (b"IFCPLATESTANDARDCASE", "IfcPlateStandardCase"),
-        // Structural
-        (b"IFCBEAM", "IfcBeam"),
-        (b"IFCBEAMSTANDARDCASE", "IfcBeamStandardCase"),
-        (b"IFCCOLUMN", "IfcColumn"),
-        (b"IFCCOLUMNSTANDARDCASE", "IfcColumnStandardCase"),
-        (b"IFCMEMBER", "IfcMember"),
-        (b"IFCMEMBERSTANDARDCASE", "IfcMemberStandardCase"),
-        (b"IFCFOOTING", "IfcFooting"),
-        (b"IFCPILE", "IfcPile"),
-        // Fenestration
-        (b"IFCDOOR", "IfcDoor"),
-        (b"IFCDOORSTANDARDCASE", "IfcDoorStandardCase"),
-        (b"IFCDOORSTYLE", "IfcDoorStyle"),
-        (b"IFCWINDOW", "IfcWindow"),
-        (b"IFCWINDOWSTANDARDCASE", "IfcWindowStandardCase"),
-        (b"IFCWINDOWSTYLE", "IfcWindowStyle"),
-        (b"IFCOPENINGELEMENT", "IfcOpeningElement"),
-        (b"IFCVOIDINGFEATURE", "IfcVoidingFeature"),
-        (b"IFCSURFACEFEATURE", "IfcSurfaceFeature"),
-        // Stairs etc.
-        (b"IFCSTAIR", "IfcStair"),
-        (b"IFCSTAIRFLIGHT", "IfcStairFlight"),
-        (b"IFCRAMP", "IfcRamp"),
-        (b"IFCRAMPFLIGHT", "IfcRampFlight"),
-        (b"IFCRAILING", "IfcRailing"),
-        (b"IFCROOF", "IfcRoof"),
-        (b"IFCCOVERING", "IfcCovering"),
-        // Bare type base classes (#69) — Revit emits these for types
-        // with no schema-specific *Type subtype. The fallback
-        // title-caser would render multi-word names as single words
-        // ("Ifctypeproduct"); spell them out so the entity column is
-        // correctly cased without relying on the consumer's fold map.
-        (b"IFCTYPEPRODUCT", "IfcTypeProduct"),
-        (b"IFCTYPEOBJECT", "IfcTypeObject"),
-        // Generic
-        (b"IFCBUILDINGELEMENTPROXY", "IfcBuildingElementProxy"),
-        (b"IFCBUILDINGELEMENTPART", "IfcBuildingElementPart"),
-        (b"IFCELEMENTASSEMBLY", "IfcElementAssembly"),
-        (b"IFCTRANSPORTELEMENT", "IfcTransportElement"),
-        (b"IFCANNOTATION", "IfcAnnotation"),
-        (b"IFCVIRTUALELEMENT", "IfcVirtualElement"),
-        (b"IFCDISCRETEACCESSORY", "IfcDiscreteAccessory"),
-        (b"IFCFASTENER", "IfcFastener"),
-        (b"IFCMECHANICALFASTENER", "IfcMechanicalFastener"),
-        (b"IFCREINFORCINGBAR", "IfcReinforcingBar"),
-        (b"IFCREINFORCINGMESH", "IfcReinforcingMesh"),
-        (b"IFCTENDON", "IfcTendon"),
-        (b"IFCTENDONANCHOR", "IfcTendonAnchor"),
-        // Distribution / MEP
-        (b"IFCDISTRIBUTIONELEMENT", "IfcDistributionElement"),
-        (b"IFCDISTRIBUTIONFLOWELEMENT", "IfcDistributionFlowElement"),
-        (b"IFCDISTRIBUTIONCONTROLELEMENT", "IfcDistributionControlElement"),
-        (b"IFCDISTRIBUTIONPORT", "IfcDistributionPort"),
-        (b"IFCFLOWFITTING", "IfcFlowFitting"),
-        (b"IFCFLOWSEGMENT", "IfcFlowSegment"),
-        (b"IFCFLOWTERMINAL", "IfcFlowTerminal"),
-        (b"IFCFLOWCONTROLLER", "IfcFlowController"),
-        (b"IFCFLOWMOVINGDEVICE", "IfcFlowMovingDevice"),
-        (b"IFCFLOWSTORAGEDEVICE", "IfcFlowStorageDevice"),
-        (b"IFCFLOWTREATMENTDEVICE", "IfcFlowTreatmentDevice"),
-        (b"IFCENERGYCONVERSIONDEVICE", "IfcEnergyConversionDevice"),
-        (b"IFCPIPEFITTING", "IfcPipeFitting"),
-        (b"IFCPIPESEGMENT", "IfcPipeSegment"),
-        (b"IFCDUCTFITTING", "IfcDuctFitting"),
-        (b"IFCDUCTSEGMENT", "IfcDuctSegment"),
-        (b"IFCDUCTSILENCER", "IfcDuctSilencer"),
-        (b"IFCCABLECARRIERFITTING", "IfcCableCarrierFitting"),
-        (b"IFCCABLECARRIERSEGMENT", "IfcCableCarrierSegment"),
-        (b"IFCCABLEFITTING", "IfcCableFitting"),
-        (b"IFCCABLESEGMENT", "IfcCableSegment"),
-        (b"IFCVALVE", "IfcValve"),
-        (b"IFCFLOWVALVE", "IfcFlowValve"),
-        (b"IFCSANITARYTERMINAL", "IfcSanitaryTerminal"),
-        (b"IFCLIGHTFIXTURE", "IfcLightFixture"),
-        (b"IFCOUTLET", "IfcOutlet"),
-        (b"IFCSWITCHINGDEVICE", "IfcSwitchingDevice"),
-        (b"IFCELECTRICAPPLIANCE", "IfcElectricAppliance"),
-        (b"IFCELECTRICDISTRIBUTIONBOARD", "IfcElectricDistributionBoard"),
-        (b"IFCELECTRICFLOWSTORAGEDEVICE", "IfcElectricFlowStorageDevice"),
-        (b"IFCAIRTERMINAL", "IfcAirTerminal"),
-        (b"IFCAIRTERMINALBOX", "IfcAirTerminalBox"),
-        (b"IFCDAMPER", "IfcDamper"),
-        (b"IFCFILTER", "IfcFilter"),
-        (b"IFCBOILER", "IfcBoiler"),
-        (b"IFCBURNER", "IfcBurner"),
-        (b"IFCCHILLER", "IfcChiller"),
-        (b"IFCCOMPRESSOR", "IfcCompressor"),
-        (b"IFCCONDENSER", "IfcCondenser"),
-        (b"IFCCOOLINGTOWER", "IfcCoolingTower"),
-        (b"IFCEVAPORATOR", "IfcEvaporator"),
-        (b"IFCFAN", "IfcFan"),
-        (b"IFCHEATEXCHANGER", "IfcHeatExchanger"),
-        (b"IFCHUMIDIFIER", "IfcHumidifier"),
-        (b"IFCMOTORCONNECTION", "IfcMotorConnection"),
-        (b"IFCPUMP", "IfcPump"),
-        (b"IFCTANK", "IfcTank"),
-        (b"IFCUNITARYEQUIPMENT", "IfcUnitaryEquipment"),
-        (b"IFCSENSOR", "IfcSensor"),
-        (b"IFCACTUATOR", "IfcActuator"),
-        (b"IFCCONTROLLER", "IfcController"),
-        (b"IFCALARM", "IfcAlarm"),
-        (b"IFCFLOWMETER", "IfcFlowMeter"),
-        (b"IFCPROTECTIVEDEVICE", "IfcProtectiveDevice"),
-        (b"IFCPROTECTIVEDEVICETRIPPINGUNIT", "IfcProtectiveDeviceTrippingUnit"),
-        (b"IFCJUNCTIONBOX", "IfcJunctionBox"),
-        (b"IFCCOMMUNICATIONSAPPLIANCE", "IfcCommunicationsAppliance"),
-        (b"IFCAUDIOVISUALAPPLIANCE", "IfcAudioVisualAppliance"),
-        (b"IFCFIRESUPPRESSIONTERMINAL", "IfcFireSuppressionTerminal"),
-        (b"IFCMEDICALDEVICE", "IfcMedicalDevice"),
-        (b"IFCMOBILETELECOMMUNICATIONSAPPLIANCE", "IfcMobileTelecommunicationsAppliance"),
-        (b"IFCSOLARDEVICE", "IfcSolarDevice"),
-        (b"IFCSTACKTERMINAL", "IfcStackTerminal"),
-        (b"IFCSPACEHEATER", "IfcSpaceHeater"),
-        (b"IFCWASTETERMINAL", "IfcWasteTerminal"),
-        (b"IFCUNITARYCONTROLELEMENT", "IfcUnitaryControlElement"),
-        (b"IFCBUILDINGSYSTEM", "IfcBuildingSystem"),
-        (b"IFCLAMP", "IfcLamp"),
-        (b"IFCCOIL", "IfcCoil"),
-        (b"IFCGRID", "IfcGrid"),
-        (b"IFCGRIDAXIS", "IfcGridAxis"),
-        // Furnishings
-        (b"IFCFURNISHINGELEMENT", "IfcFurnishingElement"),
-        (b"IFCFURNITURE", "IfcFurniture"),
-        (b"IFCSYSTEMFURNITUREELEMENT", "IfcSystemFurnitureElement"),
-        // Civil
-        (b"IFCEARTHWORKSCUT", "IfcEarthworksCut"),
-        (b"IFCEARTHWORKSFILL", "IfcEarthworksFill"),
-        (b"IFCEARTHWORKSELEMENT", "IfcEarthworksElement"),
-        (b"IFCKERB", "IfcKerb"),
-        (b"IFCPAVEMENT", "IfcPavement"),
-        (b"IFCRAIL", "IfcRail"),
-        (b"IFCROAD", "IfcRoad"),
-        (b"IFCBRIDGE", "IfcBridge"),
-        (b"IFCBRIDGEPART", "IfcBridgePart"),
-        (b"IFCMARINEFACILITY", "IfcMarineFacility"),
-        (b"IFCMARINEPART", "IfcMarinePart"),
-        (b"IFCBUILDINGSTOREY", "IfcBuildingStorey"),
-        (b"IFCSITE", "IfcSite"),
-        (b"IFCBUILDING", "IfcBuilding"),
-        (b"IFCPROJECT", "IfcProject"),
-        (b"IFCAPPLICATION", "IfcApplication"),
-        (b"IFCRELCONTAINEDINSPATIALSTRUCTURE", "IfcRelContainedInSpatialStructure"),
-        (b"IFCRELAGGREGATES", "IfcRelAggregates"),
+    // Walls
+    (b"IFCWALL", "IfcWall"),
+    (b"IFCWALLSTANDARDCASE", "IfcWallStandardCase"),
+    (b"IFCWALLELEMENTEDCASE", "IfcWallElementedCase"),
+    (b"IFCCURTAINWALL", "IfcCurtainWall"),
+    // Slabs / plates
+    (b"IFCSLAB", "IfcSlab"),
+    (b"IFCSLABSTANDARDCASE", "IfcSlabStandardCase"),
+    (b"IFCSLABELEMENTEDCASE", "IfcSlabElementedCase"),
+    (b"IFCPLATE", "IfcPlate"),
+    (b"IFCPLATESTANDARDCASE", "IfcPlateStandardCase"),
+    // Structural
+    (b"IFCBEAM", "IfcBeam"),
+    (b"IFCBEAMSTANDARDCASE", "IfcBeamStandardCase"),
+    (b"IFCCOLUMN", "IfcColumn"),
+    (b"IFCCOLUMNSTANDARDCASE", "IfcColumnStandardCase"),
+    (b"IFCMEMBER", "IfcMember"),
+    (b"IFCMEMBERSTANDARDCASE", "IfcMemberStandardCase"),
+    (b"IFCFOOTING", "IfcFooting"),
+    (b"IFCPILE", "IfcPile"),
+    // Fenestration
+    (b"IFCDOOR", "IfcDoor"),
+    (b"IFCDOORSTANDARDCASE", "IfcDoorStandardCase"),
+    (b"IFCDOORSTYLE", "IfcDoorStyle"),
+    (b"IFCWINDOW", "IfcWindow"),
+    (b"IFCWINDOWSTANDARDCASE", "IfcWindowStandardCase"),
+    (b"IFCWINDOWSTYLE", "IfcWindowStyle"),
+    (b"IFCOPENINGELEMENT", "IfcOpeningElement"),
+    (b"IFCVOIDINGFEATURE", "IfcVoidingFeature"),
+    (b"IFCSURFACEFEATURE", "IfcSurfaceFeature"),
+    // Stairs etc.
+    (b"IFCSTAIR", "IfcStair"),
+    (b"IFCSTAIRFLIGHT", "IfcStairFlight"),
+    (b"IFCRAMP", "IfcRamp"),
+    (b"IFCRAMPFLIGHT", "IfcRampFlight"),
+    (b"IFCRAILING", "IfcRailing"),
+    (b"IFCROOF", "IfcRoof"),
+    (b"IFCCOVERING", "IfcCovering"),
+    // Bare type base classes (#69) — Revit emits these for types
+    // with no schema-specific *Type subtype. The fallback
+    // title-caser would render multi-word names as single words
+    // ("Ifctypeproduct"); spell them out so the entity column is
+    // correctly cased without relying on the consumer's fold map.
+    (b"IFCTYPEPRODUCT", "IfcTypeProduct"),
+    (b"IFCTYPEOBJECT", "IfcTypeObject"),
+    // Generic
+    (b"IFCBUILDINGELEMENTPROXY", "IfcBuildingElementProxy"),
+    (b"IFCBUILDINGELEMENTPART", "IfcBuildingElementPart"),
+    (b"IFCELEMENTASSEMBLY", "IfcElementAssembly"),
+    (b"IFCTRANSPORTELEMENT", "IfcTransportElement"),
+    (b"IFCANNOTATION", "IfcAnnotation"),
+    (b"IFCVIRTUALELEMENT", "IfcVirtualElement"),
+    (b"IFCDISCRETEACCESSORY", "IfcDiscreteAccessory"),
+    (b"IFCFASTENER", "IfcFastener"),
+    (b"IFCMECHANICALFASTENER", "IfcMechanicalFastener"),
+    (b"IFCREINFORCINGBAR", "IfcReinforcingBar"),
+    (b"IFCREINFORCINGMESH", "IfcReinforcingMesh"),
+    (b"IFCTENDON", "IfcTendon"),
+    (b"IFCTENDONANCHOR", "IfcTendonAnchor"),
+    // Distribution / MEP
+    (b"IFCDISTRIBUTIONELEMENT", "IfcDistributionElement"),
+    (b"IFCDISTRIBUTIONFLOWELEMENT", "IfcDistributionFlowElement"),
+    (
+        b"IFCDISTRIBUTIONCONTROLELEMENT",
+        "IfcDistributionControlElement",
+    ),
+    (b"IFCDISTRIBUTIONPORT", "IfcDistributionPort"),
+    (b"IFCFLOWFITTING", "IfcFlowFitting"),
+    (b"IFCFLOWSEGMENT", "IfcFlowSegment"),
+    (b"IFCFLOWTERMINAL", "IfcFlowTerminal"),
+    (b"IFCFLOWCONTROLLER", "IfcFlowController"),
+    (b"IFCFLOWMOVINGDEVICE", "IfcFlowMovingDevice"),
+    (b"IFCFLOWSTORAGEDEVICE", "IfcFlowStorageDevice"),
+    (b"IFCFLOWTREATMENTDEVICE", "IfcFlowTreatmentDevice"),
+    (b"IFCENERGYCONVERSIONDEVICE", "IfcEnergyConversionDevice"),
+    (b"IFCPIPEFITTING", "IfcPipeFitting"),
+    (b"IFCPIPESEGMENT", "IfcPipeSegment"),
+    (b"IFCDUCTFITTING", "IfcDuctFitting"),
+    (b"IFCDUCTSEGMENT", "IfcDuctSegment"),
+    (b"IFCDUCTSILENCER", "IfcDuctSilencer"),
+    (b"IFCCABLECARRIERFITTING", "IfcCableCarrierFitting"),
+    (b"IFCCABLECARRIERSEGMENT", "IfcCableCarrierSegment"),
+    (b"IFCCABLEFITTING", "IfcCableFitting"),
+    (b"IFCCABLESEGMENT", "IfcCableSegment"),
+    (b"IFCVALVE", "IfcValve"),
+    (b"IFCFLOWVALVE", "IfcFlowValve"),
+    (b"IFCSANITARYTERMINAL", "IfcSanitaryTerminal"),
+    (b"IFCLIGHTFIXTURE", "IfcLightFixture"),
+    (b"IFCOUTLET", "IfcOutlet"),
+    (b"IFCSWITCHINGDEVICE", "IfcSwitchingDevice"),
+    (b"IFCELECTRICAPPLIANCE", "IfcElectricAppliance"),
+    (
+        b"IFCELECTRICDISTRIBUTIONBOARD",
+        "IfcElectricDistributionBoard",
+    ),
+    (
+        b"IFCELECTRICFLOWSTORAGEDEVICE",
+        "IfcElectricFlowStorageDevice",
+    ),
+    (b"IFCAIRTERMINAL", "IfcAirTerminal"),
+    (b"IFCAIRTERMINALBOX", "IfcAirTerminalBox"),
+    (b"IFCDAMPER", "IfcDamper"),
+    (b"IFCFILTER", "IfcFilter"),
+    (b"IFCBOILER", "IfcBoiler"),
+    (b"IFCBURNER", "IfcBurner"),
+    (b"IFCCHILLER", "IfcChiller"),
+    (b"IFCCOMPRESSOR", "IfcCompressor"),
+    (b"IFCCONDENSER", "IfcCondenser"),
+    (b"IFCCOOLINGTOWER", "IfcCoolingTower"),
+    (b"IFCEVAPORATOR", "IfcEvaporator"),
+    (b"IFCFAN", "IfcFan"),
+    (b"IFCHEATEXCHANGER", "IfcHeatExchanger"),
+    (b"IFCHUMIDIFIER", "IfcHumidifier"),
+    (b"IFCMOTORCONNECTION", "IfcMotorConnection"),
+    (b"IFCPUMP", "IfcPump"),
+    (b"IFCTANK", "IfcTank"),
+    (b"IFCUNITARYEQUIPMENT", "IfcUnitaryEquipment"),
+    (b"IFCSENSOR", "IfcSensor"),
+    (b"IFCACTUATOR", "IfcActuator"),
+    (b"IFCCONTROLLER", "IfcController"),
+    (b"IFCALARM", "IfcAlarm"),
+    (b"IFCFLOWMETER", "IfcFlowMeter"),
+    (b"IFCPROTECTIVEDEVICE", "IfcProtectiveDevice"),
+    (
+        b"IFCPROTECTIVEDEVICETRIPPINGUNIT",
+        "IfcProtectiveDeviceTrippingUnit",
+    ),
+    (b"IFCJUNCTIONBOX", "IfcJunctionBox"),
+    (b"IFCCOMMUNICATIONSAPPLIANCE", "IfcCommunicationsAppliance"),
+    (b"IFCAUDIOVISUALAPPLIANCE", "IfcAudioVisualAppliance"),
+    (b"IFCFIRESUPPRESSIONTERMINAL", "IfcFireSuppressionTerminal"),
+    (b"IFCMEDICALDEVICE", "IfcMedicalDevice"),
+    (
+        b"IFCMOBILETELECOMMUNICATIONSAPPLIANCE",
+        "IfcMobileTelecommunicationsAppliance",
+    ),
+    (b"IFCSOLARDEVICE", "IfcSolarDevice"),
+    (b"IFCSTACKTERMINAL", "IfcStackTerminal"),
+    (b"IFCSPACEHEATER", "IfcSpaceHeater"),
+    (b"IFCWASTETERMINAL", "IfcWasteTerminal"),
+    (b"IFCUNITARYCONTROLELEMENT", "IfcUnitaryControlElement"),
+    (b"IFCBUILDINGSYSTEM", "IfcBuildingSystem"),
+    (b"IFCLAMP", "IfcLamp"),
+    (b"IFCCOIL", "IfcCoil"),
+    (b"IFCGRID", "IfcGrid"),
+    (b"IFCGRIDAXIS", "IfcGridAxis"),
+    // Furnishings
+    (b"IFCFURNISHINGELEMENT", "IfcFurnishingElement"),
+    (b"IFCFURNITURE", "IfcFurniture"),
+    (b"IFCSYSTEMFURNITUREELEMENT", "IfcSystemFurnitureElement"),
+    // Civil
+    (b"IFCEARTHWORKSCUT", "IfcEarthworksCut"),
+    (b"IFCEARTHWORKSFILL", "IfcEarthworksFill"),
+    (b"IFCEARTHWORKSELEMENT", "IfcEarthworksElement"),
+    (b"IFCKERB", "IfcKerb"),
+    (b"IFCPAVEMENT", "IfcPavement"),
+    (b"IFCRAIL", "IfcRail"),
+    (b"IFCROAD", "IfcRoad"),
+    (b"IFCBRIDGE", "IfcBridge"),
+    (b"IFCBRIDGEPART", "IfcBridgePart"),
+    (b"IFCMARINEFACILITY", "IfcMarineFacility"),
+    (b"IFCMARINEPART", "IfcMarinePart"),
+    (b"IFCBUILDINGSTOREY", "IfcBuildingStorey"),
+    (b"IFCSITE", "IfcSite"),
+    (b"IFCBUILDING", "IfcBuilding"),
+    (b"IFCPROJECT", "IfcProject"),
+    (b"IFCAPPLICATION", "IfcApplication"),
+    (
+        b"IFCRELCONTAINEDINSPATIALSTRUCTURE",
+        "IfcRelContainedInSpatialStructure",
+    ),
+    (b"IFCRELAGGREGATES", "IfcRelAggregates"),
 ];
 
 /// Lazy lookup table from STEP uppercase bytes to ifcopenshell title-case.
@@ -1422,6 +1764,198 @@ END-ISO-10303-21;
             out.unit_scale.is_none(),
             "broken conversion factor must NOT resolve to a scale, got {:?}",
             out.unit_scale
+        );
+    }
+}
+
+#[cfg(test)]
+mod parse_core_fix_tests {
+    use super::{index, si_length_scale_checked, SiScaleError};
+
+    const HDR4: &str = "ISO-10303-21;\nHEADER;\nFILE_DESCRIPTION((''),'2;1');\n\
+FILE_NAME('t.ifc','2026-09-06T00:00:00',(''),(''),'ifcfast','ifcfast','');\n\
+FILE_SCHEMA(('IFC4'));\nENDSEC;\n";
+    const HDR2X3: &str = "ISO-10303-21;\nHEADER;\nFILE_DESCRIPTION((''),'2;1');\n\
+FILE_NAME('t.ifc','2026-09-06T00:00:00',(''),(''),'ifcfast','ifcfast','');\n\
+FILE_SCHEMA(('IFC2X3'));\nENDSEC;\n";
+
+    // ---- GH #149: unit scale ------------------------------------------
+
+    /// An unrecognised IfcSIPrefix must NOT collapse to the base unit.
+    /// `.KILLO.` (typo for KILO) previously resolved to 1.0 m/unit — a
+    /// plausible-looking number that is wrong by 1000×.
+    #[test]
+    fn unknown_si_prefix_is_an_error_not_the_base_unit() {
+        assert_eq!(
+            si_length_scale_checked("KILLO", "METRE"),
+            Err(SiScaleError::UnknownPrefix)
+        );
+        assert_eq!(
+            si_length_scale_checked("", "RADIAN"),
+            Err(SiScaleError::NotLength)
+        );
+        assert_eq!(si_length_scale_checked("MILLI", "METRE"), Ok(1e-3));
+    }
+
+    #[test]
+    fn unknown_prefix_leaves_unit_scale_unset_and_warns() {
+        let src = format!(
+            "{HDR4}DATA;\n\
+             #1=IFCPROJECT('0Test000000000000000001',$,'p',$,$,$,$,$,#2);\n\
+             #2=IFCUNITASSIGNMENT((#3));\n\
+             #3=IFCSIUNIT(*,.LENGTHUNIT.,.KILLO.,.METRE.);\n\
+             ENDSEC;\nEND-ISO-10303-21;\n"
+        );
+        let out = index(src.as_bytes());
+        assert!(
+            out.unit_scale.is_none(),
+            "unknown prefix must not resolve, got {:?}",
+            out.unit_scale
+        );
+        assert!(
+            out.warnings.iter().any(|w| w.contains("IfcSIPrefix")),
+            "an unknown SI prefix must surface a warning, got {:?}",
+            out.warnings
+        );
+    }
+
+    #[test]
+    fn missing_unit_assignment_warns() {
+        let src = format!(
+            "{HDR4}DATA;\n#1=IFCWALL('0Wall00000000000000001',$,'w',$,$,$,$,'T1');\n\
+             ENDSEC;\nEND-ISO-10303-21;\n"
+        );
+        let out = index(src.as_bytes());
+        assert!(out.unit_scale.is_none());
+        assert!(
+            out.warnings.iter().any(|w| w.contains("IfcUnitAssignment")),
+            "an undeclared length unit must warn, got {:?}",
+            out.warnings
+        );
+    }
+
+    // ---- GH #148: truncation ------------------------------------------
+
+    /// A doubled `;;` mid-DATA used to drop every later record with no
+    /// signal. The index must now carry a parse_error naming the offset.
+    #[test]
+    fn doubled_semicolon_sets_parse_error() {
+        let src = format!(
+            "{HDR4}DATA;\n\
+             #1=IFCWALL('0Wall00000000000000001',$,'w1',$,$,$,$,'T1');\n\
+             #2=IFCSLAB('0Slab00000000000000001',$,'s1',$,$,$,$,'T2');;\n\
+             #3=IFCBEAM('0Beam00000000000000001',$,'b1',$,$,$,$,'T3');\n\
+             ENDSEC;\nEND-ISO-10303-21;\n"
+        );
+        let out = index(src.as_bytes());
+        assert_eq!(
+            out.product_guid.len(),
+            2,
+            "records before the stray byte still parse"
+        );
+        let err = out
+            .parse_error
+            .expect("a truncated record stream must set parse_error");
+        assert!(err.contains("truncated"), "got {err:?}");
+    }
+
+    #[test]
+    fn clean_file_has_no_parse_error() {
+        let src = format!(
+            "{HDR4}DATA;\n\
+             #1=IFCWALL('0Wall00000000000000001',$,'w1',$,$,$,$,'T1');\n\
+             ENDSEC;\nEND-ISO-10303-21;\n"
+        );
+        let out = index(src.as_bytes());
+        assert!(out.parse_error.is_none(), "got {:?}", out.parse_error);
+        assert_eq!(out.product_guid.len(), 1);
+    }
+
+    // ---- GH #159: header probe ----------------------------------------
+
+    /// FILE_SCHEMA past the old 64 KB probe cap (long FILE_DESCRIPTION)
+    /// must still be found — otherwise an IFC2X3 file is parsed with
+    /// IFC4 semantics and nothing says so.
+    #[test]
+    fn file_schema_found_beyond_64k_of_header() {
+        let filler = "x".repeat(70_000);
+        let src = format!(
+            "ISO-10303-21;\nHEADER;\nFILE_DESCRIPTION(('{filler}'),'2;1');\n\
+             FILE_SCHEMA(('IFC2X3'));\nENDSEC;\nDATA;\n\
+             #1=IFCWALL('0Wall00000000000000001',$,'w1',$,$,$,$,'T1');\n\
+             ENDSEC;\nEND-ISO-10303-21;\n"
+        );
+        let out = index(src.as_bytes());
+        assert_eq!(out.schema, "IFC2X3");
+    }
+
+    /// A `FILE_SCHEMA` mention inside a quoted HEADER value must not be
+    /// mistaken for the real keyword.
+    #[test]
+    fn file_schema_inside_a_string_is_not_matched() {
+        let src = "ISO-10303-21;\nHEADER;\n\
+             FILE_DESCRIPTION(('no FILE_SCHEMA(( here'),'2;1');\n\
+             FILE_SCHEMA(('IFC2X3'));\nENDSEC;\nDATA;\nENDSEC;\nEND-ISO-10303-21;\n";
+        let out = index(src.as_bytes());
+        assert_eq!(out.schema, "IFC2X3");
+    }
+
+    // ---- GH #159: spatial elements ------------------------------------
+
+    /// IfcSpace arg[7] is LongName, not Tag. Reading it as Tag put room
+    /// names in the `tag` column of every 2x3 and IFC4 model.
+    #[test]
+    fn space_longname_is_not_read_as_tag() {
+        let src = format!(
+            "{HDR4}DATA;\n\
+             #1=IFCSPACE('0Space0000000000000001',$,'3.04',$,$,$,$,'Kontor 3.04',\
+             .ELEMENT.,.INTERNAL.,$);\n\
+             ENDSEC;\nEND-ISO-10303-21;\n"
+        );
+        let out = index(src.as_bytes());
+        let i = out
+            .product_entity
+            .iter()
+            .position(|e| e == "IfcSpace")
+            .expect("space must be indexed as a product");
+        assert_eq!(
+            out.product_tag[i], None,
+            "IfcSpace has no Tag attribute; LongName must not leak into it"
+        );
+        assert_eq!(out.product_name[i].as_deref(), Some("3.04"));
+    }
+
+    /// IFC2X3 IfcSpace has no PredefinedType — its trailing enum slot is
+    /// InteriorOrExteriorSpace. IFC4's is PredefinedType and must keep
+    /// working.
+    #[test]
+    fn ifc2x3_space_predefined_type_suppressed_ifc4_kept() {
+        let space = "#1=IFCSPACE('0Space0000000000000001',$,'3.04',$,$,$,$,'Kontor',\
+                     .ELEMENT.,.INTERNAL.,$);\n";
+        let out2x3 =
+            index(format!("{HDR2X3}DATA;\n{space}ENDSEC;\nEND-ISO-10303-21;\n").as_bytes());
+        assert_eq!(
+            out2x3.product_predefined_type[0], None,
+            "IFC2X3 IfcSpace.InteriorOrExteriorSpace must not surface as predefined_type"
+        );
+        let out4 = index(format!("{HDR4}DATA;\n{space}ENDSEC;\nEND-ISO-10303-21;\n").as_bytes());
+        assert_eq!(
+            out4.product_predefined_type[0].as_deref(),
+            Some("INTERNAL"),
+            "IFC4 IfcSpace's trailing enum IS PredefinedType"
+        );
+    }
+
+    /// IFC2X3 IfcRoof's trailing enum is ShapeType, not PredefinedType.
+    #[test]
+    fn ifc2x3_roof_shape_type_suppressed() {
+        let roof = "#1=IFCROOF('0Roof00000000000000001',$,'r',$,$,$,$,'T1',.GABLE_ROOF.);\n";
+        let out2x3 = index(format!("{HDR2X3}DATA;\n{roof}ENDSEC;\nEND-ISO-10303-21;\n").as_bytes());
+        assert_eq!(out2x3.product_predefined_type[0], None);
+        let out4 = index(format!("{HDR4}DATA;\n{roof}ENDSEC;\nEND-ISO-10303-21;\n").as_bytes());
+        assert_eq!(
+            out4.product_predefined_type[0].as_deref(),
+            Some("GABLE_ROOF")
         );
     }
 }
