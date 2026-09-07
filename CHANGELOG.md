@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-09-07
+
+Lighter, exact circles; glTF materials you can pick by; and the mesher
+tells you what it could not tessellate. Cache schema 30 → 31: every
+circular product re-extracts.
+
 ### Changed — adaptive circle tessellation (GH #170, cache schema 30 → 31)
 
 - Circles, ellipses and arcs (profile defs, `IfcCircle` / `IfcEllipse`
@@ -1680,6 +1686,7 @@ for the trail and rename table.
   IFCs from Skiplum projects (issue #1).
 - Warm-cache speedup vs `ifcopenshell.open()`: 59-678× on production files.
 
+[0.5.1]: https://github.com/EdvardGK/ifcfast/releases/tag/v0.5.1
 [0.5.0]: https://github.com/EdvardGK/ifcfast/releases/tag/v0.5.0
 [0.4.0]: https://github.com/EdvardGK/ifcfast/releases/tag/v0.4.0
 [0.3.0]: https://github.com/EdvardGK/ifcfast/releases/tag/v0.3.0
