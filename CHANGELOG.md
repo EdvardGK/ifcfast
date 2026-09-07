@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — ifcfast in the browser (GH #172)
+
+- **`crates/wasm` (`ifcfast-wasm`)**: the pure-Rust core compiled to
+  `wasm32-unknown-unknown` behind a `wasm-bindgen` class `IfcModel` —
+  `fromBytes(bytes, name)` (STEP or `.ifczip`, magic-byte dispatch),
+  `summaryJson()` / `graphJson()` / `qtoJson()` / `typesJson()` (the
+  exact shapes `scripts/generate_sample_sidecars.py` writes — verified
+  key-for-key against the shipped Duplex sample by
+  `crates/wasm/test/parity.mjs`), `toGlb(perProductMaterials, instancing)`
+  (same writer as `m.to_gltf()`), `bySourceJson()`, `statsJson()`.
+  Duplex (2.4 MB) parses, extracts and meshes in ~220 ms in Node; the
+  `.wasm` is 1.07 MB. No cut openings in v1 (manifold-csg is C++).
+  Build: `crates/wasm/build.sh` (rustup + `wasm-bindgen --target web`).
+- Core portability behind it, zero change for native builds: a
+  `clock::Instant` shim (`web-time` on wasm), `memmap2` behind a
+  default-on `mmap` feature with `source::open_bytes` for in-memory
+  input, and the mesh pass taking its serial path on wasm without
+  touching rayon.
+
 ## [0.5.1] - 2026-09-07
 
 Lighter, exact circles; glTF materials you can pick by; and the mesher

@@ -22,18 +22,27 @@
 //! Both variants converge on [`IfcSource::as_bytes`], so downstream
 //! callers see a single `&[u8]` regardless of the on-disk form.
 
+#[cfg(feature = "mmap")]
 use std::fs::File;
 use std::io::{self, Read};
 use std::ops::Deref;
+#[cfg(feature = "mmap")]
 use std::path::Path;
 
+#[cfg(feature = "mmap")]
 use memmap2::Mmap;
 
 /// Loaded IFC bytes — either a zero-copy mmap of a plain STEP file or
 /// an owned in-memory buffer holding the decompressed contents of an
 /// `.ifczip` archive.
+///
+/// The `Mmap` variant lives behind the default-on `mmap` Cargo feature
+/// (GH #172): `memmap2` has no `wasm32-unknown-unknown` implementation,
+/// and the browser build only ever has bytes in hand anyway — it loads
+/// through [`open_bytes`] into `Owned`.
 pub enum IfcSource {
     /// Plain `.ifc` / `.step` — mmap'd, zero-copy.
+    #[cfg(feature = "mmap")]
     Mmap(Mmap),
     /// Decompressed `.ifczip` payload — owned buffer.
     Owned(Vec<u8>),
@@ -44,6 +53,7 @@ impl IfcSource {
     /// both variants — callers don't need to care which one they got.
     pub fn as_bytes(&self) -> &[u8] {
         match self {
+            #[cfg(feature = "mmap")]
             IfcSource::Mmap(m) => m,
             IfcSource::Owned(v) => v,
         }
@@ -141,6 +151,7 @@ pub fn looks_like_zip(buf: &[u8]) -> bool {
 /// initial mmap view) to detect the ZIP magic — extension-based dispatch
 /// is unreliable since pipelines rename files and `.ifczip` is just one
 /// of several conventions.
+#[cfg(feature = "mmap")]
 pub fn open(path: &Path) -> io::Result<IfcSource> {
     let mut file = File::open(path)?;
     let mut peek = [0u8; 4];
@@ -164,6 +175,22 @@ pub fn open(path: &Path) -> io::Result<IfcSource> {
         check_step_trailer(&mmap)?;
         Ok(IfcSource::Mmap(mmap))
     }
+}
+
+/// Load an IFC source from bytes already in memory — the same
+/// magic-byte dispatch [`open`] performs, minus the filesystem.
+///
+/// Plain STEP bytes are taken verbatim (after the truncation guard);
+/// a PKZIP payload is decompressed to its largest STEP member. This is
+/// the only entry point available on targets without `mmap` (the
+/// browser build, GH #172), and it is the same code path a native
+/// caller gets for `.ifczip` input, so the two agree by construction.
+pub fn open_bytes(bytes: Vec<u8>) -> io::Result<IfcSource> {
+    if looks_like_zip(&bytes) {
+        return Ok(IfcSource::Owned(decompress_ifczip(&bytes)?));
+    }
+    check_step_trailer(&bytes)?;
+    Ok(IfcSource::Owned(bytes))
 }
 
 /// Decompress an `.ifczip` payload (already in memory) and return the

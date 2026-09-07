@@ -21,12 +21,12 @@ crate-type = ["cdylib", "rlib"]
 [[bin]]
 name = "ifcfast-bench"
 path = "src/bin/bench.rs"
-required-features = []
+required-features = ["mmap"]
 
 [[bin]]
 name = "ifcfast-mesh"
 path = "src/bin/mesh.rs"
-required-features = ["mesh"]
+required-features = ["mesh", "mmap"]
 
 [[bin]]
 name = "ifcfast-bundle"
@@ -39,8 +39,14 @@ path = "src/bin/clash.rs"
 required-features = ["clash"]
 
 [features]
-default = ["python", "bundle", "geom", "clash", "csg"]
+default = ["python", "mmap", "bundle", "geom", "clash", "csg"]
 python = ["dep:pyo3"]
+# Filesystem loading via `memmap2` (`source::open`, `Doc::open_editable`,
+# the `IfcSource::Mmap` variant). Default-on: every native consumer —
+# the wheel, the CLIs, the bins — opens by path. `memmap2` has no
+# `wasm32-unknown-unknown` backend, so the browser build turns this off
+# and loads bytes through `source::open_bytes` instead (GH #172).
+mmap = ["dep:memmap2"]
 mesh = ["dep:earcutr", "dep:glam", "dep:rayon", "dep:dashmap", "dep:crossbeam-channel"]
 # Streaming substrate writer (GeoParquet-of-products). Pulls in arrow
 # + parquet. Now in the default Python wheel since the clash engine
@@ -76,7 +82,7 @@ prism-csg-fast = ["mesh", "dep:i_overlay"]
 [dependencies]
 pyo3 = { version = "0.29", features = ["extension-module", "abi3-py310"], optional = true }
 memchr = "2.7"
-memmap2 = "0.9"
+memmap2 = { version = "0.9", optional = true }
 zip = { version = "2.2", default-features = false, features = ["deflate"] }
 earcutr = { version = "0.4", optional = true }
 glam = { version = "0.29", optional = true }
@@ -102,6 +108,13 @@ manifold-csg = { version = "0.2", optional = true, default-features = false, fea
 # Pre-1.0-style churn across majors — quarantined behind
 # `mesh/polygon_bool.rs` so a bump or swap is a one-file change.
 i_overlay = { version = "7.0", optional = true }
+
+# GH #172 — browser target. `web-time` is a drop-in `std::time` shim
+# backed by `performance.now()`; `std::time::Instant::now()` compiles on
+# `wasm32-unknown-unknown` but panics the moment any timer fires. Only
+# `crate::clock` touches it.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+web-time = "1.1"
 
 [dev-dependencies]
 # Property-based testing for the cut_openings dispatcher. Generates

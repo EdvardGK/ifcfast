@@ -48,10 +48,10 @@ pub mod stats;
 pub mod styles;
 
 use std::collections::HashMap;
-use std::time::Instant;
 
 use glam::{DMat4, DVec3, Mat4, Vec3, Vec4};
 
+use crate::clock::Instant;
 use crate::entity_table::EntityTable;
 use crate::lexer::{parse_field, split_top_level_args, Field};
 use crate::mesh::extrusion::LocalMesh;
@@ -506,6 +506,11 @@ pub fn mesh_ifc_streaming_framed<S: ProductSink>(
     sink: &mut S,
     frame: BakeFrame,
 ) -> MeshStats {
+    // GH #172: `wasm32-unknown-unknown` has no threads. Every parallel
+    // phase below has a plain-iterator twin under `cfg(wasm32)` and the
+    // drain takes the existing T=1 serial path, so rayon is never
+    // linked — let alone called — in the browser build.
+    #[cfg(not(target_arch = "wasm32"))]
     use rayon::prelude::*;
 
     let mut stats = MeshStats::default();
@@ -561,10 +566,8 @@ pub fn mesh_ifc_streaming_framed<S: ProductSink>(
         placement_id: Option<u64>,
     }
 
-    let partial: Vec<PartialWork> = table
-        .order()
-        .par_iter()
-        .filter_map(|&step_id| {
+    let build_partial = |&step_id: &u64| -> Option<PartialWork> {
+        {
             let (type_name, args) = table.get(step_id)?;
             if !is_product_type(type_name) {
                 return None;
@@ -587,8 +590,12 @@ pub fn mesh_ifc_streaming_framed<S: ProductSink>(
                 repr_id_opt,
                 placement_id,
             })
-        })
-        .collect();
+        }
+    };
+    #[cfg(not(target_arch = "wasm32"))]
+    let partial: Vec<PartialWork> = table.order().par_iter().filter_map(build_partial).collect();
+    #[cfg(target_arch = "wasm32")]
+    let partial: Vec<PartialWork> = table.order().iter().filter_map(build_partial).collect();
     stats.products_seen = partial.len();
 
     // Phase 1b: warm the placement cache against every referenced
@@ -621,9 +628,8 @@ pub fn mesh_ifc_streaming_framed<S: ProductSink>(
 
     // Phase 1c: parallel finalize. Look up placement matrix from the
     // frozen cache, derive origin + placement origin, build Work.
-    let work: Vec<Work> = partial
-        .into_par_iter()
-        .map(|pw| {
+    let finalize_work = |pw: PartialWork| -> Work {
+        {
             let world_f64 = pw
                 .placement_id
                 .and_then(|pid| placement_cache.get(&pid).copied())
@@ -647,8 +653,12 @@ pub fn mesh_ifc_streaming_framed<S: ProductSink>(
                 world_origin,
                 placement_origin,
             }
-        })
-        .collect();
+        }
+    };
+    #[cfg(not(target_arch = "wasm32"))]
+    let work: Vec<Work> = partial.into_par_iter().map(finalize_work).collect();
+    #[cfg(target_arch = "wasm32")]
+    let work: Vec<Work> = partial.into_iter().map(finalize_work).collect();
     // `placement_cache` Arc drops when phase 1c finishes — no longer
     // needed once every Work has its baked world matrix.
     drop(placement_cache);
@@ -680,6 +690,13 @@ pub fn mesh_ifc_streaming_framed<S: ProductSink>(
     // `std::thread::scope` once the spawn joins, propagating up to the
     // PyO3 `catch_panic` wrapper as before.
     let shape_cache: ShapeCache = ShapeCache::new();
+    // GH #172: no threads on wasm. Never call `rayon::current_num_threads`
+    // there — the query itself initialises the global pool, which tries to
+    // spawn. The serial drain below is the same code path native hosts
+    // take at T=1.
+    #[cfg(target_arch = "wasm32")]
+    let num_threads = 1usize;
+    #[cfg(not(target_arch = "wasm32"))]
     let num_threads = rayon::current_num_threads().max(1);
 
     // T=1 fast path. With one rayon worker the channel + thread::scope
@@ -696,72 +713,75 @@ pub fn mesh_ifc_streaming_framed<S: ProductSink>(
         return stats;
     }
 
-    // Cap is large enough that workers rarely block on `tx.send`
-    // even when the drain is mid-heavy-product. Each in-flight
-    // ProductOutcome carries the full per-product mesh, so RAM bound
-    // = cap × max_product_mesh — sized to a few MB peak for typical
-    // AEC files (avg ~3 KB per product mesh on the LBK 41 MB benchmark,
-    // ~10 KB on the 179 MB ARK).
-    let cap = (num_threads * 16).max(64);
-    // crossbeam_channel is lock-free; std mpsc's mutex+condvar
-    // SyncSender measured 13–24% slower than the previous
-    // Vec<ProductOutcome>::collect on real files (32k–34k products
-    // at T=8). Crossbeam recovers the Vec-collect speed while
-    // keeping the bounded RAM contract.
-    let (tx, rx) = crossbeam_channel::bounded::<(usize, ProductOutcome)>(cap);
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        // Cap is large enough that workers rarely block on `tx.send`
+        // even when the drain is mid-heavy-product. Each in-flight
+        // ProductOutcome carries the full per-product mesh, so RAM bound
+        // = cap × max_product_mesh — sized to a few MB peak for typical
+        // AEC files (avg ~3 KB per product mesh on the LBK 41 MB benchmark,
+        // ~10 KB on the 179 MB ARK).
+        let cap = (num_threads * 16).max(64);
+        // crossbeam_channel is lock-free; std mpsc's mutex+condvar
+        // SyncSender measured 13–24% slower than the previous
+        // Vec<ProductOutcome>::collect on real files (32k–34k products
+        // at T=8). Crossbeam recovers the Vec-collect speed while
+        // keeping the bounded RAM contract.
+        let (tx, rx) = crossbeam_channel::bounded::<(usize, ProductOutcome)>(cap);
 
-    std::thread::scope(|s| {
-        let table_ref = &table;
-        let shape_cache_ref = &shape_cache;
-        let style_index_ref = &style_index;
-        s.spawn(move || {
-            // Rayon drives the parallel tessellation. Per-worker `tx`
-            // clones via `for_each_with`; the seed `tx` is consumed
-            // (and dropped at the end of `for_each_with`) so the
-            // channel closes once every worker finishes its chunk.
-            work.into_par_iter()
-                .enumerate()
-                .for_each_with(tx, |tx, (seq, w)| {
-                    let outcome =
-                        tessellate_one(table_ref, shape_cache_ref, style_index_ref, frame, w);
-                    let _ = tx.send((seq, outcome));
-                });
-        });
+        std::thread::scope(|s| {
+            let table_ref = &table;
+            let shape_cache_ref = &shape_cache;
+            let style_index_ref = &style_index;
+            s.spawn(move || {
+                // Rayon drives the parallel tessellation. Per-worker `tx`
+                // clones via `for_each_with`; the seed `tx` is consumed
+                // (and dropped at the end of `for_each_with`) so the
+                // channel closes once every worker finishes its chunk.
+                work.into_par_iter()
+                    .enumerate()
+                    .for_each_with(tx, |tx, (seq, w)| {
+                        let outcome =
+                            tessellate_one(table_ref, shape_cache_ref, style_index_ref, frame, w);
+                        let _ = tx.send((seq, outcome));
+                    });
+            });
 
-        // Main-thread drain. Receives outcomes (possibly out of order
-        // due to rayon's work-stealing), buffers in a HashMap, and
-        // forwards to `sink` in seq order so the existing emission
-        // contract (substrate / OBJ / glTF / cut_openings wrapper)
-        // holds. HashMap (O(1)) rather than BTreeMap (O(log N))
-        // because we only ever look up by `next_seq` — the ordered
-        // iteration BTreeMap gives us is wasted. `&mut sink` and
-        // `&mut stats` are borrowed from the caller's frame — no
-        // Send bound needed on S because the sink never crosses a
-        // thread boundary.
-        let mut next_seq: usize = 0;
-        let mut buffer: HashMap<usize, ProductOutcome> = HashMap::new();
-        while let Ok((seq, outcome)) = rx.recv() {
-            if seq == next_seq {
-                apply_outcome(outcome, sink, &mut stats);
-                next_seq += 1;
-                while let Some(o) = buffer.remove(&next_seq) {
-                    apply_outcome(o, sink, &mut stats);
+            // Main-thread drain. Receives outcomes (possibly out of order
+            // due to rayon's work-stealing), buffers in a HashMap, and
+            // forwards to `sink` in seq order so the existing emission
+            // contract (substrate / OBJ / glTF / cut_openings wrapper)
+            // holds. HashMap (O(1)) rather than BTreeMap (O(log N))
+            // because we only ever look up by `next_seq` — the ordered
+            // iteration BTreeMap gives us is wasted. `&mut sink` and
+            // `&mut stats` are borrowed from the caller's frame — no
+            // Send bound needed on S because the sink never crosses a
+            // thread boundary.
+            let mut next_seq: usize = 0;
+            let mut buffer: HashMap<usize, ProductOutcome> = HashMap::new();
+            while let Ok((seq, outcome)) = rx.recv() {
+                if seq == next_seq {
+                    apply_outcome(outcome, sink, &mut stats);
                     next_seq += 1;
+                    while let Some(o) = buffer.remove(&next_seq) {
+                        apply_outcome(o, sink, &mut stats);
+                        next_seq += 1;
+                    }
+                } else {
+                    buffer.insert(seq, outcome);
                 }
-            } else {
-                buffer.insert(seq, outcome);
             }
-        }
-        // Channel closed. A non-empty buffer here means some workers
-        // never sent (panic); drain in seq order anyway so the sink
-        // sees the surviving outcomes. The panic will re-raise from
-        // `std::thread::scope` once the spawn joins.
-        let mut leftover: Vec<(usize, ProductOutcome)> = buffer.into_iter().collect();
-        leftover.sort_by_key(|(seq, _)| *seq);
-        for (_, outcome) in leftover {
-            apply_outcome(outcome, sink, &mut stats);
-        }
-    });
+            // Channel closed. A non-empty buffer here means some workers
+            // never sent (panic); drain in seq order anyway so the sink
+            // sees the surviving outcomes. The panic will re-raise from
+            // `std::thread::scope` once the spawn joins.
+            let mut leftover: Vec<(usize, ProductOutcome)> = buffer.into_iter().collect();
+            leftover.sort_by_key(|(seq, _)| *seq);
+            for (_, outcome) in leftover {
+                apply_outcome(outcome, sink, &mut stats);
+            }
+        });
+    }
 
     stats.elapsed_ms = t_mesh.elapsed().as_secs_f64() * 1000.0;
     stats

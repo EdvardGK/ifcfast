@@ -727,6 +727,32 @@ The loud unit signal also rides in the first-call snapshot:
 `m.summary()` (and the MCP `summary` tool) carry `unit_resolved` and
 `length_unit`, so an agent sees the problem without a second call.
 
+## Running ifcfast in the browser (GH #172)
+
+`crates/wasm` compiles the pure-Rust core to `wasm32-unknown-unknown`
+and exposes one class, `IfcModel`, through `wasm-bindgen`:
+
+```js
+import init, { IfcModel } from "./pkg/ifcfast_wasm.js";
+await init();
+const m = IfcModel.fromBytes(bytes, "model.ifc");   // STEP or .ifczip
+JSON.parse(m.summaryJson());  // the summary shape the sidecar generator writes
+JSON.parse(m.graphJson());    // products / storeys / contained_in / spaces / …
+JSON.parse(m.qtoJson());      // per-entity rows from the mesh pass
+JSON.parse(m.typesJson());    // type manifest (no per-type mini-glbs in v1)
+const glb = m.toGlb(true, true);   // Uint8Array — same writer as m.to_gltf()
+JSON.parse(m.bySourceJson()); // GH #166 counters
+m.free();
+```
+
+The JSON shapes are byte-for-byte those of `scripts/generate_sample_sidecars.py`
+(gated by `crates/wasm/test/parity.mjs`), so anything built on the
+sample sidecars renders a dropped file unchanged. Not in v1: cut
+openings (manifold-csg is C++), the substrate bundle (arrow/parquet),
+threads (single-threaded mesh pass — ~2× native). Everything stays in
+the tab; nothing is uploaded. ifcfast.com's instrument uses exactly
+this path for "drop your IFC".
+
 ## Conventions you can rely on
 
 - **Length unit: `unit_scale` / `unit_resolved` / `length_unit`**

@@ -55,3 +55,6 @@ node_modules/
 
 # Local sample corpora (Duplex, Clinic) — CC-BY inputs, never committed
 /.local-samples/
+
+# wasm-bindgen output (GH #172) — built by crates/wasm/build.sh
+crates/wasm/pkg/

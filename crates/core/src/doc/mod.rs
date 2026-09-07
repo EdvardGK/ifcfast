@@ -41,6 +41,7 @@ pub use step_fmt::{encode_string, fmt_real, fmt_tuple};
 pub use subset::{subset, SubsetStats};
 
 use std::collections::HashMap;
+#[cfg(feature = "mmap")]
 use std::path::Path;
 
 use crate::lexer::{data_section_start, endsec_position, for_each_record_span};
@@ -68,7 +69,10 @@ pub struct Doc {
 
 impl Doc {
     /// Open an IFC file (transparently decompressing `.ifczip`) into an
-    /// owned, editable document.
+    /// owned, editable document. Filesystem entry point — behind the
+    /// default-on `mmap` feature (GH #172); byte-only targets build the
+    /// same document with [`Doc::from_bytes`].
+    #[cfg(feature = "mmap")]
     pub fn open_editable(path: &Path) -> std::io::Result<Doc> {
         let source = crate::source::open(path)?;
         Ok(Doc::from_bytes(source.as_bytes().to_vec()))
