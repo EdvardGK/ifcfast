@@ -1,7 +1,7 @@
 ## Agent signature
 - **Agent**: `claude-fable-5-1`
 - **Working tree**: `/home/edkjo/workspace/inbox/ifcfast`
-- **Branch**: `main` @ `5a34393` → `0a50489` (1 feature commit; the worklog is amended into it)
+- **Branch**: `main` @ `5a34393` → `66711c4` (feature commit `66711c4`; this worklog fix-up follows)
 - **Session scope**: GH #170 adaptive circle tessellation, GH #146 GUID-named glTF materials, GH #166 `by_source` on the Python surface — gated, bundled for 0.5.1
 - **Touched paths**: crates/core/src/{entity_table.rs, lib.rs, mesh/{profile,indexed_curve,csg_primitive,boolean,curveset,gltf}.rs}, python/ifcfast/{model.py, header.py, data/AGENTS.md}, tests/{test_smoke.py, oracle/class_sweep.py, oracle/pipe_analytic.py}, AGENTS.md, CHANGELOG.md, scratch/g55/baselines/G55_*.json (local)
 - **Parallel sessions observed**: none
