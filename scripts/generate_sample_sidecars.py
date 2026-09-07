@@ -360,6 +360,59 @@ def _build_graph(model, spaces, containers, mesh_stats_by_guid, pset_attrs_by_gu
     }
 
 
+def _split_materials_per_product(glb_path: Path) -> None:
+    """GH #146 stopgap: give every primitive its own material named by the
+    product GUID (``<guid>`` for the first primitive of a node, ``<guid>#N``
+    for the rest), cloned from the colour material the style pipeline
+    assigned. The demo viewer's cross-filter keys on ``material.name``;
+    ``to_gltf`` dedupes materials to ``#rrggbb`` colours, which breaks it.
+    Rewrites the GLB in place; geometry / BIN chunk untouched."""
+    import struct
+
+    raw = glb_path.read_bytes()
+    magic, version, _total = struct.unpack_from("<III", raw, 0)
+    if magic != 0x46546C67 or version != 2:
+        raise ValueError(f"{glb_path}: not a GLB v2 file")
+    json_len, json_type = struct.unpack_from("<II", raw, 12)
+    if json_type != 0x4E4F534A:
+        raise ValueError(f"{glb_path}: first chunk is not JSON")
+    g = json.loads(raw[20 : 20 + json_len])
+    rest = raw[20 + json_len :]  # BIN chunk(s), verbatim
+
+    materials = g.setdefault("materials", [])
+    meshes = g["meshes"]
+    node_count = 0
+    prim_count = 0
+    for node in g.get("nodes", []):
+        guid = (node.get("extras") or {}).get("guid")
+        if guid is None or "mesh" not in node:
+            continue
+        node_count += 1
+        for i, prim in enumerate(meshes[node["mesh"]]["primitives"]):
+            src = materials[prim["material"]] if "material" in prim else {}
+            clone = json.loads(json.dumps(src))
+            clone["name"] = guid if i == 0 else f"{guid}#{i}"
+            prim["material"] = len(materials)
+            materials.append(clone)
+            prim_count += 1
+    # the original colour materials are now unreferenced; drop them and
+    # renumber so the file carries exactly one material per primitive
+    referenced = sorted({p["material"] for m in meshes for p in m["primitives"] if "material" in p})
+    remap = {old: new for new, old in enumerate(referenced)}
+    g["materials"] = [materials[i] for i in referenced]
+    for m in meshes:
+        for p_ in m["primitives"]:
+            if "material" in p_:
+                p_["material"] = remap[p_["material"]]
+
+    body = json.dumps(g, separators=(",", ":")).encode("utf-8")
+    body += b" " * (-len(body) % 4)
+    out = struct.pack("<III", 0x46546C67, 2, 12 + 8 + len(body) + len(rest))
+    out += struct.pack("<II", len(body), 0x4E4F534A) + body + rest
+    glb_path.write_bytes(out)
+    print(f"split materials per product: {node_count} nodes, {prim_count} primitives -> {len(g['materials'])} materials")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ifc", required=True, type=Path)
