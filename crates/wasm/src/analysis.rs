@@ -27,10 +27,17 @@ use ifcfast_core::entity_table::EntityTable;
 use ifcfast_core::extractors::{classifications, materials, psets, quantities};
 use ifcfast_core::indexer::{self, IndexedFile};
 use ifcfast_core::lexer::{parse_field, split_top_level_args, Field};
+use ifcfast_core::mesh::gltf::resolve_product_color;
 use ifcfast_core::mesh::stats::ProductStats;
-use ifcfast_core::mesh::{self, ProductMesh};
+use ifcfast_core::mesh::{self, ProductMesh, ProductSink};
+use ifcfast_core::source::IfcSource;
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
+
+/// Per-product pset-derived attributes: (fire rating, load bearing, external) — see the sidecar generator.
+pub type PsetAttrs = HashMap<String, (Option<Value>, Option<Value>, Option<Value>)>;
+/// Per-product material rollup: (thickness, layers, area) as the sidecar generator computes it.
+pub type Rollup = HashMap<String, (Option<f64>, Option<f64>, Option<f64>)>;
 
 /// Mirrors `python/ifcfast/header.py::_CACHE_SCHEMA_VERSION`. Bump in
 /// lockstep — it is hashed into `cache_key`, so a mismatch shows up as a
@@ -119,6 +126,7 @@ pub struct DriftRow {
     pub triangle_count: u32,
 }
 
+#[derive(Default)]
 pub struct MeshCounters {
     pub products_seen: usize,
     pub products_meshed: usize,
@@ -129,11 +137,34 @@ pub struct MeshCounters {
     pub by_source: Vec<(String, usize)>,
 }
 
-/// Everything the four JSON surfaces are derived from. Built once by
-/// [`Analysis::run`]; the meshes are kept (already scaled to metres and
-/// with the synthetic half-space cutters stripped) so `toGlb` never runs
-/// a second tessellation pass.
+/// Which mesh pass, if any, has run against this model.
+///
+/// v2 (GH #172) splits [`Analysis::run`] — parse + index + extractors —
+/// from the tessellation, so the browser can paint identity and the type
+/// roster while the geometry is still being produced. Everything that
+/// needs geometry pulls one of the two passes in on demand.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MeshState {
+    /// No tessellation yet. `drift` / `counters` / `meshes` are empty.
+    Pending,
+    /// [`Analysis::stream_mesh`] ran: per-product stats are complete,
+    /// but the `ProductMesh`es were released batch by batch and are NOT
+    /// retained (that is the whole point — bounded RAM on a 200 MB file).
+    Streamed,
+    /// [`Analysis::batch_mesh`] ran: stats complete AND `meshes` retained
+    /// for the glTF writer. This is the v1 behaviour.
+    Batched,
+}
+
+/// Everything the four JSON surfaces are derived from. Identity and the
+/// tier-1 join are built by [`Analysis::run`]; the geometry-derived
+/// fields (`drift`, `counters`, `segment_rows`, `meshes`) are filled by
+/// whichever mesh pass runs first — see [`MeshState`].
 pub struct Analysis {
+    /// The decompressed STEP bytes, retained so a mesh pass can run
+    /// after `run` returned. `.ifczip` input is already inflated here,
+    /// so the mesh pass never re-decompresses.
+    pub source: IfcSource,
     pub name: String,
     pub size_bytes: usize,
     pub header_schema: Option<String>,
@@ -176,14 +207,59 @@ pub struct Analysis {
     pub materials_by_guid: HashMap<String, Vec<String>>,
     pub layer_set_by_guid: HashMap<String, String>,
     /// guid → (IsExternal, LoadBearing, FireRating) as JSON values
-    pub pset_attrs: HashMap<String, (Option<Value>, Option<Value>, Option<Value>)>,
+    pub pset_attrs: PsetAttrs,
 
     pub drift: Vec<DriftRow>,
     pub drift_by_guid: HashMap<String, usize>,
 
     pub counters: MeshCounters,
     /// Metre-scaled, cutter-stripped product meshes, in emission order.
+    /// Only populated by [`Analysis::batch_mesh`]; the streaming pass
+    /// deliberately drops each mesh after emitting it.
     pub meshes: Vec<ProductMesh>,
+
+    /// IFC length-unit → metres factor, hoisted out of the geometry
+    /// block so a later mesh pass uses the same number `run` did.
+    pub unit_scale_f64: f64,
+    pub mesh_state: MeshState,
+    /// Model-wide global shift in METRES, pinned by the streaming pass
+    /// from the first emitted product's `mesh_anchor` — the same rule
+    /// `_core.extract_meshes` uses for its `global_shift`. Streamed
+    /// positions are world metres MINUS this; add it back for absolute
+    /// coordinates. `[0, 0, 0]` until the stream has started, and for
+    /// every near-origin model.
+    pub stream_shift_m: [f64; 3],
+}
+
+/// What [`Analysis::stream_mesh`] hands each finished batch to:
+/// `(metaJson, positions, indices, progressJson)`. The `ifcfast-wasm`
+/// layer wraps the JS callback in one of these so `analysis` stays free
+/// of `wasm-bindgen` types (and unit-testable off the web target).
+pub type BatchEmit<'e> = &'e mut dyn FnMut(&str, &[f32], &[u32], &str) -> Result<(), String>;
+
+/// Port of `lib.rs::python::global_shift_for` (that one is behind the
+/// `python` feature, so it is not reachable from the wasm build).
+///
+/// Returns the rounded world origin, in MODEL UNITS, only when the model
+/// genuinely sits far from the origin (> 10 km); below that f32 already
+/// resolves the coordinate finely enough and near-origin models keep
+/// absolute coordinates unchanged.
+fn global_shift_for(world_origin: &[f64; 3], unit_scale: f32) -> [f64; 3] {
+    const THRESHOLD_M: f64 = 1.0e4;
+    let us = unit_scale as f64;
+    let max_m = world_origin
+        .iter()
+        .map(|c| (c * us).abs())
+        .fold(0.0_f64, f64::max);
+    if max_m > THRESHOLD_M {
+        [
+            world_origin[0].round(),
+            world_origin[1].round(),
+            world_origin[2].round(),
+        ]
+    } else {
+        [0.0, 0.0, 0.0]
+    }
 }
 
 impl Analysis {
@@ -391,6 +467,10 @@ impl Analysis {
         let quantities_t = quantities::build(&table, &step_to_guid);
         let materials_t = materials::build(&table, &step_to_guid, unit_scale_f64);
         let classifications_t = classifications::build(&table, &step_to_guid);
+        // `EntityTable<'a>` borrows `buf`, which borrows `source`; the
+        // struct below takes `source` by value, so the borrow has to be
+        // over first. Every extractor above returns owned columns.
+        drop(table);
 
         let mut materials_by_guid: HashMap<String, Vec<String>> = HashMap::new();
         let mut layer_set_by_guid: HashMap<String, String> = HashMap::new();
@@ -408,17 +488,14 @@ impl Analysis {
                         bucket.push(mname);
                     }
                 }
-                "set" => {
-                    if !mname.is_empty() {
-                        layer_set_by_guid.insert(guid.clone(), mname);
-                    }
+                "set" if !mname.is_empty() => {
+                    layer_set_by_guid.insert(guid.clone(), mname);
                 }
                 _ => {}
             }
         }
 
-        let mut pset_attrs: HashMap<String, (Option<Value>, Option<Value>, Option<Value>)> =
-            HashMap::new();
+        let mut pset_attrs: PsetAttrs = HashMap::new();
         for i in 0..psets_t.guid.len() {
             let slot = match psets_t.prop_name[i].as_str() {
                 "IsExternal" => 0,
@@ -455,60 +532,18 @@ impl Analysis {
         }
 
         // ----- geometry ----------------------------------------------
-        // Same call `_core.analyse_drift` makes: a World-frame streaming
-        // pass collected into a Vec, then the synthetic half-space
-        // stand-in slabs stripped before any measure is taken (GH #66).
-        let (mut meshes, mesh_stats) = mesh::mesh_ifc(buf);
-        for m in &mut meshes {
-            mesh::strip_synthetic_cutters(m);
-        }
-        let unit_scale = unit_scale_f64 as f32;
-        // `analyse_drift` does the unit rescale in f32 and Python widens
-        // the result; keeping the arithmetic in f32 here means the
-        // 10-decimal rounding lands on the same value.
-        let us_len = unit_scale;
-        let us_area = unit_scale * unit_scale;
-        let us_vol = unit_scale * unit_scale * unit_scale;
-        let mut drift: Vec<DriftRow> = Vec::with_capacity(meshes.len());
-        let mut segment_rows = 0usize;
-        for m in &meshes {
-            let s = ProductStats::from_mesh(m, unit_scale);
-            segment_rows += m.segments.len();
-            drift.push(DriftRow {
-                guid: s.guid.clone(),
-                surface_area_m2: round10_opt(s.surface_area * us_area),
-                volume_abs_m3: round10_opt(s.volume.abs() * us_vol),
-                max_extent_m: round10_opt(s.max_extent * us_len),
-                triangle_count: s.triangle_count,
-            });
-        }
-        let mut drift_by_guid: HashMap<String, usize> = HashMap::new();
-        for (i, d) in drift.iter().enumerate() {
-            drift_by_guid.insert(d.guid.clone(), i);
-        }
-
-        // Scale the retained meshes into metres — exactly what
-        // `write_gltf`'s sink does before handing them to the writer.
-        let us = unit_scale as f64;
-        for m in &mut meshes {
-            for v in m.vertices.iter_mut() {
-                *v = (*v as f64 * us) as f32;
-            }
-        }
-
-        let mut by_source: Vec<(String, usize)> = mesh_stats
-            .by_source
-            .iter()
-            .map(|(k, v)| (k.clone(), *v))
-            .collect();
-        by_source.sort_by(|a, b| a.0.cmp(&b.0));
-
+        // NOT run here (GH #172 v2). `fromBytes` is parse + index +
+        // extractors only; the tessellation is pulled in on demand by
+        // `batch_mesh` (v1 behaviour, retains meshes for glTF) or driven
+        // incrementally by `stream_mesh`. Both fill exactly the fields
+        // left empty below, with identical numbers.
         let spaces = sorted_pairs(&idx.space_step_id_to_guid);
         let buildings = sorted_pairs(&idx.building_step_id_to_guid);
         let sites = sorted_pairs(&idx.site_step_id_to_guid);
         let projects = sorted_pairs(&idx.project_step_id_to_guid);
 
         Ok(Analysis {
+            source,
             name: name.to_string(),
             size_bytes,
             header_schema,
@@ -532,24 +567,325 @@ impl Analysis {
             quantity_rows: quantities_t.guid.len(),
             material_rows: materials_t.guid.len(),
             classification_rows: classifications_t.guid.len(),
-            segment_rows,
+            segment_rows: 0,
             materials_by_guid,
             layer_set_by_guid,
             pset_attrs,
-            drift,
-            drift_by_guid,
-            counters: MeshCounters {
-                products_seen: mesh_stats.products_seen,
-                products_meshed: mesh_stats.products_meshed,
-                products_deferred: mesh_stats.products_deferred,
-                triangles: mesh_stats.triangles,
-                mesh_ms: mesh_stats.elapsed_ms,
-                entity_table_ms: mesh_stats.entity_table_build_ms,
-                by_source,
-            },
-            meshes,
+            drift: Vec::new(),
+            drift_by_guid: HashMap::new(),
+            counters: MeshCounters::default(),
+            meshes: Vec::new(),
+            unit_scale_f64,
+            mesh_state: MeshState::Pending,
+            stream_shift_m: [0.0, 0.0, 0.0],
             idx,
         })
+    }
+
+    // -----------------------------------------------------------------
+    // Mesh passes
+    // -----------------------------------------------------------------
+
+    /// Make the geometry-derived numbers available, cheapest way first:
+    /// if a stream already produced them, keep them; otherwise run the
+    /// batch pass. Called by `graphJson` / `qtoJson` / `bySourceJson` /
+    /// `statsJson`.
+    pub fn ensure_stats(&mut self) {
+        if self.mesh_state == MeshState::Pending {
+            self.batch_mesh();
+        }
+    }
+
+    /// Make the retained `ProductMesh`es available for the glTF writer.
+    /// A streamed model dropped them, so this re-runs the batch pass —
+    /// the numbers are identical (same entry point, same order), only
+    /// the meshes are new. A viewer that streams never calls `toGlb`.
+    pub fn ensure_meshes(&mut self) {
+        if self.mesh_state != MeshState::Batched {
+            self.batch_mesh();
+        }
+    }
+
+    /// v1's pass, verbatim: the same call `_core.analyse_drift` makes —
+    /// a World-frame streaming pass collected into a `Vec`, then the
+    /// synthetic half-space stand-in slabs stripped before any measure is
+    /// taken (GH #66) — plus the metre rescale `write_gltf`'s sink does.
+    pub fn batch_mesh(&mut self) {
+        let unit_scale = self.unit_scale_f64 as f32;
+        let (meshes, drift, segment_rows, counters) = {
+            let buf = self.source.as_bytes();
+            let (mut meshes, mesh_stats) = mesh::mesh_ifc(buf);
+            for m in &mut meshes {
+                mesh::strip_synthetic_cutters(m);
+            }
+            let mut drift: Vec<DriftRow> = Vec::with_capacity(meshes.len());
+            let mut segment_rows = 0usize;
+            for m in &meshes {
+                segment_rows += m.segments.len();
+                drift.push(drift_row(m, unit_scale));
+            }
+
+            // Scale the retained meshes into metres — exactly what
+            // `write_gltf`'s sink does before handing them to the writer.
+            let us = unit_scale as f64;
+            for m in &mut meshes {
+                for v in m.vertices.iter_mut() {
+                    *v = (*v as f64 * us) as f32;
+                }
+            }
+            (meshes, drift, segment_rows, counters_from(&mesh_stats))
+        };
+
+        self.meshes = meshes;
+        self.set_geometry(drift, segment_rows, counters);
+        self.mesh_state = MeshState::Batched;
+    }
+
+    /// Streaming pass (GH #172 v2). Drives the core's sink ONCE and hands
+    /// `emit` a batch every `products_per_batch` emitted products, plus a
+    /// final partial batch.
+    ///
+    /// The per-product stats are computed from the same World-frame,
+    /// cutter-stripped mesh [`Analysis::batch_mesh`] measures, in the same
+    /// emission order, so `qto_json` / `graph_json` after a stream are
+    /// byte-identical to the batch path's.
+    ///
+    /// Positions are world METRES minus [`Analysis::stream_shift_m`];
+    /// indices are batch-local (already offset by the product's `v0`).
+    pub fn stream_mesh(
+        &mut self,
+        products_per_batch: usize,
+        emit: BatchEmit<'_>,
+    ) -> Result<(), String> {
+        let unit_scale = self.unit_scale_f64 as f32;
+        // Owned before the `source` borrow opens — the sink cannot hold a
+        // reference into `self` while `self.source` is borrowed.
+        let meta_of: HashMap<String, (Value, Value)> = self
+            .products
+            .iter()
+            .map(|p| {
+                let type_name = if truthy(&p.type_name) {
+                    &p.type_name
+                } else {
+                    &p.object_type
+                };
+                (p.guid.clone(), (jstr(&p.storey_guid), jstr(type_name)))
+            })
+            .collect();
+        let total = self.products.len();
+
+        let (drift, segment_rows, counters, shift, err) = {
+            let buf = self.source.as_bytes();
+            let mut sink = StreamSink {
+                unit_scale,
+                us: unit_scale as f64,
+                per_batch: products_per_batch.max(1),
+                total,
+                meta_of,
+                shift: None,
+                meta: Vec::new(),
+                positions: Vec::new(),
+                indices: Vec::new(),
+                in_batch: 0,
+                drift: Vec::new(),
+                segment_rows: 0,
+                seen: 0,
+                meshed: 0,
+                emit,
+                err: None,
+            };
+            let mesh_stats = mesh::mesh_ifc_streaming(buf, &mut sink);
+            sink.flush();
+            (
+                sink.drift,
+                sink.segment_rows,
+                counters_from(&mesh_stats),
+                sink.shift.unwrap_or([0.0, 0.0, 0.0]),
+                sink.err,
+            )
+        };
+
+        let us = self.unit_scale_f64;
+        self.stream_shift_m = [shift[0] * us, shift[1] * us, shift[2] * us];
+        // The stats are complete even if the JS callback threw partway —
+        // record them before surfacing the error, so a caller that
+        // recovers still gets consistent tables.
+        self.set_geometry(drift, segment_rows, counters);
+        self.meshes = Vec::new();
+        self.mesh_state = MeshState::Streamed;
+        match err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+
+    fn set_geometry(&mut self, drift: Vec<DriftRow>, segment_rows: usize, counters: MeshCounters) {
+        let mut drift_by_guid: HashMap<String, usize> = HashMap::with_capacity(drift.len());
+        for (i, d) in drift.iter().enumerate() {
+            drift_by_guid.insert(d.guid.clone(), i);
+        }
+        self.drift = drift;
+        self.drift_by_guid = drift_by_guid;
+        self.segment_rows = segment_rows;
+        self.counters = counters;
+    }
+}
+
+/// One `drift` row from one cutter-stripped, World-frame product mesh.
+///
+/// `analyse_drift` does the unit rescale in f32 and Python widens the
+/// result; keeping the arithmetic in f32 here means the 10-decimal
+/// rounding lands on the same value.
+fn drift_row(m: &ProductMesh, unit_scale: f32) -> DriftRow {
+    let s = ProductStats::from_mesh(m, unit_scale);
+    let us_len = unit_scale;
+    let us_area = unit_scale * unit_scale;
+    let us_vol = unit_scale * unit_scale * unit_scale;
+    DriftRow {
+        guid: s.guid.clone(),
+        surface_area_m2: round10_opt(s.surface_area * us_area),
+        volume_abs_m3: round10_opt(s.volume.abs() * us_vol),
+        max_extent_m: round10_opt(s.max_extent * us_len),
+        triangle_count: s.triangle_count,
+    }
+}
+
+fn counters_from(mesh_stats: &mesh::MeshStats) -> MeshCounters {
+    let mut by_source: Vec<(String, usize)> = mesh_stats
+        .by_source
+        .iter()
+        .map(|(k, v)| (k.clone(), *v))
+        .collect();
+    by_source.sort_by(|a, b| a.0.cmp(&b.0));
+    MeshCounters {
+        products_seen: mesh_stats.products_seen,
+        products_meshed: mesh_stats.products_meshed,
+        products_deferred: mesh_stats.products_deferred,
+        triangles: mesh_stats.triangles,
+        mesh_ms: mesh_stats.elapsed_ms,
+        entity_table_ms: mesh_stats.entity_table_build_ms,
+        by_source,
+    }
+}
+
+/// The streaming [`ProductSink`]: accumulates products into a batch,
+/// hands the batch to the JS callback, then releases the buffers.
+///
+/// Batch geometry is one merged buffer pair — the whole point on the
+/// viewer side is ~one draw call per batch instead of one per product —
+/// with the per-product spans carried in `meta` so picking and per-
+/// product colour still work.
+struct StreamSink<'e> {
+    unit_scale: f32,
+    us: f64,
+    per_batch: usize,
+    total: usize,
+    /// guid → (storey_guid, type_name) as the graph resolves them.
+    meta_of: HashMap<String, (Value, Value)>,
+    /// Model-wide shift in MODEL UNITS, pinned from the first emitted
+    /// product's `mesh_anchor` (the `extract_meshes` rule).
+    shift: Option<[f64; 3]>,
+
+    meta: Vec<Value>,
+    positions: Vec<f32>,
+    indices: Vec<u32>,
+    in_batch: usize,
+
+    drift: Vec<DriftRow>,
+    segment_rows: usize,
+    seen: usize,
+    meshed: usize,
+
+    emit: BatchEmit<'e>,
+    err: Option<String>,
+}
+
+impl StreamSink<'_> {
+    fn flush(&mut self) {
+        if self.meta.is_empty() {
+            return;
+        }
+        let meta = Value::Array(std::mem::take(&mut self.meta)).to_string();
+        if self.err.is_none() {
+            let progress = json!({
+                "seen": self.seen,
+                "meshed": self.meshed,
+                "total": self.total,
+            })
+            .to_string();
+            if let Err(e) = (self.emit)(&meta, &self.positions, &self.indices, &progress) {
+                self.err = Some(e);
+            }
+        }
+        self.positions.clear();
+        self.indices.clear();
+        self.in_batch = 0;
+    }
+}
+
+impl ProductSink for StreamSink<'_> {
+    fn on_product(&mut self, mut mesh: ProductMesh) {
+        self.seen += 1;
+        // Same order as the batch pass: strip the synthetic half-space
+        // stand-in slabs FIRST, then measure (GH #66).
+        mesh::strip_synthetic_cutters(&mut mesh);
+        self.segment_rows += mesh.segments.len();
+        let row = drift_row(&mesh, self.unit_scale);
+        let (m3, m2, tri) = (row.volume_abs_m3, row.surface_area_m2, row.triangle_count);
+        self.drift.push(row);
+
+        // A product whose only geometry was cutter slabs still gets its
+        // drift row (triangle_count 0) — that is what the batch pass
+        // does, and `products_with_mesh` counts it — but there is
+        // nothing to draw, so it never reaches a batch.
+        if mesh.vertices.is_empty() || mesh.indices.is_empty() {
+            return;
+        }
+        self.meshed += 1;
+
+        let shift = *self
+            .shift
+            .get_or_insert_with(|| global_shift_for(&mesh.mesh_anchor, self.unit_scale));
+
+        let v0 = self.positions.len() / 3;
+        let vn = mesh.vertices.len() / 3;
+        self.positions.reserve(mesh.vertices.len());
+        for c in mesh.vertices.as_chunks::<3>().0 {
+            for k in 0..3 {
+                self.positions
+                    .push(((c[k] as f64 - shift[k]) * self.us) as f32);
+            }
+        }
+        let i0 = self.indices.len();
+        let i_n = mesh.indices.len();
+        let base = v0 as u32;
+        self.indices.extend(mesh.indices.iter().map(|i| i + base));
+
+        let rgba = resolve_product_color(&mesh);
+        let (storey_guid, type_name) = self
+            .meta_of
+            .get(&mesh.guid)
+            .cloned()
+            .unwrap_or((Value::Null, Value::Null));
+        self.meta.push(json!({
+            "guid": mesh.guid,
+            "entity": mesh.entity,
+            "storey_guid": storey_guid,
+            "type_name": type_name,
+            "m3": jnum(m3),
+            "m2": jnum(m2),
+            "tri": tri,
+            "v0": v0,
+            "vn": vn,
+            "i0": i0,
+            "in": i_n,
+            "rgba": [rgba[0], rgba[1], rgba[2], rgba[3]],
+        }));
+
+        self.in_batch += 1;
+        if self.in_batch >= self.per_batch {
+            self.flush();
+        }
     }
 }
 
@@ -820,12 +1156,20 @@ const COLS: &[(&str, &[&str])] = &[
 ];
 
 fn table_meta(name: &str, rows: usize) -> Value {
+    table_meta_loaded(name, rows, true)
+}
+
+/// `loaded` is a lie worth avoiding: the geometry-derived tables
+/// (`drift`, `segments`) are genuinely absent until a mesh pass has run,
+/// and `summaryJson()` is deliberately mesh-free in v2 so the browser can
+/// show identity the moment parsing finishes (GH #172).
+fn table_meta_loaded(name: &str, rows: usize, loaded: bool) -> Value {
     let cols = COLS
         .iter()
         .find(|(n, _)| *n == name)
         .map(|(_, c)| *c)
         .unwrap_or(&[]);
-    json!({ "rows": rows, "columns": cols, "loaded": true })
+    json!({ "rows": rows, "columns": cols, "loaded": loaded })
 }
 
 impl Analysis {
@@ -904,8 +1248,15 @@ impl Analysis {
             "classifications".into(),
             table_meta("classifications", self.classification_rows),
         );
-        tables.insert("drift".into(), table_meta("drift", self.drift.len()));
-        tables.insert("segments".into(), table_meta("segments", self.segment_rows));
+        let meshed = self.mesh_state != MeshState::Pending;
+        tables.insert(
+            "drift".into(),
+            table_meta_loaded("drift", self.drift.len(), meshed),
+        );
+        tables.insert(
+            "segments".into(),
+            table_meta_loaded("segments", self.segment_rows, meshed),
+        );
 
         json!({
             "path": self.name,
@@ -932,7 +1283,7 @@ impl Analysis {
     /// a product that carries no body of its own (IfcRoof, IfcStair,
     /// IfcCurtainWall …). Port keeps the Python traversal order because
     /// float addition is not associative.
-    fn rollup(&self) -> HashMap<String, (Option<f64>, Option<f64>, Option<f64>)> {
+    fn rollup(&self) -> Rollup {
         let mut children_of: HashMap<&str, Vec<&str>> = HashMap::new();
         let mut parents: HashSet<&str> = HashSet::new();
         for (child, parent, _) in &self.aggregates {
@@ -1014,7 +1365,8 @@ impl Analysis {
                     ("none", None, None, None)
                 };
             let attrs = self.pset_attrs.get(&p.guid);
-            let pick = |f: fn(&(Option<Value>, Option<Value>, Option<Value>)) -> &Option<Value>| {
+            type Triple = (Option<Value>, Option<Value>, Option<Value>);
+            let pick = |f: fn(&Triple) -> &Option<Value>| {
                 attrs.and_then(|a| f(a).clone()).unwrap_or(Value::Null)
             };
             let type_name = if truthy(&p.type_name) {

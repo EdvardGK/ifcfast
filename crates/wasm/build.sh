@@ -33,3 +33,17 @@ else
 fi
 
 ls -l "$out"
+
+# Node gates. Both need `.local-samples/Duplex_A_20110907.ifc` (not in the
+# repo); skipped with a note when it is absent so the build still works on
+# a clean checkout. `IFCFAST_WASM_SKIP_TESTS=1` opts out entirely.
+if [[ "${IFCFAST_WASM_SKIP_TESTS:-0}" == "1" ]]; then
+  echo "==> tests skipped (IFCFAST_WASM_SKIP_TESTS=1)"
+elif [[ ! -f "$root/.local-samples/Duplex_A_20110907.ifc" ]]; then
+  echo "==> tests skipped — .local-samples/Duplex_A_20110907.ifc not present"
+else
+  echo "==> node test/parity.mjs"
+  node "$here/test/parity.mjs"
+  echo "==> node test/stream.mjs"
+  node "$here/test/stream.mjs"
+fi

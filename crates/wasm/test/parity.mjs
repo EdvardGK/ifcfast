@@ -120,8 +120,20 @@ const tParse0 = performance.now();
 const m = IfcModel.fromBytes(duplexBytes, 'Duplex_A_20110907.ifc');
 const tParse = performance.now() - tParse0;
 
-const summary = JSON.parse(m.summaryJson());
+// v2 (GH #172): fromBytes is parse + index + extractors only. The first
+// geometry-derived surface pulls in the batch mesh pass — graphJson()
+// here — and every number it produces is v1's, unchanged.
+//
+// summaryJson() is deliberately NOT one of those surfaces: it is what the
+// drop zone shows the instant parsing finishes, so it never meshes, and
+// its `drift` / `segments` tables read `rows: 0, loaded: false` until
+// geometry has run. Hence it is read AFTER graphJson() here; the check
+// itself is unchanged.
+const tMesh0 = performance.now();
 const graph = JSON.parse(m.graphJson());
+const tMesh = performance.now() - tMesh0;
+
+const summary = JSON.parse(m.summaryJson());
 const qto = JSON.parse(m.qtoJson());
 const types = JSON.parse(m.typesJson());
 const stats = JSON.parse(m.statsJson());
@@ -248,7 +260,8 @@ else console.log('INFO  no .ifczip fixture found — magic-byte dispatch not exe
 
 // ---- timings --------------------------------------------------------
 console.log(
-  `\nTIMING duplex: fromBytes (parse+extract+mesh) ${tParse.toFixed(1)} ms ` +
+  `\nTIMING duplex: fromBytes (parse+index+extractors) ${tParse.toFixed(1)} ms, ` +
+  `on-demand batch mesh (first graphJson) ${tMesh.toFixed(1)} ms ` +
   `[engine mesh ${stats.mesh_ms.toFixed(1)} ms, entity table ${stats.entity_table_ms.toFixed(1)} ms], ` +
   `toGlb ${tGlb.toFixed(1)} ms, glb ${glb.length} B`,
 );

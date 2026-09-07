@@ -921,6 +921,7 @@ name = "ifcfast-wasm"
 version = "0.5.1"
 dependencies = [
  "ifcfast-core",
+ "js-sys",
  "serde",
  "serde_json",
  "sha2",

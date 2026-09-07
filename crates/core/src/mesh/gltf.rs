@@ -1317,7 +1317,13 @@ fn push_accessor_vec(s: &mut String, first: &mut bool, bv_idx: u32, count: u32, 
 ///      all).
 /// Closing GH #3 — see `mesh::styles` for the indexer that populates
 /// the per-item and per-product fields.
-fn resolve_product_color(mesh: &ProductMesh) -> [f32; 4] {
+///
+/// Public so non-glTF consumers can paint with the SAME cascade instead
+/// of re-deriving it: `ifcfast-wasm`'s streaming mesh API hands the
+/// browser a per-product `rgba`, and a second implementation of this
+/// priority order would drift from the glTF writer's the first time the
+/// cascade changes (GH #172).
+pub fn resolve_product_color(mesh: &ProductMesh) -> [f32; 4] {
     if let Some(c) = mesh
         .parts
         .iter()

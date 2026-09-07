@@ -85,3 +85,43 @@ System Rust (Arch) has no wasm target; rustup is installed user-locally
 (`~/.cargo/bin`, `--no-modify-path`). Build with
 `PATH=$HOME/.cargo/bin:$PATH cargo build -p ifcfast-wasm --target wasm32-unknown-unknown --release`
 then `wasm-bindgen --target web`. Builds stay serialized on this box.
+
+## v2 — streaming geometry (Ed, 2026-09-07 evening)
+
+Observed on the live site: a 210 MB RIV took 2 minutes and the viewport
+was choppy. Cause: the worker meshes everything, writes ONE baked GLB,
+the main thread re-parses it in model-viewer, and every product is a
+separate draw call. Decision: **stream the geometry** — the instrument
+plays the golden-section interlude until the first batch lands, then the
+model builds up in front of the user, in a three.js viewer we own
+(merged batch geometry, ~200 products per draw call, raycast picking).
+
+### wasm API additions (keep the v1 methods working)
+
+```ts
+class IfcModel {
+  /** v2: parse + index + extractors ONLY (fast). Mesh runs on demand. */
+  static fromBytes(bytes: Uint8Array, name: string): IfcModel;
+  /** Run the mesh pass once, streaming batches through `cb` as they are
+      tessellated (synchronous callback from inside the pass — the worker
+      postMessages from it, which reaches the main thread immediately).
+      World frame, metres, minus the model's global shift (the same shift
+      `m.meshes().global_shift` reports; get it from streamShiftJson()). */
+  streamMeshes(productsPerBatch: number, cb: (metaJson: string, positions: Float32Array, indices: Uint32Array, progressJson: string) => void): void;
+  /** `[sx, sy, sz]` in metres — set once streamMeshes has started. */
+  streamShiftJson(): string;
+  // after streamMeshes has run, graphJson()/qtoJson() carry the mesh stats
+  // (m3/m2/triangles) exactly as v1 computed them.
+}
+```
+
+`metaJson` per batch: `[{guid, entity, storey_guid, type_name, m3, m2, tri, v0, vn, i0, in, rgba:[r,g,b,a]}]`
+where `v0`/`vn` are the product's vertex offset/count inside `positions`
+(xyz triples), `i0`/`in` its index offset/count inside `indices`, and the
+indices are batch-local (already offset by `v0`). `rgba` is the resolved
+surface colour (same cascade as the glTF writer). `progressJson`:
+`{seen, meshed, total}` where `total` is the product count from the index.
+
+Contract on the numbers: after the stream, `qtoJson()` must equal v1's
+`qtoJson()` byte-for-byte on the Duplex sample; the concatenation of all
+batches' triangle counts must equal `statsJson().triangles`.
