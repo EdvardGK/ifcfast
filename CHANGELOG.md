@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-09-06
+
+The 0.5 line marks the end of the Layer-1 correctness programme: every
+named QTO / mesh residue from the 0.4.x oracle sweeps is shipped or
+parked, and the engine is now gated per class against `ifcopenshell`
+on the G55 corpus. On top of that, 0.5.0 bundles everything landed
+since 0.4.42 — first-class federation, the clash-oracle harness and
+its narrow-phase speedups, the mixed-unit federation rescale, the
+canonical STEP string escapes, and the nineteen-issue review sweep.
+Cache schema 28 → 30: existing `.ifcfast` caches are rebuilt on first
+open.
+
 ### Changed — federation accepts mixed units (GH #169)
 
 `ifcfast.federate()` no longer refuses constituents authored in
@@ -124,6 +136,55 @@ them. Cache schema 29 → 30.
 #### Changed
 
 - `AGENTS.md` re-synced with the code (GH #163).
+
+### Performance — clash narrow phase (GH #143)
+
+- **Intersection-first narrow phase, rayon-parallel pairs.** The narrow
+  phase used to call parry's global `distance` for every candidate pair,
+  even at `tolerance_m == 0`, and ran serially — the federated G55
+  RIE+RIV set (33k instances, 79k candidate pairs, 12.5M triangles) did
+  not finish in 3 h. Class filters now run before any geometry work,
+  TriMeshes are built once per participating instance in parallel,
+  `intersection_test` runs first and `distance` only when a clearance
+  band needs it. Same output; 16 min on the same set (debug profile).
+- **Step 1 — single `distance()` on the clearance path.** parry's
+  best-first distance visitor returns exactly `0.0` on the first
+  touching leaf pair, so one query answers both the hard-clash and the
+  clearance question. Bit-identical output.
+- **Step 2 — band-capped reject-only prefilter.**
+  `geom::min_distance_within(a, b, cap)` seeds the BVH traversal with
+  the band cap so beyond-band candidates reject near the root. The probe
+  is reject-only (parry's composite distance is only
+  schedule-deterministic at ~1e-6 m); emitted distances still come from
+  the exact query, and the cap is padded 5 mm / 5 % so a reject can
+  never contradict the exact band verdict. Full G55 TMK sweep 10.5 h →
+  4 min on a release `.so`; output bit-identical.
+
+### Fixed — write
+
+- **`encode_string` emits canonical ISO-10303-21 escapes** (GH #142).
+  `mutate()` / `hotswap()` wrote non-ASCII as raw UTF-8 inside STEP
+  string literals — readable by our lenient reader but silently dropped
+  by strict readers (ifcopenshell 0.8.5 verified): æøå data loss on
+  rename / set_property. Now `\X2\…\X0\` runs for BMP and
+  `\X4\…\X0\` for non-BMP; `'` and `\` doubling unchanged; control
+  characters still fail loud.
+
+### Added — oracles (test-only, no runtime change)
+
+- **Clash oracle harness** (GH #141, `tests/oracle/{bcf_truth,federate,
+  clash_sweep}.py`): Solibri TMK BCF exports as ground truth,
+  version-matched by STEP header, per-rule tolerance, selection-scoped
+  supplemental runs. Five sweepable rounds on G55 Del3 / Del4; pair
+  recall 13/13 on the founding round.
+- **Mesh round-trip fidelity oracle** (`tests/oracle/mesh_roundtrip.py`,
+  `tests/test_mesh_roundtrip.py`): parse → `hotswap`-rebuild → re-parse,
+  gating scale-relative Hausdorff, triangle count, signed volume and
+  winding. IFC4 direct geometry round-trips byte-identical in the local
+  frame; IFC2x3 re-tessellates set-preserving.
+- **Receipts / sidecar generators for ifcfast.com**
+  (`scripts/generate_receipts.py`, sidecar type-gallery step): measured
+  numbers for the site, stamped with version + machine.
 
 ### Added — first-class federation (GH #50)
 
@@ -1575,6 +1636,7 @@ for the trail and rename table.
   IFCs from Skiplum projects (issue #1).
 - Warm-cache speedup vs `ifcopenshell.open()`: 59-678× on production files.
 
+[0.5.0]: https://github.com/EdvardGK/ifcfast/releases/tag/v0.5.0
 [0.4.0]: https://github.com/EdvardGK/ifcfast/releases/tag/v0.4.0
 [0.3.0]: https://github.com/EdvardGK/ifcfast/releases/tag/v0.3.0
 [0.2.0]: https://github.com/EdvardGK/ifcfast/releases/tag/v0.2.0

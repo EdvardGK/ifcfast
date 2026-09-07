@@ -57,6 +57,7 @@ def _stamp() -> dict:
         "generated": dt.date.today().isoformat(),
         "ifcfast_version": ifcfast.__version__,
         "machine": _machine(),
+        "values": "measured",
     }
 
 
