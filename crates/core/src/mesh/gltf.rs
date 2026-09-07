@@ -78,11 +78,26 @@ pub struct WriteOptions {
     /// local mesh, breaking the "all members share `parts[0]`'s
     /// local geometry" assumption the instancer relies on.
     pub instancing: bool,
+    /// When true (default, GH #146), every **baked** primitive gets its
+    /// own material named by the product GUID — `"<guid>"` for the
+    /// product's first primitive, `"<guid>#k"` for the k-th — so viewers
+    /// that can only address materials (model-viewer, most three.js
+    /// pickers) can select / restyle per product. Colours are unchanged;
+    /// the cost is one material entry per primitive. When false,
+    /// materials are deduplicated by colour and named `#rrggbb[aa]`
+    /// (smallest JSON; identity only through `node.extras`). Instance
+    /// groups always share one colour-keyed material either way —
+    /// shared geometry is the point of instancing — and carry identity
+    /// in `node.extras.instances[i].guid`.
+    pub per_product_materials: bool,
 }
 
 impl Default for WriteOptions {
     fn default() -> Self {
-        Self { instancing: true }
+        Self {
+            instancing: true,
+            per_product_materials: true,
+        }
     }
 }
 
@@ -108,7 +123,7 @@ pub fn write_with_options<W: Write>(
     let (binary, layout) = pack_binary(meshes, &plan);
 
     // 2. Build the JSON.
-    let json = build_json(meshes, &plan, &layout, binary.len() as u32);
+    let json = build_json(meshes, &plan, &layout, binary.len() as u32, options);
 
     // 3. Pad both chunks to 4-byte multiples (spec requires).
     let json_bytes = pad_json(json.into_bytes());
@@ -705,6 +720,7 @@ fn build_json(
     plan: &Plan,
     layout: &BinaryLayout,
     binary_len: u32,
+    options: &WriteOptions,
 ) -> String {
     // Pre-compute the global index ranges so we can cross-reference
     // accessors / meshes / nodes / materials without re-walking the
@@ -732,23 +748,40 @@ fn build_json(
     // instead of collapsing the whole product to the first part's
     // colour.
     //
-    // Materials are globally deduped by RGBA (quantised to u16 per
-    // channel via `color_key`) so identically-coloured primitives
-    // across the file share one entry. Material name is the hex code;
-    // viewers should pick by `node.extras.guid` not by material name.
+    // Materials: with `options.per_product_materials` (default, GH #146)
+    // every baked primitive gets its own entry named by the product GUID
+    // (`<guid>`, then `<guid>#k`) so material-addressing viewers can pick
+    // per product; otherwise they are globally deduped by RGBA (quantised
+    // to u16 per channel via `color_key`) and named by hex code, with
+    // identity only in `node.extras.guid`. Instance groups always take
+    // the deduped path.
     //
     // Per-segment colour priority (see `resolve_segment_color`):
     //   `parts[k].surface_color` → `mesh.surface_color` → entity palette.
-    let mut materials_list: Vec<[f32; 4]> = Vec::new();
+    let mut materials_list: Vec<([f32; 4], String)> = Vec::new();
     let mut color_dedup: HashMap<[u32; 4], usize> = HashMap::new();
-    let intern_color =
-        |c: [f32; 4], list: &mut Vec<[f32; 4]>, dedup: &mut HashMap<[u32; 4], usize>| -> usize {
-            let key = color_key(c);
-            *dedup.entry(key).or_insert_with(|| {
-                let idx = list.len();
-                list.push(c);
-                idx
-            })
+    let intern_color = |c: [f32; 4],
+                        list: &mut Vec<([f32; 4], String)>,
+                        dedup: &mut HashMap<[u32; 4], usize>|
+     -> usize {
+        let key = color_key(c);
+        *dedup.entry(key).or_insert_with(|| {
+            let idx = list.len();
+            list.push((c, hex_color_name(c)));
+            idx
+        })
+    };
+    let per_product = options.per_product_materials;
+    let product_material =
+        |c: [f32; 4], guid: &str, k: usize, list: &mut Vec<([f32; 4], String)>| -> usize {
+            let idx = list.len();
+            let name = if k == 0 {
+                guid.to_string()
+            } else {
+                format!("{guid}#{k}")
+            };
+            list.push((c, name));
+            idx
         };
 
     // Per-baked-product segment list: (byte_offset_in_idx_bv, n_indices, material_idx)
@@ -771,7 +804,13 @@ fn build_json(
                     continue;
                 }
                 let color = resolve_segment_color(mesh, k);
-                let mat_idx = intern_color(color, &mut materials_list, &mut color_dedup);
+                // `segs.len()` (not `k`) numbers the emitted primitives, so
+                // skipped empty segments never leave a gap in `#k`.
+                let mat_idx = if per_product {
+                    product_material(color, &mesh.guid, segs.len(), &mut materials_list)
+                } else {
+                    intern_color(color, &mut materials_list, &mut color_dedup)
+                };
                 let byte_offset = seg.index_start * idx_size;
                 segs.push((byte_offset, seg.index_count, mat_idx));
             }
@@ -782,7 +821,11 @@ fn build_json(
             // — emit one primitive covering the whole indices buffer
             // with the product-level / palette colour.
             let color = resolve_product_color(mesh);
-            let mat_idx = intern_color(color, &mut materials_list, &mut color_dedup);
+            let mat_idx = if per_product {
+                product_material(color, &mesh.guid, 0, &mut materials_list)
+            } else {
+                intern_color(color, &mut materials_list, &mut color_dedup)
+            };
             let n_indices = mesh.indices.len() as u32;
             segs.push((0, n_indices, mat_idx));
         }
@@ -924,14 +967,13 @@ fn build_json(
     }
     s.push_str("],");
 
-    // 4. Materials — globally deduped by RGBA (GH #54). Material name
-    //    is the hex code so a viewer that doesn't read node.extras can
-    //    still display something meaningful; pick-to-BIM should
-    //    use `node.extras.guid` (baked) or `node.extras.instances[i].guid`
-    //    (instanced), not material name.
+    // 4. Materials — per baked primitive named by GUID (GH #146,
+    //    default) or globally deduped by RGBA and named by hex code
+    //    (GH #54). Instance groups always use the deduped colour entry;
+    //    pick-to-BIM on them goes through `node.extras.instances[i].guid`.
     s.push_str(r#""materials":["#);
     first = true;
-    for color in &materials_list {
+    for (color, name) in &materials_list {
         if !first {
             s.push(',');
         }
@@ -939,7 +981,7 @@ fn build_json(
         let (r, g, b, a) = (color[0], color[1], color[2], color[3]);
         let translucent = a < 1.0;
         s.push_str(r#"{"name":""#);
-        s.push_str(&hex_color_name(*color));
+        push_json_string(&mut s, name);
         s.push_str(r#"","pbrMetallicRoughness":{"baseColorFactor":["#);
         s.push_str(&format_f32(r));
         s.push(',');
@@ -1305,10 +1347,9 @@ fn resolve_segment_color(mesh: &ProductMesh, segment_idx: usize) -> [f32; 4] {
     default_color_for_entity(&mesh.entity)
 }
 
-/// Material name = `#rrggbbaa` hex code. Globally-deduped materials
-/// can't carry a per-product GUID in their name (one material is shared
-/// across many products); viewers should pick by `node.extras.guid`
-/// instead.
+/// Material name for the colour-deduped path = `#rrggbb[aa]` hex code.
+/// (Per-product materials — the default — are named by GUID instead;
+/// see [`WriteOptions::per_product_materials`].)
 fn hex_color_name(c: [f32; 4]) -> String {
     let q = |x: f32| -> u8 {
         let v = x.clamp(0.0, 1.0);
@@ -1386,5 +1427,139 @@ fn format_f32(v: f32) -> String {
         format!("{}", v)
     } else {
         "0".to_string()
+    }
+}
+
+#[cfg(test)]
+mod material_naming_tests {
+    use super::*;
+    use crate::mesh::{InstancePart, MeshSegment, ProductMesh};
+
+    const IDENTITY: [f32; 16] = [
+        1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+    ];
+
+    fn unit_cube(guid: &str) -> ProductMesh {
+        // 8 corners, 12 triangles.
+        let vertices: Vec<f32> = vec![
+            0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 1.0, 0.0,
+            1.0, 1.0, 1.0, 1.0, 0.0, 1.0, 1.0,
+        ];
+        let indices: Vec<u32> = vec![
+            0, 2, 1, 0, 3, 2, 4, 5, 6, 4, 6, 7, 0, 1, 5, 0, 5, 4, 1, 2, 6, 1, 6, 5, 2, 3, 7, 2, 7,
+            6, 3, 0, 4, 3, 4, 7,
+        ];
+        ProductMesh {
+            guid: guid.into(),
+            entity: "IfcWall".into(),
+            ifc_id: 1,
+            vertices,
+            indices,
+            source: "extrusion",
+            segments: Vec::new(),
+            placement_origin: [0.0; 3],
+            parts: Vec::new(),
+            world_transform: IDENTITY,
+            world_origin: [0.0; 3],
+            mesh_anchor: [0.0; 3],
+            surface_color: None,
+            bounded_halfspaces: Vec::new(),
+        }
+    }
+
+    /// Split the cube into two segments with matching `parts` so the
+    /// writer emits two primitives.
+    fn two_segment_cube(guid: &str, colors: [Option<[f32; 4]>; 2]) -> ProductMesh {
+        let mut m = unit_cube(guid);
+        let seg = |start: u32, color: Option<[f32; 4]>| InstancePart {
+            rep_step_id: 0,
+            instance_transform: IDENTITY,
+            local_vertices: Vec::new(),
+            local_indices: Vec::new(),
+            index_start: start,
+            index_count: 18,
+            source: "extrusion".into(),
+            surface_color: color,
+        };
+        m.segments = vec![
+            MeshSegment {
+                index_start: 0,
+                index_count: 18,
+                source: "extrusion".into(),
+            },
+            MeshSegment {
+                index_start: 18,
+                index_count: 18,
+                source: "extrusion".into(),
+            },
+        ];
+        m.parts = vec![seg(0, colors[0]), seg(18, colors[1])];
+        m
+    }
+
+    fn json_of(meshes: &[ProductMesh], per_product: bool) -> String {
+        let options = WriteOptions {
+            instancing: false,
+            per_product_materials: per_product,
+        };
+        let mut buf = Vec::new();
+        write_with_options(meshes, &options, &mut buf).unwrap();
+        let json_len = u32::from_le_bytes(buf[12..16].try_into().unwrap()) as usize;
+        String::from_utf8(buf[20..20 + json_len].to_vec()).unwrap()
+    }
+
+    /// Material names in emission order.
+    fn material_names(json: &str) -> Vec<String> {
+        let start = json.find(r#""materials":["#).unwrap() + r#""materials":["#.len();
+        // `],` also ends every baseColorFactor array — stop at the next
+        // top-level key instead.
+        let end = json[start..].find(r#""meshes":["#).unwrap() + start;
+        json[start..end]
+            .split(r#"{"name":""#)
+            .skip(1)
+            .map(|chunk| chunk[..chunk.find('"').unwrap()].to_string())
+            .collect()
+    }
+
+    #[test]
+    fn per_product_materials_are_named_by_guid() {
+        let json = json_of(&[unit_cube("0AAAAAAAAAAAAAAAAAAAAA")], true);
+        assert_eq!(material_names(&json), vec!["0AAAAAAAAAAAAAAAAAAAAA"]);
+        assert!(json.contains(r#""material":0"#));
+    }
+
+    #[test]
+    fn colour_dedup_path_keeps_hex_names_and_shares_entries() {
+        let meshes = [
+            unit_cube("0AAAAAAAAAAAAAAAAAAAAA"),
+            unit_cube("0BBBBBBBBBBBBBBBBBBBBB"),
+        ];
+        let names = material_names(&json_of(&meshes, false));
+        assert_eq!(
+            names.len(),
+            1,
+            "same palette colour dedupes to one material: {names:?}"
+        );
+        assert!(names[0].starts_with('#'));
+        // …while the per-product default gives each product its own.
+        assert_eq!(
+            material_names(&json_of(&meshes, true)),
+            vec!["0AAAAAAAAAAAAAAAAAAAAA", "0BBBBBBBBBBBBBBBBBBBBB"]
+        );
+    }
+
+    #[test]
+    fn multi_primitive_products_number_their_materials() {
+        let red = Some([1.0, 0.0, 0.0, 1.0]);
+        let m = two_segment_cube("0CCCCCCCCCCCCCCCCCCCCC", [red, red]);
+        let json = json_of(&[m], true);
+        assert_eq!(
+            material_names(&json),
+            vec!["0CCCCCCCCCCCCCCCCCCCCC", "0CCCCCCCCCCCCCCCCCCCCC#1"]
+        );
+        assert!(json.contains(r#""material":0"#) && json.contains(r#""material":1"#));
+        // Dedup mode collapses the two identical reds to one entry.
+        let m = two_segment_cube("0CCCCCCCCCCCCCCCCCCCCC", [red, red]);
+        assert_eq!(material_names(&json_of(&[m], false)).len(), 1);
     }
 }

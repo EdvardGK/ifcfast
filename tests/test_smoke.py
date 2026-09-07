@@ -580,6 +580,52 @@ def test_to_gltf_writes_valid_glb_with_extensions(tmp_path):
         # instanced group.
 
 
+def test_to_gltf_materials_named_by_guid_and_mesh_stats(tmp_path):
+    """GH #146: every baked primitive's material is named by the product
+    GUID (`<guid>` / `<guid>#k`) by default so material-addressing viewers
+    can pick per product; `per_product_materials=False` dedupes by colour
+    with `#rrggbb` names. GH #166: every mesh entry point reports
+    `by_source`."""
+    import json
+    import struct
+
+    p = _write_mm_cube(tmp_path)
+    m = ifcfast.open(p, use_cache=False, write_cache=False)
+
+    def materials_and_nodes(path):
+        data = path.read_bytes()
+        jlen = struct.unpack("<I", data[12:16])[0]
+        obj = json.loads(data[20:20 + jlen].rstrip(b" "))
+        return obj
+
+    out = tmp_path / "guid_mats.glb"
+    stats = m.to_gltf(out, cut_openings=False)
+    obj = materials_and_nodes(out)
+    baked = [n for n in obj["nodes"] if "mesh" in n and "guid" in n.get("extras", {})]
+    assert baked, "fixture has at least one baked product"
+    for n in baked:
+        guid = n["extras"]["guid"]
+        for k, prim in enumerate(obj["meshes"][n["mesh"]]["primitives"]):
+            name = obj["materials"][prim["material"]]["name"]
+            assert name == (guid if k == 0 else f"{guid}#{k}"), (guid, k, name)
+
+    out2 = tmp_path / "hex_mats.glb"
+    m.to_gltf(out2, cut_openings=False, per_product_materials=False)
+    obj2 = materials_and_nodes(out2)
+    assert all(mat["name"].startswith("#") for mat in obj2["materials"])
+    assert len(obj2["materials"]) <= len(obj["materials"])
+
+    # GH #166 — the counters agree across entry points and name the
+    # representation kinds that were meshed.
+    assert isinstance(stats["by_source"], dict) and stats["by_source"]
+    assert stats["products_seen"] >= stats["products_meshed"] >= 1
+    ms = m.meshes()
+    assert ms.stats["by_source"] == stats["by_source"]
+    assert ms.stats["products_meshed"] == stats["products_meshed"]
+    products, _surfaces = m.mesh_qto()
+    assert products.attrs["mesh_stats"]["by_source"] == stats["by_source"]
+
+
 def test_bundle_then_clash_roundtrip(tmp_path):
     """The documented bundle -> clash chain must actually be invokable
     from the wheel (GH #41). Before v0.4.28, `ifcfast.clash()` was in

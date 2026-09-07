@@ -13,6 +13,7 @@ Usage (from the repo root, venv active)::
         [--baseline FILE]            # prior sweep JSON to diff against
         [--write-baseline FILE]      # save this sweep as a new baseline
         [--tolerance 0.005]          # flag classes whose ratio moved more
+        [--refresh-fast]             # new build: recompute ifcfast, keep cached ios
 
 Baselines for client corpora (e.g. G55) live OUTSIDE the repo — they are
 client data. Convention: ``scratch/<corpus>/baselines/<MODEL>.json``.
@@ -168,12 +169,24 @@ def main() -> int:
     ap.add_argument("--baseline", type=Path, default=None)
     ap.add_argument("--write-baseline", type=Path, default=None)
     ap.add_argument("--tolerance", type=float, default=0.005)
+    ap.add_argument(
+        "--refresh-fast",
+        action="store_true",
+        help="recompute the ifcfast side against a NEW build but reuse the "
+        "cached ifcopenshell volumes (the slow half) — the cache is rewritten",
+    )
     args = ap.parse_args()
 
     cache = (
         args.cache_dir / f"{args.ifc.stem}_sweep.json" if args.cache_dir else None
     )
-    if cache and cache.exists():
+    if cache and cache.exists() and args.refresh_fast:
+        data = json.load(cache.open())
+        ios = data["ios"]
+        fast = fast_volumes(args.ifc)
+        print(f"ifcfast products: {len(fast)} (refreshed; ios from cache {cache})", flush=True)
+        json.dump({"fast": fast, "ios": ios}, cache.open("w"))
+    elif cache and cache.exists():
         data = json.load(cache.open())
         fast, ios = data["fast"], data["ios"]
         print(f"loaded cached {cache}")

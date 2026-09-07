@@ -342,7 +342,23 @@ describing via `pq.read_schema(...)`):
   `PLANEANGLEUNIT` (a radian-authored semicircle was previously misread
   as a ~3.14° sliver) rather than assuming degrees. Circular +
   degree-authored profiles are byte-identical; only files with an
-  ellipse/line basis or radian-authored trims re-extract.
+  ellipse/line basis or radian-authored trims re-extract. **GH #170
+  (cache schema v31):** circle / ellipse / arc sampling is adaptive —
+  8 to 32 segments per full turn chosen so no chord deviates from the
+  arc by more than 0.5 mm (radius read in metres through the declared
+  `LENGTHUNIT`; a 15 mm pipe gets 9, anything ≥ ~105 mm radius the old
+  32), and CSG cylinders / cones / spheres follow the same rule instead
+  of a fixed 24. Circles, ellipses and profile arcs (trimmed conics,
+  `IfcArcIndex` — the two-semicircle pipe profile Revit authors) are
+  emitted at an *area-preserving* radius, so an extruded circular
+  `volume_m3` is the analytic `π r² h` for every segment count (the old
+  inscribed 32-gon under-reported by 0.64 %, an inscribed 8-gon would
+  by 10 %; verified per element on 2 882 Clinic pipes, median ratio
+  1.00000). Expect
+  2–4× fewer triangles on MEP-heavy models and a uniform +0.64 % on
+  circular-profile volumes versus v30; every circular product
+  re-extracts. A file with no resolvable `LENGTHUNIT` samples at the
+  full 32 (unchanged output).
 - Semantic payload: `materials`, `psets`, `quantities`,
   `classifications` (list-of-struct columns — `UNNEST` in DuckDB).
   Each `psets` and `quantities` struct carries `source`
@@ -1051,11 +1067,11 @@ solid subtractors still emit verbatim; union/intersection operands are
 untouched; `cut_openings=True` is unaffected (the cut consumes the
 cutters). To inspect the synthetic cutters (debugging cut placement),
 pass **`keep_cutters=True`** to `meshes()` / `iter_meshes()`. The
-native `extract_meshes` dict counts `cutters_stripped` either way, but
-`Model.meshes()` builds its `MeshList` from the geometry keys and
-**discards the counters** — from Python they are not observable on this
-path (`m.to_gltf()` is the only surface that returns a stats dict; see
-"Cut diagnostics" below).
+native `extract_meshes` dict counts `cutters_stripped` either way;
+`Model.meshes()` surfaces the mesh-pass counters as **`MeshList.stats`**
+(`products_seen` / `products_meshed` / `products_deferred` /
+`by_source`, GH #166) but not the cut / cutter counters — for those
+`m.to_gltf()` is still the surface (see "Cut diagnostics" below).
 
 **Source-tag chain encoding (v0.4.35+, GH #58 / W1).** The `source`
 field on `MeshSegment` / `InstancePart` / `instances.parquet.source`
@@ -1149,15 +1165,19 @@ net solid; in reveal-all (`cut_openings=False`, the default) both
 the host and the opening still emit as separate products with
 their full operand-by-operand fidelity preserved.
 
-Unhandled representation types (e.g. `IfcRevolvedAreaSolid`,
-`IfcSurfaceCurveSweptAreaSolid`) are counted as `unhandled:IFCXXX`
-entries in the Rust `MeshStats.by_source` map, so nothing is dropped
-silently at the core. **That map is not on the Python surface** — there
-is no `mesh_stats` symbol in the wheel; only the `ifcfast-mesh` debug
-binary (`cargo run --bin ifcfast-mesh`) prints it. From Python, detect
-untessellated products by set-differencing: guids in `m.products_df`
-that never appear in `m.meshes()` / `m.drift` had no emitted geometry.
-(Exposing `by_source` on the Python surface is GH #166.)
+Unhandled representation types (e.g. `IfcSurfaceCurveSweptAreaSolid`)
+are counted as `unhandled:IFCXXX` entries in the mesher's `by_source`
+map, so nothing is dropped silently — and since GH #166 that map is on
+every Python surface: **`m.meshes().stats["by_source"]`**,
+**`m.mesh_qto()[0].attrs["mesh_stats"]["by_source"]`**, the
+**`m.to_gltf()`** / **`m.point_cloud()`** / **`ifcfast.bundle()`** stats
+dicts. It is a `{tag: count}` of representation kinds (`"extrusion"`,
+`"brep"`, `"faceset"`, `"mapped"`, … plus the `"unhandled:…"` rows) and
+is the supported answer to "what did this file contain that ifcfast
+could not tessellate". Alongside it: `products_seen` (products with a
+Body), `products_meshed` (non-empty geometry) and `products_deferred`.
+To find *which* products, set-difference `m.products_df` guids against
+`m.meshes()`.
 
 **Cut diagnostics: `Outcome::Unsupported(reason)` (v0.4.35+, GH #58
 / W2).** When a cut can't proceed, the per-pass counters surface a
@@ -1428,8 +1448,14 @@ order. Multi-fragment products (booleans, CSG composites) and
 rep-unique singletons fall through to the baked path (one mesh per
 product, world-coord vertices) — backwards-compat with viewers
 that don't read `EXT_mesh_gpu_instancing` is preserved for those.
-Pick-to-BIM: viewers should read `node.extras.guid` (baked) OR
-`node.extras.instances[instance_id].guid` (instanced).
+Pick-to-BIM: read `node.extras.guid` (baked) OR
+`node.extras.instances[instance_id].guid` (instanced). Baked
+primitives additionally carry a **material named by the product GUID**
+— `"<guid>"` for the first primitive, `"<guid>#k"` for the k-th
+(`per_product_materials=True`, the default since GH #146) — for
+viewers that can only address materials (model-viewer, three.js
+`material.name` pickers). Instanced groups share one colour material
+by design.
 
 **All positions are `KHR_mesh_quantization` u16** (since v0.4.25).
 Baked positions: per-node `translation` = AABB min and `scale` =
@@ -1454,10 +1480,15 @@ subtracted from host walls via the manifold-csg boolean path
 `EXT_mesh_gpu_instancing` when `cut_openings=False` (the cut
 modifies per-product geometry, so instancing is disabled with
 cuts on). Per-product identity carries through `node.extras.guid`
-(baked) and `node.extras.instances[instance_id].guid` (instanced).
-The wheel ships with `csg` in the default Cargo features (since
-v0.4.25), so `pip install ifcfast` is enough — no extras or
-build-from-source needed.
+(baked) and `node.extras.instances[instance_id].guid` (instanced),
+and through the GUID-named per-primitive materials on the baked path
+(`per_product_materials=True`, default; pass `False` for
+colour-deduped `#rrggbb` materials and the smallest JSON — identity
+then lives in `extras` only). The stats dict also carries the
+mesh-pass counters (`products_seen` / `products_deferred` /
+`by_source`, GH #166). The wheel ships with `csg` in the default
+Cargo features (since v0.4.25), so `pip install ifcfast` is enough —
+no extras or build-from-source needed.
 
 Materials carry **authored `IfcSurfaceStyle` colours** since v0.4.33
 (GH #3). Each PBR `baseColorFactor` is resolved by walking, in

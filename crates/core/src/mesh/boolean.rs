@@ -463,7 +463,11 @@ fn bounded_curve_points(table: &EntityTable, id: u64) -> Option<Vec<Vec2>> {
         // otherwise booleans on curved profiles collapse to polygonal
         // chords (GH #48).
         if let Some(Field::List(seg_body)) = fields.get(1).copied().map(parse_field) {
-            if let Some(poly) = crate::mesh::indexed_curve::eval_segments_2d(&raw_pts, seg_body) {
+            if let Some(poly) = crate::mesh::indexed_curve::eval_segments_2d(
+                &raw_pts,
+                seg_body,
+                crate::mesh::profile::length_scale(table),
+            ) {
                 if poly.len() >= 3 {
                     return Some(poly);
                 }

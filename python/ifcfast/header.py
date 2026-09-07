@@ -592,7 +592,15 @@ def _resolve_step_escapes(s: str) -> str:
 #       (GH #153); IfcIndexedPolygonalFaceWithVoids holes are cut
 #       (GH #160); composite-curve profiles with an untessellatable
 #       segment are now unhandled instead of bridged (GH #154).
-_CACHE_SCHEMA_VERSION = 30
+#   31: adaptive circle tessellation (GH #170) — circles / ellipses / arcs
+#       and CSG cylinders / cones / spheres sample 8..=32 segments per turn
+#       from a 0.5 mm sagitta tolerance (radius in metres via the declared
+#       LENGTHUNIT) instead of a fixed 32 / 24; circles, ellipses and
+#       profile arcs use an area-preserving radius so extruded circular
+#       volumes are analytic for any segment count (+0.64 % vs the old
+#       inscribed 32-gon). Vertex and QTO columns move on every circular
+#       product.
+_CACHE_SCHEMA_VERSION = 31
 
 _FIELD_RE = re.compile(r"\(\s*(.*?)\s*\)\s*;", re.DOTALL)
 

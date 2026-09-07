@@ -67,6 +67,16 @@ LocalMesh = namedtuple(
 )
 
 
+def _mesh_stats(d) -> dict:
+    """Mesh-pass counters shared by every native mesh entry point (GH #166)."""
+    out = {}
+    for k in ("products_seen", "products_meshed", "products_deferred", "triangles"):
+        if k in d:
+            out[k] = int(d[k])
+    out["by_source"] = dict(d.get("by_source", {}))
+    return out
+
+
 class MeshList(list):
     """A plain ``list`` of :data:`Mesh` (fully iterable / indexable /
     ``len()``-able as before) that also carries ``.global_shift`` — the
@@ -76,6 +86,13 @@ class MeshList(list):
     """
 
     global_shift = [0.0, 0.0, 0.0]
+    #: Mesh-pass counters (GH #166): ``products_seen`` / ``products_meshed``
+    #: / ``products_deferred`` and ``by_source`` — a ``{tag: count}`` map of
+    #: representation kinds the mesher met (``"extrusion"``, ``"brep"``,
+    #: ``"faceset"``, …). Anything ifcfast could **not** tessellate shows up
+    #: as ``"unhandled:IFCXXX"``; that is the supported answer to "what did
+    #: this file contain that I am not seeing".
+    stats: dict = {}
 
 #: How many metres one of each named unit is. Geometry APIs
 #: (:meth:`Model.point_cloud`, :meth:`Model.meshes`) accept any of these
@@ -689,6 +706,7 @@ class Model:
             str(native_path_for(self.header.path)),
             bool(cut_openings),
         )
+        mesh_stats = _mesh_stats(d)
         products_df = pd.DataFrame({
             "guid": d["guid"],
             "entity": d["entity"],
@@ -716,6 +734,7 @@ class Model:
             "ny": d["surface_ny"],
             "nz": d["surface_nz"],
         })
+        products_df.attrs["mesh_stats"] = mesh_stats
         return products_df, surfaces_df
 
     def point_cloud(
@@ -907,7 +926,13 @@ class Model:
             df.attrs["global_shift"] = gshift
             yield df
 
-    def to_gltf(self, out_path, *, cut_openings: bool = True) -> dict:
+    def to_gltf(
+        self,
+        out_path,
+        *,
+        cut_openings: bool = True,
+        per_product_materials: bool = True,
+    ) -> dict:
         """One-call IFC → glTF binary (`.glb`) export.
 
         Runs the streaming mesh pass, optionally subtracts opening
@@ -927,8 +952,16 @@ class Model:
         Per-product identity carries through:
 
         * **Baked path**: ``node.extras.guid`` + ``node.extras.entity``
-          + ``node.extras.segments``. The per-product material is also
-          named by the GUID so legacy pick-to-BIM-by-material works.
+          + ``node.extras.segments``. With ``per_product_materials=True``
+          (default, GH #146) every baked primitive also gets its own
+          material named by the GUID — ``"<guid>"`` for the product's
+          first primitive, ``"<guid>#k"`` for the k-th — so viewers that
+          can only address materials (model-viewer, most three.js
+          pickers) can still select / restyle per product. Colours
+          are unchanged; the cost is one material entry per primitive.
+          ``per_product_materials=False`` dedupes materials by colour
+          instead (name ``#rrggbb[aa]``) — smallest JSON, identity only
+          via ``extras``.
         * **Instanced path**: ``node.extras.instances`` is a parallel
           array indexed by instance order — ``[{guid, entity,
           source, segments}, ...]``. Viewers map picked instance_id
@@ -949,6 +982,10 @@ class Model:
                 operands emitted as visible mesh) — gives smaller
                 glTFs when instancing kicks in, at the cost of
                 rendering door volumes as solid blocks.
+            per_product_materials: see the baked-path contract above.
+                Instanced groups always share one colour material
+                (shared geometry is the point of instancing); their
+                identity is ``node.extras.instances[i].guid``.
 
         Returns:
             Stats dict with:
@@ -964,6 +1001,10 @@ class Model:
             * ``instancing`` — whether the writer emitted
               ``EXT_mesh_gpu_instancing`` (always False when
               cut_openings=True)
+            * ``products_seen`` / ``products_deferred`` / ``by_source``
+              — mesh-pass counters (GH #166); ``by_source`` maps each
+              representation kind to a count and lists what could not
+              be tessellated as ``"unhandled:IFCXXX"``
 
         Example::
 
@@ -983,6 +1024,7 @@ class Model:
             str(native_path_for(self.header.path)),
             str(out_path),
             bool(cut_openings),
+            bool(per_product_materials),
         )
 
     def subset(self, guids: Iterable[str], *, out_path=None):
@@ -1355,6 +1397,7 @@ class Model:
         # no shift — the list arrives as [0, 0, 0].)
         gshift = list(d.get("global_shift", [0.0, 0.0, 0.0]))
         out.global_shift = [s * factor for s in gshift] if factor != 1.0 else gshift
+        out.stats = _mesh_stats(d)
         return out
 
     def iter_meshes(

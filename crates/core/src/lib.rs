@@ -250,6 +250,23 @@ mod python {
     // `--no-default-features --features python` build fails to compile
     // (GH #112).
     #[cfg(feature = "mesh")]
+    /// Mesh-pass counters every native mesh entry point returns (GH #166):
+    /// `products_seen` / `products_deferred` and `by_source` — a
+    /// `{tag: count}` map of representation kinds, where anything the
+    /// mesher could not tessellate is `"unhandled:IFCXXX"`.
+    fn set_mesh_stats(out: &Bound<'_, PyDict>, stats: &crate::mesh::MeshStats) -> PyResult<()> {
+        out.set_item("products_seen", stats.products_seen as u64)?;
+        out.set_item("products_deferred", stats.products_deferred as u64)?;
+        let by_source = PyDict::new(out.py());
+        let mut tags: Vec<(&String, &usize)> = stats.by_source.iter().collect();
+        tags.sort();
+        for (tag, n) in tags {
+            by_source.set_item(tag.as_str(), *n as u64)?;
+        }
+        out.set_item("by_source", by_source)?;
+        Ok(())
+    }
+
     fn set_cut_openings_stats(
         out: &Bound<'_, PyDict>,
         stats: &crate::mesh::cut_stats::CutOpeningsStats,
@@ -1076,6 +1093,7 @@ mod python {
             out.set_item("entity_table_ms", mesh_stats.entity_table_build_ms)?;
             out.set_item("total_ms", t_total.elapsed().as_secs_f64() * 1000.0)?;
             out.set_item("products_meshed", mesh_stats.products_meshed)?;
+            set_mesh_stats(&out, &mesh_stats)?;
             out.set_item("size_bytes", mmap.len() as u64)?;
             out.set_item("cut_openings", cut_openings)?;
             set_cut_openings_stats(&out, &sink.cut_stats)?;
@@ -1554,6 +1572,7 @@ mod python {
             out.set_item("seed", seed)?;
             out.set_item("points_emitted", sink.x.len() as u64)?;
             out.set_item("products_meshed", mesh_stats.products_meshed as u64)?;
+            set_mesh_stats(&out, &mesh_stats)?;
             out.set_item("indexer_ms", idx_ms)?;
             out.set_item("mesh_ms", mesh_ms)?;
             out.set_item("marshal_ms", t_marshal.elapsed().as_secs_f64() * 1000.0)?;
@@ -2243,6 +2262,7 @@ mod python {
                 PyList::new(py, [gs[0] * us, gs[1] * us, gs[2] * us])?,
             )?;
             out.set_item("products_meshed", mesh_stats.products_meshed as u64)?;
+            set_mesh_stats(&out, &mesh_stats)?;
             out.set_item("mesh_ms", mesh_ms)?;
             out.set_item("marshal_ms", t_marshal.elapsed().as_secs_f64() * 1000.0)?;
             out.set_item("total_ms", t_total.elapsed().as_secs_f64() * 1000.0)?;
@@ -2507,12 +2527,13 @@ mod python {
     /// `products_emitted`, `cut_openings_*` counts, output file size.
     #[cfg(feature = "mesh")]
     #[pyfunction]
-    #[pyo3(signature = (path, out_path, cut_openings = false))]
+    #[pyo3(signature = (path, out_path, cut_openings = false, per_product_materials = true))]
     pub fn write_gltf<'py>(
         py: Python<'py>,
         path: &str,
         out_path: &str,
         cut_openings: bool,
+        per_product_materials: bool,
     ) -> PyResult<Bound<'py, PyDict>> {
         catch_panic(|| {
             use crate::mesh::{BakeFrame, ProductMesh, ProductSink};
@@ -2651,6 +2672,7 @@ mod python {
             // wall keeps its own cut.
             let options = crate::mesh::gltf::WriteOptions {
                 instancing: !cut_openings,
+                per_product_materials,
             };
 
             let t_write = Instant::now();
@@ -2672,6 +2694,7 @@ mod python {
             let out = PyDict::new(py);
             out.set_item("products_emitted", sink.products.len() as u64)?;
             out.set_item("products_meshed", mesh_stats.products_meshed as u64)?;
+            set_mesh_stats(&out, &mesh_stats)?;
             out.set_item("triangles", mesh_stats.triangles as u64)?;
             out.set_item("mesh_ms", mesh_ms)?;
             out.set_item("write_ms", write_ms)?;
@@ -2794,6 +2817,7 @@ mod python {
             out.set_item("classification_rows", sem.classification_rows as u64)?;
             out.set_item("products_seen", stats.products_seen as u64)?;
             out.set_item("products_meshed", stats.products_meshed as u64)?;
+            set_mesh_stats(&out, &stats)?;
             out.set_item("products_deferred", stats.products_deferred as u64)?;
             out.set_item("triangles", stats.triangles as u64)?;
             out.set_item("instances_written", instances_written as u64)?;

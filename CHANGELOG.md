@@ -7,6 +7,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed — adaptive circle tessellation (GH #170, cache schema 30 → 31)
+
+- Circles, ellipses and arcs (profile defs, `IfcCircle` / `IfcEllipse`
+  curves, trimmed conic arcs, `IfcArcIndex` segments) and the CSG
+  cylinder / cone / sphere primitives now sample **8 to 32 segments per
+  full turn** chosen by a 0.5 mm sagitta tolerance — the radius is read
+  in metres through the file's declared `LENGTHUNIT` (memoized on the
+  entity table) — instead of a fixed 32 (profiles) / 24 (CSG). A 15 mm
+  pipe gets 9 segments; anything ≥ ~105 mm radius keeps 32. Files with
+  no resolvable length unit sample at the full 32 (unchanged output).
+- Circles, ellipses and profile arcs (trimmed conics, `IfcArcIndex`)
+  are emitted at an **area-preserving radius** — `sqrt(θ / (n·sin(θ/n)))`
+  per sector, `sqrt(2π / (n·sin(2π/n)))` for a full turn — so extruded
+  circular volumes are the analytic `π r² h` for every segment count,
+  including Revit's two-semicircle pipe profiles. The old inscribed
+  32-gon under-reported by 0.64 % (an 8-gon would by 10 %); expect a
+  uniform +0.64 % on circular-profile QTO volumes and every circular
+  product to re-extract. Verified per element: 2 882 Clinic pipes at a
+  median ifcfast / π r² L ratio of 1.00000. Only 3D directrix arcs
+  (swept paths) stay on the true curve.
+- Measured on the buildingSMART Clinic Plumbing model: pipe
+  (`IfcFlowSegment`) triangles fell 2.3×; the model total only 6 %,
+  because its valves and fittings are pre-tessellated Revit family
+  breps (one valve = 18 055 triangles) — tracked separately.
+
+### Changed — glTF materials named by product GUID again (GH #146)
+
+- `m.to_gltf(..., per_product_materials=True)` (new flag, **default
+  on**) gives every baked primitive its own material named `"<guid>"`
+  (first primitive) / `"<guid>#k"`, restoring the pick-by-material
+  contract the v0.4.33 style pipeline had broken (materials were
+  deduped by colour and named `#rrggbb`). Colours are unchanged;
+  instanced groups keep one shared colour material. Pass `False` for
+  the colour-deduped, smallest-JSON output.
+
+### Added — mesh-pass counters on the Python surface (GH #166)
+
+- `by_source` (`{representation kind: count}`, with everything the
+  mesher could not tessellate as `"unhandled:IFCXXX"`), plus
+  `products_seen` / `products_deferred`, now come back from every mesh
+  entry point: `m.meshes().stats`, `m.mesh_qto()[0].attrs["mesh_stats"]`,
+  and the `m.to_gltf()` / `m.point_cloud()` / `ifcfast.bundle()` stats
+  dicts. Previously only the `ifcfast-mesh` debug binary printed it.
+
 ## [0.5.0] - 2026-09-06
 
 The 0.5 line marks the end of the Layer-1 correctness programme: every

@@ -5,15 +5,80 @@
 //! its own `Position` (`IfcAxis2Placement2D`) — applied to every output
 //! vertex.
 //!
-//! Curve sampling: 32 segments for circles / ellipses. Good enough for
-//! BIM rendering; trivially configurable per use case.
+//! Curve sampling (GH #170): the segment count per full turn is chosen
+//! from the radius by a chord-height (sagitta) tolerance of
+//! [`CHORD_TOLERANCE_M`], clamped to `[MIN_CURVE_SAMPLES, CURVE_SAMPLES]`.
+//! A 15 mm pipe gets 9 segments, anything ≥ ~105 mm the full 32. Closed
+//! circles / ellipses are emitted with an *area-preserving* radius
+//! ([`area_preserving_scale`]) so the polygon area equals the analytic
+//! `π·a·b` for every segment count — extruded circular volumes are exact
+//! instead of under-reporting by `2π²/(3n²)` (0.64 % at 32, 10 % at 8).
+//! Profile arcs (trimmed conics, `IfcArcIndex`) get the per-sector
+//! version ([`arc_area_scale`]) so a Revit pipe authored as two
+//! semicircles is exact too; only 3D directrix arcs stay on the curve.
 
 use glam::{Mat3, Vec2, Vec3};
 
 use crate::entity_table::EntityTable;
 use crate::lexer::{parse_field, parse_ref_list, split_top_level_args, Field};
 
+/// Maximum segments per full turn (and the pre-GH #170 fixed count).
 pub const CURVE_SAMPLES: usize = 32;
+/// Minimum segments per full turn, however small the radius.
+pub const MIN_CURVE_SAMPLES: usize = 8;
+/// Sagitta (chord-height) tolerance in metres: 0.5 mm.
+pub const CHORD_TOLERANCE_M: f32 = 0.0005;
+
+/// Segments per full turn for a circle of `radius` (file units) so that
+/// no chord deviates from the arc by more than [`CHORD_TOLERANCE_M`]:
+/// `n = ceil(π / acos(1 − tol / r))`, clamped to
+/// `[MIN_CURVE_SAMPLES, CURVE_SAMPLES]`. Non-finite or non-positive radii
+/// get the minimum.
+pub fn circle_samples(radius: f32, unit_scale: f32) -> usize {
+    let r_m = radius.abs() * unit_scale;
+    if !(r_m.is_finite() && r_m > CHORD_TOLERANCE_M) {
+        return MIN_CURVE_SAMPLES;
+    }
+    let n = (std::f32::consts::PI / (1.0 - CHORD_TOLERANCE_M / r_m).acos()).ceil();
+    if !n.is_finite() {
+        return CURVE_SAMPLES;
+    }
+    (n as usize).clamp(MIN_CURVE_SAMPLES, CURVE_SAMPLES)
+}
+
+/// Radius multiplier that makes a regular `n`-gon inscribed at the
+/// scaled radius have exactly the circle's area:
+/// `sqrt(2π / (n·sin(2π/n)))` (1.0032 at n = 32, 1.0538 at n = 8).
+pub fn area_preserving_scale(n: usize) -> f32 {
+    arc_area_scale(std::f32::consts::TAU, n.max(3))
+}
+
+/// Radius multiplier for an arc of `sweep` radians sampled as `n` chords
+/// so that the polygonal sector (chords + two radii) has exactly the
+/// circular sector's area `sweep·r²/2`: `sqrt(sweep / (n·sin(sweep/n)))`.
+/// Reduces to [`area_preserving_scale`] for a full turn. Applied to the
+/// arcs of closed profiles (trimmed conics, `IfcArcIndex`) so a Revit
+/// pipe authored as two semicircles is as volume-exact as a circle
+/// profile; the arc's endpoints move radially by `(k − 1)·r`, a
+/// sub-millimetre jog where an arc meets a straight segment.
+pub fn arc_area_scale(sweep: f32, n: usize) -> f32 {
+    let n = n.max(1) as f32;
+    let t = sweep.abs() / n;
+    if !(t.is_finite() && t > 1e-6) {
+        return 1.0;
+    }
+    (sweep.abs() / (n * t.sin())).sqrt()
+}
+
+/// Metres per file length unit for the mesh pass — memoized on the table,
+/// `1.0` (metres) when the file declares no resolvable LENGTHUNIT. In
+/// that case a millimetre-authored file samples every curve at the full
+/// 32 segments (the tolerance reads as 0.5 µm), which is today's output.
+pub(crate) fn length_scale(table: &EntityTable) -> f32 {
+    table
+        .length_scale_or_init(|| resolve_length_scale_opt(table))
+        .unwrap_or(1.0)
+}
 
 /// A 2D profile polygon — one outer loop + any number of inner holes.
 #[derive(Debug, Clone, Default)]
@@ -40,11 +105,11 @@ pub fn extract(table: &EntityTable, id: u64) -> Option<Polygon2D> {
         // Same as rectangle but with RoundingRadius — approximate as plain rect for now.
         rectangle(&fields)?
     } else if type_name.eq_ignore_ascii_case(b"IFCCIRCLEPROFILEDEF") {
-        circle(&fields)?
+        circle(table, &fields)?
     } else if type_name.eq_ignore_ascii_case(b"IFCCIRCLEHOLLOWPROFILEDEF") {
-        circle_hollow(&fields)?
+        circle_hollow(table, &fields)?
     } else if type_name.eq_ignore_ascii_case(b"IFCELLIPSEPROFILEDEF") {
-        ellipse(&fields)?
+        ellipse(table, &fields)?
     } else if type_name.eq_ignore_ascii_case(b"IFCISHAPEPROFILEDEF") {
         i_shape(&fields)?
     } else if type_name.eq_ignore_ascii_case(b"IFCLSHAPEPROFILEDEF") {
@@ -135,22 +200,29 @@ fn rectangle(fields: &[&[u8]]) -> Option<Polygon2D> {
     })
 }
 
-fn circle(fields: &[&[u8]]) -> Option<Polygon2D> {
+fn circle(table: &EntityTable, fields: &[&[u8]]) -> Option<Polygon2D> {
     // (ProfileType, ProfileName, Position, Radius)
     let r = number_at(fields, 3)? as f32;
+    let n = circle_samples(r, length_scale(table));
+    let k = area_preserving_scale(n);
     Some(Polygon2D {
-        outer: sample_ellipse(r, r, CURVE_SAMPLES),
+        outer: sample_ellipse(r * k, r * k, n),
         holes: Vec::new(),
     })
 }
 
-fn circle_hollow(fields: &[&[u8]]) -> Option<Polygon2D> {
+fn circle_hollow(table: &EntityTable, fields: &[&[u8]]) -> Option<Polygon2D> {
     // (ProfileType, ProfileName, Position, Radius, WallThickness)
     let r_outer = number_at(fields, 3)? as f32;
     let t = number_at(fields, 4)? as f32;
     let r_inner = (r_outer - t).max(0.0);
-    let outer = sample_ellipse(r_outer, r_outer, CURVE_SAMPLES);
-    let mut hole = sample_ellipse(r_inner, r_inner, CURVE_SAMPLES);
+    // One segment count for both rings (from the outer radius) so the
+    // annulus tessellates as aligned quads; the shared area factor keeps
+    // the annulus area exactly π(r_o² − r_i²).
+    let n = circle_samples(r_outer, length_scale(table));
+    let k = area_preserving_scale(n);
+    let outer = sample_ellipse(r_outer * k, r_outer * k, n);
+    let mut hole = sample_ellipse(r_inner * k, r_inner * k, n);
     hole.reverse(); // CW for hole
     Some(Polygon2D {
         outer,
@@ -158,12 +230,14 @@ fn circle_hollow(fields: &[&[u8]]) -> Option<Polygon2D> {
     })
 }
 
-fn ellipse(fields: &[&[u8]]) -> Option<Polygon2D> {
+fn ellipse(table: &EntityTable, fields: &[&[u8]]) -> Option<Polygon2D> {
     // (ProfileType, ProfileName, Position, SemiAxis1, SemiAxis2)
     let a = number_at(fields, 3)? as f32;
     let b = number_at(fields, 4)? as f32;
+    let n = circle_samples(a.abs().max(b.abs()), length_scale(table));
+    let k = area_preserving_scale(n);
     Some(Polygon2D {
-        outer: sample_ellipse(a, b, CURVE_SAMPLES),
+        outer: sample_ellipse(a * k, b * k, n),
         holes: Vec::new(),
     })
 }
@@ -361,7 +435,11 @@ fn curve_to_polyline(table: &EntityTable, curve_id: u64) -> Option<Vec<Vec2>> {
         // Revit MEP pipe (4 points + 2 IfcArcIndex semicircles)
         // collapses to a 4-sided prism — GH #48.
         if let Some(seg_body) = list_body(fields.get(1).copied()) {
-            if let Some(poly) = crate::mesh::indexed_curve::eval_segments_2d(&raw_pts, seg_body) {
+            if let Some(poly) = crate::mesh::indexed_curve::eval_segments_2d(
+                &raw_pts,
+                seg_body,
+                length_scale(table),
+            ) {
                 return Some(poly);
             }
         }
@@ -477,9 +555,18 @@ fn conic_arc(
     );
     let (start, end) = arc_span(a1, a2, sense)?;
     let sweep = (end - start).abs();
-    let n = ((CURVE_SAMPLES as f32) * sweep / std::f32::consts::TAU)
+    // Segments per full turn from the larger semi-axis (GH #170), scaled
+    // by the swept angle.
+    let per_turn = circle_samples(a.abs().max(b.abs()), length_scale(table));
+    let n = ((per_turn as f32) * sweep / std::f32::consts::TAU)
         .ceil()
         .max(2.0) as usize;
+    // Sector-area-preserving radius (see `arc_area_scale`): the profile's
+    // volume no longer depends on the chord count. The ellipse is the
+    // affine image of the circle, so the same factor on both semi-axes
+    // preserves its sector area too.
+    let k = arc_area_scale(sweep, n);
+    let (a, b) = (a * k, b * k);
     let (cos, sin) = (ref_dir.x, ref_dir.y);
     let pts = (0..=n)
         .map(|i| {
@@ -645,6 +732,115 @@ fn resolve_plane_angle_scale(table: &EntityTable) -> f32 {
     resolve_plane_angle_scale_opt(table).unwrap_or(DEGREE)
 }
 
+/// Metres per declared LENGTHUNIT, or `None` when the assignment carries
+/// no resolvable one. Same table walk as the plane-angle resolver: SI
+/// units read `Prefix` + `Name` (METRE only), conversion-based units
+/// (FOOT / INCH) follow `ConversionFactor` → `IfcMeasureWithUnit` →
+/// value × SI base unit. The indexer's `resolve_length_scale` is the
+/// warning-emitting authority for `unit_scale`; this is the quiet
+/// mesh-side twin (GH #170) and agrees with it on every corpus file.
+pub(crate) fn resolve_length_scale_opt(table: &EntityTable) -> Option<f32> {
+    let unit_refs = table
+        .unit_assignment_id()
+        .and_then(|id| table.get(id))
+        .map(|(_, args)| {
+            let fields = split_top_level_args(args);
+            match fields.first().copied().map(parse_field) {
+                Some(Field::List(b)) => parse_ref_list(b),
+                _ => Vec::new(),
+            }
+        })
+        .unwrap_or_default();
+    for uref in unit_refs {
+        let (utype, uargs) = match table.get(uref) {
+            Some(x) => x,
+            None => continue,
+        };
+        let uf = split_top_level_args(uargs);
+        let is_length = matches!(
+            uf.get(1).copied().map(parse_field),
+            Some(Field::Enum(b"LENGTHUNIT"))
+        );
+        if !is_length {
+            continue;
+        }
+        if utype.eq_ignore_ascii_case(b"IFCSIUNIT") {
+            if let Some(s) = si_length_scale_fields(&uf) {
+                return Some(s);
+            }
+        } else if utype.eq_ignore_ascii_case(b"IFCCONVERSIONBASEDUNIT") {
+            // (Dimensions, UnitType, Name, ConversionFactor)
+            let factor_ref = match uf.get(3).copied().map(parse_field) {
+                Some(Field::Ref(id)) => id,
+                _ => continue,
+            };
+            let (mtype, margs) = match table.get(factor_ref) {
+                Some(x) => x,
+                None => continue,
+            };
+            if !mtype.eq_ignore_ascii_case(b"IFCMEASUREWITHUNIT") {
+                continue;
+            }
+            let mf = split_top_level_args(margs);
+            let value = match mf.first().copied().and_then(parameter_value) {
+                Some(v) if v.is_finite() && v > 0.0 => v as f32,
+                _ => continue,
+            };
+            let base_ref = match mf.get(1).copied().map(parse_field) {
+                Some(Field::Ref(id)) => id,
+                _ => continue,
+            };
+            let base = match table.get(base_ref) {
+                Some((bt, bargs)) if bt.eq_ignore_ascii_case(b"IFCSIUNIT") => {
+                    si_length_scale_fields(&split_top_level_args(bargs))
+                }
+                _ => None,
+            };
+            if let Some(b) = base {
+                return Some(value * b);
+            }
+        }
+    }
+    None
+}
+
+/// `IfcSIUnit(Dimensions, UnitType, Prefix, Name)` → metres per unit, for
+/// `Name = METRE` with any SI prefix (`$` = none).
+fn si_length_scale_fields(uf: &[&[u8]]) -> Option<f32> {
+    let is_metre = matches!(
+        uf.get(3).copied().map(parse_field),
+        Some(Field::Enum(b"METRE")) | Some(Field::Enum(b"METER"))
+    );
+    if !is_metre {
+        return None;
+    }
+    let prefix = match uf.get(2).copied().map(parse_field) {
+        Some(Field::Enum(p)) => p,
+        _ => b"",
+    };
+    let exp: i32 = match prefix {
+        b"" => 0,
+        b"EXA" => 18,
+        b"PETA" => 15,
+        b"TERA" => 12,
+        b"GIGA" => 9,
+        b"MEGA" => 6,
+        b"KILO" => 3,
+        b"HECTO" => 2,
+        b"DECA" => 1,
+        b"DECI" => -1,
+        b"CENTI" => -2,
+        b"MILLI" => -3,
+        b"MICRO" => -6,
+        b"NANO" => -9,
+        b"PICO" => -12,
+        b"FEMTO" => -15,
+        b"ATTO" => -18,
+        _ => return None,
+    };
+    Some(10f32.powi(exp))
+}
+
 /// The declared PLANEANGLEUNIT scale, or `None` when the file declares
 /// none. Split out from [`resolve_plane_angle_scale`] (GH #155) because
 /// the degrees-default above is a *trim-parameter* heuristic: an
@@ -749,8 +945,9 @@ fn arc_span(a1: f32, a2: f32, sense: bool) -> Option<(f32, f32)> {
     }
 }
 
-/// Sample an `IfcCircle` into a closed CCW polyline of `CURVE_SAMPLES`
-/// points, honouring its `IfcAxis2Placement2D` (centre + orientation).
+/// Sample an `IfcCircle` into a closed CCW polyline of
+/// [`circle_samples`] points at the area-preserving radius, honouring its
+/// `IfcAxis2Placement2D` (centre + orientation).
 fn circle_curve_2d(table: &EntityTable, fields: &[&[u8]]) -> Option<Vec<Vec2>> {
     let radius = number_at(fields, 1)? as f32;
     if !(radius.is_finite() && radius > 0.0) {
@@ -761,9 +958,11 @@ fn circle_curve_2d(table: &EntityTable, fields: &[&[u8]]) -> Option<Vec<Vec2>> {
         _ => (Vec2::ZERO, Vec2::X),
     };
     let (cos, sin) = (ref_dir.x, ref_dir.y);
-    let pts = (0..CURVE_SAMPLES)
+    let n = circle_samples(radius, length_scale(table));
+    let radius = radius * area_preserving_scale(n);
+    let pts = (0..n)
         .map(|i| {
-            let a = (i as f32) * (std::f32::consts::TAU / CURVE_SAMPLES as f32);
+            let a = (i as f32) * (std::f32::consts::TAU / n as f32);
             let lx = radius * a.cos();
             let ly = radius * a.sin();
             // Rotate the local circle by the placement's ref direction,
@@ -1144,5 +1343,194 @@ END-ISO-10303-21;
         // A huge angle terminates (the old `while e += TAU` never did:
         // TAU is below the f32 ULP at this magnitude).
         assert!(arc_span(2.0e8, 2.0e8, true).is_some());
+    }
+}
+
+#[cfg(test)]
+mod adaptive_sampling_tests {
+    use super::*;
+
+    fn polygon_area(pts: &[Vec2]) -> f32 {
+        let n = pts.len();
+        (0..n)
+            .map(|i| {
+                let a = pts[i];
+                let b = pts[(i + 1) % n];
+                a.x * b.y - b.x * a.y
+            })
+            .sum::<f32>()
+            * 0.5
+    }
+
+    #[test]
+    fn circle_samples_follows_the_sagitta_rule() {
+        // 15 mm pipe: 9 segments whether the file is in metres or mm.
+        assert_eq!(circle_samples(0.0075, 1.0), 9);
+        assert_eq!(circle_samples(7.5, 0.001), 9);
+        // ≥ ~105 mm radius saturates at the old fixed count.
+        assert_eq!(circle_samples(0.105, 1.0), CURVE_SAMPLES);
+        assert_eq!(circle_samples(1.0, 1.0), CURVE_SAMPLES);
+        // Tiny, zero, negative and non-finite radii get the floor.
+        assert_eq!(circle_samples(0.0004, 1.0), MIN_CURVE_SAMPLES);
+        assert_eq!(circle_samples(0.0, 1.0), MIN_CURVE_SAMPLES);
+        assert_eq!(circle_samples(f32::NAN, 1.0), MIN_CURVE_SAMPLES);
+        assert_eq!(circle_samples(-0.5, 1.0), CURVE_SAMPLES);
+        // Monotone in the radius.
+        let mut prev = 0;
+        for i in 1..200 {
+            let n = circle_samples(i as f32 * 0.001, 1.0);
+            assert!(n >= prev, "n({i} mm) = {n} < {prev}");
+            prev = n;
+        }
+        // An undeclared unit (scale 1.0) on a mm-authored file reads every
+        // radius as huge → the full 32, i.e. today's output.
+        assert_eq!(circle_samples(7.5, 1.0), CURVE_SAMPLES);
+    }
+
+    #[test]
+    fn area_preserving_radius_makes_polygon_area_exact() {
+        for n in [MIN_CURVE_SAMPLES, 9, 12, 16, 24, CURVE_SAMPLES] {
+            let k = area_preserving_scale(n);
+            let r = 0.0075f32;
+            let poly = sample_ellipse(r * k, r * k, n);
+            let want = std::f32::consts::PI * r * r;
+            let got = polygon_area(&poly);
+            assert!(
+                ((got - want) / want).abs() < 1e-5,
+                "n={n}: area {got} vs π r² {want}"
+            );
+        }
+        // Ellipse: π·a·b.
+        let (a, b) = (2.0f32, 0.5f32);
+        let n = 8;
+        let k = area_preserving_scale(n);
+        let got = polygon_area(&sample_ellipse(a * k, b * k, n));
+        let want = std::f32::consts::PI * a * b;
+        assert!(((got - want) / want).abs() < 1e-5);
+        // The factor is above 1 and shrinks toward 1 as n grows.
+        assert!(area_preserving_scale(8) > area_preserving_scale(32));
+        assert!((area_preserving_scale(32) - 1.0032).abs() < 1e-4);
+    }
+
+    fn units_ifc(units: &str) -> String {
+        format!(
+            "ISO-10303-21;\nHEADER;\nFILE_DESCRIPTION(('ViewDefinition [ReferenceView]'),'2;1');\n\
+FILE_NAME('u.ifc','2026-09-07T00:00:00',('test'),('skiplum'),'ifcfast','ifcfast','');\n\
+FILE_SCHEMA(('IFC4'));\nENDSEC;\nDATA;\n{units}\n\
+#50=IFCCIRCLEPROFILEDEF(.AREA.,$,$,7.5);\n\
+#51=IFCCIRCLEHOLLOWPROFILEDEF(.AREA.,$,$,7.5,1.0);\n\
+ENDSEC;\nEND-ISO-10303-21;\n"
+        )
+    }
+
+    #[test]
+    fn length_scale_resolves_si_prefix_and_conversion_units() {
+        let mm = units_ifc(
+            "#1=IFCUNITASSIGNMENT((#2,#3));\n\
+#2=IFCSIUNIT(*,.LENGTHUNIT.,.MILLI.,.METRE.);\n\
+#3=IFCSIUNIT(*,.PLANEANGLEUNIT.,$,.RADIAN.);",
+        );
+        let table = EntityTable::build(mm.as_bytes());
+        assert!((resolve_length_scale_opt(&table).unwrap() - 0.001).abs() < 1e-9);
+        assert!((length_scale(&table) - 0.001).abs() < 1e-9);
+
+        let feet = units_ifc(
+            "#1=IFCUNITASSIGNMENT((#2));\n\
+#2=IFCCONVERSIONBASEDUNIT(#4,.LENGTHUNIT.,'FOOT',#5);\n\
+#4=IFCDIMENSIONALEXPONENTS(1,0,0,0,0,0,0);\n\
+#5=IFCMEASUREWITHUNIT(IFCLENGTHMEASURE(0.3048),#6);\n\
+#6=IFCSIUNIT(*,.LENGTHUNIT.,$,.METRE.);",
+        );
+        let table = EntityTable::build(feet.as_bytes());
+        assert!((resolve_length_scale_opt(&table).unwrap() - 0.3048).abs() < 1e-6);
+
+        let none =
+            units_ifc("#1=IFCUNITASSIGNMENT((#3));\n#3=IFCSIUNIT(*,.PLANEANGLEUNIT.,$,.RADIAN.);");
+        let table = EntityTable::build(none.as_bytes());
+        assert!(resolve_length_scale_opt(&table).is_none());
+        assert_eq!(length_scale(&table), 1.0);
+    }
+
+    #[test]
+    fn arc_area_scale_reduces_to_the_closed_formula_and_is_exact() {
+        assert!(
+            (arc_area_scale(std::f32::consts::TAU, 32) - area_preserving_scale(32)).abs() < 1e-7
+        );
+        // A semicircle of radius r sampled as n chords at the scaled
+        // radius spans exactly π r² / 2 with its two radii.
+        for n in [2usize, 3, 5, 9, 16] {
+            let r = 7.5f32;
+            let k = arc_area_scale(std::f32::consts::PI, n);
+            let mut poly = vec![Vec2::ZERO];
+            for i in 0..=n {
+                let t = std::f32::consts::PI * i as f32 / n as f32;
+                poly.push(Vec2::new(r * k * t.cos(), r * k * t.sin()));
+            }
+            let want = std::f32::consts::PI * r * r / 2.0;
+            let got = polygon_area(&poly);
+            assert!(((got - want) / want).abs() < 1e-5, "n={n}: {got} vs {want}");
+        }
+        assert_eq!(arc_area_scale(0.0, 4), 1.0);
+    }
+
+    #[test]
+    fn revit_pipe_profile_of_two_trimmed_semicircles_is_volume_exact() {
+        // IfcArbitraryClosedProfileDef → IfcCompositeCurve of two
+        // IfcTrimmedCurve(IfcCircle r=7.5) semicircles, mm file: the
+        // profile area must be π r² regardless of the chord count (9/turn).
+        let ifc = "ISO-10303-21;\nHEADER;\nFILE_DESCRIPTION(('ViewDefinition [ReferenceView]'),'2;1');\n\
+FILE_NAME('p.ifc','2026-09-07T00:00:00',('test'),('skiplum'),'ifcfast','ifcfast','');\n\
+FILE_SCHEMA(('IFC4'));\nENDSEC;\nDATA;\n\
+#1=IFCUNITASSIGNMENT((#2,#3));\n\
+#2=IFCSIUNIT(*,.LENGTHUNIT.,.MILLI.,.METRE.);\n\
+#3=IFCSIUNIT(*,.PLANEANGLEUNIT.,$,.RADIAN.);\n\
+#10=IFCCARTESIANPOINT((0.,0.));\n\
+#11=IFCDIRECTION((1.,0.));\n\
+#12=IFCAXIS2PLACEMENT2D(#10,#11);\n\
+#13=IFCCIRCLE(#12,7.5);\n\
+#14=IFCTRIMMEDCURVE(#13,(IFCPARAMETERVALUE(0.)),(IFCPARAMETERVALUE(3.14159265358979)),.T.,.PARAMETER.);\n\
+#15=IFCTRIMMEDCURVE(#13,(IFCPARAMETERVALUE(3.14159265358979)),(IFCPARAMETERVALUE(6.28318530717959)),.T.,.PARAMETER.);\n\
+#16=IFCCOMPOSITECURVESEGMENT(.CONTINUOUS.,.T.,#14);\n\
+#17=IFCCOMPOSITECURVESEGMENT(.CONTINUOUS.,.T.,#15);\n\
+#18=IFCCOMPOSITECURVE((#16,#17),.F.);\n\
+#19=IFCARBITRARYCLOSEDPROFILEDEF(.AREA.,$,#18);\n\
+ENDSEC;\nEND-ISO-10303-21;\n";
+        let table = EntityTable::build(ifc.as_bytes());
+        let poly = extract(&table, 19).expect("composite of two arcs resolves");
+        assert!(
+            poly.outer.len() <= 12,
+            "adaptive: {} vertices",
+            poly.outer.len()
+        );
+        let want = std::f32::consts::PI * 7.5 * 7.5;
+        let got = polygon_area(&poly.outer).abs();
+        assert!(((got - want) / want).abs() < 1e-4, "{got} vs {want}");
+    }
+
+    #[test]
+    fn circle_profiles_adapt_to_the_declared_unit() {
+        // 7.5 mm radius in a millimetre file → 9 segments, exact area.
+        let mm =
+            units_ifc("#1=IFCUNITASSIGNMENT((#2));\n#2=IFCSIUNIT(*,.LENGTHUNIT.,.MILLI.,.METRE.);");
+        let table = EntityTable::build(mm.as_bytes());
+        let poly = extract(&table, 50).unwrap();
+        assert_eq!(poly.outer.len(), 9);
+        let want = std::f32::consts::PI * 7.5 * 7.5;
+        assert!(((polygon_area(&poly.outer) - want) / want).abs() < 1e-5);
+        // Hollow: both rings share the count; annulus area exact.
+        let hollow = extract(&table, 51).unwrap();
+        assert_eq!(hollow.outer.len(), 9);
+        assert_eq!(hollow.holes[0].len(), 9);
+        let annulus = polygon_area(&hollow.outer) + polygon_area(&hollow.holes[0]);
+        let want = std::f32::consts::PI * (7.5f32 * 7.5 - 6.5 * 6.5);
+        assert!(
+            ((annulus - want) / want).abs() < 1e-4,
+            "{annulus} vs {want}"
+        );
+
+        // The same radius in a metres file is a 7.5 m circle → 32.
+        let m = units_ifc("#1=IFCUNITASSIGNMENT((#2));\n#2=IFCSIUNIT(*,.LENGTHUNIT.,$,.METRE.);");
+        let table = EntityTable::build(m.as_bytes());
+        assert_eq!(extract(&table, 50).unwrap().outer.len(), CURVE_SAMPLES);
     }
 }

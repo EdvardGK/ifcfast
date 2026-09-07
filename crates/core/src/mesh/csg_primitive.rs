@@ -34,13 +34,16 @@ use crate::lexer::{parse_field, split_top_level_args, Field};
 use crate::mesh::extrusion::LocalMesh;
 use crate::mesh::placement::axis_placement_3d_from_id;
 
-/// Curved-surface discretisation. Used for cylinder side, cone side,
-/// cylinder/cone caps, sphere longitude ring.
-const CIRCUMFERENCE_SEGMENTS: usize = 24;
+use crate::mesh::profile::{area_preserving_scale, circle_samples, length_scale};
 
-/// Sphere latitude bands (between the two poles). Combined with
-/// `CIRCUMFERENCE_SEGMENTS` longitudes gives 24 × 11 ≈ 264 quads.
-const SPHERE_LATITUDE_BANDS: usize = 12;
+/// Curved-surface discretisation (GH #170): segments per full turn come
+/// from the radius via [`circle_samples`] (8..=32, 0.5 mm sagitta); the
+/// cylinder and cone use the area-preserving radius so their volumes are
+/// exact for any segment count. Sphere latitude bands = half the
+/// longitudes, clamped to 4..=12 (12 was the fixed count before).
+fn sphere_latitude_bands(n_lon: usize) -> usize {
+    (n_lon / 2).clamp(4, 12)
+}
 
 /// Dispatch any `IfcCsgPrimitive3D` subtype to its tessellator. Returns
 /// `None` if the type is unknown — caller surfaces that as
@@ -119,7 +122,8 @@ pub fn right_circular_cylinder(table: &EntityTable, id: u64) -> Option<LocalMesh
     let height = number_at(&fields, 1)?;
     let radius = number_at(&fields, 2)?;
 
-    let n = CIRCUMFERENCE_SEGMENTS;
+    let n = circle_samples(radius, length_scale(table));
+    let radius = radius * area_preserving_scale(n);
     let mut local: Vec<Vec3> = Vec::with_capacity(2 * n + 2);
 
     // Bottom ring (0..n), top ring (n..2n), bottom centre (2n), top centre (2n+1).
@@ -173,7 +177,8 @@ pub fn right_circular_cone(table: &EntityTable, id: u64) -> Option<LocalMesh> {
     let height = number_at(&fields, 1)?;
     let radius = number_at(&fields, 2)?;
 
-    let n = CIRCUMFERENCE_SEGMENTS;
+    let n = circle_samples(radius, length_scale(table));
+    let radius = radius * area_preserving_scale(n);
     let mut local: Vec<Vec3> = Vec::with_capacity(n + 2);
 
     for i in 0..n {
@@ -211,8 +216,8 @@ pub fn sphere(table: &EntityTable, id: u64) -> Option<LocalMesh> {
     let position = placement_from_field(table, fields.first().copied())?;
     let radius = number_at(&fields, 1)?;
 
-    let n_lon = CIRCUMFERENCE_SEGMENTS;
-    let n_lat = SPHERE_LATITUDE_BANDS;
+    let n_lon = circle_samples(radius, length_scale(table));
+    let n_lat = sphere_latitude_bands(n_lon);
     let mut local: Vec<Vec3> = Vec::with_capacity((n_lat - 1) * n_lon + 2);
 
     // Ring vertices for each interior latitude band.

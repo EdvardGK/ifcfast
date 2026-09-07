@@ -17,13 +17,14 @@
 //! 4-point lists + 2 `IfcArcIndex` semicircles) collapse to square
 //! prisms — see GH #48.
 //!
-//! Sampling density matches `profile::CURVE_SAMPLES` (32 samples per full
-//! circle), scaled by arc angle so a semicircle gets 16 chord segments.
+//! Sampling density is `profile::circle_samples` per full circle (8..=32
+//! from the arc radius, GH #170), scaled by arc angle — a metre-radius
+//! semicircle gets 16 chord segments.
 
 use glam::{Vec2, Vec3};
 
 use crate::lexer::{parse_field, split_top_level_args, Field};
-use crate::mesh::profile::CURVE_SAMPLES;
+use crate::mesh::profile::{arc_area_scale, circle_samples};
 
 /// Parse a typed inline value such as `IFCARCINDEX((1,2,3))` — returns
 /// `(name, body)` where `body` is the bytes between the outer `(` and
@@ -67,7 +68,7 @@ fn trim_ws(mut s: &[u8]) -> &[u8] {
 /// between the outer parens of the field, i.e. the inner of the LIST OF
 /// IfcSegmentIndexSelect). Returns `None` if any segment fails to parse;
 /// callers can fall back to "connect points in order" for that case.
-pub fn eval_segments_2d(pts: &[Vec2], segments_raw: &[u8]) -> Option<Vec<Vec2>> {
+pub fn eval_segments_2d(pts: &[Vec2], segments_raw: &[u8], unit_scale: f32) -> Option<Vec<Vec2>> {
     let seg_fields = split_top_level_args(segments_raw);
     if seg_fields.is_empty() {
         return None;
@@ -83,7 +84,7 @@ pub fn eval_segments_2d(pts: &[Vec2], segments_raw: &[u8]) -> Option<Vec<Vec2>> 
             let p1 = *pts.get(indices[0].checked_sub(1)?)?;
             let mid = *pts.get(indices[1].checked_sub(1)?)?;
             let p3 = *pts.get(indices[2].checked_sub(1)?)?;
-            let samples = arc_samples_2d(p1, mid, p3).unwrap_or_else(|| vec![p1, p3]);
+            let samples = arc_samples_2d(p1, mid, p3, unit_scale).unwrap_or_else(|| vec![p1, p3]);
             append_dedup_2d(&mut out, &samples);
         } else if name.eq_ignore_ascii_case(b"IFCLINEINDEX") {
             if indices.len() < 2 {
@@ -128,7 +129,7 @@ fn signed_area_2d(pts: &[Vec2]) -> f32 {
 
 /// 3D variant of [`eval_segments_2d`] — same semantics, evaluated in
 /// the plane through the three control points of each arc.
-pub fn eval_segments_3d(pts: &[Vec3], segments_raw: &[u8]) -> Option<Vec<Vec3>> {
+pub fn eval_segments_3d(pts: &[Vec3], segments_raw: &[u8], unit_scale: f32) -> Option<Vec<Vec3>> {
     let seg_fields = split_top_level_args(segments_raw);
     if seg_fields.is_empty() {
         return None;
@@ -144,7 +145,7 @@ pub fn eval_segments_3d(pts: &[Vec3], segments_raw: &[u8]) -> Option<Vec<Vec3>> 
             let p1 = *pts.get(indices[0].checked_sub(1)?)?;
             let mid = *pts.get(indices[1].checked_sub(1)?)?;
             let p3 = *pts.get(indices[2].checked_sub(1)?)?;
-            let samples = arc_samples_3d(p1, mid, p3).unwrap_or_else(|| vec![p1, p3]);
+            let samples = arc_samples_3d(p1, mid, p3, unit_scale).unwrap_or_else(|| vec![p1, p3]);
             append_dedup_3d(&mut out, &samples);
         } else if name.eq_ignore_ascii_case(b"IFCLINEINDEX") {
             if indices.len() < 2 {
@@ -236,10 +237,25 @@ fn circumcircle_2d(p1: Vec2, p2: Vec2, p3: Vec2) -> Option<(Vec2, f32)> {
 }
 
 /// Sample the unique arc from `p1` to `p3` passing through `mid` —
-/// inclusive of both endpoints. Sampling density matches
-/// `CURVE_SAMPLES` per full turn, with a minimum of two chord
-/// segments per arc.
-fn arc_samples_2d(p1: Vec2, mid: Vec2, p3: Vec2) -> Option<Vec<Vec2>> {
+/// inclusive of both endpoints. Sampling density is
+/// [`circle_samples`] per full turn for the arc's radius (`unit_scale`
+/// = metres per file unit), with a minimum of two chord segments per arc.
+fn arc_samples_2d(p1: Vec2, mid: Vec2, p3: Vec2, unit_scale: f32) -> Option<Vec<Vec2>> {
+    arc_samples_2d_impl(p1, mid, p3, unit_scale, true)
+}
+
+/// `preserve_area`: scale the chord radius by [`arc_area_scale`] so the
+/// polygonal sector equals the circular one — right for the arcs of a
+/// closed 2D profile (the QTO volume stays analytic for any chord
+/// count), wrong for a 3D directrix where the path itself must stay on
+/// the arc.
+fn arc_samples_2d_impl(
+    p1: Vec2,
+    mid: Vec2,
+    p3: Vec2,
+    unit_scale: f32,
+    preserve_area: bool,
+) -> Option<Vec<Vec2>> {
     let (center, radius) = circumcircle_2d(p1, mid, p3)?;
     let theta1 = (p1 - center).y.atan2((p1 - center).x);
     let theta_m = (mid - center).y.atan2((mid - center).x);
@@ -258,8 +274,13 @@ fn arc_samples_2d(p1: Vec2, mid: Vec2, p3: Vec2) -> Option<Vec<Vec2>> {
     if delta <= 0.0 {
         return Some(vec![p1, p3]);
     }
-    let step = std::f32::consts::TAU / CURVE_SAMPLES as f32;
+    let step = std::f32::consts::TAU / circle_samples(radius, unit_scale) as f32;
     let n = ((delta / step).ceil() as usize).max(2);
+    let radius = if preserve_area {
+        radius * arc_area_scale(delta, n)
+    } else {
+        radius
+    };
     let mut out = Vec::with_capacity(n + 1);
     for i in 0..=n {
         let t = i as f32 / n as f32;
@@ -272,7 +293,7 @@ fn arc_samples_2d(p1: Vec2, mid: Vec2, p3: Vec2) -> Option<Vec<Vec2>> {
 
 /// 3D arc sampler — projects the three control points into the plane
 /// they define, samples in 2D, lifts back.
-fn arc_samples_3d(p1: Vec3, mid: Vec3, p3: Vec3) -> Option<Vec<Vec3>> {
+fn arc_samples_3d(p1: Vec3, mid: Vec3, p3: Vec3, unit_scale: f32) -> Option<Vec<Vec3>> {
     let v_mid = mid - p1;
     let v_end = p3 - p1;
     let normal = v_mid.cross(v_end);
@@ -285,7 +306,7 @@ fn arc_samples_3d(p1: Vec3, mid: Vec3, p3: Vec3) -> Option<Vec<Vec3>> {
     let p1_2d = Vec2::ZERO;
     let mid_2d = Vec2::new(v_mid.dot(u), v_mid.dot(v));
     let p3_2d = Vec2::new(v_end.dot(u), v_end.dot(v));
-    let samples_2d = arc_samples_2d(p1_2d, mid_2d, p3_2d)?;
+    let samples_2d = arc_samples_2d_impl(p1_2d, mid_2d, p3_2d, unit_scale, false)?;
     Some(
         samples_2d
             .into_iter()
@@ -352,25 +373,30 @@ mod tests {
     #[test]
     fn arc_semicircle_upper_half() {
         // p1=(1,0), mid=(0,1), p3=(-1,0). Upper semicircle CCW. Should
-        // emit at least 16 chord segments (half of CURVE_SAMPLES=32).
+        // emit at least 16 chord segments (half of the 32 a 1 m radius gets).
         let pts = arc_samples_2d(
             Vec2::new(1.0, 0.0),
             Vec2::new(0.0, 1.0),
             Vec2::new(-1.0, 0.0),
+            1.0,
         )
         .unwrap();
         assert!(pts.len() >= 17);
-        // All samples on unit circle.
+        // All samples on the sector-area-preserving circle (GH #170):
+        // radius k = arc_area_scale(π, n) — 1.0032 for 16 chords.
+        let k = arc_area_scale(std::f32::consts::PI, pts.len() - 1);
+        assert!(k > 1.0 && k < 1.01, "k = {k}");
         for p in &pts {
-            assert!((p.length() - 1.0).abs() < 1e-4);
+            assert!((p.length() - k).abs() < 1e-4, "{p:?} vs r={k}");
         }
         // All samples in upper half-plane (with eps for endpoints).
         for p in &pts {
             assert!(p.y >= -1e-4);
         }
-        // Endpoints match.
-        assert!((pts.first().unwrap() - Vec2::new(1.0, 0.0)).length() < 1e-4);
-        assert!((pts.last().unwrap() - Vec2::new(-1.0, 0.0)).length() < 1e-4);
+        // Endpoints sit on the same rays as p1 / p3, pushed out to the
+        // area-preserving radius (the documented `(k − 1)·r` jog).
+        assert!((pts.first().unwrap() - Vec2::new(k, 0.0)).length() < 1e-4);
+        assert!((pts.last().unwrap() - Vec2::new(-k, 0.0)).length() < 1e-4);
     }
 
     #[test]
@@ -380,6 +406,7 @@ mod tests {
             Vec2::new(1.0, 0.0),
             Vec2::new(0.0, -1.0),
             Vec2::new(-1.0, 0.0),
+            1.0,
         )
         .unwrap();
         for p in &pts {
@@ -399,7 +426,7 @@ mod tests {
         ];
         // Segments = (IFCARCINDEX((1,2,3)), IFCARCINDEX((3,4,1)))
         let segs = b"IFCARCINDEX((1,2,3)),IFCARCINDEX((3,4,1))";
-        let polyline = eval_segments_2d(&pts, segs).unwrap();
+        let polyline = eval_segments_2d(&pts, segs, 1.0).unwrap();
         // Should land somewhere near 2 * 16 = 32 chord segments.
         // (Plus minus one for endpoint dedup.)
         assert!(
@@ -407,11 +434,13 @@ mod tests {
             "got {} samples — expected ~32",
             polyline.len()
         );
-        // All on unit circle.
+        // All on the area-preserving circle (radius 1.0032 for 16 chords
+        // per semicircle — the polygon area is exactly π, see
+        // `two_arc_pipe_profile_is_area_exact_for_any_chord_count`).
         for p in &polyline {
             assert!(
-                (p.length() - 1.0).abs() < 1e-3,
-                "point {:?} not on unit circle",
+                (p.length() - 1.0).abs() < 5e-3 && p.length() >= 1.0 - 1e-4,
+                "point {:?} not on the (area-preserving) unit circle",
                 p
             );
         }
@@ -426,7 +455,7 @@ mod tests {
             Vec2::new(0.0, 5.0),
         ];
         let segs = b"IFCLINEINDEX((1,2,3,4,1))";
-        let polyline = eval_segments_2d(&pts, segs).unwrap();
+        let polyline = eval_segments_2d(&pts, segs, 1.0).unwrap();
         // Closed: trailing dedup drops the repeat back to point 1.
         assert_eq!(polyline.len(), 4);
         assert_eq!(polyline[0], Vec2::new(0.0, 0.0));
@@ -446,7 +475,7 @@ mod tests {
             Vec2::new(0.0, 1.0),
         ];
         let segs = b"IFCLINEINDEX((1,2)),IFCARCINDEX((2,3,4)),IFCLINEINDEX((4,5,1))";
-        let polyline = eval_segments_2d(&pts, segs).unwrap();
+        let polyline = eval_segments_2d(&pts, segs, 1.0).unwrap();
         // Two corners + arc samples + start/end ≈ 1 (start) + 1 (arc end)
         // + 16/4=4 arc interior + 1 (corner) + 1 (close) = ~8 points.
         assert!(polyline.len() >= 6);
@@ -458,6 +487,7 @@ mod tests {
             Vec3::new(1.0, 0.0, 0.0),
             Vec3::new(0.0, 1.0, 0.0),
             Vec3::new(-1.0, 0.0, 0.0),
+            1.0,
         )
         .unwrap();
         assert!(pts.len() >= 17);
@@ -469,12 +499,38 @@ mod tests {
 
     #[test]
     fn empty_segments_returns_none() {
-        assert!(eval_segments_2d(&[Vec2::ZERO], b"").is_none());
+        assert!(eval_segments_2d(&[Vec2::ZERO], b"", 1.0).is_none());
+    }
+
+    #[test]
+    fn two_arc_pipe_profile_is_area_exact_for_any_chord_count() {
+        // Revit IFC4 pipe: 4 points + two IfcArcIndex semicircles, r=7.5 mm.
+        let r = 7.5f32;
+        let pts = vec![
+            Vec2::new(r, 0.0),
+            Vec2::new(0.0, r),
+            Vec2::new(-r, 0.0),
+            Vec2::new(0.0, -r),
+        ];
+        let segs = b"IFCARCINDEX((1,2,3)),IFCARCINDEX((3,4,1))";
+        for unit_scale in [0.001f32, 1.0] {
+            let poly = eval_segments_2d(&pts, segs, unit_scale).unwrap();
+            let area = signed_area_2d(&poly).abs();
+            let want = std::f32::consts::PI * r * r;
+            assert!(
+                ((area - want) / want).abs() < 1e-4,
+                "scale {unit_scale}: {area} vs {want} ({} pts)",
+                poly.len()
+            );
+        }
+        // mm file → ~9 chords per turn; metres file (7.5 m pipe) → 32.
+        assert!(eval_segments_2d(&pts, segs, 0.001).unwrap().len() <= 12);
+        assert!(eval_segments_2d(&pts, segs, 1.0).unwrap().len() >= 30);
     }
 
     #[test]
     fn unknown_segment_type_returns_none() {
         let pts = vec![Vec2::ZERO, Vec2::X, Vec2::Y];
-        assert!(eval_segments_2d(&pts, b"IFCBSPLINEINDEX((1,2,3))").is_none());
+        assert!(eval_segments_2d(&pts, b"IFCBSPLINEINDEX((1,2,3))", 1.0).is_none());
     }
 }

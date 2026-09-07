@@ -52,6 +52,9 @@ pub struct EntityTable<'a> {
     /// on first request via `unit_assignment_id`, tied to this table's
     /// lifetime so it can never go stale across models.
     unit_assignment: OnceLock<Option<u64>>,
+    /// Metres per file length unit, memoized by the first caller (the
+    /// mesh pass — sagitta-based curve sampling, GH #170).
+    length_scale: OnceLock<Option<f32>>,
     /// Non-`None` when the DATA walk did NOT end legitimately — a stray
     /// byte mid-stream, an unterminated final record, or a missing
     /// `DATA;` marker (GH #148). The table then describes a PARTIAL
@@ -147,6 +150,7 @@ impl<'a> EntityTable<'a> {
             entries,
             order,
             unit_assignment: OnceLock::new(),
+            length_scale: OnceLock::new(),
             scan_error,
             warnings,
         }
@@ -177,6 +181,14 @@ impl<'a> EntityTable<'a> {
                 .find(|(_, t, _)| t.eq_ignore_ascii_case(b"IFCUNITASSIGNMENT"))
                 .map(|(id, _, _)| id)
         })
+    }
+
+    /// Metres per file length unit, resolved once through the unit
+    /// assignment by `f` on first use and memoized. `None` when the file
+    /// declares no resolvable LENGTHUNIT (the mesh pass then samples
+    /// curves as if the file were in metres — the conservative choice).
+    pub fn length_scale_or_init(&self, f: impl FnOnce() -> Option<f32>) -> Option<f32> {
+        *self.length_scale.get_or_init(f)
     }
 
     /// Look up an entity by STEP id. Returns `(type_name, args)` byte slices
