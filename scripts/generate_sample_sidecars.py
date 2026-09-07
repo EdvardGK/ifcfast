@@ -381,6 +381,11 @@ def _split_materials_per_product(glb_path: Path) -> None:
 
     materials = g.setdefault("materials", [])
     meshes = g["meshes"]
+    # ifcfast >= 0.5.1 names baked materials by GUID itself (GH #146):
+    # nothing to do when the first named material is not a colour code.
+    if materials and not str(materials[0].get("name", "#")).startswith("#"):
+        print(f"materials already per product ({len(materials)}); engine-side GH #146, skipping split")
+        return
     node_count = 0
     prim_count = 0
     for node in g.get("nodes", []):
