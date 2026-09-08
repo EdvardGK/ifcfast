@@ -44,10 +44,93 @@ def _is_zip_file(p: Path) -> bool:
         return False
 
 
+# --- .ifczip decompression limits (GH #175) --------------------------
+#
+# A ZIP's declared sizes are attacker-controlled: a few hundred KB of
+# deflate can inflate to gigabytes and take the process (or, on
+# ifcfast.com, the visitor's tab) down. A compressed-size check upstream
+# sees only the packed bytes and cannot detect this at all.
+#
+# These mirror `DecompressLimits::default()` in
+# `crates/core/src/source.rs` and are enforced on the Python
+# decompression path — the one `_core.*` actually takes, since
+# `native_path_for()` inflates the archive to a tempfile before Rust
+# ever sees a path. Both sides refuse with the same message shape.
+#
+# The 200x ratio is evidence-based: measured deflate on real IFC is
+# 4.77x (G55_RIV, 101 MB MEP), 4.84x (G55_ARK, 72 MB), 5.14x (Duplex,
+# 2.4 MB), 5.28x (G55_RIE, 23 MB), and 1.8-2.7x on the repo's small STEP
+# fixtures — ~38x headroom over the worst real file we have.
+_DEFAULT_MAX_DECOMPRESSED_BYTES = 4 * 1024 * 1024 * 1024
+_DEFAULT_MAX_EXPANSION_RATIO = 200.0
+# Below this the ratio is noisy and harmless, so it is not enforced.
+_RATIO_FLOOR_BYTES = 8 * 1024 * 1024
+_MAX_MEMBERS = 4096
+_MAX_NAME_LEN = 1024
+
+
+def _env_limit(name: str, default: float, cast) -> float:
+    """Read an override from the environment, ignoring unparseable and
+    non-positive values (a typo must not silently disable the guard)."""
+    raw = os.environ.get(name)
+    if not raw:
+        return default
+    try:
+        value = cast(raw)
+    except (TypeError, ValueError):
+        warnings.warn(
+            f"{name}={raw!r} is not a number; using the default {default}.",
+            stacklevel=2,
+        )
+        return default
+    if value <= 0:
+        warnings.warn(
+            f"{name}={raw!r} is not positive; using the default {default}.",
+            stacklevel=2,
+        )
+        return default
+    return value
+
+
+def max_decompressed_bytes() -> int:
+    """Ceiling on the bytes an `.ifczip` member may inflate to.
+    Override with ``IFCFAST_MAX_DECOMPRESSED_BYTES``."""
+    return int(
+        _env_limit(
+            "IFCFAST_MAX_DECOMPRESSED_BYTES", _DEFAULT_MAX_DECOMPRESSED_BYTES, int
+        )
+    )
+
+
+def max_expansion_ratio() -> float:
+    """Ceiling on decompressed/compressed for an `.ifczip` member.
+    Override with ``IFCFAST_MAX_EXPANSION_RATIO``."""
+    return float(
+        _env_limit("IFCFAST_MAX_EXPANSION_RATIO", _DEFAULT_MAX_EXPANSION_RATIO, float)
+    )
+
+
 def _largest_step_member(zf: zipfile.ZipFile) -> zipfile.ZipInfo:
+    infos = zf.infolist()
+    # Bound the container walk itself: a crafted archive must not be able
+    # to make the member scan pathological (GH #175).
+    if len(infos) > _MAX_MEMBERS:
+        raise ValueError(
+            f".ifczip: archive holds {len(infos)} members, over the limit of "
+            f"{_MAX_MEMBERS} (ifcfast.header._MAX_MEMBERS). Refusing to walk "
+            f"the central directory."
+        )
+    for i, info in enumerate(infos):
+        if len(info.filename.encode("utf-8", "replace")) > _MAX_NAME_LEN:
+            raise ValueError(
+                f".ifczip: entry {i} carries a "
+                f"{len(info.filename.encode('utf-8', 'replace'))}-byte member "
+                f"name, over the limit of {_MAX_NAME_LEN} "
+                f"(ifcfast.header._MAX_NAME_LEN)."
+            )
     steps = [
         info
-        for info in zf.infolist()
+        for info in infos
         if info.filename.lower().endswith((".ifc", ".step", ".stp"))
     ]
     if not steps:
@@ -67,6 +150,13 @@ def _largest_step_member(zf: zipfile.ZipFile) -> zipfile.ZipInfo:
             f"ignoring {others}. Extract the intended member explicitly "
             "if this is wrong.",
             stacklevel=2,
+        )
+    cap = max_decompressed_bytes()
+    if chosen.file_size > cap:
+        raise ValueError(
+            f".ifczip: member {chosen.filename!r} declares {chosen.file_size} "
+            f"decompressed bytes, over the limit of {cap} "
+            f"(IFCFAST_MAX_DECOMPRESSED_BYTES). Refusing to inflate it."
         )
     return chosen
 
@@ -100,6 +190,12 @@ def native_path_for(p: str | Path) -> Path:
     once instead of N times. Cache is keyed by `(canonical path,
     mtime_ns)`; touching the source invalidates the entry. Tempfiles
     are removed on process exit via `atexit`.
+
+    The inflate is bounded (GH #175): a member that crosses
+    `max_decompressed_bytes()` or `max_expansion_ratio()` raises
+    `ValueError` and leaves no tempfile behind. This is the path
+    `_core.*` actually takes, so the guard is not merely a Rust-side
+    property.
     """
     p = Path(p)
     if not _is_zip_file(p):
@@ -117,11 +213,46 @@ def native_path_for(p: str | Path) -> Path:
     try:
         with p.open("rb") as f, zipfile.ZipFile(f) as zf:
             member = _largest_step_member(zf)
+            # The declared-size refusal in `_largest_step_member` is only
+            # as good as the ZIP header, which a crafted archive can lie
+            # in. So bound the inflate as it streams too (GH #175), and
+            # cross-check the expansion ratio. The denominator is the
+            # member's declared compressed size clamped to the archive
+            # length — a member cannot really carry more packed bytes
+            # than the file holds, so a header inflating it to dodge the
+            # ratio cap gets clamped back.
+            cap = max_decompressed_bytes()
+            ratio_cap = max_expansion_ratio()
+            compressed = max(min(member.compress_size, stat.st_size), 1)
+            written = 0
             with zf.open(member) as src, tmp.open("wb") as dst:
                 while True:
                     chunk = src.read(1 << 20)
                     if not chunk:
                         break
+                    written += len(chunk)
+                    if written > cap:
+                        raise ValueError(
+                            f".ifczip: member {member.filename!r} inflates past "
+                            f"the decompressed-size limit of {cap} bytes "
+                            f"(IFCFAST_MAX_DECOMPRESSED_BYTES) — {written} bytes "
+                            f"produced before the stream was cut. Refusing to "
+                            f"buffer it; raise the limit deliberately if this "
+                            f"archive is genuine."
+                        )
+                    if written >= _RATIO_FLOOR_BYTES:
+                        ratio = written / compressed
+                        if ratio > ratio_cap:
+                            raise ValueError(
+                                f".ifczip: member {member.filename!r} inflates "
+                                f"past the expansion-ratio limit of "
+                                f"{ratio_cap:.0f}x (IFCFAST_MAX_EXPANSION_RATIO) "
+                                f"— {compressed} compressed bytes had already "
+                                f"produced {written} bytes ({ratio:.1f}x). Real "
+                                f"IFC deflates ~2-6x, so this reads as a zip "
+                                f"bomb; raise the limit deliberately if this "
+                                f"archive is genuine."
+                            )
                     dst.write(chunk)
     except Exception:
         tmp.unlink(missing_ok=True)

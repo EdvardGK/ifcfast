@@ -753,6 +753,12 @@ threads (single-threaded mesh pass — ~2× native). Everything stays in
 the tab; nothing is uploaded. ifcfast.com's instrument uses exactly
 this path for "drop your IFC".
 
+A dropped `.ifczip` is bounded before it can take the tab down: the
+decompressed cap is 1 GiB on wasm (4 GiB native) and the 200× expansion
+ratio is the same on both — see the `.ifczip` bullet under *Conventions
+you can rely on*. `fromBytes` throws an `Error` with the core's message.
+Gated by `crates/wasm/test/limits.mjs`.
+
 ## Conventions you can rely on
 
 - **Length unit: `unit_scale` / `unit_resolved` / `length_unit`**
@@ -851,6 +857,37 @@ this path for "drop your IFC".
   ones, instead of silently reading one model with no trace. A
   single-member archive and a no-STEP archive are unchanged (the latter
   still raises `ValueError`).
+- **`.ifczip` decompression is bounded — zip bombs are refused (GH
+  #175).** A ZIP's declared sizes are attacker-controlled: a few hundred
+  KB of deflate can inflate to gigabytes, and a compressed-size check
+  upstream (ifcfast.com caps a dropped file at 300 MB *packed*) cannot
+  see it. The inflate is therefore streamed against four bounds, applied
+  identically by the Rust core (`source::decompress_ifczip`), the Python
+  wheel (`ifcfast.header.native_path_for`, the path `_core.*` takes), and
+  the browser build:
+
+  | bound | native default | wasm default | why |
+  |---|---|---|---|
+  | decompressed bytes | 4 GiB | 1 GiB | absolute backstop; a tab cannot hold more |
+  | expansion ratio | 200× | 200× | measured real-IFC deflate is 4.77–5.28× (G55_RIV 101 MB, G55_ARK 72 MB, G55_RIE 23 MB, Duplex 2.4 MB) and 1.8–2.7× on small fixtures — ~38× headroom |
+  | member count | 4096 | 4096 | bounds the central-directory walk |
+  | member-name length | 1024 B | 1024 B | bounds the member scan |
+
+  The ratio only applies once 8 MiB have inflated (small archives have
+  noisy ratios and cannot hurt anyone). A rejection is loud and names the
+  limit, the observed size or ratio, and the member — never a partial
+  buffer, never a silent truncation. It surfaces as `ValueError` from
+  `header()` / `open()` / any `_core.*` call, and as
+  `io::ErrorKind::InvalidData` (`.ifczip: member "…" inflates past …`)
+  from the Rust API and the `ifcfast-bundle` binary. In the browser
+  `IfcModel.fromBytes` throws an `Error` carrying the same message.
+
+  Overrides: Python reads `IFCFAST_MAX_DECOMPRESSED_BYTES` (int, bytes)
+  and `IFCFAST_MAX_EXPANSION_RATIO` (float); Rust callers pass a
+  `source::DecompressLimits` to `decompress_ifczip_with` / `open_with` /
+  `open_bytes_with` (the no-suffix functions keep the defaults). An
+  unparseable or non-positive env value warns and falls back to the
+  default rather than disabling the guard.
 - **Truncated files are refused, not half-parsed.** A STEP file
   missing its `END-ISO-10303-21;` trailer (interrupted download /
   copy) is refused at open instead of silently returning a partial

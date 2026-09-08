@@ -374,6 +374,92 @@ def test_zip_disguised_as_ifc(tmp_path):
     assert m.types() == {"IfcWall": 1}
 
 
+def test_ifczip_bomb_is_refused(tmp_path):
+    """A zip bomb — a few tens of KB that inflate to gigabytes — must be
+    refused loudly, not buffered (GH #175). The compressed-size checks a
+    caller can do upstream see only the packed bytes and cannot detect
+    this at all, so the bound lives at the decompression choke-point.
+
+    Surfaces as `ValueError` with the message intact, matching the class
+    the truncated-file guard already raises.
+    """
+    import zipfile
+
+    from ifcfast.header import native_path_for
+
+    bomb = tmp_path / "bomb.ifczip"
+    with zipfile.ZipFile(bomb, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
+        zf.writestr("bomb.ifc", b"0" * (64 * 1024 * 1024))
+    # ~65 KB on disk, 64 MiB inflated: ratio ~1000x against real IFC's 5x.
+    assert bomb.stat().st_size < 1024 * 1024
+
+    with pytest.raises(ValueError) as exc:
+        native_path_for(bomb)
+    msg = str(exc.value)
+    assert "bomb.ifc" in msg
+    assert "expansion-ratio" in msg
+    assert "IFCFAST_MAX_EXPANSION_RATIO" in msg
+
+
+def test_ifczip_decompressed_cap_is_env_overridable(tmp_path, monkeypatch):
+    """`IFCFAST_MAX_DECOMPRESSED_BYTES` tightens (or widens) the absolute
+    cap; a member declaring more than it never inflates at all."""
+    import zipfile
+
+    from ifcfast.header import native_path_for
+
+    monkeypatch.setenv("IFCFAST_MAX_DECOMPRESSED_BYTES", str(1024 * 1024))
+    arc = tmp_path / "big.ifczip"
+    with zipfile.ZipFile(arc, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
+        zf.writestr("big.ifc", b"0" * (8 * 1024 * 1024))
+
+    with pytest.raises(ValueError) as exc:
+        native_path_for(arc)
+    msg = str(exc.value)
+    assert "big.ifc" in msg
+    assert "1048576" in msg
+    assert "IFCFAST_MAX_DECOMPRESSED_BYTES" in msg
+
+
+def test_ifczip_container_walk_is_bounded(tmp_path):
+    """A crafted archive must not make the member *scan* pathological."""
+    import zipfile
+
+    from ifcfast.header import _MAX_MEMBERS, _MAX_NAME_LEN, native_path_for
+
+    many = tmp_path / "many.ifczip"
+    with zipfile.ZipFile(many, "w") as zf:
+        for i in range(_MAX_MEMBERS + 4):
+            zf.writestr(f"m{i}.ifc", b"x")
+    with pytest.raises(ValueError, match="over the limit"):
+        native_path_for(many)
+
+    long_name = tmp_path / "longname.ifczip"
+    with zipfile.ZipFile(long_name, "w") as zf:
+        zf.writestr("a" * (_MAX_NAME_LEN * 2) + ".ifc", b"x")
+    with pytest.raises(ValueError, match="member name"):
+        native_path_for(long_name)
+
+
+def test_real_ifczip_unaffected_by_the_bomb_guard(tmp_path):
+    """The guard has to be invisible to genuine files: real IFC deflates
+    ~2-6x, two orders of magnitude under the 200x cap."""
+    import zipfile
+
+    from ifcfast.header import native_path_for
+
+    body = FIXTURE.read_bytes()
+    arc = tmp_path / "real.ifczip"
+    with zipfile.ZipFile(arc, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("real.ifc", body)
+    assert len(body) / arc.stat().st_size < 200.0
+
+    assert native_path_for(arc).read_bytes() == body
+    assert ifcfast.header(arc).schema == "IFC4"
+    m = ifcfast.open(arc, use_cache=False, write_cache=False)
+    assert m.types() == {"IfcWall": 1}
+
+
 # ---------------------------------------------------------------------------
 # iter_point_cloud — streaming point cloud (GH #23 fix)
 # ---------------------------------------------------------------------------

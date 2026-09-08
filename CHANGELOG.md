@@ -7,6 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security — bounded `.ifczip` decompression (GH #175)
+
+- **Zip bombs are refused loudly instead of buffered.** A ZIP's declared
+  sizes are attacker-controlled: a few hundred KB of deflate can inflate
+  to gigabytes, taking a process — or, since GH #172 put the parser in
+  the visitor's tab, a browser tab — down. A compressed-size check
+  upstream (ifcfast.com caps a dropped file at 300 MB *packed*) cannot
+  detect this at all, so the bound lives at the decompression
+  choke-point and is shared by every entry point.
+  - `source::decompress_ifczip` now streams the inflate against a
+    decompressed-byte cap (**4 GiB** native, **1 GiB** on
+    `wasm32` — a tab cannot hold more) and an expansion-ratio cap
+    (**200×**, enforced once 8 MiB have inflated). Measured deflate on
+    real IFC is 4.77× (G55_RIV, 101 MB), 4.84× (G55_ARK, 72 MB), 5.14×
+    (Duplex, 2.4 MB), 5.28× (G55_RIE, 23 MB), and 1.8–2.7× on the repo's
+    small STEP fixtures — the cap carries ~38× headroom.
+  - The container walk is bounded too: **4096** members (read out of the
+    End-Of-Central-Directory record *before* the buffer reaches the ZIP
+    reader, which pre-allocates one entry struct per declared member) and
+    **1024 bytes** per member name.
+  - Failures are `io::ErrorKind::InvalidData` naming the limit, the
+    observed size or ratio, and the member; the buffer is dropped whole,
+    never returned partially.
+  - New `source::DecompressLimits` (with `Default`) plus
+    `decompress_ifczip_with` / `open_with` / `open_bytes_with`; the
+    existing `decompress_ifczip` / `open` / `open_bytes` signatures are
+    unchanged and take the defaults.
+  - Python enforces the same bounds on its own decompression path
+    (`ifcfast.header.native_path_for`, which is what `_core.*` calls
+    actually run), raising `ValueError` with the message intact — the
+    same class the truncated-file guard raises. Overridable with
+    `IFCFAST_MAX_DECOMPRESSED_BYTES` (int) and
+    `IFCFAST_MAX_EXPANSION_RATIO` (float); an unparseable or non-positive
+    value warns and keeps the default.
+  - Genuine archives are unaffected: `.ifczip` inputs across the corpus
+    open byte-identically.
+
 ### Added — ifcfast in the browser (GH #172)
 
 - **`crates/wasm` (`ifcfast-wasm`)**: the pure-Rust core compiled to
