@@ -3,9 +3,19 @@
 //   node crates/wasm/test/parity.mjs
 //
 // Loads `crates/wasm/pkg/` (build it with `crates/wasm/build.sh` first),
-// runs `IfcModel.fromBytes` on the Duplex sample, and diffs the four JSON
+// runs `IfcModel.fromBytes` on the Duplex sample, and diffs the JSON
 // surfaces key-by-key against the sidecars the Python generator baked
 // into `ifcfast-site/public/sample/`.
+//
+// GH #183 added the four long-format data layers (psets / quantities /
+// materials / classifications) to both sides. Those diff EXACTLY,
+// row-for-row: both the wheel and the wasm build serialise the output of
+// the same `extractors::*::build` call, which emits in EntityTable order
+// over a sorted inheritance list — no HashMap iteration, so no
+// order-insensitivity escape hatch is warranted. Their sidecars are
+// newer than the other four, so a stale `public/sample/` skips them with
+// a note rather than failing; regenerate with
+// `scripts/generate_sample_sidecars.py`.
 //
 // Ignored keys, and why:
 //   * summary.path / summary.parse_seconds  — inputs, not outputs.
@@ -139,6 +149,14 @@ const types = JSON.parse(m.typesJson());
 const stats = JSON.parse(m.statsJson());
 const bySource = JSON.parse(m.bySourceJson());
 
+// GH #183 — serialise-only surfaces; the extractors ran inside fromBytes.
+const layers = {
+  psets: JSON.parse(m.psetsJson()),
+  quantities: JSON.parse(m.quantitiesJson()),
+  materials: JSON.parse(m.materialsJson()),
+  classifications: JSON.parse(m.classificationsJson()),
+};
+
 const tGlb0 = performance.now();
 const glb = m.toGlb(true, false);
 const tGlb = performance.now() - tGlb0;
@@ -148,9 +166,42 @@ const refGraph = JSON.parse(fs.readFileSync(path.join(SITE, 'duplex.graph.json')
 const refQto = JSON.parse(fs.readFileSync(path.join(SITE, 'duplex.qto.json'), 'utf8'));
 const refTypes = JSON.parse(fs.readFileSync(path.join(SITE, 'types/manifest.json'), 'utf8'));
 
+// ---- staleness guard for the two GH #181 / #184 fields --------------
+//
+// Both land in the sidecars only when `scripts/generate_sample_sidecars.py`
+// is re-run. Until then the reference is a version behind on exactly two
+// keys, which is a stale FILE, not a regression — so they are named and
+// skipped rather than either failing the gate or being ignored silently.
+// The moment the regen lands, both guards go false and the comparison is
+// strict with no code change.
+const ref181 = (refSummary.tables?.storeys?.columns ?? []).includes('elevation_m');
+if (!ref181) {
+  console.log('SKIP  storeys.elevation_m (summary columns + graph.storeys[]) — sidecars predate GH #181; regenerate');
+  summary.tables.storeys.columns = summary.tables.storeys.columns.filter((c) => c !== 'elevation_m');
+  for (const st of graph.storeys) delete st.elevation_m;
+}
+
 check(
   'summary.json',
-  diff(refSummary, summary, { ignore: new Set(['path', 'parse_seconds']) }),
+  diff(refSummary, summary, {
+    // GH #184: compared separately just below — the wheel title-cases the
+    // class names through its generated full-schema entity list
+    // (`ifcfast.data.schema_supertypes.ALL_ENTITIES`), the wasm build
+    // reports the STEP token it counted. Counts are diffed exactly; only
+    // the key SPELLING is normalised.
+    ignore: new Set(['path', 'parse_seconds', 'skipped_product_types']),
+  }),
+);
+
+const upperKeys = (o) => Object.fromEntries(Object.entries(o ?? {}).map(([k, v]) => [k.toUpperCase(), v]));
+check(
+  'summary.skipped_product_types (key case normalised)',
+  diff(
+    upperKeys(refSummary.skipped_product_types),
+    upperKeys(summary.skipped_product_types),
+    {},
+    'skipped_product_types',
+  ),
 );
 
 // Order-insensitive collections (HashMap iteration on the reference side).
@@ -167,6 +218,32 @@ for (const [field, key] of [['spaces', 'guid'], ['buildings', 'guid'], ['sites',
 }
 
 check('qto.json', diff(refQto, qto, {}, '', []));
+
+// ---- long-format data layers (GH #183) ------------------------------
+//
+// Also a self-check against summaryJson(): the table metadata has always
+// advertised these row counts and column lists; the point of the issue
+// was that nothing could read a row. A mismatch here means the accessor
+// and the advertisement disagree, which is worse than either being wrong.
+for (const [layer, rows] of Object.entries(layers)) {
+  const meta = summary.tables[layer];
+  const selfDiffs = [];
+  if (!Array.isArray(rows)) selfDiffs.push(`${layer}: not an array`);
+  else {
+    if (rows.length !== meta.rows) selfDiffs.push(`${layer}: ${rows.length} rows != summary ${meta.rows}`);
+    const want = [...meta.columns].sort().join(',');
+    const bad = rows.findIndex((r) => Object.keys(r).sort().join(',') !== want);
+    if (bad >= 0) selfDiffs.push(`${layer}[${bad}]: columns ${Object.keys(rows[bad]).sort().join(',')} != ${want}`);
+  }
+  check(`${layer} vs summaryJson().tables.${layer}`, selfDiffs);
+
+  const ref = path.join(SITE, `duplex.${layer}.json`);
+  if (!fs.existsSync(ref)) {
+    console.log(`SKIP  ${layer}.json — no ${path.basename(ref)} in public/sample (regenerate sidecars)`);
+    continue;
+  }
+  check(`${layer}.json`, diff(JSON.parse(fs.readFileSync(ref, 'utf8')), rows, { cap: 60 }, layer));
+}
 
 const stripTypes = (o) => ({
   source: o.source,

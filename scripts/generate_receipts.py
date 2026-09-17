@@ -418,7 +418,7 @@ def receipts_model(clinic: Path, work: Path, out: Path, clash_df: pd.DataFrame |
             classes.append({"entity": entity, "model": d, "n": v["n"], "volume_m3": _round(v["volume_m3"], 2)})
         if d == "Architectural":
             for s in m.storeys:
-                storeys.append({"guid": s.guid, "name": s.name, "elevation_m": _round(s.elevation, 2), "products": len(list(m.filter(storey_guid=s.guid)))})
+                storeys.append({"guid": s.guid, "name": s.name, "elevation_m": (_round(s.elevation_m, 2) if s.elevation_m is not None else None), "products": len(list(m.filter(storey_guid=s.guid)))})
         models.append(
             {
                 "name": d,

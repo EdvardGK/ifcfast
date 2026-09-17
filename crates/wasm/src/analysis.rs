@@ -42,7 +42,7 @@ pub type Rollup = HashMap<String, (Option<f64>, Option<f64>, Option<f64>)>;
 /// Mirrors `python/ifcfast/header.py::_CACHE_SCHEMA_VERSION`. Bump in
 /// lockstep — it is hashed into `cache_key`, so a mismatch shows up as a
 /// changed key rather than stale data.
-const CACHE_SCHEMA_VERSION: u32 = 31;
+const CACHE_SCHEMA_VERSION: u32 = 32;
 const HASH_HEAD_BYTES: usize = 4 * 1024 * 1024;
 const HASH_TAIL_BYTES: usize = 4 * 1024 * 1024;
 /// `header.py::_HEADER_READ_BYTES` — the window FILE_SCHEMA is read from.
@@ -62,6 +62,16 @@ pub fn round10(v: f64) -> f64 {
 /// Python JSON as `null`.
 fn round10_opt(v: f32) -> Option<f64> {
     let v = v as f64;
+    if v.is_finite() {
+        Some(round10(v))
+    } else {
+        None
+    }
+}
+
+/// `round10` guarded for NaN / infinity, which reach the Python JSON as
+/// `null` (`DataFrame.to_json` writes non-finite doubles that way).
+fn finite10(v: f64) -> Option<f64> {
     if v.is_finite() {
         Some(round10(v))
     } else {
@@ -111,8 +121,19 @@ pub struct ProductRow {
 pub struct StoreyRow {
     pub guid: String,
     pub name: Option<String>,
+    /// Raw `IfcBuildingStorey.Elevation` — **file units**, not metres.
+    /// Kept verbatim so a round-trip writes back the number the file
+    /// declared (GH #180 / #181).
     pub elevation: Option<f64>,
     pub building_guid: Option<String>,
+    /// [`StoreyRow::elevation`] in METRES — the view every other length
+    /// surface in this module already speaks (`drift` `*_m`, QTO `*_m3`,
+    /// streamed vertices). `None` when the elevation is absent or NaN,
+    /// or when the file declared a length unit that could not be
+    /// resolved: a fabricated metre value is worse than an absent one,
+    /// and `unwrap_or(1.0)` would turn an unresolvable millimetre model
+    /// into a plausible-looking 1000x error (GH #181).
+    pub elevation_m: Option<f64>,
 }
 
 /// The drift columns the sidecars consume, already in SI (the Rust
@@ -197,10 +218,18 @@ pub struct Analysis {
     pub opening_guids: HashSet<String>,
     pub type_object_count: usize,
 
-    pub pset_rows: usize,
-    pub quantity_rows: usize,
-    pub material_rows: usize,
-    pub classification_rows: usize,
+    /// The four long-format data layers, retained verbatim so
+    /// `psetsJson` / `quantitiesJson` / `materialsJson` /
+    /// `classificationsJson` are a pure serialise (GH #183).
+    ///
+    /// Retaining them does not raise peak memory: every one of these is
+    /// already fully materialised inside [`Analysis::run`], alongside the
+    /// `EntityTable` they were built from. Only the steady state grows,
+    /// and it grows by exactly what the caller is about to ask for.
+    pub psets_t: psets::PsetTable,
+    pub quantities_t: quantities::QuantityTable,
+    pub materials_t: materials::MaterialTable,
+    pub classifications_t: classifications::ClassificationTable,
     pub segment_rows: usize,
 
     /// guid → (materials in first-seen order, layer-set name)
@@ -285,11 +314,21 @@ impl Analysis {
         for i in 0..idx.storey_guid.len() {
             let sid = idx.storey_step_id[i];
             storey_step_to_guid.insert(sid, idx.storey_guid[i].clone());
+            let elevation = idx.storey_elevation[i];
             storeys.push(StoreyRow {
                 guid: idx.storey_guid[i].clone(),
                 name: idx.storey_name[i].clone(),
-                elevation: idx.storey_elevation[i],
+                elevation,
                 building_guid: None,
+                // `model.py`'s rule verbatim: `None if elev is None or
+                // elev != elev or st_scale is None`. Note it reads
+                // `idx.unit_scale` (an `Option`), NOT the `unit_scale_f64`
+                // this module defaults to 1.0 further down — that default
+                // is right for geometry and wrong here.
+                elevation_m: match (elevation, idx.unit_scale) {
+                    (Some(e), Some(scale)) if !e.is_nan() => Some(e * scale),
+                    _ => None,
+                },
             });
         }
 
@@ -563,10 +602,10 @@ impl Analysis {
             storey_building,
             voids,
             opening_guids,
-            pset_rows: psets_t.guid.len(),
-            quantity_rows: quantities_t.guid.len(),
-            material_rows: materials_t.guid.len(),
-            classification_rows: classifications_t.guid.len(),
+            psets_t,
+            quantities_t,
+            materials_t,
+            classifications_t,
             segment_rows: 0,
             materials_by_guid,
             layer_set_by_guid,
@@ -1057,7 +1096,13 @@ const COLS: &[(&str, &[&str])] = &[
             "type_source",
         ],
     ),
-    ("storeys", &["guid", "name", "elevation", "building_guid"]),
+    // `elevation_m` is LAST because Python's column list is
+    // `StoreyRow.__dataclass_fields__` order and it is the defaulted
+    // field (GH #181).
+    (
+        "storeys",
+        &["guid", "name", "elevation", "building_guid", "elevation_m"],
+    ),
     (
         "spaces",
         &["guid", "step_id", "name", "storey_guid", "storey_name"],
@@ -1235,18 +1280,18 @@ impl Analysis {
             table_meta("storey_building", self.storey_building.len()),
         );
         tables.insert("voids".into(), table_meta("voids", self.voids.len()));
-        tables.insert("psets".into(), table_meta("psets", self.pset_rows));
+        tables.insert("psets".into(), table_meta("psets", self.psets_t.guid.len()));
         tables.insert(
             "quantities".into(),
-            table_meta("quantities", self.quantity_rows),
+            table_meta("quantities", self.quantities_t.guid.len()),
         );
         tables.insert(
             "materials".into(),
-            table_meta("materials", self.material_rows),
+            table_meta("materials", self.materials_t.guid.len()),
         );
         tables.insert(
             "classifications".into(),
-            table_meta("classifications", self.classification_rows),
+            table_meta("classifications", self.classifications_t.guid.len()),
         );
         let meshed = self.mesh_state != MeshState::Pending;
         tables.insert(
@@ -1257,6 +1302,32 @@ impl Analysis {
             "segments".into(),
             table_meta_loaded("segments", self.segment_rows, meshed),
         );
+
+        // GH #184: entities with the `IfcProduct` attribute shape whose
+        // class no whitelist entry claimed. A file made entirely of such
+        // a class indexes to ZERO products, and without this the drop
+        // zone renders an empty model with no explanation.
+        //
+        // Keys are the STEP tokens the indexer counted — `IFCTUBEBUNDLE`,
+        // not `IfcTubeBundle`. The wheel title-cases them through
+        // `ifcfast.data.schema_supertypes.ALL_ENTITIES`, the full
+        // IFC2X3/IFC4/IFC4X3 entity list generated into the Python
+        // package; the wasm crate has no such list and the core's
+        // `type_name_uppercase_with_proper_case` is (a) `pub(crate)` and
+        // (b) backed by the 153-entry PRODUCT whitelist spelling map,
+        // which by definition never contains a SKIPPED class — its
+        // fallback would produce `Ifctubebundle`, a wrong answer that
+        // looks right. The STEP spelling is what the file actually says,
+        // so that is what the browser reports; `crates/wasm/test/
+        // parity.mjs` normalises the key case (and only the case) when
+        // diffing against the wheel's summary. See the report on #184.
+        let mut skipped: Vec<(&String, &u32)> =
+            self.idx.skipped_product_type_counts.iter().collect();
+        skipped.sort_by(|a, b| a.0.cmp(b.0));
+        let mut skipped_types = Map::new();
+        for (name, count) in skipped {
+            skipped_types.insert(name.clone(), json!(count));
+        }
 
         json!({
             "path": self.name,
@@ -1276,6 +1347,7 @@ impl Analysis {
             "parse_seconds": self.parse_seconds,
             "duplicate_step_ids": self.duplicate_step_ids,
             "warnings": self.idx.warnings,
+            "skipped_product_types": Value::Object(skipped_types),
         })
     }
 
@@ -1410,6 +1482,7 @@ impl Analysis {
                     "name": jstr(&s.name),
                     "elevation": s.elevation,
                     "building_guid": jstr(&s.building_guid),
+                    "elevation_m": jnum(s.elevation_m),
                 })
             })
             .collect();
@@ -1611,6 +1684,149 @@ impl Analysis {
         Value::Object(m)
     }
 
+    // -----------------------------------------------------------------
+    // Long-format data layers (GH #183)
+    // -----------------------------------------------------------------
+    //
+    // `summaryJson().tables.<name>` has always reported these loaded,
+    // with their row counts and column lists, while nothing could read a
+    // row. These four are the rows — the same columns, in the same
+    // order, with the same normalisation as the Python DataFrames
+    // (`model.psets` / `.quantities` / `.materials` /
+    // `.classifications`), because both sides serialise the output of
+    // the SAME `extractors::*::build` call. Row order is therefore
+    // identical by construction, not by luck: the extractors emit in
+    // `EntityTable` order over a sorted inheritance list, no `HashMap`
+    // iteration in the emission path.
+    //
+    // Missing values are `null`, never `""` — a property whose value the
+    // authoring tool left as `$` is absent, not empty. That is the
+    // pandas `None` the sidecar's `to_json` writes.
+    //
+    // `psets.value` and `quantities.value` are STRINGS (or `null`).
+    // The extractor keeps the STEP literal verbatim and names its type
+    // in the sibling column (`value_type` / `quantity_type`); the Python
+    // layer marshals the same `Option<String>` into an `object` column
+    // and never coerces it either. Parsing `"3.0"` to `3.0` here would
+    // make the browser disagree with the wheel, so a consumer that wants
+    // a number reads `value_type` and parses.
+
+    /// `[{guid, pset_name, prop_name, value, value_type, source}]` —
+    /// `model.psets` as row objects.
+    pub fn psets_json(&self) -> Value {
+        let t = &self.psets_t;
+        let mut rows = Vec::with_capacity(t.guid.len());
+        for i in 0..t.guid.len() {
+            let mut r = Map::new();
+            r.insert("guid".into(), Value::String(t.guid[i].clone()));
+            r.insert("pset_name".into(), Value::String(t.pset_name[i].clone()));
+            r.insert("prop_name".into(), Value::String(t.prop_name[i].clone()));
+            r.insert("value".into(), jstr(&t.value[i]));
+            r.insert("value_type".into(), jstr(&t.value_type[i]));
+            r.insert("source".into(), Value::String(t.source[i].clone()));
+            rows.push(Value::Object(r));
+        }
+        Value::Array(rows)
+    }
+
+    /// `[{guid, qto_name, quantity_name, value, quantity_type,
+    /// unit_step_id, source}]` — `model.quantities` as row objects.
+    ///
+    /// `unit_step_id` is a JSON number (the STEP id of the
+    /// `IfcNamedUnit` overriding the project unit) or `null`. Python
+    /// carries the column as `float64` because it is nullable, so the
+    /// sidecar writes `1234.0`; both parse to the same JS number.
+    pub fn quantities_json(&self) -> Value {
+        let t = &self.quantities_t;
+        let mut rows = Vec::with_capacity(t.guid.len());
+        for i in 0..t.guid.len() {
+            let mut r = Map::new();
+            r.insert("guid".into(), Value::String(t.guid[i].clone()));
+            r.insert("qto_name".into(), Value::String(t.qto_name[i].clone()));
+            r.insert(
+                "quantity_name".into(),
+                Value::String(t.quantity_name[i].clone()),
+            );
+            r.insert("value".into(), jstr(&t.value[i]));
+            r.insert(
+                "quantity_type".into(),
+                Value::String(t.quantity_type[i].clone()),
+            );
+            r.insert(
+                "unit_step_id".into(),
+                match t.unit_step_id[i] {
+                    Some(id) => json!(id),
+                    None => Value::Null,
+                },
+            );
+            r.insert("source".into(), Value::String(t.source[i].clone()));
+            rows.push(Value::Object(r));
+        }
+        Value::Array(rows)
+    }
+
+    /// `[{guid, role, layer_index, material_name, layer_thickness_mm,
+    /// category, fraction, source}]` — `model.materials` as row objects.
+    ///
+    /// `layer_index` is `-1` on every non-layered role (that is the
+    /// extractor's encoding, not a missing value, so it stays a number).
+    /// `layer_thickness_mm` and `fraction` go through [`round10`]: the
+    /// sidecar's `DataFrame.to_json` writes doubles at
+    /// `double_precision=10` even for `object`-dtype columns, so without
+    /// it a thickness would differ from the wheel's in the 11th decimal.
+    pub fn materials_json(&self) -> Value {
+        let t = &self.materials_t;
+        let mut rows = Vec::with_capacity(t.guid.len());
+        for i in 0..t.guid.len() {
+            let mut r = Map::new();
+            r.insert("guid".into(), Value::String(t.guid[i].clone()));
+            r.insert("role".into(), Value::String(t.role[i].to_string()));
+            r.insert("layer_index".into(), json!(t.layer_index[i]));
+            r.insert("material_name".into(), jstr(&t.material_name[i]));
+            r.insert(
+                "layer_thickness_mm".into(),
+                jnum(t.layer_thickness_mm[i].and_then(finite10)),
+            );
+            r.insert("category".into(), jstr(&t.category[i]));
+            r.insert("fraction".into(), jnum(t.fraction[i].and_then(finite10)));
+            r.insert("source".into(), Value::String(t.source[i].to_string()));
+            rows.push(Value::Object(r));
+        }
+        Value::Array(rows)
+    }
+
+    /// `[{guid, system_name, edition, identification, name, location,
+    /// source, assignment_source}]` — `model.classifications` as row
+    /// objects.
+    ///
+    /// `identification` is the normalised column: IFC4
+    /// `IfcClassificationReference.Identification` and IFC2x3
+    /// `.ItemReference` land in the same place, done once in the core
+    /// extractor so the browser inherits it. `source` here is
+    /// `IfcClassification.Source` (the publishing body); the
+    /// instance-vs-type provenance every other layer calls `source` is
+    /// `assignment_source`.
+    pub fn classifications_json(&self) -> Value {
+        let t = &self.classifications_t;
+        let mut rows = Vec::with_capacity(t.guid.len());
+        for i in 0..t.guid.len() {
+            let mut r = Map::new();
+            r.insert("guid".into(), Value::String(t.guid[i].clone()));
+            r.insert("system_name".into(), jstr(&t.system_name[i]));
+            r.insert("edition".into(), jstr(&t.edition[i]));
+            r.insert("identification".into(), jstr(&t.identification[i]));
+            r.insert("name".into(), jstr(&t.name[i]));
+            r.insert("location".into(), jstr(&t.location[i]));
+            r.insert("source".into(), jstr(&t.source[i]));
+            r.insert(
+                "assignment_source".into(),
+                Value::String(t.assignment_source[i].to_string()),
+            );
+            rows.push(Value::Object(r));
+        }
+        Value::Array(rows)
+    }
+
     pub fn stats_json(&self) -> Value {
         json!({
             "products_seen": self.counters.products_seen,
@@ -1651,11 +1867,249 @@ fn slugify(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Explicit, so the tests do not lean on the parent module's private
+    // `use` leaking through the glob.
+    use serde_json::{json, Value};
 
     #[test]
     fn round10_matches_pandas_double_precision() {
         assert_eq!(round10(40.24124908447266), 40.2412490845);
         assert_eq!(round10(9.307999610900879), 9.3079996109);
+    }
+
+    // ----- GH #183: the four data-layer accessors ------------------
+    //
+    // `tests/fixtures/minimal.ifc` is the smallest fixture that carries
+    // all four layers at once (one wall with two Pset_WallCommon
+    // properties, a Qto_WallBaseQuantities pair, one IfcMaterial and one
+    // NS 3451 IfcClassificationReference), and it is already the one
+    // `crates/wasm/test/parity.mjs` smoke-tests.
+
+    fn fixture(name: &str) -> Analysis {
+        let path = format!("{}/../../tests/fixtures/{name}", env!("CARGO_MANIFEST_DIR"));
+        let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
+        Analysis::run(&bytes, name).unwrap_or_else(|e| panic!("{name} parses: {e}"))
+    }
+
+    fn minimal() -> Analysis {
+        fixture("minimal.ifc")
+    }
+
+    /// Every row is an object, the rows are exactly as many as
+    /// `summaryJson().tables.<table>.rows` promised, and every row's key
+    /// set is exactly the advertised column list — no extra key, no
+    /// silently dropped one.
+    fn check_layer(a: &Analysis, table: &str, rows: &Value, columns: &[&str]) {
+        let promised = a.summary_json()["tables"][table]["rows"]
+            .as_u64()
+            .expect("summary reports a row count") as usize;
+        let rows = rows.as_array().expect("an array of row objects");
+        assert_eq!(rows.len(), promised, "{table}: rows vs summaryJson");
+        assert!(promised > 0, "{table}: fixture carries no rows to check");
+
+        let want: std::collections::BTreeSet<&str> = columns.iter().copied().collect();
+        for (i, row) in rows.iter().enumerate() {
+            let obj = row
+                .as_object()
+                .unwrap_or_else(|| panic!("{table}[{i}] is not an object"));
+            let got: std::collections::BTreeSet<&str> = obj.keys().map(|k| k.as_str()).collect();
+            assert_eq!(got, want, "{table}[{i}]: column key set");
+        }
+    }
+
+    #[test]
+    fn psets_json_matches_summary_and_columns() {
+        let a = minimal();
+        let rows = a.psets_json();
+        check_layer(
+            &a,
+            "psets",
+            &rows,
+            &[
+                "guid",
+                "pset_name",
+                "prop_name",
+                "value",
+                "value_type",
+                "source",
+            ],
+        );
+        let r = &rows[0];
+        assert_eq!(r["pset_name"], json!("Pset_WallCommon"));
+        assert_eq!(r["source"], json!("instance"));
+        // The STEP literal is kept verbatim as a string; `value_type`
+        // names the type. Never coerced to a JSON boolean (GH #183).
+        assert!(r["value"].is_string(), "pset value stays a string");
+    }
+
+    #[test]
+    fn quantities_json_matches_summary_and_columns() {
+        let a = minimal();
+        let rows = a.quantities_json();
+        check_layer(
+            &a,
+            "quantities",
+            &rows,
+            &[
+                "guid",
+                "qto_name",
+                "quantity_name",
+                "value",
+                "quantity_type",
+                "unit_step_id",
+                "source",
+            ],
+        );
+        let r = &rows[0];
+        assert_eq!(r["qto_name"], json!("Qto_WallBaseQuantities"));
+        assert!(r["value"].is_string(), "quantity value stays a string");
+        // `IfcQuantityLength('Length',$,$,3.0,$)` has no per-quantity
+        // unit override, so the extractor falls back to the project's
+        // LENGTHUNIT — `#3=IFCSIUNIT(*,.LENGTHUNIT.,$,.METRE.)` in this
+        // fixture — exactly as the wheel does (`m.quantities.unit_step_id`
+        // is 3.0 there). The Area row has no AREAUNIT to fall back to and
+        // is null, which is what the second assertion pins.
+        assert_eq!(r["unit_step_id"], json!(3));
+        let area = rows
+            .as_array()
+            .expect("quantities_json is an array")
+            .iter()
+            .find(|x| x["quantity_name"] == json!("NetSideArea"))
+            .expect("NetSideArea row");
+        assert_eq!(area["unit_step_id"], Value::Null);
+    }
+
+    #[test]
+    fn materials_json_matches_summary_and_columns() {
+        let a = minimal();
+        let rows = a.materials_json();
+        check_layer(
+            &a,
+            "materials",
+            &rows,
+            &[
+                "guid",
+                "role",
+                "layer_index",
+                "material_name",
+                "layer_thickness_mm",
+                "category",
+                "fraction",
+                "source",
+            ],
+        );
+        let r = &rows[0];
+        assert_eq!(r["material_name"], json!("Concrete"));
+        // Non-layered role: -1 is the extractor's encoding, a number.
+        assert_eq!(r["layer_index"], json!(-1));
+        // A single material has no thickness and no fraction — null, not 0.
+        assert_eq!(r["layer_thickness_mm"], Value::Null);
+        assert_eq!(r["fraction"], Value::Null);
+    }
+
+    #[test]
+    fn classifications_json_matches_summary_and_columns() {
+        let a = minimal();
+        let rows = a.classifications_json();
+        check_layer(
+            &a,
+            "classifications",
+            &rows,
+            &[
+                "guid",
+                "system_name",
+                "edition",
+                "identification",
+                "name",
+                "location",
+                "source",
+                "assignment_source",
+            ],
+        );
+        let r = &rows[0];
+        // IFC4 `Identification` and IFC2x3 `ItemReference` normalise onto
+        // this one column in the core extractor — the whole reason a
+        // browser-side IDS ClassificationFacet is reachable (GH #183).
+        assert_eq!(r["identification"], json!("232.1"));
+        assert_eq!(r["name"], json!("Yttervegger"));
+        assert_eq!(r["assignment_source"], json!("instance"));
+    }
+
+    // ----- GH #181: StoreyRow.elevation_m -------------------------
+    //
+    // The 1000x trap. `elevation` is the raw file-unit attribute and
+    // must stay raw; `elevation_m` is the metres view. The fixtures are
+    // GH #180's: `storey_mm.ifc` declares `.MILLI. .METRE.` and a storey
+    // at `3000.`, `broken_conversion_unit.ifc` declares a LENGTHUNIT
+    // whose conversion chain does not resolve.
+
+    fn storeys_of(a: &mut Analysis) -> Vec<Value> {
+        a.ensure_stats();
+        a.graph_json()["storeys"]
+            .as_array()
+            .expect("graph.storeys")
+            .clone()
+    }
+
+    #[test]
+    fn storey_elevation_m_is_metres_not_file_units() {
+        let mut a = fixture("storey_mm.ifc");
+        let storeys = storeys_of(&mut a);
+        let upper = storeys
+            .iter()
+            .find(|s| s["name"] == json!("Plan 02"))
+            .expect("Plan 02");
+        // Raw attribute kept verbatim, in the file's own millimetres.
+        assert_eq!(upper["elevation"], json!(3000.0));
+        // …and the metres view next to it. 3000 mm = 3 m.
+        assert_eq!(upper["elevation_m"], json!(3.0));
+    }
+
+    #[test]
+    fn storey_elevation_m_is_null_when_the_unit_is_unresolved() {
+        let mut a = fixture("broken_conversion_unit.ifc");
+        let storeys = storeys_of(&mut a);
+        let s = &storeys[0];
+        // The elevation itself is 0.0, which is exactly why this case
+        // needs its own test: `unwrap_or(1.0)` on the unit scale would
+        // yield a perfectly plausible `0.0` instead of "unknown".
+        assert_eq!(s["elevation"], json!(0.0));
+        assert_eq!(s["elevation_m"], Value::Null);
+    }
+
+    #[test]
+    fn storey_columns_carry_elevation_m_last() {
+        let a = minimal();
+        // Python's list is `StoreyRow.__dataclass_fields__` order, and
+        // `elevation_m` is the defaulted field, so it comes last.
+        assert_eq!(
+            a.summary_json()["tables"]["storeys"]["columns"],
+            json!(["guid", "name", "elevation", "building_guid", "elevation_m"])
+        );
+    }
+
+    // ----- GH #184: skipped_product_types --------------------------
+
+    #[test]
+    fn skipped_product_types_explains_a_silent_zero() {
+        let a = fixture("unlisted_product.ifc");
+        let summary = a.summary_json();
+        // The whole point: zero products, and a reason.
+        assert_eq!(summary["products"], json!(0));
+        assert_eq!(
+            summary["skipped_product_types"],
+            json!({ "IFCTUBEBUNDLE": 1 }),
+            "STEP spelling, not the wheel's title case — see the comment \
+             in summary_json()"
+        );
+    }
+
+    #[test]
+    fn skipped_product_types_is_an_empty_object_on_a_covered_file() {
+        let a = minimal();
+        // Empty OBJECT, not null and not absent: a consumer can branch on
+        // `Object.keys(...).length` without a presence check.
+        assert_eq!(a.summary_json()["skipped_product_types"], json!({}));
     }
 
     #[test]

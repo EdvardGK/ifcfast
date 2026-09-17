@@ -314,9 +314,16 @@ def _build_graph(model, spaces, containers, mesh_stats_by_guid, pset_attrs_by_gu
         })
 
     # Storeys / buildings / sites / projects
+    # `elevation` is the raw IfcBuildingStorey.Elevation in FILE units;
+    # `elevation_m` is the metres view every other length surface in the
+    # library speaks (GH #180/#181). The dict is spelled out rather than
+    # `asdict(s)` so adding a StoreyRow field never silently changes the
+    # sidecar shape — but that also means a new field has to be added
+    # HERE, which is why `elevation_m` did not appear on its own.
     storeys = [
         {"guid": s.guid, "name": s.name, "elevation": s.elevation,
-         "building_guid": getattr(s, "building_guid", None)}
+         "building_guid": getattr(s, "building_guid", None),
+         "elevation_m": getattr(s, "elevation_m", None)}
         for s in model.storeys
     ]
 
@@ -486,6 +493,31 @@ def main():
             "rows": _qto_aggregates(per_product),
         }, default=_json_default, indent=2)
     )
+    # ---- long-format data layers (GH #183) --------------------------
+    #
+    # The same records already inside the bundle, broken out as their own
+    # sidecars so `crates/wasm/test/parity.mjs` can diff them one-to-one
+    # against `m.psetsJson()` / `.quantitiesJson()` / `.materialsJson()` /
+    # `.classificationsJson()`. Both sides serialise the output of the
+    # SAME `extractors::*::build` call, so row order matches by
+    # construction and the diff is exact, not set-wise.
+    #
+    # `_df_to_records` goes through `DataFrame.to_json`, which is what
+    # pins the encoding the wasm side has to reproduce: missing values
+    # are `null` (never `""`), `psets.value` / `quantities.value` stay
+    # STRINGS with the type in the sibling column, and doubles are
+    # written at `double_precision=10`.
+    for layer, frame in (
+        ("psets", model.psets),
+        ("quantities", model.quantities),
+        ("materials", model.materials),
+        ("classifications", model.classifications),
+    ):
+        recs = _df_to_records(frame)
+        path = args.out / f"{args.prefix}.{layer}.json"
+        path.write_text(json.dumps(recs, default=_json_default, indent=2))
+        print(f"wrote {path}  ({len(recs)} rows, {path.stat().st_size / 1024:.1f} KB)")
+
     # Per-product mesh stats keyed by guid — joined into graph.json
     # so qto-panel can show m³/m²/lm next to type/material rows.
     mesh_stats_by_guid: dict[str, dict] = {}

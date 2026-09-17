@@ -167,6 +167,19 @@ has no such rows; a build that *cannot produce* the layer (`drift` /
 of returning `[]`, so "none" and "unavailable" are never confused
 (GH #162).
 
+**`StoreyRow` carries two elevations (GH #180).** `elevation` is the
+raw `IfcBuildingStorey.Elevation` attribute in the **file's own length
+unit** — millimetres on most Revit / Archicad output — kept verbatim
+so it round-trips. `elevation_m` is the same value in **metres**
+(`elevation * m.unit_scale`), and is the one to compare against any
+geometry surface (`m.meshes()` coordinates, `mesh_qto` `*_m3`, `drift`
+`*_m`). `elevation_m` is `None` when the elevation is absent or the
+file declared a length unit that could not be resolved
+(`m.unit_scale is None`) — an absent value beats a fabricated metre
+one. Storey columns are now `guid, name, elevation, building_guid,
+elevation_m`; `diff()`'s `storey_deltas` carry both `elevation` and
+`elevation_m` pairs.
+
 ## Decision tree for common tasks
 
 | You want… | Call this |
@@ -726,6 +739,8 @@ reopens a memoised model if you ask for a different `strict` policy.
 The loud unit signal also rides in the first-call snapshot:
 `m.summary()` (and the MCP `summary` tool) carry `unit_resolved` and
 `length_unit`, so an agent sees the problem without a second call.
+`summary()` also carries `skipped_product_types` (GH #178) — see the
+gotcha list.
 
 ## Running ifcfast in the browser (GH #172)
 
@@ -740,6 +755,12 @@ JSON.parse(m.summaryJson());  // the summary shape the sidecar generator writes
 JSON.parse(m.graphJson());    // products / storeys / contained_in / spaces / …
 JSON.parse(m.qtoJson());      // per-entity rows from the mesh pass
 JSON.parse(m.typesJson());    // type manifest (no per-type mini-glbs in v1)
+// The four long-format data layers (GH #183) — same columns, same
+// normalisation and same row order as the Python DataFrames.
+JSON.parse(m.psetsJson());           // [{guid, pset_name, prop_name, value, value_type, source}]
+JSON.parse(m.quantitiesJson());      // [{guid, qto_name, quantity_name, value, quantity_type, unit_step_id, source}]
+JSON.parse(m.materialsJson());       // [{guid, role, layer_index, material_name, layer_thickness_mm, category, fraction, source}]
+JSON.parse(m.classificationsJson()); // [{guid, system_name, edition, identification, name, location, source, assignment_source}]
 const glb = m.toGlb(true, true);   // Uint8Array — same writer as m.to_gltf()
 JSON.parse(m.bySourceJson()); // GH #166 counters
 m.free();
@@ -752,6 +773,25 @@ openings (manifold-csg is C++), the substrate bundle (arrow/parquet),
 threads (single-threaded mesh pass — ~2× native). Everything stays in
 the tab; nothing is uploaded. ifcfast.com's instrument uses exactly
 this path for "drop your IFC".
+
+The four data-layer accessors are serialise-only: the extractors run
+inside `fromBytes`, so unlike `graphJson()` / `qtoJson()` none of them
+triggers a mesh pass. Missing values are `null`, never `""`.
+**`psets.value` and `quantities.value` are strings** — the STEP
+literal verbatim, with the IFC type in the sibling `value_type` /
+`quantity_type` column; the wheel does not coerce them either, so
+parse on the consumer side rather than expecting a JSON number or
+boolean. `source` is `"instance"` / `"type"`, and type-inherited rows
+are included with the instance winning a name collision; on
+`classificationsJson()` that flag is `assignment_source`, because
+`source` there is `IfcClassification.Source` (the publishing body).
+`identification` is the schema-normalised code column — IFC4
+`Identification` and IFC2x3 `ItemReference` land in the same place —
+which is what makes a browser-side IDS `PropertyFacet` /
+`ClassificationFacet` reachable without a second parser. On a large
+model these are the biggest payloads this API hands out: one JSON
+document per layer for the whole file, so a guid-filtered variant is
+the obvious next step if it bites.
 
 A dropped `.ifczip` is bounded before it can take the tab down: the
 decompressed cap is 1 GiB on wasm (4 GiB native) and the 200× expansion
@@ -836,6 +876,24 @@ Gated by `crates/wasm/test/limits.mjs`.
   stays unique, and `m.summary()["duplicate_step_ids"]` reports how many
   rows were collapsed (0 on a well-formed file). Treat a non-zero count
   as a loud "this source is malformed" signal.
+- **Unknown product classes are reported, not dropped (GH #178).** The
+  tier-1 indexer only emits rows for entity types in its product
+  whitelist. A file whose products are all of some class outside it
+  used to open as `len(m) == 0` with no error and no warning — the
+  type objects still listed, so the model looked half-parsed rather
+  than unsupported. `IfcGeographicElement` and `IfcCivilElement` (the
+  correct IFC4 classes for terrain, survey markers and landscape
+  objects) were two such classes; they are whitelisted now, along with
+  18 others `classify.py` already called take-off products. More
+  durably: any record with the `IfcProduct` attribute shape that the
+  whitelist does not claim is counted by class and surfaced as
+  `m.skipped_product_types` / `m.summary()["skipped_product_types"]`
+  (`{"IfcTubeBundle": 3}`, ifcopenshell title case; empty on a
+  fully-covered file). `ifcfast.open()` emits a `UserWarning` when
+  that dict is non-empty **and** the model indexed zero products, and
+  `ifcfast index` prints a `SKIPPED` block. Treat a non-empty dict as
+  "these elements are in the file but in no table on this model" —
+  parse with ifcopenshell, or open an issue naming the class.
 - **Empty tables report canonical dtypes (GH #71).** A model with no
   quantities / no geometry used to report `schemas["quantities"]` /
   `schemas["drift"]` columns as all-`float64` (the empty-DataFrame
@@ -1192,12 +1250,28 @@ faces)` namedtuple or `None` (unknown GUID, geometryless product, or —
 in cut mode — the target is itself an opening, or the cut consumed the
 host). `cut_openings` / `keep_cutters` match `m.meshes()` exactly, and
 the cut result is identical to the matching product from
-`meshes(cut_openings=True)`. **Coordinate contrast:** `m.mesh()`
-returns `vertices` as **`float64` absolute world coordinates** (full
-precision, no shift) — a single product can't overflow f32 the way a
-whole georeferenced model can, so there is no `global_shift` to add
-back. Use `m.meshes()` for batch extraction (shifted `float32` +
-`MeshList.global_shift`); use `m.mesh()` for one element at a time.
+`meshes(cut_openings=True)`.
+
+**Which frame each mesh call speaks (GH #179).** Three entry points, two frames — the batch paths trade absolute coordinates for `float32` precision on georeferenced models, the single-product path does not:
+
+| call | vertices | dtype | absolute world coords |
+|---|---|---|---|
+| `m.meshes()` | shifted world | `float32` | `v + ms.global_shift` |
+| `m.iter_meshes()` | shifted world | `float32` | `v + it.global_shift` |
+| `m.mesh(guid)` | **absolute world** | `float64` | already absolute |
+| any of them with `frame="local"` | representation-local, **native units** | `float32` | `placement @ [x, y, z, 1]` |
+
+A single product can't overflow f32 the way a whole georeferenced model can, so `m.mesh()` has no `global_shift` to add back. `global_shift` is `[0, 0, 0]` on near-origin models, so all three rows agree there and the difference only shows on georeferenced deliveries — a near-origin fixture cannot catch a lost shift.
+
+**`m.iter_meshes()` returns a `MeshIter`, not a bare generator (GH #179).** It iterates exactly as before (`for mesh in m.iter_meshes():`) and is additionally re-iterable, `len()`-able, and carries `.global_shift` / `.frame` / `.unit` / `.stats` — the `MeshList` metadata the streaming path used to drop. Without it, streaming a georeferenced model yields plausible-looking coordinates wrong by exactly the georeference offset:
+
+```python
+it = m.iter_meshes()
+for mesh in it:
+    world_zmin = mesh.vertices[:, 2].min() + it.global_shift[2]
+```
+
+(`MeshIter` is not an iterator: `next(m.iter_meshes())` no longer works — wrap it in `iter()`.)
 
 **Local frame: `frame="local"` (GH #127).** Both `m.mesh(guid)` and
 `m.meshes()` take `frame=`: `"world"` (default, everything above) or
@@ -1584,9 +1658,10 @@ from ifcfast.federated_floors import (
 
 storeys = [
     StoreyInfo(model_name="ARK", storey_name=s.name,
-               elevation_mm=s.elevation, storey_guid=s.guid)
-    for s in m.storeys
-]                                                    # elevation in MM
+               elevation_mm=s.elevation_m * 1000.0, storey_guid=s.guid)
+    for s in m.storeys if s.elevation_m is not None
+]   # elevation_m is metres whatever the file, and None when the file's
+    # length unit could not be resolved (GH #180)
 out = synthesise_federated_floors(storeys)           # identity rule
 out = synthesise_federated_floors(storeys, rule=make_prefix_rule("C-"),
                                   tolerance_mm=100.0)
@@ -1656,6 +1731,12 @@ consumers — neither ships in the wheel:
 - `scripts/generate_sample_sidecars.py` — builds the sample sidecar
   artefacts (substrate + per-type glTF minis + manifest) used for
   demos and viewer smoke-tests.
+
+`crates/core/src/indexer.rs::PRODUCT_TYPES` is the canonical
+product-membership source; `tests/test_product_whitelist_parity_178.py`
+asserts it covers `classify.py`'s COUNT/MEASURE/LINEAR sets via
+`_core.product_types()`. Adding an entity to `classify.py` without
+adding it to `PRODUCT_TYPES` (and to `ENTITY_NAME_PAIRS`) now fails CI.
 
 `AGENTS.md` itself is mirrored into `python/ifcfast/data/AGENTS.md` so
 the wheel can serve it; `tests/test_agents_guide.py` fails if the copy

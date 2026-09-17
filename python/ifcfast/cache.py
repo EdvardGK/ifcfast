@@ -56,7 +56,12 @@ from .header import IFCHeader, native_path_for
 #                  container_kind). Site / Building / Storey / Space
 #                  containment all surface; previously only storey
 #                  edges were kept and the rest were silently dropped.
-CACHE_VERSION = 5
+# v6 (2026-09-17): storeys.parquet gains `elevation_m` (GH #180) — the
+#                  metres view of IfcBuildingStorey.Elevation, which is
+#                  raw file units in `elevation`. A v5 cache has no such
+#                  column, so a StoreyRow rebuilt from it would carry
+#                  elevation_m=None on a model that can resolve it.
+CACHE_VERSION = 6
 
 CONTAINED_IN_FILE = "contained_in.parquet"
 AGGREGATES_FILE = "aggregates.parquet"
@@ -856,6 +861,12 @@ def write_index(model) -> Path:
         # GH #71 (5): persist the dedup count so a cache-hit Model still
         # reports it in summary().
         "duplicate_step_ids": int(getattr(model, "duplicate_step_ids", 0)),
+        # GH #178: product-shaped entities the tier-1 whitelist skipped.
+        # Persisted so a cache hit reports the same coverage gap (and
+        # fires the same silent-zero warning) as the cold parse.
+        "skipped_product_types": {
+            str(k): int(v) for k, v in (model.skipped_product_types or {}).items()
+        },
         "warnings": list(getattr(model, "warnings", [])),
         "type_counts": model.type_counts,
         "encoded_at": time.time(),
@@ -966,7 +977,7 @@ def read_index(hdr: IFCHeader):
                 TypeObjectRow(**{k: _none_if_nan(v) for k, v in row.items()})
             )
 
-    return Model(
+    model = Model(
         header=hdr,
         schema=m.get("schema", ""),
         unit_scale=m.get("unit_scale"),
@@ -986,6 +997,12 @@ def read_index(hdr: IFCHeader):
         _storey_building_df=storey_building_df,
         _voids_df=voids_df,
     )
+    # GH #178: restore the skipped-product coverage gap and re-fire the
+    # silent-zero warning, so a cache hit is as loud as a cold parse.
+    from .whitelist import note_skipped as _note_skipped
+
+    _note_skipped(model, m.get("skipped_product_types"))
+    return model
 
 
 def _none_if_nan(v):

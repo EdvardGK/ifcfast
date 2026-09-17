@@ -334,6 +334,21 @@ mod python {
         Ok(())
     }
 
+    // ----- product_types -------------------------------------------------
+
+    /// The tier-1 product whitelist in ifcopenshell title case.
+    ///
+    /// The canonical membership source is `indexer::PRODUCT_TYPES`;
+    /// this function exists so `tests/test_product_whitelist_parity_178.py`
+    /// can assert in CI that it still covers every entity
+    /// `ifcfast.classify` calls a take-off product. The two lists drifted
+    /// unnoticed until a file of `IfcGeographicElement` indexed to zero
+    /// products (GH #178).
+    #[pyfunction]
+    fn product_types() -> PyResult<Vec<String>> {
+        catch_panic(|| Ok(indexer::product_type_names()))
+    }
+
     // ----- index_ifc ----------------------------------------------------
 
     #[pyfunction]
@@ -364,6 +379,16 @@ mod python {
                 tc.set_item(k, v)?;
             }
             dict.set_item("type_counts", tc)?;
+
+            // GH #178: entities shaped like IfcProduct that no rule in
+            // `PRODUCT_TYPES` claimed, keyed by the raw uppercase STEP
+            // token. Non-empty alongside an empty product table is the
+            // silent-zero signature Python warns on.
+            let skipped = PyDict::new(py);
+            for (k, v) in &idx.skipped_product_type_counts {
+                skipped.set_item(k, v)?;
+            }
+            dict.set_item("skipped_product_types", skipped)?;
 
             let products = PyDict::new(py);
             products.set_item("step_id", PyList::new(py, &idx.product_step_id)?)?;
@@ -3346,6 +3371,7 @@ mod python {
     fn _core(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add("IfcfastError", _py.get_type::<IfcfastError>())?;
         m.add_function(wrap_pyfunction!(index_ifc, m)?)?;
+        m.add_function(wrap_pyfunction!(product_types, m)?)?;
         m.add_function(wrap_pyfunction!(extract_psets, m)?)?;
         m.add_function(wrap_pyfunction!(extract_quantities, m)?)?;
         m.add_function(wrap_pyfunction!(extract_materials, m)?)?;

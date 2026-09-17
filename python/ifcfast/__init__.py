@@ -257,7 +257,8 @@ Geometry (no CAD kernel required):
     m.meshes()                  # per-product triangles: (guid, entity, vertices, faces)
     m.mesh(guid)                # one product's mesh without tessellating the model
     m.mesh(guid, frame="local") # LocalMesh: native-unit local coords + 4x4 placement
-    m.iter_meshes() / m.iter_point_cloud()   # streaming variants (bounded memory)
+    m.iter_meshes() / m.iter_point_cloud()   # iteration form of meshes() — same
+                                # eager pass, carries global_shift/frame/unit (GH #179)
     m.point_cloud(per_m2=1000)  # area-weighted surface samples + normals
     m.mesh_qto()                # -> (products_df, per_surface_df); volume/area/orientation
     m.to_gltf("out.glb")        # viewer-ready glTF (cut_openings=True by default);

@@ -46,11 +46,29 @@ def _strict_signal(msg: str, strict: bool) -> None:
     warnings.warn(msg, UserWarning, stacklevel=2)
 
 
-#: One product's raw triangle mesh, as returned by :meth:`Model.meshes`.
-#: ``vertices`` is a ``float32[N, 3]`` numpy array of world-coordinate
-#: positions; ``faces`` is a ``uint32[M, 3]`` numpy array of triangle
-#: vertex indices. Constructed for direct use as
-#: ``trimesh.Trimesh(mesh.vertices, mesh.faces)``.
+#: One product's raw triangle mesh, as returned by :meth:`Model.meshes`,
+#: :meth:`Model.iter_meshes` and :meth:`Model.mesh`. ``faces`` is a
+#: ``uint32[M, 3]`` numpy array of triangle vertex indices. Constructed
+#: for direct use as ``trimesh.Trimesh(mesh.vertices, mesh.faces)``.
+#:
+#: **``vertices`` is NOT in the same frame on every entry point** (GH
+#: #179) — the batch paths trade absolute coordinates for ``float32``
+#: precision on georeferenced models, the single-product path does not:
+#:
+#: ===================== ================== ======= ==========================
+#: call                  frame              dtype   absolute world coords
+#: ===================== ================== ======= ==========================
+#: ``m.meshes()``        shifted world      float32 ``v + ms.global_shift``
+#: ``m.iter_meshes()``   shifted world      float32 ``v + it.global_shift``
+#: ``m.mesh(guid)``      **absolute world** float64 already absolute
+#: ``frame="local"``     representation     float32 ``placement @ [x,y,z,1]``
+#: ===================== ================== ======= ==========================
+#:
+#: Units are ``unit=`` (metres by default) everywhere except
+#: ``frame="local"``, which is always the file's native length unit.
+#: ``global_shift`` is ``[0, 0, 0]`` for near-origin models, so all three
+#: rows agree there and the difference is invisible until the model is
+#: georeferenced — which is exactly when it is worth 200 km.
 Mesh = namedtuple("Mesh", ["guid", "entity", "vertices", "faces"])
 
 #: One product's triangle mesh in its **local representation frame**, as
@@ -93,6 +111,62 @@ class MeshList(list):
     #: as ``"unhandled:IFCXXX"``; that is the supported answer to "what did
     #: this file contain that I am not seeing".
     stats: dict = {}
+
+
+class MeshIter:
+    """Iterable returned by :meth:`Model.iter_meshes` — yields
+    :data:`Mesh` (or :data:`LocalMesh`) rows and *also* carries the
+    frame metadata the rows themselves don't (GH #179).
+
+    ``for mesh in m.iter_meshes():`` is unchanged; what is new is that
+    the model-wide offset is reachable from the streaming path::
+
+        >>> it = m.iter_meshes()
+        >>> it.global_shift                  # [Sx, Sy, Sz] or [0, 0, 0]
+        >>> for mesh in it:
+        ...     absolute = mesh.vertices + it.global_shift
+
+    Without it, a far-origin model streamed through ``iter_meshes()``
+    yields plausible-looking coordinates that are wrong by exactly the
+    georeference offset — the silent kind of wrong.
+
+    Attributes:
+        global_shift: ``[Sx, Sy, Sz]`` in :attr:`unit`, the same list
+            :attr:`MeshList.global_shift` carries. Add it per vertex for
+            absolute world coordinates. ``[0, 0, 0]`` for near-origin
+            models and always ``[0, 0, 0]`` for ``frame="local"``.
+        frame: the ``frame=`` the iterator was built with
+            (``"world"`` / ``"local"``).
+        unit: the ``unit=`` the vertices are in (``"m"`` by default;
+            ignored — and reported as the native unit — for
+            ``frame="local"``).
+        stats: the mesh-pass counters :attr:`MeshList.stats` carries.
+
+    Re-iterable (the Rust pass runs eagerly, so the rows are already
+    materialised) and ``len()``-able.
+    """
+
+    __slots__ = ("_meshes", "global_shift", "stats", "frame", "unit")
+
+    def __init__(self, meshes: MeshList, *, frame: str = "world", unit: str = "m"):
+        self._meshes = meshes
+        self.global_shift = meshes.global_shift
+        self.stats = meshes.stats
+        self.frame = frame
+        self.unit = unit
+
+    def __iter__(self):
+        return iter(self._meshes)
+
+    def __len__(self) -> int:
+        return len(self._meshes)
+
+    def __repr__(self) -> str:
+        return (
+            f"MeshIter({len(self._meshes)} products, frame={self.frame!r}, "
+            f"unit={self.unit!r}, global_shift={self.global_shift})"
+        )
+
 
 #: How many metres one of each named unit is. Geometry APIs
 #: (:meth:`Model.point_cloud`, :meth:`Model.meshes`) accept any of these
@@ -195,10 +269,31 @@ class ProductRow:
 
 @dataclass
 class StoreyRow:
+    """One ``IfcBuildingStorey``, indexed.
+
+    Two elevation fields, on purpose (GH #180):
+
+    * ``elevation`` — the raw ``IfcBuildingStorey.Elevation`` attribute,
+      in the **file's own length unit** (millimetres on most Revit /
+      Archicad output). Kept verbatim so a round-trip writes back the
+      number the file declared.
+    * ``elevation_m`` — the same value in **metres**
+      (``elevation * Model.unit_scale``), matching every other
+      length-valued surface in the library (``mesh_qto`` ``*_m3``,
+      ``drift`` ``*_m``, :meth:`Model.meshes` coordinates). This is the
+      one to compare against geometry. ``None`` when ``elevation`` is
+      ``None`` or the file declared a length unit that could not be
+      resolved (:attr:`Model.unit_scale` is ``None``) — a fabricated
+      metre value would be worse than an absent one.
+    """
+
     guid: str
     name: Optional[str]
+    #: Raw ``IfcBuildingStorey.Elevation`` — **file units**, not metres.
     elevation: Optional[float]
     building_guid: Optional[str]
+    #: :attr:`elevation` converted to **metres**; ``None`` when unknown.
+    elevation_m: Optional[float] = None
 
 
 @dataclass
@@ -1285,6 +1380,19 @@ class Model:
         are already absolute. The GUID always keeps each mesh joined to
         its product in the spatial graph regardless of shift.
 
+        Frame summary (the full table is on :data:`Mesh`):
+
+        ===================== ================== ======= ======================
+        call                  frame              dtype   absolute world coords
+        ===================== ================== ======= ======================
+        ``m.meshes()``        shifted world      float32 ``v + global_shift``
+        ``m.iter_meshes()``   shifted world      float32 ``v + global_shift``
+        ``m.mesh(guid)``      **absolute world** float64 already absolute
+        ===================== ================== ======= ======================
+
+        :meth:`iter_meshes` returns the same rows behind a
+        :class:`MeshIter` that carries the same ``global_shift``.
+
         Args:
             unit: output coordinate unit — ``"m"`` (default), ``"mm"``,
                 ``"cm"``, ``"dm"``, ``"ft"``, ``"in"`` (long names also
@@ -1407,23 +1515,45 @@ class Model:
         keep_cutters: bool = False,
         frame: str = "world",
     ):
-        """Generator form of :meth:`meshes` — yields ``Mesh`` namedtuples
+        """Streaming form of :meth:`meshes` — iterate ``Mesh`` namedtuples
         one at a time (``LocalMesh`` when ``frame="local"``). Identical
-        data; use this when you want to stream through products without
-        materialising the whole list. Note the Rust mesher still runs
-        eagerly (one batch pass), so this trades list-construction memory
-        for iteration ergonomics, not peak RAM.
+        data; use this when you want to walk products without holding the
+        whole list yourself. Note the Rust mesher still runs eagerly (one
+        batch pass), so this trades list-construction memory for
+        iteration ergonomics, not peak RAM.
+
+        Returns a :class:`MeshIter`, not a bare generator (GH #179). The
+        rows are the same, but the iterator carries the frame metadata a
+        ``Mesh`` row cannot::
+
+            >>> it = m.iter_meshes()
+            >>> len(it), it.frame, it.unit
+            >>> it.global_shift                       # [Sx, Sy, Sz]
+            >>> for mesh in it:
+            ...     world = mesh.vertices + it.global_shift
+
+        **Frame** (see :data:`Mesh` for the full table): like
+        :meth:`meshes`, vertices are ``float32`` in the *shifted* world
+        frame — a single model-wide ``global_shift`` subtracted so
+        georeferenced geometry survives ``float32``. Add
+        ``it.global_shift`` back for absolute world coordinates. It is
+        ``[0, 0, 0]`` on near-origin models, which is why a near-origin
+        fixture cannot catch a missing shift. :meth:`mesh` (one product,
+        ``float64``) returns absolute coordinates instead.
 
         ``cut_openings`` / ``keep_cutters`` / ``frame`` mirror
         :meth:`meshes` — see that method for the full contract.
         """
-        for mesh in self.meshes(
-            unit=unit,
-            cut_openings=cut_openings,
-            keep_cutters=keep_cutters,
+        return MeshIter(
+            self.meshes(
+                unit=unit,
+                cut_openings=cut_openings,
+                keep_cutters=keep_cutters,
+                frame=frame,
+            ),
             frame=frame,
-        ):
-            yield mesh
+            unit=unit,
+        )
 
     def mesh(
         self,
@@ -1459,6 +1589,11 @@ class Model:
           ``global_shift`` because a whole georeferenced model spans an
           extent that overflows f32; one product does not.)
         * ``faces`` is shape ``(M, 3)`` ``uint32`` triangle indices.
+
+        So ``m.mesh(guid).vertices`` and the matching row from
+        :meth:`meshes` / :meth:`iter_meshes` differ by exactly
+        ``global_shift`` on a georeferenced model, and agree exactly on a
+        near-origin one. The full frame table is on :data:`Mesh`.
 
         ``cut_openings`` / ``keep_cutters`` mirror :meth:`meshes` exactly
         — cross-product ``IfcRelVoidsElement`` openings are folded via the
@@ -1924,8 +2059,26 @@ class Model:
             # collapsed (last-wins). A loud flag instead of a silently
             # non-unique key column.
             "duplicate_step_ids": self.duplicate_step_ids,
+            # GH #178: entities with the IfcProduct attribute shape whose
+            # class is not in the tier-1 whitelist, so they appear in NO
+            # table on this model. Empty on a fully-covered file; with
+            # `products == 0` it explains an otherwise silent empty model.
+            "skipped_product_types": self.skipped_product_types,
             "warnings": list(self.warnings),
         }
+
+    @property
+    def skipped_product_types(self) -> dict[str, int]:
+        """``{entity: count}`` of product-shaped entities the tier-1
+        whitelist did not claim (GH #178), in ifcopenshell title case.
+
+        Empty for every model whose classes ifcfast knows. Non-empty
+        means those elements are missing from `products`, `meshes`,
+        `mesh_qto` and `clash` — the file is not empty, this build cannot
+        read those classes. `ifcfast.open()` warns when this is non-empty
+        AND the model indexed zero products.
+        """
+        return dict(getattr(self, "_skipped_product_types", None) or {})
 
     @property
     def schemas(self) -> dict:
@@ -2111,7 +2264,9 @@ class Model:
                     ...
                 },
                 "storey_deltas": [
-                    {"guid": ..., "name": ..., "elevation": [old, new]},
+                    {"guid": ..., "name": ...,
+                     "elevation":   [old, new],   # raw, file units
+                     "elevation_m": [old, new]},  # metres (GH #180)
                     ...
                 ],
             }
@@ -2171,11 +2326,22 @@ class Model:
         storey_deltas: list[dict] = []
         for guid in l_storeys.keys() & r_storeys.keys():
             ls, rs = l_storeys[guid], r_storeys[guid]
-            if ls.elevation != rs.elevation or ls.name != rs.name:
+            # `elevation_m` is in the comparison too: a revision that
+            # only changes the file's LENGTHUNIT leaves the raw
+            # `elevation` identical while the real height moves (GH #180).
+            if (
+                ls.elevation != rs.elevation
+                or ls.elevation_m != rs.elevation_m
+                or ls.name != rs.name
+            ):
                 storey_deltas.append({
                     "guid": guid,
                     "name": [ls.name, rs.name],
+                    # `elevation` is raw file units on each side — which
+                    # can be two DIFFERENT units across a revision pair.
+                    # `elevation_m` is the comparable one (GH #180).
                     "elevation": [ls.elevation, rs.elevation],
+                    "elevation_m": [ls.elevation_m, rs.elevation_m],
                 })
 
         def _trim(lst, n):
@@ -2587,21 +2753,31 @@ def _index_native(
     schema = raw.get("schema") or hdr.schema
     type_counts: dict[str, int] = dict(raw.get("type_counts") or {})
 
-    # Storeys.
+    # Storeys. `elevation` stays raw (file units); `elevation_m` is the
+    # metres view every other length surface in the library speaks
+    # (GH #180). No unit_scale (declared-but-unresolvable LENGTHUNIT) =>
+    # no metres value, rather than a silently-wrong one.
     storeys: list[StoreyRow] = []
     storey_step_to_guid: dict[int, str] = {}
     s = raw["storeys"]
     n_st = len(s["step_id"])
+    st_scale = raw.get("unit_scale")
     for i in range(n_st):
         sid = int(s["step_id"][i])
         guid = s["guid"][i]
         storey_step_to_guid[sid] = guid
+        elev = s["elevation"][i]
         storeys.append(
             StoreyRow(
                 guid=guid,
                 name=s["name"][i],
-                elevation=s["elevation"][i],
+                elevation=elev,
                 building_guid=None,  # patched below
+                elevation_m=(
+                    None
+                    if elev is None or elev != elev or st_scale is None
+                    else float(elev) * float(st_scale)
+                ),
             )
         )
 
@@ -2910,6 +3086,13 @@ def _index_native(
     # GH #73: classify the unit signal and fire the loud channel. Done
     # here (cold parse) and again on the cache-hit path in `open_ifc`.
     _signal_unresolved_unit(model, p, strict)
+    # GH #178: record the product-shaped entities no whitelist entry
+    # claimed, and warn if that is why the model came back empty. Done
+    # here (cold parse) and again in `cache.read_index` (cache hit), so
+    # both paths through `ifcfast.open()` say the same thing.
+    from .whitelist import note_skipped as _note_skipped
+
+    _note_skipped(model, raw.get("skipped_product_types"))
     return model
 
 

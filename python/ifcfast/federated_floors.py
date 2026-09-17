@@ -66,9 +66,17 @@ from typing import Any, Callable, Iterable, Optional
 class StoreyInfo:
     """One storey from one discipline model.
 
-    `elevation_mm` is in millimetres — IFC files are usually authored in
-    mm, and `IfcBuildingStorey.Elevation` is already in model units.
-    Convert before passing if your file is in metres.
+    `elevation_mm` is in millimetres. `IfcBuildingStorey.Elevation` —
+    and therefore `StoreyRow.elevation` — is in the FILE's units, which
+    is mm on most Revit / Archicad output but not all of them. Build
+    from the unit-explicit field instead of assuming (GH #180). Guard
+    the None: `elevation_m` is None when the file's length unit could
+    not be resolved::
+
+        StoreyInfo(model_name="ARK", storey_name=s.name,
+                   elevation_mm=s.elevation_m * 1000.0,
+                   storey_guid=s.guid)
+        for s in m.storeys if s.elevation_m is not None
     """
 
     model_name: str

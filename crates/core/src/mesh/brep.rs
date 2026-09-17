@@ -280,11 +280,12 @@ fn mesh_face(
         outer_verts.reverse();
     }
 
-    // No declared holes (or no explicit outer tag) → keep the cheap fan
-    // triangulation. Fan is exact for the convex / simple-polygon faces
-    // that dominate breps and avoids the projection cost.
+    // No declared holes (or no explicit outer tag) → triangulate the
+    // single loop. Convex loops keep the cheap fan (exact, and breps
+    // dominate the triangle budget); concave loops go through earcut so
+    // a notch isn't bridged (GH #177).
     if !have_explicit_outer || inner_loops.is_empty() {
-        fan_triangulate(&outer_verts, mesh);
+        triangulate_simple_loop(mesh, &outer_verts);
         return;
     }
 
@@ -332,6 +333,137 @@ fn fan_triangulate(verts: &[u32], mesh: &mut LocalMesh) {
         mesh.indices.push(verts[i]);
         mesh.indices.push(verts[i + 1]);
     }
+}
+
+/// Triangulate ONE closed, hole-free loop of mesh vertex indices.
+///
+/// GH #177: fanning from vertex 0 is exact only for convex loops. A
+/// concave hole-free outline (L / C / U footprints, a notched plate, a
+/// brep face whose outer bound wraps a re-entrant corner) gets triangles
+/// that bridge the notch, so the mesh over-fills the opening — and the
+/// resulting shell over-reports area and, when closed, volume, with no
+/// flag on it.
+///
+/// So: classify first, pay second. A cheap 3D convexity test keeps the
+/// fan for the convex quads and triangles that dominate a brep-heavy
+/// model's triangle budget (see GH #171 — MEP breps are the hot path),
+/// and only concave loops pay Newell + projection + earcut. Triangle
+/// count is `n - 2` either way, so nothing but connectivity moves.
+pub(crate) fn triangulate_simple_loop(mesh: &mut LocalMesh, verts: &[u32]) {
+    let n = verts.len();
+    if n < 3 {
+        return;
+    }
+    if n == 3 {
+        mesh.indices.push(verts[0]);
+        mesh.indices.push(verts[1]);
+        mesh.indices.push(verts[2]);
+        return;
+    }
+    if loop_is_convex(mesh, verts) {
+        fan_triangulate(verts, mesh);
+        return;
+    }
+    // Concave (or the loop's Newell normal is degenerate) — ear-clip it
+    // with an empty hole set. If the projection bails the face is too
+    // degenerate to clip, so fan it anyway: a present face beats a
+    // dropped one.
+    if !triangulate_face_with_holes(mesh, verts, &[]) {
+        fan_triangulate(verts, mesh);
+    }
+}
+
+/// Is a closed 3D loop convex when viewed along its own Newell normal?
+///
+/// Every consecutive edge pair's cross product, dotted with the face
+/// normal, must share one sign. Collinear / near-collinear corners are
+/// neutral — they carry no information about convexity and must not be
+/// allowed to flip the verdict (a zero-length or doubled-back edge would
+/// otherwise mark half the corpus concave).
+///
+/// The test is **per corner and scale-free**, which a single loop-global
+/// epsilon on the raw cross-product cannot be. `turn` has units of
+/// length², so a threshold of the form `max_edge² · k` makes a corner's
+/// verdict depend on how long the loop's LONGEST edge happens to be: a
+/// genuine reflex corner between two short edges is silently neutral,
+/// whatever its angle. That is not academic — a chord plus a finely
+/// tessellated concave arc (N ≳ 42 segments, so each arc edge is ≲1 % of
+/// the chord) reads as convex, fans, and bridges the segment. Two
+/// constants, both dimensionless:
+///
+/// * `MIN_EDGE_FRACTION_SQ = 1e-6` — a corner whose incoming or outgoing
+///   edge is shorter than `1e-3` of the longest edge (hence `1e-6` on
+///   squared lengths) is neutral. `max_edge_sq` is still computed for
+///   exactly this, as the loop's scale reference. At that length the
+///   f32 direction noise on rebased vertices is ~1e-4 rad, so this
+///   guards the sine threshold below with a 10× margin.
+/// * `MIN_SIN_TURN = 1e-3` — for every other corner, `turn` is compared
+///   against `1e-3 · |e1| · |e2|`, i.e. `sin θ > 1e-3` (~0.06°),
+///   independent of the loop's units and of the other edges' lengths.
+///
+/// Verdict: convex iff no two signed corners disagree in sign.
+///
+/// Returns `false` for a degenerate loop (zero Newell normal), which
+/// routes the caller to earcut — which reports the degeneracy properly.
+fn loop_is_convex(mesh: &LocalMesh, verts: &[u32]) -> bool {
+    let vtx = |idx: u32| -> Vec3 {
+        let b = idx as usize * 3;
+        Vec3::new(mesh.vertices[b], mesh.vertices[b + 1], mesh.vertices[b + 2])
+    };
+    let n = verts.len();
+
+    // Newell normal + the loop's scale, in one pass.
+    let mut normal = Vec3::ZERO;
+    let mut max_edge_sq = 0.0_f32;
+    for i in 0..n {
+        let a = vtx(verts[i]);
+        let b = vtx(verts[(i + 1) % n]);
+        normal.x += (a.y - b.y) * (a.z + b.z);
+        normal.y += (a.z - b.z) * (a.x + b.x);
+        normal.z += (a.x - b.x) * (a.y + b.y);
+        max_edge_sq = max_edge_sq.max((b - a).length_squared());
+    }
+    if normal.length_squared() < 1e-20 || max_edge_sq <= 0.0 {
+        return false;
+    }
+    let nrm = normal.normalize();
+
+    // See the doc comment: both constants are dimensionless, and the
+    // second one makes each corner's verdict independent of the rest of
+    // the loop.
+    const MIN_EDGE_FRACTION_SQ: f32 = 1e-6;
+    const MIN_SIN_TURN: f32 = 1e-3;
+    let min_edge_sq = max_edge_sq * MIN_EDGE_FRACTION_SQ;
+
+    let mut sign = 0_i32;
+    for i in 0..n {
+        let a = vtx(verts[i]);
+        let b = vtx(verts[(i + 1) % n]);
+        let c = vtx(verts[(i + 2) % n]);
+        let e1 = b - a;
+        let e2 = c - b;
+        let e1_sq = e1.length_squared();
+        let e2_sq = e2.length_squared();
+        // Degenerate corner: one of the edges is noise at this scale.
+        if e1_sq < min_edge_sq || e2_sq < min_edge_sq {
+            continue;
+        }
+        let turn = e1.cross(e2).dot(nrm);
+        // |e1 × e2| = |e1||e2| sin θ, so this is a pure angle threshold.
+        let eps = MIN_SIN_TURN * (e1_sq * e2_sq).sqrt();
+        if turn > eps {
+            if sign < 0 {
+                return false;
+            }
+            sign = 1;
+        } else if turn < -eps {
+            if sign > 0 {
+                return false;
+            }
+            sign = -1;
+        }
+    }
+    true
 }
 
 /// Ear-clip a planar face (one outer loop + N hole loops, all given as
@@ -734,5 +866,335 @@ END-ISO-10303-21;
             (area - expected).abs() < 1e-3,
             "expected tilted hole-excluded area {expected}, got {area}"
         );
+    }
+
+    /// GH #177: a concave, hole-free loop must NOT be fan-filled. The
+    /// L-footprint below is a 10×10 square minus a 6×6 corner: true area
+    /// 100 - 36 = 64. Ear-clipping keeps the notch empty; the fan bridges
+    /// it (see `fan_triangulate_bridges_concave_notch`). Triangle count
+    /// is n - 2 = 4 either way — only connectivity moves.
+    #[test]
+    fn concave_l_face_does_not_bridge_notch() {
+        const L: [[f32; 3]; 6] = [
+            [0.0, 0.0, 0.0],
+            [10.0, 0.0, 0.0],
+            [10.0, 4.0, 0.0],
+            [4.0, 4.0, 0.0],
+            [4.0, 10.0, 0.0],
+            [0.0, 10.0, 0.0],
+        ];
+        let mut mesh = LocalMesh::new();
+        let loop_idx: Vec<u32> = L
+            .iter()
+            .map(|c| {
+                let idx = (mesh.vertices.len() / 3) as u32;
+                mesh.vertices.extend_from_slice(c);
+                idx
+            })
+            .collect();
+
+        triangulate_simple_loop(&mut mesh, &loop_idx);
+        let area = tri_area(&mesh);
+        assert!(
+            (area - 64.0).abs() < 1e-3,
+            "expected the notch left empty (area 64), got {area}"
+        );
+        assert_eq!(
+            mesh.indices.len() / 3,
+            4,
+            "an n=6 loop must still yield n - 2 = 4 triangles"
+        );
+
+        // The same loop started at a different vertex is the same
+        // polygon, so it must give the same area. (It does not for the
+        // fan: vertex 0 of the ordering above happens to see the whole
+        // L, which is exactly why the bug hid for so long.)
+        let mut rot = LocalMesh::new();
+        let rot_idx: Vec<u32> = [1usize, 2, 3, 4, 5, 0]
+            .iter()
+            .map(|&k| {
+                let idx = (rot.vertices.len() / 3) as u32;
+                rot.vertices.extend_from_slice(&L[k]);
+                idx
+            })
+            .collect();
+        triangulate_simple_loop(&mut rot, &rot_idx);
+        let rot_area = tri_area(&rot);
+        assert!(
+            (rot_area - 64.0).abs() < 1e-3,
+            "rotated start vertex: expected 64, got {rot_area}"
+        );
+        assert_eq!(rot.indices.len() / 3, 4);
+    }
+
+    /// The legacy fan path over-fills the same concave loop — the bug
+    /// GH #177 removes. Started at (10,0) the fan emits a triangle that
+    /// spans the notch plus one wound backwards, and the unsigned area
+    /// comes out at the full 100 instead of 64.
+    #[test]
+    fn fan_triangulate_bridges_concave_notch() {
+        let mut mesh = LocalMesh::new();
+        for c in [
+            [10.0, 0.0, 0.0f32],
+            [10.0, 4.0, 0.0],
+            [4.0, 4.0, 0.0],
+            [4.0, 10.0, 0.0],
+            [0.0, 10.0, 0.0],
+            [0.0, 0.0, 0.0],
+        ] {
+            mesh.vertices.extend_from_slice(&c);
+        }
+        fan_triangulate(&[0, 1, 2, 3, 4, 5], &mut mesh);
+        let area = tri_area(&mesh);
+        assert!(
+            area > 64.0 + 1e-3,
+            "fan should over-fill the notch, got {area}"
+        );
+        assert!(
+            (area - 100.0).abs() < 1e-3,
+            "expected fan area 100, got {area}"
+        );
+    }
+
+    /// Convex loops keep the exact fan — same triangles, same order,
+    /// same indices. Breps dominate the triangle budget (GH #171), so
+    /// the convexity gate must not push quads and hexagons through
+    /// Newell + projection + earcut, and must not move any existing
+    /// mesh's connectivity.
+    #[test]
+    fn convex_face_still_fans() {
+        // Regular-ish hexagon in the XY plane.
+        let hex: Vec<[f32; 3]> = (0..6)
+            .map(|i| {
+                let a = std::f32::consts::TAU * (i as f32) / 6.0;
+                [5.0 * a.cos(), 5.0 * a.sin(), 0.0]
+            })
+            .collect();
+
+        let build = |verts: &[[f32; 3]]| -> (LocalMesh, Vec<u32>) {
+            let mut m = LocalMesh::new();
+            let idx = verts
+                .iter()
+                .map(|c| {
+                    let i = (m.vertices.len() / 3) as u32;
+                    m.vertices.extend_from_slice(c);
+                    i
+                })
+                .collect();
+            (m, idx)
+        };
+
+        let (mut via_helper, idx) = build(&hex);
+        triangulate_simple_loop(&mut via_helper, &idx);
+
+        let (mut via_fan, idx2) = build(&hex);
+        fan_triangulate(&idx2, &mut via_fan);
+
+        assert_eq!(
+            via_helper.indices, via_fan.indices,
+            "a convex loop must take the fan fast path unchanged"
+        );
+        assert_eq!(via_helper.indices.len() / 3, 4);
+    }
+
+    /// GH #177 (review): the loop-global epsilon. `eps = max_edge² *
+    /// 1e-4` makes a corner's verdict depend on the loop's LONGEST edge,
+    /// so a re-entrant boundary made of many short edges is neutral
+    /// regardless of its angle. The loop below is a 10 × 5 rectangle
+    /// whose bottom side is replaced by a concave 100-segment arc
+    /// bulging up to (5, 2): the long sides set `max_edge = 10`
+    /// (`eps = 0.01`), while each arc corner contributes only
+    /// `|e1||e2| sin θ ≈ 0.11² · 0.0152 ≈ 1.8e-4` — three orders below
+    /// the threshold. Every arc corner reads neutral, the four
+    /// rectangle corners agree in sign, the loop is called convex, and
+    /// the fan bridges the arc and over-reports the face by the
+    /// segment's ~13.75 units of area.
+    ///
+    /// The per-corner test compares against `1e-3 · |e1| · |e2|`, i.e.
+    /// `sin θ > 1e-3`, so the same corners are signed at any
+    /// tessellation density and the loop is concave.
+    #[test]
+    fn chord_plus_fine_concave_arc_is_concave() {
+        // Circle through (0,0), (5,2), (10,0): centre (5, -5.25), r = 7.25.
+        const CX: f64 = 5.0;
+        const CY: f64 = -5.25;
+        const R: f64 = 7.25;
+        const N: usize = 100;
+
+        let a_start = (0.0f64 - CY).atan2(0.0 - CX); // at (0,0)
+        let a_end = (0.0f64 - CY).atan2(10.0 - CX); // at (10,0)
+
+        let mut pts: Vec<[f32; 3]> = Vec::new();
+        // Concave arc, (0,0) -> (5,2) -> (10,0), endpoints included.
+        for i in 0..=N {
+            let t = i as f64 / N as f64;
+            let a = a_start + (a_end - a_start) * t;
+            pts.push([(CX + R * a.cos()) as f32, (CY + R * a.sin()) as f32, 0.0]);
+        }
+        // Three long straight sides back round: the loop's scale.
+        pts.push([10.0, 5.0, 0.0]);
+        pts.push([0.0, 5.0, 0.0]);
+
+        let mut mesh = LocalMesh::new();
+        let idx: Vec<u32> = pts
+            .iter()
+            .map(|c| {
+                let i = (mesh.vertices.len() / 3) as u32;
+                mesh.vertices.extend_from_slice(c);
+                i
+            })
+            .collect();
+
+        assert!(
+            !loop_is_convex(&mesh, &idx),
+            "a 100-segment concave arc between two long edges must read concave"
+        );
+
+        // Shoelace over the authored polygon, in f64.
+        let mut shoelace = 0.0f64;
+        for i in 0..pts.len() {
+            let a = pts[i];
+            let b = pts[(i + 1) % pts.len()];
+            shoelace += a[0] as f64 * b[1] as f64 - b[0] as f64 * a[1] as f64;
+        }
+        let expected = (0.5 * shoelace).abs() as f32;
+
+        triangulate_simple_loop(&mut mesh, &idx);
+        let area = tri_area(&mesh);
+        assert!(
+            (area - expected).abs() < 1e-3,
+            "expected the arc left empty (area {expected}), got {area}"
+        );
+        assert_eq!(
+            mesh.indices.len() / 3,
+            pts.len() - 2,
+            "an n-gon must still yield n - 2 triangles"
+        );
+    }
+
+    /// The other side of the same constant: a densely tessellated CONVEX
+    /// loop must stay on the fan fast path. A regular 100-gon turns
+    /// 3.6° per corner — 60× the `sin θ > 1e-3` floor — so every corner
+    /// is signed, and they all agree.
+    #[test]
+    fn regular_100gon_is_still_convex() {
+        let mut mesh = LocalMesh::new();
+        let n = 100;
+        let idx: Vec<u32> = (0..n)
+            .map(|i| {
+                let a = std::f32::consts::TAU * (i as f32) / (n as f32);
+                let j = (mesh.vertices.len() / 3) as u32;
+                mesh.vertices
+                    .extend_from_slice(&[5.0 * a.cos(), 5.0 * a.sin(), 0.0]);
+                j
+            })
+            .collect();
+        assert!(
+            loop_is_convex(&mesh, &idx),
+            "a regular 100-gon must still take the fan fast path"
+        );
+    }
+
+    /// The convexity test and the earcut projection are both computed in
+    /// the face's own plane, so a tilted concave face behaves the same.
+    /// The L-footprint lifted onto the plane z = x scales in-plane areas
+    /// by sqrt(2): 64 * sqrt(2).
+    #[test]
+    fn concave_face_tilted_plane() {
+        let mut mesh = LocalMesh::new();
+        let s = |x: f32, y: f32| [x, y, x]; // z = x tilt
+        let pts = [
+            s(0.0, 0.0),
+            s(10.0, 0.0),
+            s(10.0, 4.0),
+            s(4.0, 4.0),
+            s(4.0, 10.0),
+            s(0.0, 10.0),
+        ];
+        let idx: Vec<u32> = pts
+            .iter()
+            .map(|c| {
+                let i = (mesh.vertices.len() / 3) as u32;
+                mesh.vertices.extend_from_slice(c);
+                i
+            })
+            .collect();
+        triangulate_simple_loop(&mut mesh, &idx);
+        let expected = 64.0 * std::f32::consts::SQRT_2;
+        let area = tri_area(&mesh);
+        assert!(
+            (area - expected).abs() < 1e-3,
+            "expected tilted concave area {expected}, got {area}"
+        );
+        assert_eq!(mesh.indices.len() / 3, 4);
+    }
+
+    /// GH #177 end-to-end: a closed `IfcFacetedBrep` L-prism (10×10
+    /// footprint minus a 6×6 corner, extruded 2) walked through the real
+    /// `IfcFace` / `IfcFaceOuterBound` / `IfcPolyLoop` traversal.
+    ///
+    /// Analytic surface area = 2 caps (64 each) + perimeter 40 × height
+    /// 2 = 128 + 80 = 208. The caps are the concave faces; fanning them
+    /// from the wrong start vertex inflates the total.
+    const L_PRISM_BREP_IFC: &str = r#"ISO-10303-21;
+HEADER;
+FILE_DESCRIPTION(('ViewDefinition [ReferenceView]'),'2;1');
+FILE_NAME('lprism.ifc','2026-09-17T00:00:00',('test'),('skiplum'),'ifcfast','ifcfast','');
+FILE_SCHEMA(('IFC4'));
+ENDSEC;
+DATA;
+#1=IFCCARTESIANPOINT((0.,0.,0.));
+#2=IFCCARTESIANPOINT((10.,0.,0.));
+#3=IFCCARTESIANPOINT((10.,4.,0.));
+#4=IFCCARTESIANPOINT((4.,4.,0.));
+#5=IFCCARTESIANPOINT((4.,10.,0.));
+#6=IFCCARTESIANPOINT((0.,10.,0.));
+#7=IFCCARTESIANPOINT((0.,0.,2.));
+#8=IFCCARTESIANPOINT((10.,0.,2.));
+#9=IFCCARTESIANPOINT((10.,4.,2.));
+#10=IFCCARTESIANPOINT((4.,4.,2.));
+#11=IFCCARTESIANPOINT((4.,10.,2.));
+#12=IFCCARTESIANPOINT((0.,10.,2.));
+#100=IFCPOLYLOOP((#1,#6,#5,#4,#3,#2));
+#101=IFCFACEOUTERBOUND(#100,.T.);
+#102=IFCFACE((#101));
+#110=IFCPOLYLOOP((#7,#8,#9,#10,#11,#12));
+#111=IFCFACEOUTERBOUND(#110,.T.);
+#112=IFCFACE((#111));
+#120=IFCPOLYLOOP((#1,#2,#8,#7));
+#121=IFCFACEOUTERBOUND(#120,.T.);
+#122=IFCFACE((#121));
+#130=IFCPOLYLOOP((#2,#3,#9,#8));
+#131=IFCFACEOUTERBOUND(#130,.T.);
+#132=IFCFACE((#131));
+#140=IFCPOLYLOOP((#3,#4,#10,#9));
+#141=IFCFACEOUTERBOUND(#140,.T.);
+#142=IFCFACE((#141));
+#150=IFCPOLYLOOP((#4,#5,#11,#10));
+#151=IFCFACEOUTERBOUND(#150,.T.);
+#152=IFCFACE((#151));
+#160=IFCPOLYLOOP((#5,#6,#12,#11));
+#161=IFCFACEOUTERBOUND(#160,.T.);
+#162=IFCFACE((#161));
+#170=IFCPOLYLOOP((#6,#1,#7,#12));
+#171=IFCFACEOUTERBOUND(#170,.T.);
+#172=IFCFACE((#171));
+#200=IFCCLOSEDSHELL((#102,#112,#122,#132,#142,#152,#162,#172));
+#201=IFCFACETEDBREP(#200);
+ENDSEC;
+END-ISO-10303-21;
+"#;
+
+    #[test]
+    fn faceted_brep_concave_l_prism_surface_area() {
+        let table = EntityTable::build(L_PRISM_BREP_IFC.as_bytes());
+        let mesh = faceted_brep(&table, 201).expect("brep #201 meshes");
+        let area = tri_area(&mesh);
+        assert!(
+            (area - 208.0).abs() < 1e-3,
+            "expected L-prism surface area 208 (2*64 caps + 40*2 sides), got {area}"
+        );
+        // 2 concave caps at 4 triangles + 6 quad sides at 2 = 20.
+        assert_eq!(mesh.indices.len() / 3, 20);
     }
 }

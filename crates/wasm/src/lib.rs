@@ -20,6 +20,14 @@
 //!   * **Single-threaded.** No rayon on the web target; the mesh pass
 //!     takes the core's existing T=1 serial path.
 //!
+//! GH #183 adds the four long-format data layers — [`IfcModel::psets_json`],
+//! [`IfcModel::quantities_json`], [`IfcModel::materials_json`],
+//! [`IfcModel::classifications_json`] — as row-object JSON with the same
+//! columns and the same normalisation as the Python DataFrames. They were
+//! parsed all along (`summaryJson().tables` reported their row counts);
+//! they simply had no accessor. A browser-side IDS `PropertyFacet` /
+//! `ClassificationFacet` reads them.
+//!
 //! v2 (GH #172, streaming geometry): [`IfcModel::from_bytes`] no longer
 //! meshes. It parses, indexes and runs the extractors — everything the
 //! identity + roster surfaces need — and the tessellation is either
@@ -104,6 +112,67 @@ impl IfcModel {
     pub fn qto_json(&mut self) -> String {
         self.inner.ensure_stats();
         self.inner.qto_json().to_string()
+    }
+
+    /// `[{guid, pset_name, prop_name, value, value_type, source}]` —
+    /// every property row, long format, exactly `model.psets` (GH #183).
+    ///
+    /// Mesh-free: the extractors already ran in `fromBytes`, so this is
+    /// a serialise, not a computation.
+    ///
+    /// `value` is the STEP literal as a **string** (or `null`), with
+    /// `value_type` naming the IFC type — the wheel does not coerce it
+    /// either, and a browser that parsed `"3.0"` into `3.0` would
+    /// disagree with the desktop for the same file. `source` is
+    /// `"instance"` or `"type"`: type-inherited properties are included,
+    /// with instance winning on a name collision.
+    ///
+    /// This is the payload an IDS `PropertyFacet` needs. On a large
+    /// model it is also the biggest string this API hands out — one JSON
+    /// document for every property of every product.
+    #[wasm_bindgen(js_name = psetsJson)]
+    pub fn psets_json(&self) -> String {
+        self.inner.psets_json().to_string()
+    }
+
+    /// `[{guid, qto_name, quantity_name, value, quantity_type,
+    /// unit_step_id, source}]` — `model.quantities` (GH #183).
+    ///
+    /// Authored quantities, i.e. what the exporter wrote into
+    /// `Qto_*`. Not to be confused with `qtoJson()`, which is ifcfast's
+    /// own per-class aggregate over the mesh pass. `value` is a string
+    /// for the same reason as in `psetsJson`.
+    #[wasm_bindgen(js_name = quantitiesJson)]
+    pub fn quantities_json(&self) -> String {
+        self.inner.quantities_json().to_string()
+    }
+
+    /// `[{guid, role, layer_index, material_name, layer_thickness_mm,
+    /// category, fraction, source}]` — `model.materials` (GH #183).
+    ///
+    /// The long-format layer table. `graphJson()`'s per-product
+    /// `materials` array is a name rollup of these rows; this is the
+    /// rows themselves, with per-layer thickness in millimetres
+    /// (unit-normalised by the extractor) and `layer_index` ordering
+    /// them through the wall.
+    #[wasm_bindgen(js_name = materialsJson)]
+    pub fn materials_json(&self) -> String {
+        self.inner.materials_json().to_string()
+    }
+
+    /// `[{guid, system_name, edition, identification, name, location,
+    /// source, assignment_source}]` — `model.classifications` (GH #183).
+    ///
+    /// `identification` is the normalised code: IFC4
+    /// `IfcClassificationReference.Identification` and IFC2x3
+    /// `.ItemReference` both land here, so an NS 3451 lookup is one
+    /// column regardless of schema. Watch the two provenance columns:
+    /// `source` is `IfcClassification.Source` (the publishing body),
+    /// `assignment_source` is the `"instance"` / `"type"` flag the other
+    /// three layers call `source`.
+    #[wasm_bindgen(js_name = classificationsJson)]
+    pub fn classifications_json(&self) -> String {
+        self.inner.classifications_json().to_string()
     }
 
     /// `types/manifest.json` — the type roster. `glb` / `bytes` are empty

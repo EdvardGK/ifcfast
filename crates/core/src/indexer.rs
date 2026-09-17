@@ -62,10 +62,13 @@ pub(crate) const PRODUCT_TYPES: &[&[u8]] = &[
     b"IFCRAMPFLIGHT",
     b"IFCRAILING",
     b"IFCROOF",
+    b"IFCCHIMNEY",
     // Covering / finish
     b"IFCCOVERING",
+    b"IFCSHADINGDEVICE",
     // Generic
     b"IFCBUILDINGELEMENTPROXY",
+    b"IFCPROXY",
     b"IFCBUILDINGELEMENTPART",
     b"IFCELEMENTASSEMBLY",
     b"IFCTRANSPORTELEMENT",
@@ -74,14 +77,19 @@ pub(crate) const PRODUCT_TYPES: &[&[u8]] = &[
     b"IFCDISCRETEACCESSORY",
     b"IFCFASTENER",
     b"IFCMECHANICALFASTENER",
+    b"IFCVIBRATIONISOLATOR",
+    b"IFCVIBRATIONDAMPER",
     b"IFCREINFORCINGBAR",
     b"IFCREINFORCINGMESH",
+    b"IFCREINFORCINGELEMENT",
     b"IFCTENDON",
     b"IFCTENDONANCHOR",
+    b"IFCTENDONCONDUIT",
     // Distribution / MEP
     b"IFCDISTRIBUTIONELEMENT",
     b"IFCDISTRIBUTIONFLOWELEMENT",
     b"IFCDISTRIBUTIONCONTROLELEMENT",
+    b"IFCDISTRIBUTIONCHAMBERELEMENT",
     b"IFCDISTRIBUTIONPORT",
     b"IFCFLOWFITTING",
     b"IFCFLOWSEGMENT",
@@ -109,6 +117,9 @@ pub(crate) const PRODUCT_TYPES: &[&[u8]] = &[
     b"IFCELECTRICAPPLIANCE",
     b"IFCELECTRICDISTRIBUTIONBOARD",
     b"IFCELECTRICFLOWSTORAGEDEVICE",
+    b"IFCELECTRICGENERATOR",
+    b"IFCELECTRICMOTOR",
+    b"IFCTRANSFORMER",
     b"IFCAIRTERMINAL",
     b"IFCAIRTERMINALBOX",
     b"IFCDAMPER",
@@ -120,6 +131,7 @@ pub(crate) const PRODUCT_TYPES: &[&[u8]] = &[
     b"IFCCONDENSER",
     b"IFCCOOLINGTOWER",
     b"IFCEVAPORATOR",
+    b"IFCEVAPORATIVECOOLER",
     b"IFCFAN",
     b"IFCHEATEXCHANGER",
     b"IFCHUMIDIFIER",
@@ -166,6 +178,22 @@ pub(crate) const PRODUCT_TYPES: &[&[u8]] = &[
     b"IFCBRIDGEPART",
     b"IFCMARINEFACILITY",
     b"IFCMARINEPART",
+    // Civil / geographic catchalls (GH #178). `IfcGeographicElement` is
+    // the correct IFC4 class for terrain, survey markers and landscape
+    // reference objects; `IfcCivilElement` is its infrastructure
+    // sibling. Both were listed in `classify.py::MEASURE_ENTITIES` but
+    // missing here, so such a file indexed to ZERO products.
+    b"IFCGEOGRAPHICELEMENT",
+    b"IFCCIVILELEMENT",
+    // Infrastructure products named by `classify.py::COUNT_ENTITIES`
+    // (IFC4X3 additions) — added with the same drift fix, and now held
+    // in place by `tests/test_product_whitelist_parity_178.py`.
+    b"IFCIMPACTPROTECTIONDEVICE",
+    b"IFCMOORINGDEVICE",
+    b"IFCNAVIGATIONELEMENT",
+    b"IFCSIGN",
+    b"IFCVEHICLE",
+    b"IFCTRANSPORTATIONDEVICE",
 ];
 
 /// Spatial structure types — separate output table.
@@ -493,6 +521,86 @@ pub(crate) fn is_meshable_product(type_name: &[u8]) -> bool {
     .contains(type_name)
 }
 
+/// The tier-1 product whitelist, in ifcopenshell title case
+/// (`IfcGeographicElement`, not `IFCGEOGRAPHICELEMENT`).
+///
+/// Exposed so the Python layer can assert — in CI, not by inspection —
+/// that this list still covers every entity `classify.py` declares a
+/// take-off product. The two lists drifted silently for a year and a
+/// file made of `IfcGeographicElement` indexed to zero products
+/// (GH #178). See `tests/test_product_whitelist_parity_178.py` and
+/// `_core.product_types()`.
+pub fn product_type_names() -> Vec<String> {
+    PRODUCT_TYPES
+        .iter()
+        .copied()
+        .map(type_name_uppercase_with_proper_case)
+        .collect()
+}
+
+/// Cheap "this record has the shape of an `IfcProduct` but no rule
+/// claimed it" probe (GH #178).
+///
+/// The indexer's dispatch miss is silent by design — >99% of records on
+/// an MEP file are `IfcCartesianPoint` / `IfcPolyLoop` / property
+/// values. But a miss on a real product is a silently EMPTY model, so
+/// misses that look like products are counted and surfaced
+/// (`IndexedFile::skipped_product_type_counts` → `summary()`).
+///
+/// Two stages, cheapest first:
+/// 1. `IfcRoot` prefilter — every `IfcRoot` subtype starts with a
+///    22-character `IfcGloballyUniqueId` string literal, so
+///    `args[0] == '\''` and `args[23] == '\''` rejects the hot path at
+///    two byte compares, with no argument split.
+/// 2. `IfcProduct` shape — attribute 4 is `ObjectType` (a string or
+///    `$`, never a list / reference / enum), and attributes 5 and 6 are
+///    `ObjectPlacement` and `Representation`: both must be a reference
+///    or `$`, and at least one an actual reference. That rejects
+///    `IfcPropertySet` (5 args) and `IfcTypeObject` subtypes (arg 5/6
+///    are LISTS), which is most of the population of `IfcRoot` entities
+///    we deliberately don't index as products.
+///
+/// The `IfcRel*` relationships need BOTH halves. Many of them do carry
+/// Ref-or-`$` at attributes 5/6 — `IfcRelAssignsToGroup` (a list at 4,
+/// refs at 5/6), `IfcRelConnectsPathElements`,
+/// `IfcRelSpaceBoundary(1st/2ndLevel)`, `IfcRelConnectsPorts`, and the
+/// `IfcRelAssignsTo*` family with `ObjectType` = `$` — so the shape test
+/// alone counts them as skipped products. The caller rejects any type
+/// name starting with `IFCREL` BEFORE calling this (no split at all),
+/// and the `ObjectType` check here is the belt to that braces: a
+/// relationship whose attribute 4 is a list or a reference can never
+/// pass, whatever it is called.
+///
+/// Deliberately misses a product carrying neither placement nor
+/// representation — undetectable at this cost, and invisible in every
+/// downstream table anyway. Also misses a record whose GlobalId is not
+/// exactly 22 characters (the prefilter checks the closing quote at byte
+/// 23): every IFC writer emits 22, and relaxing it would let every
+/// `IfcPropertySingleValue('Name',…)` through to the split, which is the
+/// hot path this filter exists to protect.
+fn looks_like_unindexed_product<'a>(args: &'a [u8], fields: &mut Vec<&'a [u8]>) -> bool {
+    if args.len() < 24 || args[0] != b'\'' || args[23] != b'\'' {
+        return false;
+    }
+    split_top_level_args_into(args, fields);
+    if fields.len() < 7 {
+        return false;
+    }
+    // Attribute 4 is `IfcObject.ObjectType` — an optional STRING. A
+    // list (`IfcRelAssignsToGroup.RelatedObjects`), a reference or an
+    // enum there means this is not an `IfcObject` at all.
+    if !matches!(parse_field(fields[4]), Field::String(_) | Field::Null) {
+        return false;
+    }
+    let placement = parse_field(fields[5]);
+    let representation = parse_field(fields[6]);
+    let placement_ref = matches!(placement, Field::Ref(_));
+    let representation_ref = matches!(representation, Field::Ref(_));
+    let placement_ok = placement_ref || matches!(placement, Field::Null);
+    let representation_ok = representation_ref || matches!(representation, Field::Null);
+    placement_ok && representation_ok && (placement_ref || representation_ref)
+}
+
 // ----------------------------------------------------------------------
 // Dispatch
 // ----------------------------------------------------------------------
@@ -569,6 +677,17 @@ pub struct IndexedFile {
 
     // ----- Type histogram for PRODUCT types only -----
     pub type_counts: HashMap<String, u32>,
+
+    /// Entities that carry the `IfcProduct` attribute shape but are NOT
+    /// in [`PRODUCT_TYPES`], keyed by the raw uppercase STEP token
+    /// (`IFCTUBEBUNDLE`) with an occurrence count (GH #178).
+    ///
+    /// Empty on every model whose products are all whitelisted. Non-empty
+    /// alongside `product_step_id.is_empty()` is the silent-zero
+    /// signature: the file HAS products, this build just doesn't know
+    /// the class. Python turns that pair into a `UserWarning` at
+    /// `ifcfast.open()` and reports it in `Model.summary()`.
+    pub skipped_product_type_counts: HashMap<String, u32>,
 
     // ----- Products (column-major) -----
     pub product_step_id: Vec<u64>,
@@ -916,6 +1035,27 @@ pub fn index(buf: &[u8]) -> IndexedFile {
                 if suffix_ok || ifc2x3_style || bare_base {
                     EntityKind::TypeObject
                 } else {
+                    // GH #178: a miss that has the IfcProduct attribute
+                    // shape is counted, not just dropped — otherwise a
+                    // file made of an un-whitelisted product class
+                    // indexes to zero products with no signal at all.
+                    // `IfcRel*` relationships are rejected by name,
+                    // before any argument split: several of them carry
+                    // Ref-or-`$` at attributes 5/6 and would otherwise be
+                    // counted as skipped products on every real file.
+                    if t.starts_with(b"IFC")
+                        && !t.starts_with(b"IFCREL")
+                        && looks_like_unindexed_product(rec.args, &mut fields_buf)
+                    {
+                        // `from_utf8_lossy` borrows for valid UTF-8; only
+                        // the first sight of a class allocates a key.
+                        let key = String::from_utf8_lossy(t);
+                        if let Some(n) = out.skipped_product_type_counts.get_mut(key.as_ref()) {
+                            *n += 1;
+                        } else {
+                            out.skipped_product_type_counts.insert(key.into_owned(), 1);
+                        }
+                    }
                     return;
                 }
             }
@@ -1536,6 +1676,55 @@ const ENTITY_NAME_PAIRS: &[(&[u8], &str)] = &[
     (b"IFCBRIDGEPART", "IfcBridgePart"),
     (b"IFCMARINEFACILITY", "IfcMarineFacility"),
     (b"IFCMARINEPART", "IfcMarinePart"),
+    // Five entries that were in PRODUCT_TYPES but had no title-case
+    // spelling, so the fallback caser reported them as
+    // `IfcElectricflowstoragedevice` — a name `classify.py` cannot match,
+    // which silently demoted them to SKIP. Same drift family as GH #178,
+    // caught by `product_whitelist_tests::every_product_type_has_a_canonical_name`.
+    (
+        b"IFCDISTRIBUTIONCONTROLELEMENT",
+        "IfcDistributionControlElement",
+    ),
+    (
+        b"IFCELECTRICDISTRIBUTIONBOARD",
+        "IfcElectricDistributionBoard",
+    ),
+    (
+        b"IFCELECTRICFLOWSTORAGEDEVICE",
+        "IfcElectricFlowStorageDevice",
+    ),
+    (
+        b"IFCPROTECTIVEDEVICETRIPPINGUNIT",
+        "IfcProtectiveDeviceTrippingUnit",
+    ),
+    (
+        b"IFCMOBILETELECOMMUNICATIONSAPPLIANCE",
+        "IfcMobileTelecommunicationsAppliance",
+    ),
+    // Civil / geographic catchalls + infrastructure products (GH #178).
+    (b"IFCGEOGRAPHICELEMENT", "IfcGeographicElement"),
+    (b"IFCCIVILELEMENT", "IfcCivilElement"),
+    (b"IFCIMPACTPROTECTIONDEVICE", "IfcImpactProtectionDevice"),
+    (b"IFCMOORINGDEVICE", "IfcMooringDevice"),
+    (b"IFCNAVIGATIONELEMENT", "IfcNavigationElement"),
+    (b"IFCSIGN", "IfcSign"),
+    (b"IFCVEHICLE", "IfcVehicle"),
+    (b"IFCTRANSPORTATIONDEVICE", "IfcTransportationDevice"),
+    (b"IFCCHIMNEY", "IfcChimney"),
+    (b"IFCSHADINGDEVICE", "IfcShadingDevice"),
+    (b"IFCPROXY", "IfcProxy"),
+    (b"IFCVIBRATIONISOLATOR", "IfcVibrationIsolator"),
+    (b"IFCVIBRATIONDAMPER", "IfcVibrationDamper"),
+    (b"IFCREINFORCINGELEMENT", "IfcReinforcingElement"),
+    (b"IFCTENDONCONDUIT", "IfcTendonConduit"),
+    (
+        b"IFCDISTRIBUTIONCHAMBERELEMENT",
+        "IfcDistributionChamberElement",
+    ),
+    (b"IFCELECTRICGENERATOR", "IfcElectricGenerator"),
+    (b"IFCELECTRICMOTOR", "IfcElectricMotor"),
+    (b"IFCTRANSFORMER", "IfcTransformer"),
+    (b"IFCEVAPORATIVECOOLER", "IfcEvaporativeCooler"),
     (b"IFCBUILDINGSTOREY", "IfcBuildingStorey"),
     (b"IFCSITE", "IfcSite"),
     (b"IFCBUILDING", "IfcBuilding"),
@@ -1600,7 +1789,7 @@ FILE_NAME('feet.ifc','2026-06-13T00:00:00',(''),(''),'ifcfast','ifcfast','');
 FILE_SCHEMA(('IFC4'));
 ENDSEC;
 DATA;
-#1=IFCPROJECT('0Test000000000000000001',$,'p',$,$,$,$,(#5),#2);
+#1=IFCPROJECT('0Test00000000000000001',$,'p',$,$,$,$,(#5),#2);
 #2=IFCUNITASSIGNMENT((#4));
 #3=IFCSIUNIT(*,.LENGTHUNIT.,$,.METRE.);
 #4=IFCCONVERSIONBASEDUNIT(#7,.LENGTHUNIT.,'FOOT',#9);
@@ -1620,7 +1809,7 @@ FILE_NAME('inch.ifc','2026-06-13T00:00:00',(''),(''),'ifcfast','ifcfast','');
 FILE_SCHEMA(('IFC4'));
 ENDSEC;
 DATA;
-#1=IFCPROJECT('0Test000000000000000001',$,'p',$,$,$,$,(#5),#2);
+#1=IFCPROJECT('0Test00000000000000001',$,'p',$,$,$,$,(#5),#2);
 #2=IFCUNITASSIGNMENT((#4));
 #3=IFCSIUNIT(*,.LENGTHUNIT.,$,.METRE.);
 #4=IFCCONVERSIONBASEDUNIT(#7,.LENGTHUNIT.,'INCH',#9);
@@ -1640,7 +1829,7 @@ FILE_NAME('mm.ifc','2026-06-13T00:00:00',(''),(''),'ifcfast','ifcfast','');
 FILE_SCHEMA(('IFC4'));
 ENDSEC;
 DATA;
-#1=IFCPROJECT('0Test000000000000000001',$,'p',$,$,$,$,(#5),#2);
+#1=IFCPROJECT('0Test00000000000000001',$,'p',$,$,$,$,(#5),#2);
 #2=IFCUNITASSIGNMENT((#3));
 #3=IFCSIUNIT(*,.LENGTHUNIT.,.MILLI.,.METRE.);
 #5=IFCGEOMETRICREPRESENTATIONCONTEXT($,'Model',3,1.0E-5,#6,$);
@@ -1661,7 +1850,7 @@ FILE_NAME('broken.ifc','2026-06-13T00:00:00',(''),(''),'ifcfast','ifcfast','');
 FILE_SCHEMA(('IFC4'));
 ENDSEC;
 DATA;
-#1=IFCPROJECT('0Test000000000000000001',$,'p',$,$,$,$,(#5),#2);
+#1=IFCPROJECT('0Test00000000000000001',$,'p',$,$,$,$,(#5),#2);
 #2=IFCUNITASSIGNMENT((#4));
 #4=IFCCONVERSIONBASEDUNIT(#7,.LENGTHUNIT.,'FOOT',#9);
 #7=IFCDIMENSIONALEXPONENTS(1,0,0,0,0,0,0);
@@ -1715,7 +1904,7 @@ FILE_NAME('bare.ifc','2026-06-13T00:00:00',(''),(''),'ifcfast','ifcfast','');
 FILE_SCHEMA(('IFC2X3'));
 ENDSEC;
 DATA;
-#1=IFCPROJECT('0Test000000000000000001',$,'p',$,$,$,$,(#5),#2);
+#1=IFCPROJECT('0Test00000000000000001',$,'p',$,$,$,$,(#5),#2);
 #2=IFCUNITASSIGNMENT((#3));
 #3=IFCSIUNIT(*,.LENGTHUNIT.,.MILLI.,.METRE.);
 #5=IFCGEOMETRICREPRESENTATIONCONTEXT($,'Model',3,1.0E-5,#6,$);
@@ -1801,7 +1990,7 @@ FILE_SCHEMA(('IFC2X3'));\nENDSEC;\n";
     fn unknown_prefix_leaves_unit_scale_unset_and_warns() {
         let src = format!(
             "{HDR4}DATA;\n\
-             #1=IFCPROJECT('0Test000000000000000001',$,'p',$,$,$,$,$,#2);\n\
+             #1=IFCPROJECT('0Test00000000000000001',$,'p',$,$,$,$,$,#2);\n\
              #2=IFCUNITASSIGNMENT((#3));\n\
              #3=IFCSIUNIT(*,.LENGTHUNIT.,.KILLO.,.METRE.);\n\
              ENDSEC;\nEND-ISO-10303-21;\n"
@@ -1957,5 +2146,124 @@ FILE_SCHEMA(('IFC2X3'));\nENDSEC;\n";
             out4.product_predefined_type[0].as_deref(),
             Some("GABLE_ROOF")
         );
+    }
+}
+
+#[cfg(test)]
+mod product_whitelist_tests {
+    use super::{
+        entity_name_map, index, product_type_names, type_name_uppercase_with_proper_case,
+        PRODUCT_TYPES,
+    };
+
+    const HDR: &str = "ISO-10303-21;\nHEADER;\nFILE_DESCRIPTION((''),'2;1');\n\
+FILE_NAME('t.ifc','2026-09-17T00:00:00',(''),(''),'ifcfast','ifcfast','');\n\
+FILE_SCHEMA(('IFC4'));\nENDSEC;\n";
+
+    /// Every whitelisted type must have a canonical title-case spelling.
+    /// Without one the fallback title-caser emits `Ifcgeographicelement`,
+    /// which no downstream consumer (`classify.py`, `m.types()`, the
+    /// oracle) recognises — a second, quieter drift of the same kind as
+    /// GH #178.
+    #[test]
+    fn every_product_type_has_a_canonical_name() {
+        let map = entity_name_map();
+        let missing: Vec<String> = PRODUCT_TYPES
+            .iter()
+            .filter(|t| !map.contains_key(**t))
+            .map(|t| String::from_utf8_lossy(t).into_owned())
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "PRODUCT_TYPES entries with no ENTITY_NAME_PAIRS spelling: {missing:?}"
+        );
+    }
+
+    #[test]
+    fn geographic_and_civil_elements_are_products() {
+        assert_eq!(
+            type_name_uppercase_with_proper_case(b"IFCGEOGRAPHICELEMENT"),
+            "IfcGeographicElement"
+        );
+        let names = product_type_names();
+        for want in ["IfcGeographicElement", "IfcCivilElement"] {
+            assert!(names.iter().any(|n| n == want), "{want} not whitelisted");
+        }
+    }
+
+    /// GH #178: the whole point of the fix — a file whose only product
+    /// is an un-whitelisted class must not index to a silent zero.
+    #[test]
+    fn unindexed_product_classes_are_counted() {
+        let src = format!(
+            "{HDR}DATA;\n\
+#1=IFCPROJECT('0Test00000000000000001',$,'p',$,$,$,$,(),$);\n\
+#2=IFCTUBEBUNDLE('0Test00000000000000002',$,'tb',$,$,#3,$,$,$);\n\
+#3=IFCLOCALPLACEMENT($,$);\n\
+#4=IFCPROPERTYSET('0Test00000000000000003',$,'Pset_X',$,());\n\
+ENDSEC;\nEND-ISO-10303-21;\n"
+        );
+        let idx = index(src.as_bytes());
+        assert!(
+            idx.product_step_id.is_empty(),
+            "IfcTubeBundle is not whitelisted"
+        );
+        assert_eq!(
+            idx.skipped_product_type_counts
+                .get("IFCTUBEBUNDLE")
+                .copied(),
+            Some(1)
+        );
+        // IfcPropertySet is an IfcRoot with 5 args — it must NOT be
+        // mistaken for a product.
+        assert_eq!(idx.skipped_product_type_counts.len(), 1);
+    }
+
+    /// GH #178 (review): several `IfcRel*` relationships carry
+    /// Ref-or-`$` at attributes 5/6 — `IfcRelAssignsToGroup`,
+    /// `IfcRelConnectsPathElements`, `IfcRelSpaceBoundary`,
+    /// `IfcRelConnectsPorts` — so the attribute-shape probe alone
+    /// counts them as skipped products on every real file, drowning the
+    /// signal the counter exists for.
+    #[test]
+    fn relationships_are_never_counted_as_skipped_products() {
+        let src = format!(
+            "{HDR}DATA;\n\
+#1=IFCPROJECT('0Test00000000000000001',$,'p',$,$,$,$,(),$);\n\
+#2=IFCWALL('0Test00000000000000002',$,'w',$,$,#3,$,$,$);\n\
+#3=IFCLOCALPLACEMENT($,$);\n\
+#4=IFCRELASSIGNSTOGROUP('0Test00000000000000004',$,$,$,(#5,#6),$,#7);\n\
+#5=IFCWALL('0Test00000000000000005',$,'w2',$,$,#3,$,$,$);\n\
+#6=IFCWALL('0Test00000000000000006',$,'w3',$,$,#3,$,$,$);\n\
+#7=IFCGROUP('0Test00000000000000007',$,'g',$,$);\n\
+#8=IFCRELCONNECTSPATHELEMENTS('0Test00000000000000008',$,$,$,$,#5,#6,(),(),.ATSTART.,.ATEND.);\n\
+#9=IFCRELSPACEBOUNDARY('0Test00000000000000009',$,$,$,#10,#5,$,.PHYSICAL.,.EXTERNAL.);\n\
+#10=IFCSPACE('0Test00000000000000010',$,'s',$,$,#3,$,$,$,$,$);\n\
+#11=IFCRELCONNECTSPORTS('0Test00000000000000011',$,$,$,#12,#13,$);\n\
+#12=IFCDISTRIBUTIONPORT('0Test00000000000000012',$,'p1',$,$,#3,$,$,$,$);\n\
+#13=IFCDISTRIBUTIONPORT('0Test00000000000000013',$,'p2',$,$,#3,$,$,$,$);\n\
+ENDSEC;\nEND-ISO-10303-21;\n"
+        );
+        let idx = index(src.as_bytes());
+        assert!(
+            idx.skipped_product_type_counts.is_empty(),
+            "relationships counted as skipped products: {:?}",
+            idx.skipped_product_type_counts
+        );
+    }
+
+    /// A whitelisted product is indexed, not counted as skipped.
+    #[test]
+    fn whitelisted_products_are_not_counted_as_skipped() {
+        let src = format!(
+            "{HDR}DATA;\n\
+#1=IFCPROJECT('0Test00000000000000001',$,'p',$,$,$,$,(),$);\n\
+#2=IFCGEOGRAPHICELEMENT('0Test00000000000000002',$,'terrain',$,$,#3,$,$,.TERRAIN.);\n\
+#3=IFCLOCALPLACEMENT($,$);\n\
+ENDSEC;\nEND-ISO-10303-21;\n"
+        );
+        let idx = index(src.as_bytes());
+        assert_eq!(idx.product_entity, vec!["IfcGeographicElement".to_string()]);
+        assert!(idx.skipped_product_type_counts.is_empty());
     }
 }

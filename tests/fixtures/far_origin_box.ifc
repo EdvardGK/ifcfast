@@ -1,0 +1,48 @@
+ISO-10303-21;
+HEADER;
+FILE_DESCRIPTION(('ViewDefinition [CoordinationView]'),'2;1');
+FILE_NAME('far_origin_box.ifc','2026-09-17T09:00:00',(''),(''),'ifcfast test fixture','ifcfast test fixture','');
+FILE_SCHEMA(('IFC4'));
+ENDSEC;
+DATA;
+/* geom_box.ifc, moved to NTM-scale coordinates (GH #179). The single
+   box sits at x=213000.01, y=6720000.32, z=120.0 metres via its
+   IfcLocalPlacement, which is far enough out that the mesh pass pins a
+   non-zero global_shift ([213000, 6720000, 120]) and the batch f32
+   frame stops being absolute. A near-origin fixture cannot catch a lost
+   shift, because there the shift is [0, 0, 0]. */
+#1=IFCPROJECT('1vcWxgW5X54vfTjqCotYm0',$,'Far Origin Box',$,$,$,$,(#10),#5);
+#2=IFCSIUNIT(*,.LENGTHUNIT.,$,.METRE.);
+#3=IFCSIUNIT(*,.AREAUNIT.,$,.SQUARE_METRE.);
+#4=IFCSIUNIT(*,.VOLUMEUNIT.,$,.CUBIC_METRE.);
+#5=IFCUNITASSIGNMENT((#4,#2,#3));
+#6=IFCCARTESIANPOINT((0.,0.,0.));
+#7=IFCDIRECTION((0.,0.,1.));
+#8=IFCDIRECTION((1.,0.,0.));
+#9=IFCAXIS2PLACEMENT3D(#6,#7,#8);
+#10=IFCGEOMETRICREPRESENTATIONCONTEXT($,'Model',3,1.0000000000000001E-05,#9,$);
+#11=IFCGEOMETRICREPRESENTATIONSUBCONTEXT('Body','Model',*,*,*,*,#10,$,.MODEL_VIEW.,$);
+#12=IFCSITE('0izAL03L1FWuhfhUKpsjA0',$,'Site',$,$,$,$,$,$,$,$,$,$,$);
+#13=IFCBUILDING('06e3CZIo522870NFirxDu0',$,'Building',$,$,$,$,$,$,$,$,$);
+#14=IFCBUILDINGSTOREY('2osa7tPAv1JRTOf2Jwg5H0',$,'Level 0',$,$,$,$,$,$,120.);
+#15=IFCRELAGGREGATES('3QxbZTlnT49BABKFykB4r0',$,$,$,#1,(#12));
+#16=IFCRELAGGREGATES('2nemRcVSz76uEL6qyGSGg0',$,$,$,#12,(#13));
+#17=IFCRELAGGREGATES('1LiaGEw2bEmva6RsQY1tO0',$,$,$,#13,(#14));
+#18=IFCBUILDINGELEMENTPROXY('0F341KN2n67eWRM6f6jhL0',$,'Box',$,$,#32,#29,$,$);
+#19=IFCCARTESIANPOINT((0.,0.));
+#20=IFCAXIS2PLACEMENT2D(#19,$);
+#21=IFCRECTANGLEPROFILEDEF(.AREA.,$,#20,2.,3.);
+#22=IFCCARTESIANPOINT((0.,0.,0.));
+#23=IFCDIRECTION((0.,0.,1.));
+#24=IFCDIRECTION((1.,0.,0.));
+#25=IFCAXIS2PLACEMENT3D(#22,#23,#24);
+#26=IFCDIRECTION((0.,0.,1.));
+#27=IFCEXTRUDEDAREASOLID(#21,#25,#26,4.);
+#28=IFCSHAPEREPRESENTATION(#11,'Body','SweptSolid',(#27));
+#29=IFCPRODUCTDEFINITIONSHAPE($,$,(#28));
+#30=IFCCARTESIANPOINT((213000.01,6720000.32,120.));
+#31=IFCAXIS2PLACEMENT3D(#30,#7,#8);
+#32=IFCLOCALPLACEMENT($,#31);
+#33=IFCRELCONTAINEDINSPATIALSTRUCTURE('0qgeROl_T6ZxoCmgAVcvj0',$,$,$,(#18),#14);
+ENDSEC;
+END-ISO-10303-21;

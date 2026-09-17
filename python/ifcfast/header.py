@@ -731,7 +731,34 @@ def _resolve_step_escapes(s: str) -> str:
 #       volumes are analytic for any segment count (+0.64 % vs the old
 #       inscribed 32-gon). Vertex and QTO columns move on every circular
 #       product.
-_CACHE_SCHEMA_VERSION = 31
+#   32: product whitelist drift fix (GH #178) — the Rust tier-1
+#       `PRODUCT_TYPES` gains the 20 entities `classify.py` already
+#       declared take-off products but the indexer never matched, chief
+#       among them `IfcGeographicElement` / `IfcCivilElement` (a model
+#       made of them indexed to ZERO products, no error, no warning).
+#       Every cached index built before this bump is missing those rows
+#       for the same file, so the key must change or a cache hit keeps
+#       serving the empty answer. The index manifest also gains
+#       `skipped_product_types` (entities with the IfcProduct attribute
+#       shape that no whitelist entry claimed), which `summary()` and
+#       the new open-time warning read. Five entities already IN the
+#       whitelist also change `entity` VALUES: they had no title-case
+#       spelling, so they were reported as `IfcElectricflowstoragedevice`
+#       — a name `classify.py` cannot match, which silently demoted them
+#       to SKIP. Now `IfcElectricFlowStorageDevice`,
+#       `IfcDistributionControlElement`, `IfcElectricDistributionBoard`,
+#       `IfcProtectiveDeviceTrippingUnit`,
+#       `IfcMobileTelecommunicationsAppliance`.
+#       Same bump, GH #177: a concave hole-free brep face (`IfcFace` with
+#       one bound, or an `IfcIndexedPolygonalFace` with no voids) is now
+#       ear-clipped instead of fan-filled, so a re-entrant corner is no
+#       longer bridged. `surface_area_m2`, the per-surface rows, mesh
+#       connectivity (vertex order is unchanged, triangle order is not)
+#       and therefore `mesh_quality` can all move on any model carrying
+#       non-convex faces. Volumes are invariant: the fan and the ear-clip
+#       span the same closed shell, so the divergence theorem gives the
+#       same number.
+_CACHE_SCHEMA_VERSION = 32
 
 _FIELD_RE = re.compile(r"\(\s*(.*?)\s*\)\s*;", re.DOTALL)
 

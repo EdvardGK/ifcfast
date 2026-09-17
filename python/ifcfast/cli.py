@@ -113,6 +113,13 @@ def _cmd_index(args: argparse.Namespace) -> int:
         pretty.append("top types:")
         for entity, count in top:
             pretty.append(f"  {entity:<32} {count}")
+    # GH #178: never print "products: 0" without saying why, when the
+    # file did contain product-shaped entities this build can't read.
+    skipped = summary.get("skipped_product_types") or {}
+    if skipped:
+        pretty.append("SKIPPED (entity class not in ifcfast's product whitelist):")
+        for entity, count in sorted(skipped.items(), key=lambda kv: -kv[1]):
+            pretty.append(f"  {entity:<32} {count}")
     _emit(summary, args, pretty_lines=pretty)
     return 0
 

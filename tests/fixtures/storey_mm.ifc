@@ -1,0 +1,30 @@
+ISO-10303-21;
+HEADER;
+FILE_DESCRIPTION(('ViewDefinition [ReferenceView]'),'2;1');
+FILE_NAME('storey_mm.ifc','2026-09-17T09:00:00',('ifcfast tests'),('Skiplum'),'ifcfast','ifcfast-tests','');
+FILE_SCHEMA(('IFC4'));
+ENDSEC;
+DATA;
+/* Millimetre model (GH #180): IfcBuildingStorey.Elevation = 3000. is
+   3000 mm = 3.0 m. `StoreyRow.elevation` keeps the raw 3000.0;
+   `elevation_m` is the 3.0 every other length surface speaks. */
+#1=IFCPROJECT('0YvctVUKr0kugbFTf53Omm',$,'Millimetre Project',$,$,$,$,(#5),#2);
+#2=IFCUNITASSIGNMENT((#3,#4));
+#3=IFCSIUNIT(*,.LENGTHUNIT.,.MILLI.,.METRE.);
+#4=IFCSIUNIT(*,.PLANEANGLEUNIT.,$,.RADIAN.);
+#5=IFCGEOMETRICREPRESENTATIONCONTEXT($,'Model',3,1.0E-5,#6,$);
+#6=IFCAXIS2PLACEMENT3D(#7,$,$);
+#7=IFCCARTESIANPOINT((0.,0.,0.));
+#10=IFCSITE('1XvctVUKr0kugbFTf53Omm',$,'Site',$,$,#15,$,$,.ELEMENT.,(59,56,0),(10,45,0),0.,$,$);
+#11=IFCBUILDING('2XvctVUKr0kugbFTf53Omm',$,'Building A',$,$,#15,$,$,.ELEMENT.,$,$,$);
+#12=IFCBUILDINGSTOREY('3XvctVUKr0kugbFTf53Omm',$,'Plan 01',$,$,#15,$,'Plan 01',.ELEMENT.,0.);
+#13=IFCBUILDINGSTOREY('9XvctVUKr0kugbFTf53Omm',$,'Plan 02',$,$,#15,$,'Plan 02',.ELEMENT.,3000.);
+#15=IFCLOCALPLACEMENT($,#6);
+#16=IFCLOCALPLACEMENT(#15,#6);
+#20=IFCRELAGGREGATES('4XvctVUKr0kugbFTf53Omm',$,$,$,#1,(#10));
+#21=IFCRELAGGREGATES('5XvctVUKr0kugbFTf53Omm',$,$,$,#10,(#11));
+#22=IFCRELAGGREGATES('6XvctVUKr0kugbFTf53Omm',$,$,$,#11,(#12,#13));
+#30=IFCWALL('7XvctVUKr0kugbFTf53Omm',$,'Wall-001',$,$,#16,$,'tag-001',.STANDARD.);
+#31=IFCRELCONTAINEDINSPATIALSTRUCTURE('8XvctVUKr0kugbFTf53Omm',$,$,$,(#30),#13);
+ENDSEC;
+END-ISO-10303-21;

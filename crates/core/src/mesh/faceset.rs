@@ -2,10 +2,11 @@
 //!
 //! Easiest of all the geometry types: vertices already exist as a flat
 //! `IfcCartesianPointList3D`, faces are 1-based index lists into them.
-//! For polygons with >3 vertices we fan-triangulate (Archicad and Revit
-//! both emit convex faces almost exclusively; non-convex faces would
-//! need earcutr with a projection to 2D, which we'll add if it becomes
-//! a problem).
+//! Polygons with >3 vertices go through `brep::triangulate_simple_loop`:
+//! convex faces (the overwhelming majority of what Archicad and Revit
+//! emit) keep the cheap fan, concave ones are projected and ear-clipped
+//! so the notch isn't bridged (GH #177). Declared voids are handled one
+//! step earlier, by `brep::triangulate_face_with_holes` (GH #160).
 
 use glam::DVec3;
 
@@ -125,27 +126,25 @@ pub fn polygonal_face_set(table: &EntityTable, id: u64) -> Option<LocalMesh> {
             {
                 continue;
             }
-            // Projection failed (degenerate face) or an index is out of
-            // range — fall through to the fan below so the face is at
-            // least present rather than dropped.
+            // Projection failed (degenerate face) — fall through to the
+            // fan below so the face is at least present rather than
+            // dropped. An out-of-range index falls through too, and is
+            // then caught by the whole-loop range check below.
         }
 
-        // Fan-triangulate the outer loop.
-        for i in 1..(mapped.len() - 1) {
-            // Validate indices fit the coords table.
-            let a = mapped[0];
-            let b = mapped[i];
-            let c = mapped[i + 1];
-            if (a as usize) >= coords.len()
-                || (b as usize) >= coords.len()
-                || (c as usize) >= coords.len()
-            {
-                continue;
-            }
-            mesh.indices.push(a);
-            mesh.indices.push(b);
-            mesh.indices.push(c);
+        // Hole-free outer loop. Validate the whole loop against the
+        // coords table FIRST and skip the face outright if any index is
+        // out of range: `loop_is_convex` indexes `mesh.vertices`
+        // unguarded, so a fan fallback here would be an out-of-bounds
+        // panic, not a slightly-wrong face. A face referencing a
+        // non-existent coordinate has no recoverable geometry anyway.
+        // Then triangulate: convex loops keep the cheap fan, concave
+        // ones are ear-clipped so a re-entrant corner isn't bridged
+        // (GH #177).
+        if mapped.iter().any(|&i| (i as usize) >= coords.len()) {
+            continue;
         }
+        crate::mesh::brep::triangulate_simple_loop(&mut mesh, &mapped);
     }
 
     if mesh.indices.is_empty() {
@@ -361,5 +360,37 @@ END-ISO-10303-21;
         let table = EntityTable::build(FACE_WITH_VOID_IFC.as_bytes());
         let mesh = polygonal_face_set(&table, 5).expect("faceset #5 meshes");
         assert!((tri_area(&mesh) - 100.0).abs() < 1e-3);
+    }
+
+    /// GH #177: a hole-free but CONCAVE `IfcIndexedPolygonalFace`. The
+    /// U-outline below is a 10×10 square minus a 4×7 slot cut in from
+    /// the top edge: true area 100 - 28 = 72. Vertex 0 cannot see the
+    /// far leg, so the old inline fan bridged the slot and reported the
+    /// full 100.
+    const CONCAVE_U_FACE_IFC: &str = r#"ISO-10303-21;
+HEADER;
+FILE_DESCRIPTION(('ViewDefinition [ReferenceView]'),'2;1');
+FILE_NAME('u.ifc','2026-09-17T00:00:00',('test'),('skiplum'),'ifcfast','ifcfast','');
+FILE_SCHEMA(('IFC4'));
+ENDSEC;
+DATA;
+#1=IFCCARTESIANPOINTLIST3D(((0.,0.,0.),(10.,0.,0.),(10.,10.,0.),(7.,10.,0.),(7.,3.,0.),(3.,3.,0.),(3.,10.,0.),(0.,10.,0.)));
+#2=IFCINDEXEDPOLYGONALFACE((1,2,3,4,5,6,7,8));
+#3=IFCPOLYGONALFACESET(#1,.F.,(#2),$);
+ENDSEC;
+END-ISO-10303-21;
+"#;
+
+    #[test]
+    fn concave_c_face_in_polygonal_faceset() {
+        let table = EntityTable::build(CONCAVE_U_FACE_IFC.as_bytes());
+        let mesh = polygonal_face_set(&table, 3).expect("faceset #3 meshes");
+        let area = tri_area(&mesh);
+        assert!(
+            (area - 72.0).abs() < 1e-3,
+            "expected the slot left empty (area 72), got {area}"
+        );
+        // n - 2 triangles, same as the fan would have produced.
+        assert_eq!(mesh.indices.len() / 3, 6);
     }
 }
