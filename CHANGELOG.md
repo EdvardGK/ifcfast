@@ -7,6 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.2] - 2026-09-18
+
+### Fixed — tester-issue sweep (GH #177 #178 #179 #180 #183, cache schema v32)
+
+- **Concave brep faces no longer bridge their notch (GH #177).** Hole-free
+  `IfcFace` / `IfcIndexedPolygonalFace` loops were fan-triangulated from
+  vertex 0, which is only valid for convex outlines; L/C/U-shapes got
+  triangles across the opening. A per-corner, scale-free convexity test now
+  routes concave loops through the Newell-projection ear-clip path; convex
+  loops keep the exact fan (bit-identical). Volumes are invariant,
+  `surface_area_m2` and connectivity move on concave faces. Oracle gate:
+  zero per-class drift on four G55 models; two ARK walls now match
+  ifcopenshell exactly.
+- **`open()` no longer returns a silent empty model (GH #178).**
+  `IfcGeographicElement`, `IfcCivilElement` and 18 other take-off classes
+  `classify.py` already listed were missing from the Rust product whitelist;
+  five listed classes had no title-case spelling and were silently demoted
+  to SKIP. New `_core.product_types()` plus a parity test keep the two in
+  step. IfcProduct-shaped records outside the whitelist are counted per
+  class and surfaced as `m.skipped_product_types` /
+  `summary()["skipped_product_types"]`, an `ifcfast index` SKIPPED block,
+  and a `UserWarning` when a model indexed zero products.
+- **`iter_meshes()` exposes `global_shift` (GH #179).** It returns a
+  `MeshIter` — iterates as before, re-iterable, `len()`-able, carries
+  `.global_shift` / `.frame` / `.unit` / `.stats`. The frame of every mesh
+  entry point is documented. `next(m.iter_meshes())` now needs `iter()`.
+- **`StoreyRow.elevation_m` (GH #180).** Metres next to the raw file-unit
+  `elevation`, threaded through `schemas`, `summary()`, `preview()`, the
+  index cache and `diff()` (which also reports unit-only changes). `None`
+  when the length unit is unresolved.
+- **wasm data layers (GH #183, #181, #184).** `psetsJson()`,
+  `quantitiesJson()`, `materialsJson()`, `classificationsJson()` mirror the
+  Python DataFrames; storeys carry `elevation_m`; `summaryJson()` carries
+  `skipped_product_types` (STEP-token keys until GH #186).
+- Cache: `_CACHE_SCHEMA_VERSION` 31 → 32 (wasm mirrored), index
+  `CACHE_VERSION` 5 → 6. Follow-ups filed: #182 #185 #186 #187.
+
 ### Security — bounded `.ifczip` decompression (GH #175)
 
 - **Zip bombs are refused loudly instead of buffered.** A ZIP's declared
@@ -1742,6 +1779,7 @@ for the trail and rename table.
   IFCs from Skiplum projects (issue #1).
 - Warm-cache speedup vs `ifcopenshell.open()`: 59-678× on production files.
 
+[0.5.2]: https://github.com/EdvardGK/ifcfast/releases/tag/v0.5.2
 [0.5.1]: https://github.com/EdvardGK/ifcfast/releases/tag/v0.5.1
 [0.5.0]: https://github.com/EdvardGK/ifcfast/releases/tag/v0.5.0
 [0.4.0]: https://github.com/EdvardGK/ifcfast/releases/tag/v0.4.0

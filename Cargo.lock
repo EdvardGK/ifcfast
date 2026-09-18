@@ -895,7 +895,7 @@ dependencies = [
 
 [[package]]
 name = "ifcfast-core"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "arrow",
  "crossbeam-channel",
@@ -918,7 +918,7 @@ dependencies = [
 
 [[package]]
 name = "ifcfast-wasm"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "ifcfast-core",
  "js-sys",
