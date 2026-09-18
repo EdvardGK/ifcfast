@@ -622,6 +622,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "mmap")]
     fn open_dispatches_zip_via_magic_bytes() {
         let payload = b"ISO-10303-21;\nHEADER;\nENDSEC;\nEND-ISO-10303-21;\n";
         let archive = make_zip("model.ifc", payload);
@@ -668,6 +669,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "mmap")]
     fn open_refuses_truncated_plain_ifc() {
         // The whole point of GH #89: a direct `open` (the choke-point
         // every `_core.*` entry funnels through) must refuse a truncated
@@ -854,6 +856,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "mmap")]
     fn open_with_applies_the_caller_limits() {
         let archive = make_bomb("bomb.ifc", 8 * 1024 * 1024);
         let tmp =
@@ -907,6 +910,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "mmap")]
     fn open_accepts_terminated_plain_ifc() {
         let whole = b"ISO-10303-21;\nHEADER;\nENDSEC;\nDATA;\nENDSEC;\nEND-ISO-10303-21;\n";
         let tmp =
