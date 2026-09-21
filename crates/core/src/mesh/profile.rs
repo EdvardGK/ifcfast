@@ -39,11 +39,31 @@ pub fn circle_samples(radius: f32, unit_scale: f32) -> usize {
     if !(r_m.is_finite() && r_m > CHORD_TOLERANCE_M) {
         return MIN_CURVE_SAMPLES;
     }
-    let n = (std::f32::consts::PI / (1.0 - CHORD_TOLERANCE_M / r_m).acos()).ceil();
-    if !n.is_finite() {
+    let n = chord_count(std::f32::consts::PI / (1.0 - CHORD_TOLERANCE_M / r_m).acos());
+    if n == 0 {
         return CURVE_SAMPLES;
     }
-    (n as usize).clamp(MIN_CURVE_SAMPLES, CURVE_SAMPLES)
+    n.clamp(MIN_CURVE_SAMPLES, CURVE_SAMPLES)
+}
+
+/// Guard band subtracted from a chord-count ratio before rounding up.
+pub const SEGMENT_RATIO_EPS: f32 = 1e-4;
+
+/// Chord count for a ratio `x` = (swept angle / chord angle), robust to
+/// last-ulp libm noise: `ceil(x − SEGMENT_RATIO_EPS)`. An exact
+/// semicircle at 32 chords per turn is `x = 16` in exact arithmetic; f32
+/// `atan2` on Apple libm returns π plus one ulp, and a bare `ceil`
+/// then tessellates one half of a duct profile with 17 chords and the
+/// other with 16 — platform-dependent geometry (caught by the
+/// far-origin duct gate on macOS CI). 1e-4 of a chord is far below any
+/// sagitta effect. Non-finite or non-positive ratios yield 0; callers
+/// clamp exactly as they did for the non-finite case before.
+pub fn chord_count(x: f32) -> usize {
+    let n = (x - SEGMENT_RATIO_EPS).ceil();
+    if !n.is_finite() || n <= 0.0 {
+        return 0;
+    }
+    n as usize
 }
 
 /// Radius multiplier that makes a regular `n`-gon inscribed at the
@@ -558,9 +578,7 @@ fn conic_arc(
     // Segments per full turn from the larger semi-axis (GH #170), scaled
     // by the swept angle.
     let per_turn = circle_samples(a.abs().max(b.abs()), length_scale(table));
-    let n = ((per_turn as f32) * sweep / std::f32::consts::TAU)
-        .ceil()
-        .max(2.0) as usize;
+    let n = chord_count((per_turn as f32) * sweep / std::f32::consts::TAU).max(2);
     // Sector-area-preserving radius (see `arc_area_scale`): the profile's
     // volume no longer depends on the chord count. The ellipse is the
     // affine image of the circle, so the same factor on both semi-axes
@@ -1385,6 +1403,24 @@ mod adaptive_sampling_tests {
         // An undeclared unit (scale 1.0) on a mm-authored file reads every
         // radius as huge → the full 32, i.e. today's output.
         assert_eq!(circle_samples(7.5, 1.0), CURVE_SAMPLES);
+    }
+
+    #[test]
+    fn chord_count_absorbs_last_ulp_libm_noise() {
+        // An exact semicircle at 32 chords per turn.
+        assert_eq!(chord_count(16.0), 16);
+        // One ulp above 16 is still an exact semicircle: Apple libm's f32
+        // `atan2` returns PI + 1 ulp where glibc returns PI, and a bare
+        // `ceil` would tessellate that half with 17 chords (GH #188).
+        assert_eq!(chord_count(16.0 + f32::EPSILON * 16.0), 16);
+        // Genuinely longer sweeps still round up.
+        assert_eq!(chord_count(16.001), 17);
+        assert_eq!(chord_count(16.5), 17);
+        // Degenerate ratios yield 0 for the caller to clamp.
+        assert_eq!(chord_count(f32::INFINITY), 0);
+        assert_eq!(chord_count(f32::NAN), 0);
+        assert_eq!(chord_count(0.0), 0);
+        assert_eq!(chord_count(-3.0), 0);
     }
 
     #[test]

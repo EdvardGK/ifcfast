@@ -24,7 +24,7 @@
 use glam::{Vec2, Vec3};
 
 use crate::lexer::{parse_field, split_top_level_args, Field};
-use crate::mesh::profile::{arc_area_scale, circle_samples};
+use crate::mesh::profile::{arc_area_scale, chord_count, circle_samples};
 
 /// Parse a typed inline value such as `IFCARCINDEX((1,2,3))` — returns
 /// `(name, body)` where `body` is the bytes between the outer `(` and
@@ -275,7 +275,7 @@ fn arc_samples_2d_impl(
         return Some(vec![p1, p3]);
     }
     let step = std::f32::consts::TAU / circle_samples(radius, unit_scale) as f32;
-    let n = ((delta / step).ceil() as usize).max(2);
+    let n = chord_count(delta / step).max(2);
     let radius = if preserve_area {
         radius * arc_area_scale(delta, n)
     } else {
@@ -526,6 +526,32 @@ mod tests {
         // mm file → ~9 chords per turn; metres file (7.5 m pipe) → 32.
         assert!(eval_segments_2d(&pts, segs, 0.001).unwrap().len() <= 12);
         assert!(eval_segments_2d(&pts, segs, 1.0).unwrap().len() >= 30);
+    }
+
+    #[test]
+    fn exact_semicircle_is_16_chords_in_every_orientation() {
+        // r = 200 m -> 32 chords per full turn, so an exact semicircle is
+        // 16 chords / 17 samples. A bare `ceil` on the f32 angle ratio
+        // gives 17 chords wherever libm's `atan2` returns PI + 1 ulp
+        // (Apple), which made the far-origin duct gate platform-dependent
+        // (GH #188).
+        let r = 200.0f32;
+        let (east, west) = (Vec2::new(r, 0.0), Vec2::new(-r, 0.0));
+        let (north, south) = (Vec2::new(0.0, r), Vec2::new(0.0, -r));
+        for (p1, mid, p3) in [
+            (east, north, west), // CCW over the top
+            (west, north, east), // CW over the top
+            (east, south, west), // CW under the bottom
+            (west, south, east), // CCW under the bottom
+        ] {
+            let pts = arc_samples_2d(p1, mid, p3, 1.0).unwrap();
+            assert_eq!(pts.len(), 17, "semicircle {p1:?} -> {mid:?} -> {p3:?}");
+        }
+        // Both halves of a circle built from two IfcArcIndex semicircles
+        // must agree, or one side of a duct is finer than the other.
+        let top = arc_samples_2d(east, north, west, 1.0).unwrap();
+        let bottom = arc_samples_2d(west, south, east, 1.0).unwrap();
+        assert_eq!(top.len(), bottom.len());
     }
 
     #[test]

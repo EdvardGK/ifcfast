@@ -1975,7 +1975,7 @@ mod python {
                         seed,
                         area_scale,
                         unit_scale: idx.unit_scale.unwrap_or(1.0),
-                                chunk_points,
+                        chunk_points,
                         shift: None,
                         buf_guid: Vec::new(),
                         buf_entity: Vec::new(),
@@ -2699,9 +2699,9 @@ mod python {
                     if mesh.indices.is_empty() || mesh.vertices.is_empty() {
                         return;
                     }
-                    let shift = *self
-                        .shift
-                        .get_or_insert_with(|| global_shift_for(&mesh.mesh_anchor, self.unit_scale));
+                    let shift = *self.shift.get_or_insert_with(|| {
+                        global_shift_for(&mesh.mesh_anchor, self.unit_scale)
+                    });
                     crate::mesh::rebase::shift_world_in_place(&mut mesh, &shift, self.unit_scale);
                     self.products.push(mesh);
                 }

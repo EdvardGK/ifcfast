@@ -28,8 +28,8 @@ use ifcfast_core::extractors::{classifications, materials, psets, quantities};
 use ifcfast_core::indexer::{self, IndexedFile};
 use ifcfast_core::lexer::{parse_field, split_top_level_args, Field};
 use ifcfast_core::mesh::gltf::resolve_product_color;
-use ifcfast_core::mesh::stats::ProductStats;
 use ifcfast_core::mesh::rebase::{global_shift_for, shift_world_in_place, shifted_world_positions};
+use ifcfast_core::mesh::stats::ProductStats;
 use ifcfast_core::mesh::{self, BakeFrame, ProductMesh, ProductSink};
 use ifcfast_core::source::IfcSource;
 use serde_json::{json, Map, Value};
@@ -2138,7 +2138,11 @@ mod tests {
             if m.guid != DUCT_A.0 && m.guid != DUCT_B.0 {
                 continue;
             }
-            check_probe("unplaced-first", &probe(&m.vertices, shift, &m.guid), &m.guid);
+            check_probe(
+                "unplaced-first",
+                &probe(&m.vertices, shift, &m.guid),
+                &m.guid,
+            );
             checked += 1;
         }
         assert_eq!(checked, 2);

@@ -1766,7 +1766,10 @@ mod far_origin_instancing_tests {
 
     #[test]
     fn instanced_translation_comes_from_the_f64_anchor_in_metres() {
-        let meshes = [cube("0AAAAAAAAAAAAAAAAAAAAA", 0.0), cube("0BBBBBBBBBBBBBBBBBBBBB", 2000.0)];
+        let meshes = [
+            cube("0AAAAAAAAAAAAAAAAAAAAA", 0.0),
+            cube("0BBBBBBBBBBBBBBBBBBBBB", 2000.0),
+        ];
         let options = WriteOptions {
             instancing: true,
             per_product_materials: true,

@@ -98,7 +98,11 @@ fn part_anchor_places_the_part_even_when_mesh_anchor_does_not() {
         "expected one InstancePart (the solid); got {}",
         m.parts.len()
     );
-    assert!(m.parts[0].source.contains("faceset"), "{}", m.parts[0].source);
+    assert!(
+        m.parts[0].source.contains("faceset"),
+        "{}",
+        m.parts[0].source
+    );
 
     // `parts[0].anchor` is the f64 twin of the transform every consumer
     // composes for that part — this is the invariant the glTF instanced
@@ -152,5 +156,3 @@ fn the_anchor_fix_does_not_move_vertices() {
         );
     }
 }
-
-

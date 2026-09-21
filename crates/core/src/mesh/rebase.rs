@@ -140,10 +140,7 @@ mod tests {
         // 9 km in metre units — still under the threshold.
         assert_eq!(global_shift_for(&[9000.0, 0.0, 0.0], 1.0), [0.0, 0.0, 0.0]);
         // The same 9 km authored in millimetres.
-        assert_eq!(
-            global_shift_for(&[9.0e6, 0.0, 0.0], 0.001),
-            [0.0, 0.0, 0.0]
-        );
+        assert_eq!(global_shift_for(&[9.0e6, 0.0, 0.0], 0.001), [0.0, 0.0, 0.0]);
     }
 
     #[test]
