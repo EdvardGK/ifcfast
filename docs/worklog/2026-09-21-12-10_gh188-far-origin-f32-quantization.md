@@ -1,7 +1,7 @@
 ## Agent signature
 - **Agent**: `claude-fable-5-1` (coordinator) + opus implementer / sonnet auditor / opus reviewer sub-agents
 - **Working tree**: `/home/edkjo/workspace/inbox/ifcfast`
-- **Branch**: `main` @ `c00f81b` → `72b0f95` (1 commit this session)
+- **Branch**: `main` @ `c00f81b` → `c28de71` (5 commits this session: `72b0f95` fix, `844b5ce` worklog, `11353b1` chord count + fmt, `0c5b317` worklog addendum, `c28de71` clippy)
 - **Session scope**: #188 far-origin f32 quantization fix — model-level global shift, Local bake + f64 rebase on wasm / to_gltf / drift
 - **Touched paths**: crates/core/src/mesh/{rebase.rs (new), mod.rs, gltf.rs, cut_openings.rs}, crates/core/src/lib.rs, crates/core/tests/{mesh_anchor_188.rs (new), cut_openings_proptest.rs}, crates/wasm/{build.sh, src/analysis.rs, src/lib.rs, test/stream.mjs}, python/ifcfast/{header.py, model.py, data/AGENTS.md}, AGENTS.md, tests/fixtures/{far_origin_duct_mm.ifc, far_origin_unplaced_first_mm.ifc} (new), tests/test_far_origin_gltf_188.py (new); ifcfast-site `ef2f72d` (wasm sync + Duplex sidecars); scratch/g55/baselines/G55_{ARK,RIB,RIE,RIV}.json rewritten (local only)
 - **Parallel sessions observed**: none (`git log origin/main --since=2026-09-18T15:00` shows only this session's commit)
@@ -88,4 +88,4 @@ implementer's test caught it; per-part `anchor` field instead.
   segment-count sites. A/B vs 0.5.2: RIV identical, ARK 10/12 221 move
   ~1e-6 (boundary arcs, one fewer chord, volume analytic). wasm gates
   5/5, 22/22, 18/18. Site wasm re-synced `ec53a08`.
-- Branch end sha now `11353b1`; worklog commit follows.
+- rust-lint then failed on two clippy `needless_range_loop` in gltf test code → `c28de71`. CI fully green on `c28de71` (10/10 jobs).
