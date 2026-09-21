@@ -1809,12 +1809,12 @@ mod far_origin_instancing_tests {
             }
             // …and the mesh's own baked first vertex (the sink's output)
             // agrees with it, because local vertex 0 is the local origin.
-            for k in 0..3 {
+            for (k, &tk) in t.iter().enumerate() {
                 assert!(
-                    (mesh.vertices[k] as f64 - t[k] as f64).abs() < 5.0e-8,
+                    (mesh.vertices[k] as f64 - tk as f64).abs() < 5.0e-8,
                     "instance {i} axis {k}: baked {} vs instanced {}",
                     mesh.vertices[k],
-                    t[k]
+                    tk
                 );
             }
             // The f32 route this replaced is off by millimetres — proof
@@ -1835,11 +1835,11 @@ mod far_origin_instancing_tests {
         // nodes render 1000x the baked ones.
         let s = read_vec3(&bin, &views.scale, 0);
         let expect = (100.0 / 65535.0) * US as f32;
-        for k in 0..3 {
+        for (k, &sk) in s.iter().enumerate() {
             assert!(
-                ((s[k] - expect) / expect).abs() < 1.0e-5,
+                ((sk - expect) / expect).abs() < 1.0e-5,
                 "instance scale axis {k}: {} vs {expect}",
-                s[k]
+                sk
             );
         }
     }
