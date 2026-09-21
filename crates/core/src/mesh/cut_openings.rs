@@ -1708,6 +1708,7 @@ mod tests {
         // Pretend the extractor populated parts for substrate dedup.
         mesh.parts.push(crate::mesh::InstancePart {
             rep_step_id: 42,
+            anchor: [0.0; 3],
             instance_transform: [
                 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
             ],

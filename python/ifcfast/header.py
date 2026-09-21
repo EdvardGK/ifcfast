@@ -758,7 +758,21 @@ def _resolve_step_escapes(s: str) -> str:
 #       non-convex faces. Volumes are invariant: the fan and the ear-clip
 #       span the same closed shell, so the divergence theorem gives the
 #       same number.
-_CACHE_SCHEMA_VERSION = 32
+#   33: GH #188 — the mesh pass behind `m.drift` (and behind the browser
+#       build's `qtoJson` / `graphJson`) moved from the World bake to the
+#       Local bake, and every metre cast moved from an f32 copy of the
+#       unit factor to the f64 one. Cached `drift.parquet` therefore
+#       moves: `surface_area_m2`, `volume_abs_m3`, `aabb_volume_m3`,
+#       `max_extent_m`, `centroid_*_m`, `placement_*_m`,
+#       `drift_distance_m` and `drift_ratio` shift by ~1e-7 relative on a
+#       near-origin model and by much more on a georeferenced one, where
+#       the World bake had already quantised the geometry onto the f32
+#       lattice at the georeference. `mesh_quality` is derived from
+#       volume vs AABB, so a borderline element can flip class. The
+#       streamed positions the browser draws from move for the same
+#       reason. A cache written before this bump would keep serving the
+#       pre-fix numbers under the old key.
+_CACHE_SCHEMA_VERSION = 33
 
 _FIELD_RE = re.compile(r"\(\s*(.*?)\s*\)\s*;", re.DOTALL)
 

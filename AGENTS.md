@@ -420,8 +420,10 @@ self-join on one file, split by `source_model`:
 ON a.source_model < b.source_model AND …`.
 
 **Cache schema version** is at `_CACHE_SCHEMA_VERSION` in
-`python/ifcfast/header.py` — when it bumps, the column set changed.
-Old caches become orphaned automatically.
+`python/ifcfast/header.py` — when it bumps, the column set or a derived
+*value* changed. Old caches become orphaned automatically. The browser
+build mirrors it at `CACHE_SCHEMA_VERSION` in `crates/wasm/src/analysis.rs`;
+the two are hashed into the same `cache_key` and bump in lockstep.
 
 **Cache freshness is verified, not assumed.** The cache key cannot see
 a same-size edit confined to the middle of a >8 MB file (its hash only
@@ -762,17 +764,35 @@ JSON.parse(m.quantitiesJson());      // [{guid, qto_name, quantity_name, value, 
 JSON.parse(m.materialsJson());       // [{guid, role, layer_index, material_name, layer_thickness_mm, category, fraction, source}]
 JSON.parse(m.classificationsJson()); // [{guid, system_name, edition, identification, name, location, source, assignment_source}]
 const glb = m.toGlb(true, true);   // Uint8Array — same writer as m.to_gltf()
+JSON.parse(m.shiftJson());    // [sx, sy, sz] metres — add back for absolute coords
 JSON.parse(m.bySourceJson()); // GH #166 counters
 m.free();
 ```
 
 The JSON shapes are byte-for-byte those of `scripts/generate_sample_sidecars.py`
 (gated by `crates/wasm/test/parity.mjs`), so anything built on the
-sample sidecars renders a dropped file unchanged. Not in v1: cut
+sample sidecars renders a dropped file unchanged. (GH #188 moved both the
+browser mesh pass and the wheel's `m.drift` to the Local frame in the
+same change, so the two still agree exactly — but every geometry-derived
+value moved by ~1e-7 relative against pre-0.5.3 sidecars, which is why
+`public/sample/` had to be regenerated.) Not in v1: cut
 openings (manifold-csg is C++), the substrate bundle (arrow/parquet),
 threads (single-threaded mesh pass — ~2× native). Everything stays in
 the tab; nothing is uploaded. ifcfast.com's instrument uses exactly
 this path for "drop your IFC".
+
+**Frame: `streamMeshes` / `toGlb` positions are shifted world METRES**
+(GH #188) — `JSON.parse(m.streamShiftJson())` is the `[sx, sy, sz]` to
+add back for absolute world coordinates, and `m.shiftJson()` is the same
+value under a frame-neutral name. It is valid after **either** pass:
+`streamMeshes()` pins it, and so does anything that triggers the batch
+pass (`graphJson` / `qtoJson` / `statsJson` / `toGlb`). `[0, 0, 0]`
+before any mesh pass has run and for every model within 10 km of the
+origin, so a near-origin fixture cannot catch a wrong one — the gate is
+the far-origin section of `crates/wasm/test/stream.mjs`, which runs on
+the in-repo `tests/fixtures/far_origin_duct_mm.ifc` whether or not the
+Duplex sample is present. The `.glb` from `toGlb()` carries the same
+three numbers in `asset.extras.ifcfast.global_shift`.
 
 The four data-layer accessors are serialise-only: the extractors run
 inside `fromBytes`, so unlike `graphJson()` / `qtoJson()` none of them
@@ -1252,16 +1272,62 @@ host). `cut_openings` / `keep_cutters` match `m.meshes()` exactly, and
 the cut result is identical to the matching product from
 `meshes(cut_openings=True)`.
 
-**Which frame each mesh call speaks (GH #179).** Three entry points, two frames — the batch paths trade absolute coordinates for `float32` precision on georeferenced models, the single-product path does not:
+**Which frame each mesh call speaks (GH #179, GH #188).** Four entry points, two frames — the batch paths trade absolute coordinates for `float32` precision on georeferenced models, the single-product path does not:
 
 | call | vertices | dtype | absolute world coords |
 |---|---|---|---|
 | `m.meshes()` | shifted world | `float32` | `v + ms.global_shift` |
 | `m.iter_meshes()` | shifted world | `float32` | `v + it.global_shift` |
+| `m.to_gltf()` | shifted world | `float32` | `v + stats["global_shift"]`, also in the `.glb` as `asset.extras.ifcfast.global_shift` |
 | `m.mesh(guid)` | **absolute world** | `float64` | already absolute |
 | any of them with `frame="local"` | representation-local, **native units** | `float32` | `placement @ [x, y, z, 1]` |
 
-A single product can't overflow f32 the way a whole georeferenced model can, so `m.mesh()` has no `global_shift` to add back. `global_shift` is `[0, 0, 0]` on near-origin models, so all three rows agree there and the difference only shows on georeferenced deliveries — a near-origin fixture cannot catch a lost shift.
+A single product can't overflow f32 the way a whole georeferenced model can, so `m.mesh()` has no `global_shift` to add back. `global_shift` is `[0, 0, 0]` on near-origin models, so all rows agree there and the difference only shows on georeferenced deliveries — **a near-origin fixture cannot catch a lost or mis-applied shift**, which is why the gate for this is `tests/fixtures/far_origin_duct_mm.ifc`: a millimetre model on a Norwegian NTM placement, where the `f32` ulp is 8 mm in X and 128 mm in Y and a Ø400 duct came back with a 105 mm radius spread and half its faces at zero area before GH #188.
+
+**One convention, one number — and how it is decided.** Everything that
+reports a `global_shift` — `m.meshes()`, `m.iter_meshes()`,
+`m.to_gltf()`, `m.point_cloud()` and the browser build's `shiftJson()` /
+`streamShiftJson()` — reports the *same* three metres. Two things make
+that true, and both are rules, not accidents:
+
+1. **The shift is a model-level value, pinned before the first
+   emission.** The mesh pass resolves every product's placement chain in
+   phase 1 and only then tessellates, so it can scan all of them and hand
+   sinks one number through `ProductSink::on_global_shift` before a
+   single product is emitted. The rule is: the rounded world origin of
+   the **lowest-step-id product further than 10 km from the origin**, or
+   `[0, 0, 0]` if none is. Not "the first product the sink happens to
+   see": a `$`, cyclic or `IfcGridPlacement` placement resolves to
+   identity, so a product carrying one anchors at the origin, and the
+   paths do not agree on who goes first anyway (the glTF sink suppresses
+   openings and holds void hosts for a later flush; the point-cloud sink
+   skips products that sample to zero points). If the model-level pin is
+   `[0, 0, 0]`, each sink falls back to the first emitted product's
+   `mesh_anchor` — that fallback is what catches files whose
+   georeference is baked into the representation geometry instead of the
+   placements, where every placement really is identity.
+2. **Every metre cast goes through the `f64` unit factor** the indexer
+   read. (`0.001` is not representable in `f32`; scaling through an `f32`
+   copy adds a uniform `1 + 4.75e-8`, which is 59 mm of absolute position
+   at an NTM georeference.) `f32` copies of the factor survive only where
+   they are tolerances — the drift floor, the weld epsilon, the cut
+   kernel — never on a coordinate.
+
+`tests/fixtures/far_origin_unplaced_first_mm.ifc` is the gate on rule 1:
+its first product has no `ObjectPlacement`.
+
+**`m.drift` measures in the Local frame too** (GH #188). Surface area,
+volume and extent are translation-invariant, so the columns mean what
+they always meant — they are just no longer taken on geometry that was
+already quantised onto the georeference's `f32` lattice. Expect ~1e-7
+relative movement against pre-0.5.3 values on a near-origin model, and
+much more on a georeferenced one. `drift_distance_m` is now the
+placement-vs-geometry difference computed in `f64`
+(`world_origin - mesh_anchor`, both exact) instead of two `f32`
+subtractions at georeference magnitude; `centroid_*_m` and
+`placement_*_m` stay absolute world metres.
+
+The shift has to be subtracted **before** the `f32` cast, not after. Baking absolute coordinates to `f32` and then subtracting recovers nothing — the residual still carries the lattice. `mesh::rebase` is the single implementation (`BakeFrame::Local` bake → `(local + (mesh_anchor - shift)) * unit_scale` in `f64` → cast); `extract_meshes`, the glTF sink and the wasm passes all call it.
 
 **`m.iter_meshes()` returns a `MeshIter`, not a bare generator (GH #179).** It iterates exactly as before (`for mesh in m.iter_meshes():`) and is additionally re-iterable, `len()`-able, and carries `.global_shift` / `.frame` / `.unit` / `.stats` — the `MeshList` metadata the streaming path used to drop. Without it, streaming a georeferenced model yields plausible-looking coordinates wrong by exactly the georeference offset:
 

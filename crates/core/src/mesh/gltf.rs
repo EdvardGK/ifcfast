@@ -30,6 +30,18 @@
 //! `instances: [{guid, entity, segments}, ...]` (instanced path) so the
 //! viewer can pick by GUID either way.
 //!
+//! **Frame (GH #188).** Positions are *shifted* world metres: the caller
+//! subtracts a model-wide anchor in f64 before the f32 cast so a
+//! georeferenced millimetre model does not quantise onto the 8 mm /
+//! 128 mm lattice of absolute f32. The value is on
+//! [`WriteOptions::global_shift`], is written to
+//! `asset.extras.ifcfast.global_shift`, and `position + global_shift`
+//! is the absolute world coordinate. It is `[0, 0, 0]` for every model
+//! within 10 km of the origin, so near-origin output is unchanged there
+//! up to the f32 unit-factor correction that came with it — metre files
+//! are bit-identical, millimetre files move by at most one f32 ulp
+//! (`0.001f32 != 0.001f64`).
+//!
 //! Materials follow [`resolve_product_color`] — authored
 //! `IfcSurfaceStyle` colour when present (resolved via `mesh::styles`),
 //! else the per-entity palette fallback in [`default_color_for_entity`].
@@ -90,6 +102,31 @@ pub struct WriteOptions {
     /// shared geometry is the point of instancing — and carry identity
     /// in `node.extras.instances[i].guid`.
     pub per_product_materials: bool,
+    /// Model-wide global shift in **metres** (GH #188). The sink hands
+    /// the writer *shifted* world metres — `vertex + global_shift` is
+    /// the absolute world coordinate — and this field is what lets the
+    /// writer (a) record the value in `asset.extras.ifcfast.global_shift`
+    /// so the GLB self-describes, and (b) place instanced nodes in the
+    /// same frame as the baked ones.
+    ///
+    /// `[0, 0, 0]` for near-origin models, which is every file inside
+    /// 10 km of the origin — there baked and instanced output are
+    /// absolute and this changes nothing.
+    pub global_shift: [f64; 3],
+    /// Metres per model length unit, for the **instanced** path only.
+    ///
+    /// Baked vertices arrive already scaled (the sink did it), but
+    /// `parts[].local_vertices` / `instance_transform` / `mesh_anchor`
+    /// describe the *representation* and stay in the file's native unit
+    /// — nothing downstream would be right if the writer mutated them.
+    /// So the instanced path applies `unit_scale` itself, to the shared
+    /// mesh's quantization denorm and to each instance's translation.
+    /// Without it a millimetre model's instanced nodes land 1000× out
+    /// while its baked nodes are correct.
+    ///
+    /// `1.0` (the default) means "the meshes are already in the output
+    /// unit" — what `ifcfast-mesh`'s raw World-frame dump wants.
+    pub unit_scale: f64,
 }
 
 impl Default for WriteOptions {
@@ -97,6 +134,8 @@ impl Default for WriteOptions {
         Self {
             instancing: true,
             per_product_materials: true,
+            global_shift: [0.0, 0.0, 0.0],
+            unit_scale: 1.0,
         }
     }
 }
@@ -120,7 +159,7 @@ pub fn write_with_options<W: Write>(
     let plan = Plan::classify(meshes, options.instancing);
 
     // 1. Build the binary buffer.
-    let (binary, layout) = pack_binary(meshes, &plan);
+    let (binary, layout) = pack_binary(meshes, &plan, options);
 
     // 2. Build the JSON.
     let json = build_json(meshes, &plan, &layout, binary.len() as u32, options);
@@ -307,7 +346,11 @@ struct InstancedViews {
 
 /// Concatenate every product's positions + indices (and per-group TRS
 /// arrays) into one binary blob, aligned to 4 bytes between regions.
-fn pack_binary(meshes: &[ProductMesh], plan: &Plan) -> (Vec<u8>, BinaryLayout) {
+fn pack_binary(
+    meshes: &[ProductMesh],
+    plan: &Plan,
+    options: &WriteOptions,
+) -> (Vec<u8>, BinaryLayout) {
     // Conservatively reserve. Over-estimates are cheap; re-allocs are not.
     let baked_verts: usize = plan.baked.iter().map(|&i| meshes[i].vertices.len()).sum();
     let baked_idx: usize = plan.baked.iter().map(|&i| meshes[i].indices.len()).sum();
@@ -364,7 +407,7 @@ fn pack_binary(meshes: &[ProductMesh], plan: &Plan) -> (Vec<u8>, BinaryLayout) {
         // the per-instance transform alone (no extra node TRS).
         let n_instances = group.member_indices.len() as u32;
         let (translation, rotation, scale) =
-            pack_instance_trs_quantized(meshes, group, q_translation, q_scale, &mut bin);
+            pack_instance_trs_quantized(meshes, group, q_translation, q_scale, options, &mut bin);
 
         layout.instanced.push(InstancedViews {
             positions,
@@ -585,16 +628,37 @@ fn bbox(vertices: &[f32]) -> ([f32; 3], [f32; 3]) {
 ///
 /// For a rigid IFC instance (S_inst = identity scale, which is the
 /// usual case for IfcMappedItem / world placement chains), the
-/// composed TRS that takes a u16 vertex straight to world coords is:
+/// composed TRS that takes a u16 vertex straight to output coords is:
 ///
-///   T_new = T_inst + R_inst · (S_inst ⊙ T_quant)
+///   T_new = (A_f64 · us − shift_m) + R_inst · (S_inst ⊙ T_quant) · us
+///   (A_f64 = `parts[0].anchor`)
 ///   R_new = R_inst   (unchanged)
-///   S_new = S_inst ⊙ S_quant   (component-wise scale composition)
+///   S_new = S_inst ⊙ S_quant · us   (component-wise scale composition)
 ///
-/// where ⊙ is Hadamard (element-wise) product on vec3. The derivation:
+/// where ⊙ is Hadamard (element-wise) product on vec3, `us` is
+/// [`WriteOptions::unit_scale`] and `shift_m` is
+/// [`WriteOptions::global_shift`]. The derivation:
 ///
 ///   world = T_inst + R_inst · S_inst · (T_quant + S_quant · v_u16)
 ///         = (T_inst + R_inst · S_inst · T_quant) + R_inst · (S_inst ⊙ S_quant) · v_u16
+///
+/// scaled to metres and shifted, term by term.
+///
+/// **Two things are deliberately not taken from the f32 matrix** (GH #188):
+///
+/// * the translation. `T_inst` is the f32 `world_transform *
+///   instance_transform` translation column — the same point as
+///   `mesh.mesh_anchor`, but quantised at the absolute magnitude. On an
+///   NTM-georeferenced millimetre model that is up to 64 mm per
+///   instance, so every instanced duct is displaced. `A_f64` is
+///   `mesh.parts[0].anchor` (`effective_f64 * rep_origin` for that
+///   fragment), shifted and scaled in f64 with the f32 cast last.
+/// * the unit. `parts[].local_vertices` and `instance_transform` are in
+///   the file's native unit while the baked path's vertices are metres;
+///   `us` is what puts the two frames back on the same scale.
+///
+/// Rotation and scale still come from the f32 matrix: those are
+/// unit-magnitude numbers where f32 has ~7 significant digits to spare.
 ///
 /// This works cleanly when S_inst is axis-aligned scale (true for all
 /// IFC placements I've seen). If a future file presents a sheared
@@ -606,11 +670,14 @@ fn pack_instance_trs_quantized(
     group: &InstanceGroup,
     q_translation: [f32; 3],
     q_scale: [f32; 3],
+    options: &WriteOptions,
     bin: &mut Vec<u8>,
 ) -> (View, View, View) {
     let n = group.member_indices.len();
     let q_t = Vec3::new(q_translation[0], q_translation[1], q_translation[2]);
     let q_s = Vec3::new(q_scale[0], q_scale[1], q_scale[2]);
+    let us = options.unit_scale;
+    let shift = options.global_shift;
 
     let mut t_scratch: Vec<Vec3> = Vec::with_capacity(n);
     let mut r_scratch: Vec<(f32, f32, f32, f32)> = Vec::with_capacity(n);
@@ -620,14 +687,27 @@ fn pack_instance_trs_quantized(
         let world = Mat4::from_cols_array(&mesh.world_transform);
         let inst = Mat4::from_cols_array(&mesh.parts[0].instance_transform);
         let m = world * inst;
-        let (scale, rot, trans) = m.to_scale_rotation_translation();
+        let (scale, rot, _trans) = m.to_scale_rotation_translation();
+        // The instance origin in output (shifted, scaled) coordinates,
+        // resolved through the f64 anchor rather than the f32 matrix.
+        // `parts[0].anchor`, NOT `mesh.mesh_anchor`: a product whose
+        // first fragment carried vertices but no triangles pins
+        // `mesh_anchor` there and pushes no part, so the two can be
+        // different points and only the part's own anchor places the
+        // part's own geometry (GH #188 review).
+        let a = mesh.parts[0].anchor;
+        let anchor = Vec3::new(
+            (a[0] * us - shift[0]) as f32,
+            (a[1] * us - shift[1]) as f32,
+            (a[2] * us - shift[2]) as f32,
+        );
         // Compose quant denorm INTO the instance TRS.
-        // T_new = T_inst + R_inst * (S_inst ⊙ T_quant)
-        let t_new = trans + rot * (scale * q_t);
+        // T_new = A + R_inst * (S_inst ⊙ T_quant) * us
+        let t_new = anchor + rot * (scale * q_t) * (us as f32);
         // R_new = R_inst
         let r_new = rot;
-        // S_new = S_inst ⊙ S_quant
-        let s_new = scale * q_s;
+        // S_new = S_inst ⊙ S_quant * us
+        let s_new = scale * q_s * (us as f32);
         t_scratch.push(t_new);
         r_scratch.push((r_new.x, r_new.y, r_new.z, r_new.w));
         s_scratch.push(s_new);
@@ -682,6 +762,18 @@ fn pack_instance_trs_quantized(
             target: trs_target,
         },
     )
+}
+
+/// JSON number for an f64 that may be an integral value. Rust's `{}`
+/// prints `0` for `0.0` and the shortest round-tripping form otherwise,
+/// both of which are valid JSON numbers — but NaN / infinity are not,
+/// and a shift is caller-supplied, so they are clamped to `0`.
+fn fmt_f64(v: f64) -> String {
+    if v.is_finite() {
+        format!("{v}")
+    } else {
+        "0".to_string()
+    }
 }
 
 fn pad4(buf: &mut Vec<u8>) {
@@ -847,7 +939,18 @@ fn build_json(
 
     // ----- begin JSON -----
     let mut s = String::with_capacity(meshes.len() * 400 + 8192);
-    s.push_str(r#"{"asset":{"version":"2.0","generator":"ifcfast-mesh"},"#);
+    // `asset.extras.ifcfast.global_shift` — the three metres the writer
+    // subtracted from every position, baked and instanced alike, so the
+    // file self-describes its frame (GH #188). Always present; `[0,0,0]`
+    // on near-origin models, where positions are absolute.
+    let gs = options.global_shift;
+    s.push_str(r#"{"asset":{"version":"2.0","generator":"ifcfast-mesh","extras":{"ifcfast":{"global_shift":["#);
+    s.push_str(&fmt_f64(gs[0]));
+    s.push(',');
+    s.push_str(&fmt_f64(gs[1]));
+    s.push(',');
+    s.push_str(&fmt_f64(gs[2]));
+    s.push_str(r#"]}}},"#);
 
     // Extensions used / required.
     //   - EXT_mesh_gpu_instancing: declared whenever ≥1 instance group
@@ -1479,6 +1582,7 @@ mod material_naming_tests {
         let mut m = unit_cube(guid);
         let seg = |start: u32, color: Option<[f32; 4]>| InstancePart {
             rep_step_id: 0,
+            anchor: [0.0; 3],
             instance_transform: IDENTITY,
             local_vertices: Vec::new(),
             local_indices: Vec::new(),
@@ -1507,6 +1611,7 @@ mod material_naming_tests {
         let options = WriteOptions {
             instancing: false,
             per_product_materials: per_product,
+            ..WriteOptions::default()
         };
         let mut buf = Vec::new();
         write_with_options(meshes, &options, &mut buf).unwrap();
@@ -1567,5 +1672,193 @@ mod material_naming_tests {
         // Dedup mode collapses the two identical reds to one entry.
         let m = two_segment_cube("0CCCCCCCCCCCCCCCCCCCCC", [red, red]);
         assert_eq!(material_names(&json_of(&[m], false)).len(), 1);
+    }
+}
+
+/// GH #188: the instanced path must place its nodes through the f64
+/// `mesh_anchor`, not the f32 `world_transform * instance_transform`
+/// translation, and must apply `unit_scale` to the native-unit shared
+/// mesh. A near-origin fixture cannot catch either: there the shift is
+/// zero, the f32 translation is exact and most files are in metres.
+#[cfg(test)]
+mod far_origin_instancing_tests {
+    use super::*;
+    use crate::mesh::{InstancePart, ProductMesh};
+
+    /// A millimetre-unit NTM georeference — the GH #188 numbers. The f32
+    /// ulp is 8 mm in X and 128 mm in Y at these magnitudes.
+    const ANCHOR: [f64; 3] = [92_519_899.3, 1_247_315_537.2, 127_250.0];
+    const SHIFT_MODEL: [f64; 3] = [92_519_899.0, 1_247_315_537.0, 127_250.0];
+    const US: f64 = 0.001;
+
+    /// One 100 mm cube sharing rep 7, anchored `dx` mm east of `ANCHOR`.
+    /// `vertices` are what the sink hands the writer: shifted world
+    /// metres. `world_transform` is the f32 placement the old code read
+    /// its translation from.
+    fn cube(guid: &str, dx: f64) -> ProductMesh {
+        let local: Vec<f32> = vec![
+            0.0, 0.0, 0.0, 100.0, 0.0, 0.0, 100.0, 100.0, 0.0, 0.0, 100.0, 0.0, 0.0, 0.0, 100.0,
+            100.0, 0.0, 100.0, 100.0, 100.0, 100.0, 0.0, 100.0, 100.0,
+        ];
+        let indices: Vec<u32> = vec![
+            0, 2, 1, 0, 3, 2, 4, 5, 6, 4, 6, 7, 0, 1, 5, 0, 5, 4, 1, 2, 6, 1, 6, 5, 2, 3, 7, 2, 7,
+            6, 3, 0, 4, 3, 4, 7,
+        ];
+        let anchor = [ANCHOR[0] + dx, ANCHOR[1], ANCHOR[2]];
+        let off = [
+            anchor[0] - SHIFT_MODEL[0],
+            anchor[1] - SHIFT_MODEL[1],
+            anchor[2] - SHIFT_MODEL[2],
+        ];
+        let mut vertices = Vec::with_capacity(local.len());
+        for c in local.as_chunks::<3>().0 {
+            for k in 0..3 {
+                vertices.push(((c[k] as f64 + off[k]) * US) as f32);
+            }
+        }
+        let mut world = [0.0f32; 16];
+        world[0] = 1.0;
+        world[5] = 1.0;
+        world[10] = 1.0;
+        world[15] = 1.0;
+        world[12] = anchor[0] as f32;
+        world[13] = anchor[1] as f32;
+        world[14] = anchor[2] as f32;
+        ProductMesh {
+            guid: guid.into(),
+            entity: "IfcDuctSegment".into(),
+            ifc_id: 1,
+            vertices,
+            indices: indices.clone(),
+            source: "extrusion",
+            segments: Vec::new(),
+            placement_origin: [world[12], world[13], world[14]],
+            parts: vec![InstancePart {
+                rep_step_id: 7,
+                anchor,
+                instance_transform: [
+                    1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+                ],
+                local_vertices: local,
+                local_indices: indices,
+                index_start: 0,
+                index_count: 36,
+                source: "extrusion".into(),
+                surface_color: None,
+            }],
+            world_transform: world,
+            world_origin: anchor,
+            mesh_anchor: anchor,
+            surface_color: None,
+            bounded_halfspaces: Vec::new(),
+        }
+    }
+
+    fn read_vec3(bin: &[u8], view: &View, i: usize) -> [f32; 3] {
+        let base = view.byte_offset as usize + i * 12;
+        let mut out = [0.0f32; 3];
+        for (k, o) in out.iter_mut().enumerate() {
+            let at = base + k * 4;
+            *o = f32::from_le_bytes(bin[at..at + 4].try_into().unwrap());
+        }
+        out
+    }
+
+    #[test]
+    fn instanced_translation_comes_from_the_f64_anchor_in_metres() {
+        let meshes = [cube("0AAAAAAAAAAAAAAAAAAAAA", 0.0), cube("0BBBBBBBBBBBBBBBBBBBBB", 2000.0)];
+        let options = WriteOptions {
+            instancing: true,
+            per_product_materials: true,
+            global_shift: [
+                SHIFT_MODEL[0] * US,
+                SHIFT_MODEL[1] * US,
+                SHIFT_MODEL[2] * US,
+            ],
+            unit_scale: US,
+        };
+        let plan = Plan::classify(&meshes, options.instancing);
+        assert_eq!(plan.instanced.len(), 1, "both cubes share rep 7");
+        assert!(plan.baked.is_empty());
+        let (bin, layout) = pack_binary(&meshes, &plan, &options);
+        let views = &layout.instanced[0];
+        assert_eq!(views.n_instances, 2);
+
+        for (i, mesh) in meshes.iter().enumerate() {
+            let t = read_vec3(&bin, &views.translation, i);
+            // The shared local mesh's quantization min is the origin, so
+            // the instance translation IS the shifted, scaled anchor of
+            // `parts[0]` — see `mesh_anchor_188.rs` for why it is the
+            // part's anchor and not the product's.
+            let a = mesh.parts[0].anchor;
+            let want = [
+                (a[0] * US - options.global_shift[0]) as f32,
+                (a[1] * US - options.global_shift[1]) as f32,
+                (a[2] * US - options.global_shift[2]) as f32,
+            ];
+            for k in 0..3 {
+                assert!(
+                    (t[k] as f64 - want[k] as f64).abs() < 5.0e-8,
+                    "instance {i} axis {k}: {} vs {}",
+                    t[k],
+                    want[k]
+                );
+            }
+            // …and the mesh's own baked first vertex (the sink's output)
+            // agrees with it, because local vertex 0 is the local origin.
+            for k in 0..3 {
+                assert!(
+                    (mesh.vertices[k] as f64 - t[k] as f64).abs() < 5.0e-8,
+                    "instance {i} axis {k}: baked {} vs instanced {}",
+                    mesh.vertices[k],
+                    t[k]
+                );
+            }
+            // The f32 route this replaced is off by millimetres — proof
+            // the assertion above actually bites.
+            let m = Mat4::from_cols_array(&mesh.world_transform)
+                * Mat4::from_cols_array(&mesh.parts[0].instance_transform);
+            let (_s, _r, f32_trans) = m.to_scale_rotation_translation();
+            let stale_y = f32_trans.y as f64 * US - options.global_shift[1];
+            assert!(
+                (stale_y - want[1] as f64).abs() > 1.0e-3,
+                "the f32 translation should be >1 mm out here, got {stale_y} vs {}",
+                want[1]
+            );
+        }
+
+        // The shared mesh is in native units, so the instance SCALE must
+        // carry `unit_scale` — otherwise a millimetre model's instanced
+        // nodes render 1000x the baked ones.
+        let s = read_vec3(&bin, &views.scale, 0);
+        let expect = (100.0 / 65535.0) * US as f32;
+        for k in 0..3 {
+            assert!(
+                ((s[k] - expect) / expect).abs() < 1.0e-5,
+                "instance scale axis {k}: {} vs {expect}",
+                s[k]
+            );
+        }
+    }
+
+    #[test]
+    fn near_origin_metre_models_keep_the_absolute_frame() {
+        // Shift zero, unit_scale 1.0: the instance translation is the
+        // absolute anchor, exactly as before GH #188.
+        let mut m = cube("0CCCCCCCCCCCCCCCCCCCCC", 0.0);
+        m.mesh_anchor = [3.0, 4.0, 5.0];
+        m.parts[0].anchor = m.mesh_anchor;
+        m.world_origin = m.mesh_anchor;
+        m.world_transform[12] = 3.0;
+        m.world_transform[13] = 4.0;
+        m.world_transform[14] = 5.0;
+        let mut m2 = m.clone();
+        m2.guid = "0DDDDDDDDDDDDDDDDDDDDD".into();
+        let meshes = [m, m2];
+        let options = WriteOptions::default();
+        let plan = Plan::classify(&meshes, true);
+        let (bin, layout) = pack_binary(&meshes, &plan, &options);
+        let t = read_vec3(&bin, &layout.instanced[0].translation, 0);
+        assert_eq!(t, [3.0, 4.0, 5.0]);
     }
 }

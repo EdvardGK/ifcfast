@@ -29,7 +29,8 @@ use ifcfast_core::indexer::{self, IndexedFile};
 use ifcfast_core::lexer::{parse_field, split_top_level_args, Field};
 use ifcfast_core::mesh::gltf::resolve_product_color;
 use ifcfast_core::mesh::stats::ProductStats;
-use ifcfast_core::mesh::{self, ProductMesh, ProductSink};
+use ifcfast_core::mesh::rebase::{global_shift_for, shift_world_in_place, shifted_world_positions};
+use ifcfast_core::mesh::{self, BakeFrame, ProductMesh, ProductSink};
 use ifcfast_core::source::IfcSource;
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
@@ -42,7 +43,7 @@ pub type Rollup = HashMap<String, (Option<f64>, Option<f64>, Option<f64>)>;
 /// Mirrors `python/ifcfast/header.py::_CACHE_SCHEMA_VERSION`. Bump in
 /// lockstep — it is hashed into `cache_key`, so a mismatch shows up as a
 /// changed key rather than stale data.
-const CACHE_SCHEMA_VERSION: u32 = 32;
+const CACHE_SCHEMA_VERSION: u32 = 33;
 const HASH_HEAD_BYTES: usize = 4 * 1024 * 1024;
 const HASH_TAIL_BYTES: usize = 4 * 1024 * 1024;
 /// `header.py::_HEADER_READ_BYTES` — the window FILE_SCHEMA is read from.
@@ -60,8 +61,7 @@ pub fn round10(v: f64) -> f64 {
 
 /// `round10` for a value that may be NaN / infinite — those reach the
 /// Python JSON as `null`.
-fn round10_opt(v: f32) -> Option<f64> {
-    let v = v as f64;
+fn round10_opt(v: f64) -> Option<f64> {
     if v.is_finite() {
         Some(round10(v))
     } else {
@@ -251,12 +251,13 @@ pub struct Analysis {
     /// block so a later mesh pass uses the same number `run` did.
     pub unit_scale_f64: f64,
     pub mesh_state: MeshState,
-    /// Model-wide global shift in METRES, pinned by the streaming pass
-    /// from the first emitted product's `mesh_anchor` — the same rule
+    /// Model-wide global shift in METRES, pinned by whichever mesh pass
+    /// ran — [`Analysis::stream_mesh`] or [`Analysis::batch_mesh`] —
+    /// from the first emitted product's `mesh_anchor`, the same rule
     /// `_core.extract_meshes` uses for its `global_shift`. Streamed
-    /// positions are world metres MINUS this; add it back for absolute
-    /// coordinates. `[0, 0, 0]` until the stream has started, and for
-    /// every near-origin model.
+    /// positions and the `toGlb` GLB alike are world metres MINUS this;
+    /// add it back for absolute coordinates. `[0, 0, 0]` before any mesh
+    /// pass has run, and for every near-origin model.
     pub stream_shift_m: [f64; 3],
 }
 
@@ -265,31 +266,6 @@ pub struct Analysis {
 /// layer wraps the JS callback in one of these so `analysis` stays free
 /// of `wasm-bindgen` types (and unit-testable off the web target).
 pub type BatchEmit<'e> = &'e mut dyn FnMut(&str, &[f32], &[u32], &str) -> Result<(), String>;
-
-/// Port of `lib.rs::python::global_shift_for` (that one is behind the
-/// `python` feature, so it is not reachable from the wasm build).
-///
-/// Returns the rounded world origin, in MODEL UNITS, only when the model
-/// genuinely sits far from the origin (> 10 km); below that f32 already
-/// resolves the coordinate finely enough and near-origin models keep
-/// absolute coordinates unchanged.
-fn global_shift_for(world_origin: &[f64; 3], unit_scale: f32) -> [f64; 3] {
-    const THRESHOLD_M: f64 = 1.0e4;
-    let us = unit_scale as f64;
-    let max_m = world_origin
-        .iter()
-        .map(|c| (c * us).abs())
-        .fold(0.0_f64, f64::max);
-    if max_m > THRESHOLD_M {
-        [
-            world_origin[0].round(),
-            world_origin[1].round(),
-            world_origin[2].round(),
-        ]
-    } else {
-        [0.0, 0.0, 0.0]
-    }
-}
 
 impl Analysis {
     pub fn run(bytes: &[u8], name: &str) -> Result<Analysis, String> {
@@ -645,15 +621,25 @@ impl Analysis {
         }
     }
 
-    /// v1's pass, verbatim: the same call `_core.analyse_drift` makes —
-    /// a World-frame streaming pass collected into a `Vec`, then the
-    /// synthetic half-space stand-in slabs stripped before any measure is
-    /// taken (GH #66) — plus the metre rescale `write_gltf`'s sink does.
+    /// The batch pass: a Local-frame streaming pass collected into a
+    /// `Vec`, the synthetic half-space stand-in slabs stripped before any
+    /// measure is taken (GH #66), then the same shifted-world-metres
+    /// reposition `write_gltf`'s sink does.
+    ///
+    /// Local, not World (GH #188): a World bake casts to f32 at the
+    /// absolute magnitude, which on an NTM-georeferenced millimetre model
+    /// is an 8 mm / 128 mm vertex lattice — round ducts wobble ±4 mm and
+    /// one face in ten collapses to zero area. The stats are taken from
+    /// the Local mesh (surface area / volume / max extent are
+    /// translation-invariant, and more accurate here), and the retained
+    /// meshes are repositioned through `mesh::rebase` so `toGlb` writes a
+    /// precise GLB.
     pub fn batch_mesh(&mut self) {
         let unit_scale = self.unit_scale_f64 as f32;
-        let (meshes, drift, segment_rows, counters) = {
+        let us = self.unit_scale_f64;
+        let (meshes, drift, segment_rows, counters, shift) = {
             let buf = self.source.as_bytes();
-            let (mut meshes, mesh_stats) = mesh::mesh_ifc(buf);
+            let (mut meshes, mesh_stats) = mesh::mesh_ifc_framed(buf, BakeFrame::Local);
             for m in &mut meshes {
                 mesh::strip_synthetic_cutters(m);
             }
@@ -661,20 +647,44 @@ impl Analysis {
             let mut segment_rows = 0usize;
             for m in &meshes {
                 segment_rows += m.segments.len();
-                drift.push(drift_row(m, unit_scale));
+                drift.push(drift_row(m, us, unit_scale));
             }
 
-            // Scale the retained meshes into metres — exactly what
-            // `write_gltf`'s sink does before handing them to the writer.
-            let us = unit_scale as f64;
+            // Pin the model-wide shift on the first product that has
+            // drawable geometry — the same rule, in the same order, the
+            // streaming sink uses, so `streamShiftJson()` is one value
+            // whichever pass produced it.
+            //
+            // `us` is the f64 unit factor, not `unit_scale as f64`: the
+            // shift is reported in metres through the same factor, and
+            // 0.001 is not representable in f32 — at NTM magnitudes the
+            // f32 factor puts `position + shift` 4 mm / 59 mm off the
+            // absolute coordinate it is supposed to reconstruct.
+            // The model-level pin (GH #188), decided from the placement
+            // chains before any product was emitted. `[0, 0, 0]` leaves
+            // the first-emitted-anchor fallback below to fire.
+            let mut shift: Option<[f64; 3]> = if mesh_stats.global_shift == [0.0, 0.0, 0.0] {
+                None
+            } else {
+                Some(mesh_stats.global_shift)
+            };
             for m in &mut meshes {
-                for v in m.vertices.iter_mut() {
-                    *v = (*v as f64 * us) as f32;
+                if m.vertices.is_empty() || m.indices.is_empty() {
+                    continue;
                 }
+                let s = *shift.get_or_insert_with(|| global_shift_for(&m.mesh_anchor, us));
+                shift_world_in_place(m, &s, us);
             }
-            (meshes, drift, segment_rows, counters_from(&mesh_stats))
+            (
+                meshes,
+                drift,
+                segment_rows,
+                counters_from(&mesh_stats),
+                shift.unwrap_or([0.0, 0.0, 0.0]),
+            )
         };
 
+        self.stream_shift_m = [shift[0] * us, shift[1] * us, shift[2] * us];
         self.meshes = meshes;
         self.set_geometry(drift, segment_rows, counters);
         self.mesh_state = MeshState::Batched;
@@ -684,12 +694,14 @@ impl Analysis {
     /// `emit` a batch every `products_per_batch` emitted products, plus a
     /// final partial batch.
     ///
-    /// The per-product stats are computed from the same World-frame,
+    /// The per-product stats are computed from the same Local-frame,
     /// cutter-stripped mesh [`Analysis::batch_mesh`] measures, in the same
     /// emission order, so `qto_json` / `graph_json` after a stream are
     /// byte-identical to the batch path's.
     ///
-    /// Positions are world METRES minus [`Analysis::stream_shift_m`];
+    /// Positions are world METRES minus [`Analysis::stream_shift_m`],
+    /// repositioned from the Local bake in f64 so a georeferenced
+    /// millimetre model keeps sub-micron vertex precision (GH #188);
     /// indices are batch-local (already offset by the product's `v0`).
     pub fn stream_mesh(
         &mut self,
@@ -717,7 +729,10 @@ impl Analysis {
             let buf = self.source.as_bytes();
             let mut sink = StreamSink {
                 unit_scale,
-                us: unit_scale as f64,
+                // f64 factor, deliberately not `unit_scale as f64` — see
+                // `batch_mesh`: the reported shift uses the same one, so
+                // `position + shift` reconstructs the absolute coordinate.
+                us: self.unit_scale_f64,
                 per_batch: products_per_batch.max(1),
                 total,
                 meta_of,
@@ -733,7 +748,7 @@ impl Analysis {
                 emit,
                 err: None,
             };
-            let mesh_stats = mesh::mesh_ifc_streaming(buf, &mut sink);
+            let mesh_stats = mesh::mesh_ifc_streaming_framed(buf, &mut sink, BakeFrame::Local);
             sink.flush();
             (
                 sink.drift,
@@ -770,21 +785,22 @@ impl Analysis {
     }
 }
 
-/// One `drift` row from one cutter-stripped, World-frame product mesh.
+/// One `drift` row from one cutter-stripped, Local-frame product mesh.
 ///
-/// `analyse_drift` does the unit rescale in f32 and Python widens the
-/// result; keeping the arithmetic in f32 here means the 10-decimal
-/// rounding lands on the same value.
-fn drift_row(m: &ProductMesh, unit_scale: f32) -> DriftRow {
-    let s = ProductStats::from_mesh(m, unit_scale);
+/// The rescale is done in f64 on f32 inputs, and `analyse_drift` does
+/// exactly the same, so the 10-decimal rounding lands on the same value
+/// on both sides (GH #188). `unit_scale_f32` is only the tolerance
+/// parameter `ProductStats` needs (drift floor, weld epsilon).
+fn drift_row(m: &ProductMesh, unit_scale: f64, unit_scale_f32: f32) -> DriftRow {
+    let s = ProductStats::from_mesh(m, unit_scale_f32);
     let us_len = unit_scale;
     let us_area = unit_scale * unit_scale;
     let us_vol = unit_scale * unit_scale * unit_scale;
     DriftRow {
         guid: s.guid.clone(),
-        surface_area_m2: round10_opt(s.surface_area * us_area),
-        volume_abs_m3: round10_opt(s.volume.abs() * us_vol),
-        max_extent_m: round10_opt(s.max_extent * us_len),
+        surface_area_m2: round10_opt(s.surface_area as f64 * us_area),
+        volume_abs_m3: round10_opt(s.volume.abs() as f64 * us_vol),
+        max_extent_m: round10_opt(s.max_extent as f64 * us_len),
         triangle_count: s.triangle_count,
     }
 }
@@ -815,14 +831,18 @@ fn counters_from(mesh_stats: &mesh::MeshStats) -> MeshCounters {
 /// with the per-product spans carried in `meta` so picking and per-
 /// product colour still work.
 struct StreamSink<'e> {
+    /// Tolerance parameter for `ProductStats` (drift floor, weld eps).
     unit_scale: f32,
+    /// Linear-unit-to-metres factor, f64 — the one every metre cast and
+    /// the reported shift go through (GH #188).
     us: f64,
     per_batch: usize,
     total: usize,
     /// guid → (storey_guid, type_name) as the graph resolves them.
     meta_of: HashMap<String, (Value, Value)>,
     /// Model-wide shift in MODEL UNITS, pinned from the first emitted
-    /// product's `mesh_anchor` (the `extract_meshes` rule).
+    /// product's `mesh_anchor` (the `extract_meshes` rule —
+    /// [`mesh::rebase::global_shift_for`]).
     shift: Option<[f64; 3]>,
 
     meta: Vec<Value>,
@@ -863,13 +883,23 @@ impl StreamSink<'_> {
 }
 
 impl ProductSink for StreamSink<'_> {
+    /// GH #188: the model-level pin, decided from the placement chains
+    /// before any emission. Non-zero wins over the first-emitted-anchor
+    /// fallback in `on_product`, which only exists for files whose
+    /// georeference is baked into the representation geometry.
+    fn on_global_shift(&mut self, shift: [f64; 3]) {
+        if shift != [0.0, 0.0, 0.0] {
+            self.shift = Some(shift);
+        }
+    }
+
     fn on_product(&mut self, mut mesh: ProductMesh) {
         self.seen += 1;
         // Same order as the batch pass: strip the synthetic half-space
         // stand-in slabs FIRST, then measure (GH #66).
         mesh::strip_synthetic_cutters(&mut mesh);
         self.segment_rows += mesh.segments.len();
-        let row = drift_row(&mesh, self.unit_scale);
+        let row = drift_row(&mesh, self.us, self.unit_scale);
         let (m3, m2, tri) = (row.volume_abs_m3, row.surface_area_m2, row.triangle_count);
         self.drift.push(row);
 
@@ -884,17 +914,15 @@ impl ProductSink for StreamSink<'_> {
 
         let shift = *self
             .shift
-            .get_or_insert_with(|| global_shift_for(&mesh.mesh_anchor, self.unit_scale));
+            .get_or_insert_with(|| global_shift_for(&mesh.mesh_anchor, self.us));
 
         let v0 = self.positions.len() / 3;
         let vn = mesh.vertices.len() / 3;
-        self.positions.reserve(mesh.vertices.len());
-        for c in mesh.vertices.as_chunks::<3>().0 {
-            for k in 0..3 {
-                self.positions
-                    .push(((c[k] as f64 - shift[k]) * self.us) as f32);
-            }
-        }
+        // Local frame → shifted world metres, repositioned in f64 with
+        // the f32 cast last (GH #188). Subtracting the shift AFTER an
+        // absolute f32 bake — what this did before — recovers nothing:
+        // the residual still carries the 8 mm / 128 mm lattice.
+        shifted_world_positions(&mesh, &shift, self.us, &mut self.positions);
         let i0 = self.indices.len();
         let i_n = mesh.indices.len();
         let base = v0 as u32;
@@ -1870,6 +1898,258 @@ mod tests {
     // Explicit, so the tests do not lean on the parent module's private
     // `use` leaking through the glob.
     use serde_json::{json, Value};
+
+    // ----- GH #188: far-origin precision --------------------------
+    //
+    // `far_origin_duct_mm.ifc` is a millimetre model whose site sits at
+    // a Norwegian NTM georeference (x ~ 9.2e7 mm, y ~ 1.25e9 mm), where
+    // the f32 ulp is 8 mm / 128 mm. Two IfcDuctSegments share one
+    // extruded annulus, outer r = 200 mm, inner r = 198 mm, depth
+    // 7386.5 mm. Baked in the World frame that circle came back with a
+    // 105 mm radius spread and 51% of its triangles at zero area; the
+    // Local bake + f64 reposition is what these bounds check.
+    //
+    // A near-origin fixture cannot catch any of this: there the shift is
+    // [0, 0, 0] and every frame agrees.
+
+    /// Duct axis (metres, absolute) and the extrusion's z span, straight
+    /// from the fixture's placement numbers: site (92200000, 1247000000,
+    /// 0) + duct (319899.3, 315537.2, 127250) mm, duct B 2000 mm east.
+    const DUCT_A: (&str, f64, f64) = ("1VluSltEX0WftNcGXN68O9", 92_519.899_3, 1_247_315.537_2);
+    const DUCT_B: (&str, f64, f64) = ("1VluSltEX0WftNcGXN68P0", 92_521.899_3, 1_247_315.537_2);
+    const Z_BOTTOM_M: f64 = 127.25;
+    const Z_TOP_M: f64 = 134.636_5;
+    /// `200 mm * arc_area_scale(pi, 16)` — the area-preserving radius the
+    /// adaptive tessellator (GH #170) samples a 16-chord semicircle at.
+    const OUTER_R_MM: f64 = 200.644_4;
+
+    fn axis_of(guid: &str) -> (f64, f64) {
+        if guid == DUCT_A.0 {
+            (DUCT_A.1, DUCT_A.2)
+        } else if guid == DUCT_B.0 {
+            (DUCT_B.1, DUCT_B.2)
+        } else {
+            panic!("unknown fixture guid {guid}");
+        }
+    }
+
+    /// Radius spread (mm) of the outer-loop vertices about the duct
+    /// axis, the absolute XY bbox centre (m), and the absolute z span.
+    /// `positions` are shifted world metres; `shift` puts them back.
+    struct Probe {
+        outer_n: usize,
+        outer_mean_mm: f64,
+        outer_spread_mm: f64,
+        centre: (f64, f64),
+        z_min: f64,
+        z_max: f64,
+    }
+
+    fn probe(positions: &[f32], shift: [f64; 3], guid: &str) -> Probe {
+        let (ax, ay) = axis_of(guid);
+        let (mut x0, mut x1) = (f64::INFINITY, f64::NEG_INFINITY);
+        let (mut y0, mut y1) = (f64::INFINITY, f64::NEG_INFINITY);
+        let (mut z0, mut z1) = (f64::INFINITY, f64::NEG_INFINITY);
+        let mut outer: Vec<f64> = Vec::new();
+        for c in positions.as_chunks::<3>().0 {
+            let x = c[0] as f64 + shift[0];
+            let y = c[1] as f64 + shift[1];
+            let z = c[2] as f64 + shift[2];
+            x0 = x0.min(x);
+            x1 = x1.max(x);
+            y0 = y0.min(y);
+            y1 = y1.max(y);
+            z0 = z0.min(z);
+            z1 = z1.max(z);
+            let r_mm = ((x - ax).powi(2) + (y - ay).powi(2)).sqrt() * 1000.0;
+            if r_mm > 199.5 {
+                outer.push(r_mm);
+            }
+        }
+        let mn = outer.iter().cloned().fold(f64::INFINITY, f64::min);
+        let mx = outer.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        Probe {
+            outer_n: outer.len(),
+            outer_mean_mm: outer.iter().sum::<f64>() / outer.len() as f64,
+            outer_spread_mm: mx - mn,
+            centre: ((x0 + x1) / 2.0, (y0 + y1) / 2.0),
+            z_min: z0,
+            z_max: z1,
+        }
+    }
+
+    fn zero_area_triangles(positions: &[f32], indices: &[u32], from: usize, count: usize) -> usize {
+        let mut n = 0;
+        for t in indices[from..from + count].as_chunks::<3>().0 {
+            let p = |i: u32| {
+                let i = i as usize * 3;
+                [
+                    positions[i] as f64,
+                    positions[i + 1] as f64,
+                    positions[i + 2] as f64,
+                ]
+            };
+            let (a, b, c) = (p(t[0]), p(t[1]), p(t[2]));
+            let u = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+            let v = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
+            let cr = [
+                u[1] * v[2] - u[2] * v[1],
+                u[2] * v[0] - u[0] * v[2],
+                u[0] * v[1] - u[1] * v[0],
+            ];
+            if (cr[0] * cr[0] + cr[1] * cr[1] + cr[2] * cr[2]).sqrt() == 0.0 {
+                n += 1;
+            }
+        }
+        n
+    }
+
+    fn check_probe(tag: &str, pr: &Probe, guid: &str) {
+        let (ax, ay) = axis_of(guid);
+        assert!(pr.outer_n >= 32, "{tag}: only {} outer verts", pr.outer_n);
+        assert!(
+            pr.outer_spread_mm < 0.05,
+            "{tag} {guid}: outer radius spread {:.4} mm (mean {:.4}) — f32 quantisation at NTM magnitude",
+            pr.outer_spread_mm,
+            pr.outer_mean_mm
+        );
+        assert!(
+            (pr.outer_mean_mm - OUTER_R_MM).abs() < 0.01,
+            "{tag} {guid}: outer radius {:.4} mm, expected {OUTER_R_MM}",
+            pr.outer_mean_mm
+        );
+        // positions + shift reconstruct absolute world metres: the XY
+        // bbox centre is the placement point and the z span is the
+        // extrusion, both to 0.1 mm.
+        assert!(
+            (pr.centre.0 - ax).abs() < 1.0e-4 && (pr.centre.1 - ay).abs() < 1.0e-4,
+            "{tag} {guid}: absolute centre ({:.6}, {:.6}) vs placement ({ax}, {ay})",
+            pr.centre.0,
+            pr.centre.1
+        );
+        assert!(
+            (pr.z_min - Z_BOTTOM_M).abs() < 1.0e-4 && (pr.z_max - Z_TOP_M).abs() < 1.0e-4,
+            "{tag} {guid}: absolute z span {:.6}..{:.6} vs {Z_BOTTOM_M}..{Z_TOP_M}",
+            pr.z_min,
+            pr.z_max
+        );
+    }
+
+    #[test]
+    fn far_origin_duct_streams_precise_positions_and_reports_its_shift() {
+        let mut a = fixture("far_origin_duct_mm.ifc");
+        let mut batches: Vec<(Vec<Value>, Vec<f32>, Vec<u32>)> = Vec::new();
+        {
+            let mut emit = |meta: &str, pos: &[f32], idx: &[u32], _progress: &str| {
+                batches.push((
+                    serde_json::from_str(meta).expect("meta is JSON"),
+                    pos.to_vec(),
+                    idx.to_vec(),
+                ));
+                Ok(())
+            };
+            a.stream_mesh(16, &mut emit).expect("stream runs");
+        }
+
+        let shift = a.stream_shift_m;
+        assert!(
+            shift[0] != 0.0 && shift[1] != 0.0,
+            "a georeferenced model must report its shift, got {shift:?}"
+        );
+        // The shift is the rounded anchor of the first product, in metres.
+        assert!((shift[0] - 92_519.899).abs() < 1.0e-9, "{shift:?}");
+        assert!((shift[1] - 1_247_315.537).abs() < 1.0e-9, "{shift:?}");
+
+        let mut seen = 0;
+        for (meta, positions, indices) in &batches {
+            for row in meta {
+                let guid = row["guid"].as_str().unwrap();
+                let v0 = row["v0"].as_u64().unwrap() as usize;
+                let vn = row["vn"].as_u64().unwrap() as usize;
+                let i0 = row["i0"].as_u64().unwrap() as usize;
+                let in_ = row["in"].as_u64().unwrap() as usize;
+                let span = &positions[v0 * 3..(v0 + vn) * 3];
+                check_probe("stream", &probe(span, shift, guid), guid);
+                assert_eq!(
+                    zero_area_triangles(positions, indices, i0, in_),
+                    0,
+                    "stream {guid}: zero-area triangles"
+                );
+                seen += 1;
+            }
+        }
+        assert_eq!(seen, 2, "both duct segments stream");
+    }
+
+    #[test]
+    fn far_origin_duct_batch_pass_retains_precise_meshes() {
+        // `toGlb` reads `inner.meshes`, which only the batch pass fills.
+        let mut a = fixture("far_origin_duct_mm.ifc");
+        a.ensure_meshes();
+        let shift = a.stream_shift_m;
+        assert!(
+            shift[0] != 0.0 && shift[1] != 0.0,
+            "the batch pass pins the shift too, got {shift:?}"
+        );
+        assert_eq!(a.meshes.len(), 2);
+        for m in &a.meshes {
+            check_probe("batch", &probe(&m.vertices, shift, &m.guid), &m.guid);
+            assert_eq!(
+                zero_area_triangles(&m.vertices, &m.indices, 0, m.indices.len()),
+                0,
+                "batch {}: zero-area triangles",
+                m.guid
+            );
+        }
+    }
+
+    /// GH #188 review item 1: the shift is a property of the FILE, not
+    /// of whichever product the pass emits first. The fixture leads with
+    /// a `$`-placement product, whose `mesh_anchor` is the origin.
+    #[test]
+    fn an_unplaced_first_product_does_not_zero_the_shift() {
+        for streamed in [false, true] {
+            let mut a = fixture("far_origin_unplaced_first_mm.ifc");
+            if streamed {
+                let mut emit = |_m: &str, _p: &[f32], _i: &[u32], _g: &str| Ok(());
+                a.stream_mesh(16, &mut emit).expect("stream runs");
+            } else {
+                a.ensure_meshes();
+                // The premise: the unplaced box is emitted first.
+                assert_eq!(a.meshes[0].guid, "0UnplacedFirstProd00__");
+            }
+            let s = a.stream_shift_m;
+            assert!(
+                (s[0] - 92_519.899).abs() < 1.0e-9 && (s[1] - 1_247_315.537).abs() < 1.0e-9,
+                "streamed={streamed}: {s:?}"
+            );
+        }
+    }
+
+    /// The same fixture keeps its ducts round on the batch path, which is
+    /// what `toGlb` writes from.
+    #[test]
+    fn an_unplaced_first_product_does_not_break_the_ducts() {
+        let mut a = fixture("far_origin_unplaced_first_mm.ifc");
+        a.ensure_meshes();
+        let shift = a.stream_shift_m;
+        let mut checked = 0;
+        for m in &a.meshes {
+            if m.guid != DUCT_A.0 && m.guid != DUCT_B.0 {
+                continue;
+            }
+            check_probe("unplaced-first", &probe(&m.vertices, shift, &m.guid), &m.guid);
+            checked += 1;
+        }
+        assert_eq!(checked, 2);
+    }
+
+    #[test]
+    fn near_origin_models_still_report_a_zero_shift() {
+        let mut a = fixture("geom_box.ifc");
+        a.ensure_meshes();
+        assert_eq!(a.stream_shift_m, [0.0, 0.0, 0.0]);
+    }
 
     #[test]
     fn round10_matches_pandas_double_precision() {

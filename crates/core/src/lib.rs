@@ -1113,7 +1113,7 @@ mod python {
             out.set_item("surface_nx", PyList::new(py, sink.s_nx)?)?;
             out.set_item("surface_ny", PyList::new(py, sink.s_ny)?)?;
             out.set_item("surface_nz", PyList::new(py, sink.s_nz)?)?;
-            out.set_item("unit_scale", unit_scale as f64)?;
+            out.set_item("unit_scale", idx.unit_scale.unwrap_or(1.0))?;
             out.set_item("indexer_ms", idx_ms)?;
             out.set_item("mesh_ms", mesh_ms)?;
             out.set_item("entity_table_ms", mesh_stats.entity_table_build_ms)?;
@@ -1140,11 +1140,25 @@ mod python {
             // next to the mesh pass that follows.
             let idx = py.detach(|| indexer::index(&mmap));
             refuse_truncated_index(&idx, path)?;
+            // The f32 copy is for the tolerance parameters only (the
+            // drift floor and the weld epsilon inside `ProductStats`);
+            // every metre CAST goes through the f64 factor, because
+            // 0.001 is not representable in f32 and the 4.75e-8 residue
+            // is 59 mm of absolute position at an NTM georeference
+            // (GH #188).
             let unit_scale = idx.unit_scale.unwrap_or(1.0) as f32;
-            let us_len = unit_scale;
-            let us_area = unit_scale * unit_scale;
-            let us_vol = unit_scale * unit_scale * unit_scale;
-            let (mut meshes, mesh_stats) = py.detach(|| crate::mesh::mesh_ifc(&mmap));
+            let us_len = idx.unit_scale.unwrap_or(1.0);
+            let us_area = us_len * us_len;
+            let us_vol = us_len * us_len * us_len;
+            // Local bake, not World (GH #188): the World bake casts to
+            // f32 at the absolute magnitude, so on a georeferenced
+            // millimetre model every measure below is taken on geometry
+            // that has already been quantised onto an 8 mm / 128 mm
+            // lattice. Surface area, volume and extent are
+            // translation-invariant, so the Local frame measures the
+            // same quantities — just without that noise.
+            let (mut meshes, mesh_stats) =
+                py.detach(|| crate::mesh::mesh_ifc_framed(&mmap, crate::mesh::BakeFrame::Local));
             // Drift is the geometry-validity signal layer: its centroid /
             // AABB / volume columns must describe the ELEMENT. Strip the
             // synthetic half-space stand-in slabs first, or every clipped
@@ -1152,6 +1166,23 @@ mod python {
             // "broken mesh" class drift exists to catch).
             for m in &mut meshes {
                 crate::mesh::strip_synthetic_cutters(m);
+            }
+            // Placement-vs-geometry drift is a comparison between the
+            // placement origin and the mesh centroid, and `from_mesh`
+            // takes both from the mesh it is handed. In the Local frame
+            // the centroid is near origin, so the placement origin has to
+            // come along: `world_origin - mesh_anchor` is the same point
+            // expressed in that frame, differenced in f64 (both terms are
+            // absolute; the result is metres-to-tens-of-metres). That is
+            // strictly better than the old comparison, which subtracted
+            // two f32 numbers at georeference magnitude.
+            for m in &mut meshes {
+                let d = [
+                    m.world_origin[0] - m.mesh_anchor[0],
+                    m.world_origin[1] - m.mesh_anchor[1],
+                    m.world_origin[2] - m.mesh_anchor[2],
+                ];
+                m.placement_origin = [d[0] as f32, d[1] as f32, d[2] as f32];
             }
             let prod_stats: Vec<crate::mesh::stats::ProductStats> = meshes
                 .iter()
@@ -1187,21 +1218,27 @@ mod python {
             let mut mesh_quality = Vec::with_capacity(n);
             let mut meshed_total = 0u32;
             let mut raw_error_count = 0u32;
-            for s in &prod_stats {
-                let px_m = s.placement_x * us_len;
-                let py_m = s.placement_y * us_len;
-                let pz_m = s.placement_z * us_len;
-                let cx_m = ((s.xmin + s.xmax) * 0.5) * us_len;
-                let cy_m = ((s.ymin + s.ymax) * 0.5) * us_len;
-                let cz_m = ((s.zmin + s.zmax) * 0.5) * us_len;
-                let drift_m = s.drift_distance * us_len;
-                let extent_m = s.max_extent * us_len;
+            for (s, mesh) in prod_stats.iter().zip(meshes.iter()) {
+                // The bbox / placement columns are absolute world metres,
+                // so the Local frame's anchor goes back on here — in f64,
+                // from `mesh_anchor` (geometry) and `world_origin`
+                // (placement), never from a re-cast f32.
+                let a = mesh.mesh_anchor;
+                let px_m = mesh.world_origin[0] * us_len;
+                let py_m = mesh.world_origin[1] * us_len;
+                let pz_m = mesh.world_origin[2] * us_len;
+                let cx_m = ((s.xmin + s.xmax) as f64 * 0.5 + a[0]) * us_len;
+                let cy_m = ((s.ymin + s.ymax) as f64 * 0.5 + a[1]) * us_len;
+                let cz_m = ((s.zmin + s.zmax) as f64 * 0.5 + a[2]) * us_len;
+                // A distance, so frame-invariant — only the unit cast.
+                let drift_m = s.drift_distance as f64 * us_len;
+                let extent_m = s.max_extent as f64 * us_len;
                 // Per-row severity, recomputed against SI values so the
                 // 10 mm absolute threshold is unit-independent (the old
                 // `drift < 10.0` rule against raw model units was 10 mm
                 // on mm-files but 10 m on metre-files — over-strict on
                 // mm files and over-lenient on metre files).
-                let severity: &'static str = if drift_m < 0.010 || s.drift_ratio <= 2.0 {
+                let severity: &'static str = if drift_m < 0.010 || (s.drift_ratio as f64) <= 2.0 {
                     "ok"
                 } else if s.drift_ratio <= 10.0 {
                     "warn"
@@ -1212,8 +1249,8 @@ mod python {
                 entity.push(s.entity.clone());
                 source.push(s.source);
                 tri_count.push(s.triangle_count);
-                surface_area.push(s.surface_area * us_area);
-                volume_abs.push(s.volume.abs() * us_vol);
+                surface_area.push(s.surface_area as f64 * us_area);
+                volume_abs.push(s.volume.abs() as f64 * us_vol);
                 px.push(px_m);
                 py_v.push(py_m);
                 pz.push(pz_m);
@@ -1222,9 +1259,9 @@ mod python {
                 cz.push(cz_m);
                 drift_distance.push(drift_m);
                 max_extent.push(extent_m);
-                drift_ratio.push(s.drift_ratio);
+                drift_ratio.push(s.drift_ratio as f64);
                 drift_severity.push(severity);
-                aabb_volume.push(s.aabb_volume * us_vol);
+                aabb_volume.push(s.aabb_volume as f64 * us_vol);
                 mesh_quality.push(s.mesh_quality);
 
                 meshed_total += 1;
@@ -1279,7 +1316,7 @@ mod python {
             out.set_item("drift_severity", PyList::new(py, drift_severity)?)?;
             out.set_item("aabb_volume_m3", PyList::new(py, aabb_volume)?)?;
             out.set_item("mesh_quality", PyList::new(py, mesh_quality)?)?;
-            out.set_item("unit_scale", unit_scale as f64)?;
+            out.set_item("unit_scale", idx.unit_scale.unwrap_or(1.0))?;
             // Use the SI-recomputed counts so file-level totals agree
             // with the per-row severity actually emitted (after the
             // world-coordinate-baked demotion, if any).
@@ -1339,35 +1376,12 @@ mod python {
 
     // ----- global shift (CloudCompare contract) ------------------------
 
-    /// Decide the model-wide global shift from the first geometry
-    /// product's f64 world origin. Returns the rounded origin (so far-
-    /// from-origin geometry is repositioned near the f32-precise origin)
-    /// only when the origin is genuinely large; otherwise `[0, 0, 0]` so
-    /// near-origin models keep absolute world coordinates unchanged.
-    ///
-    /// Threshold is in metres (origin scaled by `unit_scale`): 10 km.
-    /// Below it, f32 already represents the coordinate finely enough
-    /// (~1 mm quantum at 10 km) that no shift is warranted; above it
-    /// (UTM eastings/northings, mm-based georef at 1e8–1e9) geometry
-    /// collapses without the shift.
+    /// The model-wide global-shift rule lives in
+    /// [`crate::mesh::rebase::global_shift_for`] — one definition shared
+    /// by `extract_meshes`, `sample_point_cloud`, `write_gltf` and the
+    /// wasm streaming pass, so the four cannot drift apart.
     #[cfg(feature = "mesh")]
-    fn global_shift_for(world_origin: &[f64; 3], unit_scale: f32) -> [f64; 3] {
-        const THRESHOLD_M: f64 = 1.0e4;
-        let us = unit_scale as f64;
-        let max_m = world_origin
-            .iter()
-            .map(|c| (c * us).abs())
-            .fold(0.0_f64, f64::max);
-        if max_m > THRESHOLD_M {
-            [
-                world_origin[0].round(),
-                world_origin[1].round(),
-                world_origin[2].round(),
-            ]
-        } else {
-            [0.0, 0.0, 0.0]
-        }
-    }
+    use crate::mesh::rebase::global_shift_for;
 
     /// The product's `world_from_local` placement matrix as a flat
     /// **row-major** 16-float list (numpy: `np.array(p).reshape(4, 4)`),
@@ -1455,11 +1469,16 @@ mod python {
                 per_m2: f32,
                 seed: u64,
                 area_scale: f32,
-                // Linear-unit-to-metres factor. Sampled point COORDINATES
-                // are scaled by this so the output is always metres,
-                // matching mesh_qto's m²/m³ convention. Normals are
-                // direction vectors and stay unit-length (not scaled).
-                unit_scale: f32,
+                // Linear-unit-to-metres factor, f64 (GH #188): sampled
+                // point COORDINATES are scaled by this so the output is
+                // always metres, matching mesh_qto's m²/m³ convention,
+                // and the reported `global_shift` uses the same number so
+                // `point + global_shift` is the absolute coordinate.
+                // Normals are direction vectors and stay unit-length
+                // (not scaled). `area_scale` is a sampling *density*, not
+                // a coordinate cast, and stays f32 so point counts are
+                // unchanged.
+                unit_scale: f64,
                 // Model-wide global shift (CloudCompare contract), in model
                 // units. Set lazily from the first geometry product's f64
                 // world origin (rounded). Points are positioned as
@@ -1481,6 +1500,17 @@ mod python {
             }
 
             impl ProductSink for CloudSink {
+                /// GH #188: the model-level pin, decided from the
+                /// placement chains before any emission. Non-zero wins
+                /// over the first-emitted-anchor fallback below, which
+                /// only exists for files whose georeference is baked
+                /// into the representation geometry.
+                fn on_global_shift(&mut self, shift: [f64; 3]) {
+                    if shift != [0.0, 0.0, 0.0] {
+                        self.shift = Some(shift);
+                    }
+                }
+
                 fn on_product(&mut self, mut mesh: ProductMesh) {
                     // Area-weighted sampling walks every triangle — a
                     // synthetic ±20 000-unit half-space slab would soak up
@@ -1506,15 +1536,22 @@ mod python {
                     if n == 0 {
                         return;
                     }
-                    // Pin the model-wide shift to the first geometry product's
-                    // world origin (rounded to a clean model-unit value). All
-                    // later products subtract the same shift, so the relative
-                    // layout of the whole model is preserved while every point
-                    // stays near origin in f32. Threshold-gated like
-                    // CloudCompare: only shift when the origin is large enough
-                    // (>10 km in metres) to actually lose f32 precision, so
-                    // normal building models stay byte-identical (shift 0) and
-                    // return absolute world coordinates as before.
+                    // The model-wide shift, normally already set by
+                    // `on_global_shift` from the placement chains before
+                    // the first emission (GH #188). The fallback here
+                    // pins it from the first EMITTED product's precise
+                    // origin, which is what catches a file whose
+                    // georeference is baked into the representation
+                    // geometry rather than the placements. All products
+                    // subtract the same value, so the model's relative
+                    // layout is preserved while every point stays near
+                    // origin in f32. Threshold-gated like CloudCompare:
+                    // only shift when the origin is large enough (>10 km
+                    // in metres) to actually lose f32 precision, so
+                    // normal building models keep absolute world
+                    // coordinates (shift 0) — unchanged there up to the
+                    // f32 unit-factor correction, which is bit-identical
+                    // on metre files and ≤ 1 f32 ulp on millimetre ones.
                     let shift = *self.shift.get_or_insert_with(|| {
                         global_shift_for(&mesh.mesh_anchor, self.unit_scale)
                     });
@@ -1536,7 +1573,7 @@ mod python {
                     // then scale native-unit → metres. Local shape is near
                     // origin, `off` is small → no f32 collapse. Normals are
                     // direction vectors, copied through unchanged.
-                    let us = self.unit_scale as f64;
+                    let us = self.unit_scale;
                     self.x
                         .extend(cloud.x.iter().map(|v| ((*v as f64 + off[0]) * us) as f32));
                     self.y
@@ -1553,7 +1590,7 @@ mod python {
                 per_m2,
                 seed,
                 area_scale,
-                unit_scale,
+                unit_scale: idx.unit_scale.unwrap_or(1.0),
                 shift: None,
                 guid: Vec::new(),
                 entity: Vec::new(),
@@ -1584,12 +1621,12 @@ mod python {
             out.set_item("nx", PyList::new(py, &sink.nx)?)?;
             out.set_item("ny", PyList::new(py, &sink.ny)?)?;
             out.set_item("nz", PyList::new(py, &sink.nz)?)?;
-            out.set_item("unit_scale", unit_scale as f64)?;
+            out.set_item("unit_scale", idx.unit_scale.unwrap_or(1.0))?;
             // Global shift in METRES: add this back to (x, y, z) to recover
             // absolute world coordinates. `[0, 0, 0]` when the model has no
             // geometry or already sits near origin.
             let gs = sink.shift.unwrap_or([0.0, 0.0, 0.0]);
-            let us = unit_scale as f64;
+            let us = sink.unit_scale;
             out.set_item(
                 "global_shift",
                 PyList::new(py, [gs[0] * us, gs[1] * us, gs[2] * us])?,
@@ -1655,7 +1692,8 @@ mod python {
         per_m2: f32,
         seed: u64,
         area_scale: f32,
-        unit_scale: f32,
+        /// Linear-unit-to-metres factor, f64 — see `CloudSink` (GH #188).
+        unit_scale: f64,
         chunk_points: usize,
         shift: Option<[f64; 3]>,
         // Working buffer. Flushed (drained) when len >= chunk_points.
@@ -1683,7 +1721,7 @@ mod python {
         /// the buffer after `shift.get_or_insert_with`).
         fn flush(&mut self) {
             let shift = self.shift.expect("shift set before any flush");
-            let us = self.unit_scale as f64;
+            let us = self.unit_scale;
             let shift_m = [shift[0] * us, shift[1] * us, shift[2] * us];
             let chunk = CloudChunk {
                 guid: std::mem::take(&mut self.buf_guid),
@@ -1714,6 +1752,17 @@ mod python {
 
     #[cfg(feature = "mesh")]
     impl crate::mesh::ProductSink for StreamingCloudSink {
+        /// GH #188: the model-level pin, decided from the placement
+        /// chains before any emission. Non-zero wins over the
+        /// first-emitted-anchor fallback below, which only exists for
+        /// files whose georeference is baked into the representation
+        /// geometry.
+        fn on_global_shift(&mut self, shift: [f64; 3]) {
+            if shift != [0.0, 0.0, 0.0] {
+                self.shift = Some(shift);
+            }
+        }
+
         fn on_product(&mut self, mut mesh: crate::mesh::ProductMesh) {
             use crate::mesh::sample::sample as sample_mesh;
             if self.stop.load(std::sync::atomic::Ordering::Relaxed) {
@@ -1750,7 +1799,7 @@ mod python {
                 mesh.mesh_anchor[1] - shift[1],
                 mesh.mesh_anchor[2] - shift[2],
             ];
-            let us = self.unit_scale as f64;
+            let us = self.unit_scale;
             // Reserve to keep `extend` allocations bounded; cap at the
             // remaining-to-chunk-boundary count so a single huge product
             // doesn't briefly balloon the buffer past chunk_points.
@@ -1925,8 +1974,8 @@ mod python {
                         per_m2,
                         seed,
                         area_scale,
-                        unit_scale,
-                        chunk_points,
+                        unit_scale: idx.unit_scale.unwrap_or(1.0),
+                                chunk_points,
                         shift: None,
                         buf_guid: Vec::new(),
                         buf_entity: Vec::new(),
@@ -2042,7 +2091,13 @@ mod python {
             let unit_scale = idx.unit_scale.unwrap_or(1.0) as f32;
 
             struct MeshSink {
-                unit_scale: f32,
+                /// Linear-unit-to-metres factor, f64 (GH #188): the cast
+                /// to metres and the reported `global_shift` go through
+                /// the same number, so `vertex + global_shift` is the
+                /// absolute coordinate. `unit_scale_f32` feeds the cut
+                /// kernel's tolerances and the shift threshold only.
+                unit_scale: f64,
+                unit_scale_f32: f32,
                 cut_openings: bool,
                 // GH #127: emit representation-item-frame vertices verbatim
                 // (native units, no shift, no metre scaling) instead of the
@@ -2097,25 +2152,23 @@ mod python {
                             vbytes.extend_from_slice(&v.to_le_bytes());
                         }
                     } else {
+                        // Reposition local-frame shape to `local + off` (f64),
+                        // scale native-unit → metres, cast last. Far-from-origin
+                        // geometry stays precise: shape near origin, off small.
+                        // Shared with the glTF sink and the wasm passes — see
+                        // `mesh::rebase` (GH #188).
                         let shift = *self.shift.get_or_insert_with(|| {
                             global_shift_for(&mesh.mesh_anchor, self.unit_scale)
                         });
-                        let off = [
-                            mesh.mesh_anchor[0] - shift[0],
-                            mesh.mesh_anchor[1] - shift[1],
-                            mesh.mesh_anchor[2] - shift[2],
-                        ];
-                        // Reposition local-frame shape to `local + off` (f64),
-                        // scale native-unit → metres. Far-from-origin geometry
-                        // stays precise: shape near origin, off small.
-                        let us = self.unit_scale as f64;
-                        for chunk in mesh.vertices.as_chunks::<3>().0 {
-                            let x = ((chunk[0] as f64 + off[0]) * us) as f32;
-                            let y = ((chunk[1] as f64 + off[1]) * us) as f32;
-                            let z = ((chunk[2] as f64 + off[2]) * us) as f32;
-                            vbytes.extend_from_slice(&x.to_le_bytes());
-                            vbytes.extend_from_slice(&y.to_le_bytes());
-                            vbytes.extend_from_slice(&z.to_le_bytes());
+                        let mut pos: Vec<f32> = Vec::with_capacity(mesh.vertices.len());
+                        crate::mesh::rebase::shifted_world_positions(
+                            &mesh,
+                            &shift,
+                            self.unit_scale,
+                            &mut pos,
+                        );
+                        for v in &pos {
+                            vbytes.extend_from_slice(&v.to_le_bytes());
                         }
                     }
                     let mut ibytes = Vec::with_capacity(mesh.indices.len() * 4);
@@ -2141,6 +2194,22 @@ mod python {
             }
 
             impl ProductSink for MeshSink {
+                /// GH #188: the model-level pin, decided from the
+                /// placement chains before any emission. Non-zero wins
+                /// over the first-emitted-anchor fallback below, which
+                /// only exists for files whose georeference is baked
+                /// into the representation geometry.
+                ///
+                /// `frame="local"` declines it: that frame emits the
+                /// representation item's own coordinates in native
+                /// units, and its contract (GH #127) is `global_shift ==
+                /// [0, 0, 0]` — there is nothing to add back.
+                fn on_global_shift(&mut self, shift: [f64; 3]) {
+                    if !self.local_frame && shift != [0.0, 0.0, 0.0] {
+                        self.shift = Some(shift);
+                    }
+                }
+
                 fn on_product(&mut self, mut mesh: ProductMesh) {
                     // Skip geometryless products — no triangles to hand back.
                     if mesh.indices.is_empty() || mesh.vertices.is_empty() {
@@ -2158,7 +2227,8 @@ mod python {
                                 Routed::PassThrough(m) => mesh = m,
                             }
                         }
-                        let outcome = crate::mesh::cut_openings::apply(&mut mesh, self.unit_scale);
+                        let outcome =
+                            crate::mesh::cut_openings::apply(&mut mesh, self.unit_scale_f32);
                         self.bump_outcome(outcome);
                         // The cut may have emptied the mesh (cutter fully
                         // consumed the host); skip in that case.
@@ -2174,6 +2244,7 @@ mod python {
                     // (±20 000 model units — GH #66). Strip them unless the
                     // caller explicitly asked for reveal-all geometry.
                     let cut_applied = cfg!(feature = "csg") && self.cut_openings;
+                    // (the strip below is extent-based, frame-neutral)
                     if !cut_applied && !self.keep_cutters {
                         self.cutters_stripped +=
                             crate::mesh::strip_synthetic_cutters(&mut mesh) as u64;
@@ -2207,7 +2278,8 @@ mod python {
             };
 
             let mut sink = MeshSink {
-                unit_scale,
+                unit_scale: idx.unit_scale.unwrap_or(1.0),
+                unit_scale_f32: unit_scale,
                 cut_openings,
                 local_frame,
                 keep_cutters,
@@ -2242,7 +2314,7 @@ mod python {
             #[cfg(feature = "csg")]
             if let Some(mut cross) = sink.cross.take() {
                 let prism_table = prism_table_for_flush(&mmap);
-                for (folded, outcome) in cross.flush(sink.unit_scale, prism_table.as_ref()) {
+                for (folded, outcome) in cross.flush(sink.unit_scale_f32, prism_table.as_ref()) {
                     sink.bump_outcome(outcome);
                     if folded.indices.is_empty() || folded.vertices.is_empty() {
                         continue;
@@ -2281,8 +2353,9 @@ mod python {
             out.set_item("frame", frame)?;
             // Global shift in METRES — add back to vertices for absolute
             // world coords. `[0, 0, 0]` for near-origin or empty models.
+            // Same f64 factor the vertices were scaled by (GH #188).
             let gs = sink.shift.unwrap_or([0.0, 0.0, 0.0]);
-            let us = unit_scale as f64;
+            let us = sink.unit_scale;
             out.set_item(
                 "global_shift",
                 PyList::new(py, [gs[0] * us, gs[1] * us, gs[2] * us])?,
@@ -2503,8 +2576,9 @@ mod python {
                 // Encode absolute world coords in metres as f64 (full precision —
                 // no global shift). Absolute = (local + mesh_anchor) * unit_scale,
                 // the same identity extract_meshes' shifted-frame encode reduces
-                // to when its model-wide shift is added back.
-                let us = unit_scale as f64;
+                // to when its model-wide shift is added back — which only holds
+                // because both use the f64 unit factor (GH #188).
+                let us = idx.unit_scale.unwrap_or(1.0);
                 let anchor = mesh.mesh_anchor;
                 for chunk in mesh.vertices.as_chunks::<3>().0 {
                     let x = (chunk[0] as f64 + anchor[0]) * us;
@@ -2550,7 +2624,12 @@ mod python {
     /// positions per node) still applies.
     ///
     /// Returns a small dict of stats: `products_meshed`,
-    /// `products_emitted`, `cut_openings_*` counts, output file size.
+    /// `products_emitted`, `cut_openings_*` counts, output file size,
+    /// and `global_shift` — `[Sx, Sy, Sz]` in METRES (GH #188). glTF
+    /// positions are *shifted* world metres; add `global_shift` back per
+    /// vertex for absolute world coordinates. It is `[0, 0, 0]` for
+    /// near-origin models, and the GLB carries the same three numbers in
+    /// `asset.extras.ifcfast.global_shift` so the file self-describes.
     #[cfg(feature = "mesh")]
     #[pyfunction]
     #[pyo3(signature = (path, out_path, cut_openings = false, per_product_materials = true))]
@@ -2581,36 +2660,49 @@ mod python {
             /// Accumulating sink: collects every `ProductMesh` into a
             /// `Vec`, optionally routing cross-product void hosts and
             /// in-rep cut applies through the same dispatcher
-            /// `extract_meshes` uses, then scales world-baked vertices
-            /// from model units to metres so the glTF writer sees a
-            /// metres-everywhere contract.
+            /// `extract_meshes` uses, then repositions the Local-frame
+            /// vertices into shifted world metres so the glTF writer
+            /// sees the same metres-everywhere contract `m.meshes()`
+            /// ships.
             struct GltfSink {
                 products: Vec<ProductMesh>,
                 cut_openings: bool,
-                unit_scale: f32,
+                /// Metres per model unit as the indexer read it — f64,
+                /// deliberately not `unit_scale as f64`. 0.001 is not
+                /// representable in f32, and the 4.75e-8 relative error
+                /// is 4 mm in X / 59 mm in Y at NTM magnitudes: exactly
+                /// the absolute coordinate `vertex + global_shift` is
+                /// supposed to reconstruct (GH #188). The f32 copy stays
+                /// for the cut kernel, whose tolerances are local-scale.
+                unit_scale: f64,
+                unit_scale_f32: f32,
+                /// Model-wide global shift (CloudCompare contract), model
+                /// units — pinned from the first emitted product's f64
+                /// `mesh_anchor`, exactly as `extract_meshes` pins its
+                /// `global_shift`. `None` until the first product with
+                /// geometry arrives.
+                shift: Option<[f64; 3]>,
                 cut_stats: crate::mesh::cut_stats::CutOpeningsStats,
                 #[cfg(feature = "csg")]
                 cross: Option<crate::mesh::cut_openings::CrossProductCut>,
             }
 
             impl GltfSink {
-                /// Scale a world-baked product's vertices from model
-                /// units into metres so the glTF emitter sees the same
-                /// metres-everywhere contract `m.meshes()` ships. Also
-                /// rebases against the model's f64 mesh_anchor so the
-                /// f32 vertex stream stays precise for far-from-origin
-                /// (georeferenced) geometry. The output is appended
-                /// to `self.products`.
+                /// Reposition a Local-frame product into shifted world
+                /// metres (GH #188): `(local + (mesh_anchor - shift)) *
+                /// unit_scale`, all in f64 with the f32 cast last. A
+                /// World-frame bake would have cast at the absolute
+                /// magnitude — 8 mm / 128 mm lattice on an NTM-
+                /// georeferenced millimetre model. The output is
+                /// appended to `self.products`.
                 fn push_scaled(&mut self, mut mesh: ProductMesh) {
                     if mesh.indices.is_empty() || mesh.vertices.is_empty() {
                         return;
                     }
-                    let us = self.unit_scale as f64;
-                    for chunk in mesh.vertices.as_chunks_mut::<3>().0 {
-                        chunk[0] = (chunk[0] as f64 * us) as f32;
-                        chunk[1] = (chunk[1] as f64 * us) as f32;
-                        chunk[2] = (chunk[2] as f64 * us) as f32;
-                    }
+                    let shift = *self
+                        .shift
+                        .get_or_insert_with(|| global_shift_for(&mesh.mesh_anchor, self.unit_scale));
+                    crate::mesh::rebase::shift_world_in_place(&mut mesh, &shift, self.unit_scale);
                     self.products.push(mesh);
                 }
 
@@ -2621,6 +2713,17 @@ mod python {
             }
 
             impl ProductSink for GltfSink {
+                /// GH #188: the model-level pin, decided from the
+                /// placement chains before any emission. Non-zero wins
+                /// over the first-emitted-anchor fallback below, which
+                /// only exists for files whose georeference is baked
+                /// into the representation geometry.
+                fn on_global_shift(&mut self, shift: [f64; 3]) {
+                    if shift != [0.0, 0.0, 0.0] {
+                        self.shift = Some(shift);
+                    }
+                }
+
                 fn on_product(&mut self, mut mesh: ProductMesh) {
                     #[cfg(feature = "csg")]
                     if self.cut_openings {
@@ -2631,7 +2734,8 @@ mod python {
                                 Routed::PassThrough(m) => mesh = m,
                             }
                         }
-                        let outcome = crate::mesh::cut_openings::apply(&mut mesh, self.unit_scale);
+                        let outcome =
+                            crate::mesh::cut_openings::apply(&mut mesh, self.unit_scale_f32);
                         self.bump_outcome(outcome);
                     }
                     #[cfg(not(feature = "csg"))]
@@ -2664,29 +2768,34 @@ mod python {
             let mut sink = GltfSink {
                 products: Vec::new(),
                 cut_openings,
-                unit_scale,
+                unit_scale: idx.unit_scale.unwrap_or(1.0),
+                unit_scale_f32: unit_scale,
+                shift: None,
                 cut_stats: crate::mesh::cut_stats::CutOpeningsStats::default(),
                 #[cfg(feature = "csg")]
                 cross,
             };
 
             let t_mesh = Instant::now();
-            // World frame so the glTF writer can compute per-product
-            // AABBs directly from `mesh.vertices`. The kernel already
-            // applies the model-wide global shift to prevent far-from-
-            // origin f32 collapse internally.
+            // Local (QTO) bake + per-product f64 reposition in
+            // `push_scaled` — the `extract_meshes` recipe, and the only
+            // one that survives a georeferenced millimetre model
+            // (GH #188). The writer still gets one world-metres frame,
+            // so its per-product AABBs come straight off `mesh.vertices`.
             let mesh_stats = py.detach(|| {
-                crate::mesh::mesh_ifc_streaming_framed(&mmap, &mut sink, BakeFrame::World)
+                crate::mesh::mesh_ifc_streaming_framed(&mmap, &mut sink, BakeFrame::Local)
             });
 
             // Cross-product flush — fold buffered hosts with their
             // arrived openings, run the result through `push_scaled`.
-            // `None`: this is a `BakeFrame::World` pass, so the host
-            // mesh is in world coordinates — the near-origin prism
-            // result would not align. Manifold fold only here.
+            // The prism table is passed exactly as `extract_meshes`
+            // passes it: this is a Local-frame pass, so the near-origin
+            // prism fast-path aligns with the host mesh and the fold is
+            // the same one the batch mesh path takes.
             #[cfg(feature = "csg")]
             if let Some(mut cross) = sink.cross.take() {
-                for (folded, outcome) in cross.flush(sink.unit_scale, None) {
+                let prism_table = prism_table_for_flush(&mmap);
+                for (folded, outcome) in cross.flush(sink.unit_scale_f32, prism_table.as_ref()) {
                     sink.bump_outcome(outcome);
                     sink.push_scaled(folded);
                 }
@@ -2696,9 +2805,22 @@ mod python {
             // Cut-applied meshes have geometry diverging from any
             // shared rep — disable instancing in that case so each
             // wall keeps its own cut.
+            // Global shift in METRES — what the writer records in
+            // `asset.extras.ifcfast.global_shift` and what the caller
+            // gets back as the `global_shift` stat. `[0, 0, 0]` for
+            // near-origin models and for a file with no geometry.
+            let shift_model = sink.shift.unwrap_or([0.0, 0.0, 0.0]);
+            let us = sink.unit_scale;
+            let global_shift_m = [
+                shift_model[0] * us,
+                shift_model[1] * us,
+                shift_model[2] * us,
+            ];
             let options = crate::mesh::gltf::WriteOptions {
                 instancing: !cut_openings,
                 per_product_materials,
+                global_shift: global_shift_m,
+                unit_scale: us,
             };
 
             let t_write = Instant::now();
@@ -2730,6 +2852,11 @@ mod python {
             out.set_item("cut_openings", cut_openings)?;
             set_cut_openings_stats(&out, &sink.cut_stats)?;
             out.set_item("instancing", options.instancing)?;
+            // Baked + instanced positions are shifted world metres; add
+            // this back per vertex for absolute world coordinates. The
+            // GLB self-describes the same value under
+            // `asset.extras.ifcfast.global_shift` (GH #188).
+            out.set_item("global_shift", PyList::new(py, global_shift_m)?)?;
             Ok(out)
         })
     }

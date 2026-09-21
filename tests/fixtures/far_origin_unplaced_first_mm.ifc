@@ -1,0 +1,98 @@
+ISO-10303-21;
+HEADER;
+FILE_DESCRIPTION(('ViewDefinition [ReferenceView]'),'2;1');
+FILE_NAME('far_origin_unplaced_first_mm.ifc','2026-09-21T09:00:00',(''),(''),'ifcfast test fixture','ifcfast test fixture','');
+FILE_SCHEMA(('IFC4'));
+ENDSEC;
+DATA;
+/* GH #188 — the far-origin gate with an UNPLACED product first.
+
+   `far_origin_duct_mm.ifc` with one product added: #18, an
+   IfcBuildingElementProxy whose ObjectPlacement is `$` and whose body is
+   a small box at the representation origin. It has the lowest step id of
+   any product, so it is the FIRST product the mesh pass emits.
+
+   A `$` (or cyclic, or IfcGridPlacement) placement resolves to identity
+   — see `finalize_work` in mesh/mod.rs — so this product's world origin
+   and mesh_anchor are [0,0,0]. A global shift pinned from the first
+   EMITTED product therefore reads [0,0,0] on a file that is 1 247 km
+   from the origin, and every product after it gets encoded at absolute
+   f32 magnitude: #188 in full, silently, with nothing in the output
+   saying so.
+
+   The shift is pinned from the placement chains of ALL products before
+   the first emission instead, so this file must still report
+   [92519.899, 1247315.537, 127.25] on every surface and the ducts must
+   still come back round. */
+
+/* --- the unplaced first product --------------------------------- */
+
+/* GH #188 — the far-origin precision gate for round MEP.
+
+   MILLIMETRE units with the site placement at a Norwegian NTM
+   georeference, #30 = (92200000., 1247000000., 0.) — the numbers from
+   the KNM_RIV report. At that magnitude the f32 ulp is 8 mm in X and
+   128 mm in Y, so a World-frame (absolute f32) bake quantises a
+   Oe400 duct wall onto a lattice coarser than the wall itself: the
+   circle wobbles +-4 mm and one face in ten collapses to zero area.
+   A near-origin fixture cannot catch that — there the shift is
+   [0, 0, 0] and every path agrees.
+
+   Two IfcDuctSegments share ONE IfcProductDefinitionShape (#48), so
+   the glTF writer groups them into an EXT_mesh_gpu_instancing node and
+   the instanced translation path is exercised alongside the baked one.
+
+   Geometry: IfcExtrudedAreaSolid over IfcArbitraryProfileDefWithVoids,
+   both loops IfcIndexedPolyCurve + two IfcArcIndex semicircles —
+   outer r = 200.0 mm, inner r = 198.0 mm, depth 7386.5 mm. */
+#1=IFCPROJECT('3Kx7pQ9nT4wu1gYaZbCd00',$,'Far Origin Duct',$,$,$,$,(#10),#8);
+#2=IFCSIUNIT(*,.LENGTHUNIT.,.MILLI.,.METRE.);
+#3=IFCSIUNIT(*,.AREAUNIT.,$,.SQUARE_METRE.);
+#4=IFCSIUNIT(*,.VOLUMEUNIT.,$,.CUBIC_METRE.);
+#8=IFCUNITASSIGNMENT((#2,#3,#4));
+#5=IFCCARTESIANPOINT((0.,0.,0.));
+#6=IFCDIRECTION((0.,0.,1.));
+#7=IFCDIRECTION((1.,0.,0.));
+#9=IFCAXIS2PLACEMENT3D(#5,#6,#7);
+#10=IFCGEOMETRICREPRESENTATIONCONTEXT($,'Model',3,1.E-05,#9,$);
+#11=IFCGEOMETRICREPRESENTATIONSUBCONTEXT('Body','Model',*,*,*,*,#10,$,.MODEL_VIEW.,$);
+#12=IFCSITE('1AbCdEfGhIjKlMnOpQrSt0',$,'Site',$,$,#32,$,$,.ELEMENT.,$,$,$,$,$);
+#13=IFCBUILDING('2AbCdEfGhIjKlMnOpQrSt0',$,'Building',$,$,#33,$,$,.ELEMENT.,$,$,$);
+#14=IFCBUILDINGSTOREY('3AbCdEfGhIjKlMnOpQrSt0',$,'Level 0',$,$,#34,$,$,.ELEMENT.,127.25);
+#15=IFCRELAGGREGATES('0RelAggProjSite000000_',$,$,$,#1,(#12));
+#16=IFCRELAGGREGATES('0RelAggSiteBldg000000_',$,$,$,#12,(#13));
+#17=IFCRELAGGREGATES('0RelAggBldgStry000000_',$,$,$,#13,(#14));
+#18=IFCCARTESIANPOINT((0.,0.));
+#19=IFCAXIS2PLACEMENT2D(#18,$);
+#20=IFCRECTANGLEPROFILEDEF(.AREA.,$,#19,2000.,3000.);
+#21=IFCEXTRUDEDAREASOLID(#20,#9,#6,4000.);
+#22=IFCSHAPEREPRESENTATION(#11,'Body','SweptSolid',(#21));
+#23=IFCPRODUCTDEFINITIONSHAPE($,$,(#22));
+#24=IFCBUILDINGELEMENTPROXY('0UnplacedFirstProd00__',$,'Unplaced Box',$,$,$,#23,$,$);
+/* --- placements ------------------------------------------------- */
+#30=IFCCARTESIANPOINT((92200000.,1247000000.,0.));
+#31=IFCAXIS2PLACEMENT3D(#30,#6,#7);
+#32=IFCLOCALPLACEMENT($,#31);
+#33=IFCLOCALPLACEMENT(#32,#9);
+#34=IFCLOCALPLACEMENT(#33,#9);
+#35=IFCCARTESIANPOINT((319899.3,315537.2,127250.));
+#36=IFCAXIS2PLACEMENT3D(#35,#6,#7);
+#37=IFCLOCALPLACEMENT(#34,#36);
+#38=IFCCARTESIANPOINT((321899.3,315537.2,127250.));
+#39=IFCAXIS2PLACEMENT3D(#38,#6,#7);
+#40=IFCLOCALPLACEMENT(#34,#39);
+/* --- the shared duct profile + body ----------------------------- */
+#41=IFCCARTESIANPOINTLIST2D(((200.,0.),(0.,200.),(-200.,0.),(0.,-200.)));
+#42=IFCINDEXEDPOLYCURVE(#41,(IFCARCINDEX((1,2,3)),IFCARCINDEX((3,4,1))),.F.);
+#43=IFCCARTESIANPOINTLIST2D(((198.,0.),(0.,198.),(-198.,0.),(0.,-198.)));
+#44=IFCINDEXEDPOLYCURVE(#43,(IFCARCINDEX((1,2,3)),IFCARCINDEX((3,4,1))),.F.);
+#45=IFCARBITRARYPROFILEDEFWITHVOIDS(.AREA.,'DuctWall',#42,(#44));
+#46=IFCEXTRUDEDAREASOLID(#45,#9,#6,7386.5);
+#47=IFCSHAPEREPRESENTATION(#11,'Body','SweptSolid',(#46));
+#48=IFCPRODUCTDEFINITIONSHAPE($,$,(#47));
+/* --- the two products ------------------------------------------- */
+#50=IFCDUCTSEGMENT('1VluSltEX0WftNcGXN68O9',$,'Duct A',$,$,#37,#48,$,$);
+#51=IFCDUCTSEGMENT('1VluSltEX0WftNcGXN68P0',$,'Duct B',$,$,#40,#48,$,$);
+#52=IFCRELCONTAINEDINSPATIALSTRUCTURE('0RelContStryDucts0000_',$,$,$,(#24,#50,#51),#14);
+ENDSEC;
+END-ISO-10303-21;

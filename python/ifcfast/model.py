@@ -1100,6 +1100,17 @@ class Model:
               — mesh-pass counters (GH #166); ``by_source`` maps each
               representation kind to a count and lists what could not
               be tessellated as ``"unhandled:IFCXXX"``
+            * ``global_shift`` — ``[Sx, Sy, Sz]`` in METRES (GH #188).
+              glTF positions are *shifted* world metres, like
+              ``m.meshes()``: add this back per vertex for absolute
+              world coordinates. ``[0, 0, 0]`` for every model within
+              10 km of the origin, so near-origin files are unchanged.
+              The ``.glb`` carries the same three numbers in
+              ``asset.extras.ifcfast.global_shift``, so a consumer that
+              only has the file can still recover the frame. Without the
+              shift a georeferenced millimetre model (NTM: x ~ 9.2e7 mm,
+              y ~ 1.25e9 mm) quantises onto the f32 lattice there —
+              8 mm / 128 mm — and round MEP renders as a wobbling cage.
 
         Example::
 

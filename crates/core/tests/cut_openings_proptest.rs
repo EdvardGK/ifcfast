@@ -152,6 +152,7 @@ fn build_pair_product_mesh(host: &Box3, cutter: &Box3) -> ProductMesh {
     let parts = vec![
         InstancePart {
             rep_step_id: 1,
+            anchor: [0.0; 3],
             instance_transform: identity_mat4_cols(),
             local_vertices: Vec::new(),
             local_indices: Vec::new(),
@@ -162,6 +163,7 @@ fn build_pair_product_mesh(host: &Box3, cutter: &Box3) -> ProductMesh {
         },
         InstancePart {
             rep_step_id: 2,
+            anchor: [0.0; 3],
             instance_transform: identity_mat4_cols(),
             local_vertices: Vec::new(),
             local_indices: Vec::new(),

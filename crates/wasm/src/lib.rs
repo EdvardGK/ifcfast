@@ -213,9 +213,16 @@ impl IfcModel {
         // The writer needs the retained meshes, which only the batch
         // pass keeps — a streamed model released them product by product.
         self.inner.ensure_meshes();
+        // The retained meshes are shifted world metres (GH #188); the
+        // writer needs the shift both to self-describe the frame in
+        // `asset.extras.ifcfast.global_shift` and to place instanced
+        // nodes, and `unit_scale` because `parts[].local_vertices` —
+        // what an instance group shares — are still in native units.
         let options = WriteOptions {
             instancing: instancing.unwrap_or(true),
             per_product_materials: per_product_materials.unwrap_or(true),
+            global_shift: self.inner.stream_shift_m,
+            unit_scale: self.inner.unit_scale_f64,
         };
         // `write_with_options` takes a slice of owned meshes, so the
         // clone is confined to what is actually emitted. Empty meshes are
@@ -266,7 +273,9 @@ impl IfcModel {
     /// builds instead of waiting for one baked GLB.
     ///
     ///   * `positions` — `Float32Array`, world METRES minus
-    ///     [`IfcModel::stream_shift_json`]. A **copy** into JS memory,
+    ///     [`IfcModel::stream_shift_json`], repositioned from the Local
+    ///     bake in f64 so a georeferenced millimetre model keeps its
+    ///     round MEP round (GH #188). A **copy** into JS memory,
     ///     not a view: a view into the wasm heap would be detached by the
     ///     next allocation the pass makes, and the callback is free to
     ///     keep (or transfer) what it is handed.
@@ -321,14 +330,31 @@ impl IfcModel {
             .map_err(|m| JsError::new(&m))
     }
 
-    /// `[sx, sy, sz]` in METRES — the model-wide global shift the
-    /// streamed positions were reduced by. Add it back for absolute world
-    /// coordinates. `[0, 0, 0]` before the stream starts and for every
-    /// model within 10 km of the origin; same rule (and same value) as
-    /// `_core.extract_meshes`' `global_shift`.
+    /// `[sx, sy, sz]` in METRES — the model-wide global shift every
+    /// position handed out was reduced by. Add it back for absolute world
+    /// coordinates.
+    ///
+    /// Valid after **either** mesh pass: `streamMeshes()` positions and
+    /// the `toGlb()` GLB share one value, and any surface that triggers
+    /// the batch pass (`graphJson` / `qtoJson` / `statsJson` / `toGlb`)
+    /// pins it too. `[0, 0, 0]` before any mesh pass has run and for
+    /// every model within 10 km of the origin; same rule (and same
+    /// value) as `_core.extract_meshes`' `global_shift` and
+    /// `m.to_gltf()`'s `global_shift` stat.
+    ///
+    /// A near-origin model cannot exercise this — there the shift is
+    /// zero and every frame agrees (GH #188).
     #[wasm_bindgen(js_name = streamShiftJson)]
     pub fn stream_shift_json(&self) -> String {
         let s = self.inner.stream_shift_m;
         format!("[{},{},{}]", s[0], s[1], s[2])
+    }
+
+    /// Frame-neutral alias for [`IfcModel::stream_shift_json`] — the
+    /// same three metres, for callers that never streamed (`toGlb` /
+    /// `qtoJson` pin it just as well). Both names stay.
+    #[wasm_bindgen(js_name = shiftJson)]
+    pub fn shift_json(&self) -> String {
+        self.stream_shift_json()
     }
 }

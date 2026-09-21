@@ -42,8 +42,153 @@ function check(label, ok, detail = '') {
   console.log(`${ok ? 'PASS' : 'FAIL'}  ${label}${detail ? `  — ${detail}` : ''}`);
 }
 
+function summarise() {
+  const failed = results.filter((r) => !r.ok);
+  console.log(`\n${results.length - failed.length}/${results.length} checks passed`);
+  process.exit(failed.length ? 1 : 0);
+}
+
+function glbJson(b) {
+  const dv = new DataView(b.buffer, b.byteOffset, b.byteLength);
+  if (dv.getUint32(0, true) !== 0x46546c67) throw new Error('not a GLB');
+  const jsonLen = dv.getUint32(12, true);
+  return JSON.parse(Buffer.from(b.buffer, b.byteOffset + 20, jsonLen).toString('utf8'));
+}
+
+// ---------------------------------------------------------------------
+// far-origin precision (GH #188) — in-repo fixture, always runs
+// ---------------------------------------------------------------------
+//
+// `far_origin_duct_mm.ifc` is a millimetre model on a Norwegian NTM site
+// placement (x ~ 9.2e7 mm, y ~ 1.25e9 mm), where the f32 ulp is 8 mm and
+// 128 mm. Two IfcDuctSegments share one extruded annulus, outer
+// r = 200 mm. Streamed in the World frame that circle came back with a
+// 105 mm radius spread; the Local bake + f64 reposition holds it under
+// 0.05 mm. The Duplex gate below cannot catch this — near-origin models
+// have a zero shift and every frame agrees.
+
+const FAR_NAME = 'far_origin_duct_mm.ifc';
+const farBytes = fs.readFileSync(path.join(repo, 'tests/fixtures', FAR_NAME));
+// Placement chain, metres: site (92200000, 1247000000, 0) mm + duct
+// (319899.3, 315537.2, 127250) mm; duct B 2000 mm east.
+const FAR_AXIS = {
+  '1VluSltEX0WftNcGXN68O9': [92519.8993, 1247315.5372],
+  '1VluSltEX0WftNcGXN68P0': [92521.8993, 1247315.5372],
+};
+
+const far = IfcModel.fromBytes(farBytes, FAR_NAME);
+const farBatches = [];
+far.streamMeshes(8, (metaJson, positions, indices, _p) => {
+  farBatches.push({ meta: JSON.parse(metaJson), positions, indices });
+});
+const farShift = JSON.parse(far.streamShiftJson());
+
+check(
+  'far-origin: streamShiftJson() reports the georeference (not [0,0,0])',
+  Array.isArray(farShift) && farShift.length === 3
+    && Math.abs(farShift[0] - 92519.899) < 1e-6
+    && Math.abs(farShift[1] - 1247315.537) < 1e-6,
+  JSON.stringify(farShift),
+);
+check(
+  'far-origin: shiftJson() is the same value under the neutral name',
+  far.shiftJson() === far.streamShiftJson(),
+  far.shiftJson(),
+);
+
+let farErr = '';
+let farSeen = 0;
+let worstSpread = 0;
+for (const b of farBatches) {
+  for (const row of b.meta) {
+    const axis = FAR_AXIS[row.guid];
+    if (!axis) { farErr ||= `unexpected guid ${row.guid}`; continue; }
+    let rMin = Infinity;
+    let rMax = -Infinity;
+    let outer = 0;
+    for (let v = row.v0; v < row.v0 + row.vn; v++) {
+      const x = b.positions[v * 3] + farShift[0];
+      const y = b.positions[v * 3 + 1] + farShift[1];
+      const r = Math.hypot(x - axis[0], y - axis[1]) * 1000;
+      if (r > 199.5) { outer++; rMin = Math.min(rMin, r); rMax = Math.max(rMax, r); }
+    }
+    if (outer < 32) farErr ||= `${row.guid}: only ${outer} outer-loop vertices`;
+    const spread = rMax - rMin;
+    worstSpread = Math.max(worstSpread, spread);
+    if (!(spread < 0.05)) {
+      farErr ||= `${row.guid}: outer radius spread ${spread.toFixed(4)} mm (mean ~${rMax.toFixed(4)})`;
+    }
+    farSeen++;
+  }
+}
+if (farSeen !== 2) farErr ||= `${farSeen} duct segments streamed, expected 2`;
+check(
+  'far-origin: streamed Ø400 duct stays round (radius spread < 0.05 mm)',
+  !farErr,
+  farErr || `worst spread ${worstSpread.toFixed(5)} mm over ${farSeen} ducts`,
+);
+
+// GH #188 review item 1: the same file with a `$`-placement product
+// FIRST. A `$` placement resolves to identity, so that product anchors
+// at the origin; a shift pinned from the first EMITTED product would
+// read [0,0,0] here and quantise every duct after it.
+const unplaced = IfcModel.fromBytes(
+  fs.readFileSync(path.join(repo, 'tests/fixtures', 'far_origin_unplaced_first_mm.ifc')),
+  'far_origin_unplaced_first_mm.ifc',
+);
+const unplacedMeta = [];
+unplaced.streamMeshes(8, (metaJson, positions, _i, _p) => {
+  for (const row of JSON.parse(metaJson)) unplacedMeta.push({ row, positions });
+});
+const unplacedShift = JSON.parse(unplaced.streamShiftJson());
+check(
+  'far-origin: an unplaced FIRST product does not zero the shift',
+  Math.abs(unplacedShift[0] - 92519.899) < 1e-6
+    && Math.abs(unplacedShift[1] - 1247315.537) < 1e-6,
+  `${JSON.stringify(unplacedShift)} over ${unplacedMeta.length} products, first = ${unplacedMeta[0]?.row.guid}`,
+);
+let unplacedErr = '';
+if (unplacedMeta[0]?.row.guid !== '0UnplacedFirstProd00__') {
+  unplacedErr = `first streamed product is ${unplacedMeta[0]?.row.guid}, fixture has lost its teeth`;
+}
+for (const { row, positions } of unplacedMeta) {
+  const axis = FAR_AXIS[row.guid];
+  if (!axis) continue;
+  let rMin = Infinity;
+  let rMax = -Infinity;
+  for (let v = row.v0; v < row.v0 + row.vn; v++) {
+    const r = Math.hypot(
+      positions[v * 3] + unplacedShift[0] - axis[0],
+      positions[v * 3 + 1] + unplacedShift[1] - axis[1],
+    ) * 1000;
+    if (r > 199.5) { rMin = Math.min(rMin, r); rMax = Math.max(rMax, r); }
+  }
+  if (!(rMax - rMin < 0.05)) unplacedErr ||= `${row.guid}: spread ${(rMax - rMin).toFixed(4)} mm`;
+}
+check('far-origin: ducts stay round behind the unplaced product', !unplacedErr, unplacedErr);
+unplaced.free();
+
+const farGlb = glbJson(far.toGlb(true, true));
+const farExtras = ((farGlb.asset.extras ?? {}).ifcfast ?? {}).global_shift;
+check(
+  'far-origin: toGlb() self-describes the same shift in asset.extras',
+  Array.isArray(farExtras) && farExtras.length === 3
+    && farExtras.every((v, i) => Math.abs(v - farShift[i]) < 1e-9),
+  JSON.stringify(farExtras),
+);
+far.free();
+
+// ---------------------------------------------------------------------
+// the Duplex stream contract — needs a sample that is not in the repo
+// ---------------------------------------------------------------------
+
 const NAME = 'Duplex_A_20110907.ifc';
-const bytes = fs.readFileSync(path.join(SAMPLES, NAME));
+const DUPLEX = path.join(SAMPLES, NAME);
+if (!fs.existsSync(DUPLEX)) {
+  console.log(`SKIP  Duplex stream contract — ${path.relative(repo, DUPLEX)} not present`);
+  summarise();
+}
+const bytes = fs.readFileSync(DUPLEX);
 const BATCH = 64;
 
 // ---------------------------------------------------------------------
@@ -57,13 +202,6 @@ const tV1Mesh = performance.now() - tV1Mesh0;
 const v1Graph = JSON.parse(v1.graphJson());
 const v1Stats = JSON.parse(v1.statsJson());
 const v1Glb = glbJson(v1.toGlb(true, false));
-
-function glbJson(b) {
-  const dv = new DataView(b.buffer, b.byteOffset, b.byteLength);
-  if (dv.getUint32(0, true) !== 0x46546c67) throw new Error('not a GLB');
-  const jsonLen = dv.getUint32(12, true);
-  return JSON.parse(Buffer.from(b.buffer, b.byteOffset + 20, jsonLen).toString('utf8'));
-}
 
 // ---------------------------------------------------------------------
 // the stream
@@ -325,6 +463,4 @@ console.log(
 m.free();
 v1.free();
 
-const failed = results.filter((r) => !r.ok);
-console.log(`\n${results.length - failed.length}/${results.length} checks passed`);
-process.exit(failed.length ? 1 : 0);
+summarise();

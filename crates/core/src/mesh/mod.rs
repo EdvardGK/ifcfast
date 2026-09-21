@@ -42,6 +42,7 @@ pub mod polygon_bool;
 pub mod prism_csg;
 pub mod profile;
 pub mod qto;
+pub mod rebase;
 pub mod revolved;
 pub mod sample;
 pub mod stats;
@@ -233,6 +234,20 @@ pub struct InstancePart {
     /// step_id of the source representation item — shared across every
     /// instance pointing to the same `IfcRepresentationMap`.
     pub rep_step_id: u64,
+    /// Precise (f64) world position of THIS fragment's local origin —
+    /// `world_f64 * instance_transform * rep_origin`, the same quantity
+    /// [`ProductMesh::mesh_anchor`] holds for the product's *first*
+    /// fragment.
+    ///
+    /// The two are usually equal and often both zero. They differ when a
+    /// fragment that carries vertices but no triangles comes first (a
+    /// point-only `IfcGeometricCurveSet`, a degenerate handler): it pins
+    /// `mesh_anchor` and pushes no part, so `parts[0]` is anchored
+    /// somewhere else. A consumer that positions `parts[i]`'s geometry
+    /// in f64 — the glTF instanced path — must use this field;
+    /// `mesh_anchor` is the `Local` bake's frame origin, not a per-part
+    /// one (GH #188).
+    pub anchor: [f64; 3],
     /// `t_target * t_origin` from `IfcMappedItem`, identity for direct
     /// geometry. Column-major 4x4 (glam `Mat4` layout).
     pub instance_transform: [f32; 16],
@@ -387,6 +402,14 @@ pub struct MeshStats {
     pub products_emitted_geometryless: usize,
     pub triangles: usize,
     pub by_source: HashMap<String, usize>,
+    /// Model-wide global shift in MODEL UNITS, decided once per pass
+    /// before the first emission — see [`ProductSink::on_global_shift`].
+    /// `[0, 0, 0]` for a near-origin model, and also for a model whose
+    /// georeference is baked into representation geometry rather than
+    /// placements (there the sink's first-emitted-anchor fallback
+    /// supplies the value instead, so this field is not a substitute
+    /// for what the sink was told).
+    pub global_shift: [f64; 3],
     pub elapsed_ms: f64,
     pub entity_table_build_ms: f64,
 }
@@ -401,6 +424,38 @@ pub struct MeshStats {
 /// `Vec<ProductMesh>` did, and we're back at OOM on 1 GB files.
 pub trait ProductSink {
     fn on_product(&mut self, mesh: ProductMesh);
+
+    /// The model-wide global shift, in MODEL UNITS, handed to the sink
+    /// **once, before the first [`ProductSink::on_product`]** (GH #188).
+    ///
+    /// It is decided from the resolved placement chain of every product
+    /// in the file — the rounded world origin of the lowest-step-id
+    /// product that sits further than 10 km from the origin — so it does
+    /// not depend on which product a given consumer happens to emit
+    /// first. That matters twice over:
+    ///
+    /// * a product with `$`, cyclic or `IfcGridPlacement` placement
+    ///   resolves to identity (see the `finalize_work` comment), so its
+    ///   `mesh_anchor` is the origin. Pinning from the first *emitted*
+    ///   product would then return `[0, 0, 0]` on a georeferenced model
+    ///   and encode everything after it at absolute `f32` magnitude —
+    ///   GH #188 in full, silently;
+    /// * the paths emit different first products (the glTF sink
+    ///   suppresses openings and holds void hosts for a later flush; the
+    ///   point-cloud sink skips products that sample to zero points), so
+    ///   a first-emitted rule cannot give one number per model.
+    ///
+    /// `[0, 0, 0]` means "no placement in this file is far enough out to
+    /// warrant a shift". A sink must then keep its own fallback: pin
+    /// from the first emitted product's `mesh_anchor`, which is what
+    /// catches a file whose georeference is baked into the
+    /// representation geometry rather than the placement (GH #116
+    /// facesets, GH #153 breps) — there every placement is identity and
+    /// only the geometry knows where the model is.
+    ///
+    /// Default: ignore it. Sinks that never hand out world coordinates
+    /// (the QTO sink, the substrate writer) have nothing to do here.
+    fn on_global_shift(&mut self, _shift_model_units: [f64; 3]) {}
 
     /// Whether this sink also wants emissions for products that produce
     /// no body geometry (no `Representation`, no body items, or every
@@ -446,8 +501,16 @@ impl ProductSink for VecSink {
 /// around 1 GB IFC on 16 GB hosts. For bounded-RAM analysis use
 /// [`mesh_ifc_streaming`] with a streaming sink (e.g. Parquet writer).
 pub fn mesh_ifc(buf: &[u8]) -> (Vec<ProductMesh>, MeshStats) {
+    mesh_ifc_framed(buf, BakeFrame::World)
+}
+
+/// [`mesh_ifc`] with an explicit [`BakeFrame`]. Every batch consumer that
+/// hands out world coordinates or measures geometry wants
+/// [`BakeFrame::Local`] plus [`rebase`] — see the `World` variant's doc
+/// for why (GH #188).
+pub fn mesh_ifc_framed(buf: &[u8], frame: BakeFrame) -> (Vec<ProductMesh>, MeshStats) {
     let mut sink = VecSink::default();
-    let stats = mesh_ifc_streaming(buf, &mut sink);
+    let stats = mesh_ifc_streaming_framed(buf, &mut sink, frame);
     (sink.products, stats)
 }
 
@@ -458,8 +521,13 @@ pub fn mesh_ifc(buf: &[u8]) -> (Vec<ProductMesh>, MeshStats) {
 /// Coordinate frame the mesher bakes vertices into.
 ///
 /// - `World`: vertices are full world coordinates (`world * local`). The
-///   default, used by OBJ/glTF/drift/substrate consumers that want
-///   absolute placement.
+///   default, used by OBJ/substrate consumers that want absolute
+///   placement. **The `f32` cast happens at the absolute magnitude**, so
+///   on a georeferenced millimetre model (NTM: `x ~ 9.2e7`,
+///   `y ~ 1.25e9`) the vertex lattice is 8 mm / 128 mm and round MEP
+///   disintegrates — GH #117, GH #188. Any consumer that hands world
+///   coordinates to a caller wants `Local` + [`rebase`] instead; only
+///   pass `World` when a genuinely absolute `f32` frame is the contract.
 /// - `Local`: vertices carry the object's *shape* in a near-origin
 ///   frame — the linear (rotation/scale) part of the placement is
 ///   applied but the large world *translation* is dropped, with each
@@ -662,6 +730,40 @@ pub fn mesh_ifc_streaming_framed<S: ProductSink>(
     // `placement_cache` Arc drops when phase 1c finishes — no longer
     // needed once every Work has its baked world matrix.
     drop(placement_cache);
+
+    // Phase 1d: decide the model-wide global shift and tell the sink,
+    // BEFORE the first product is emitted (GH #188). Every product's
+    // world origin is already resolved at this point, so this is one
+    // linear scan over `work` — no second parse, no extra placement
+    // resolution.
+    //
+    // Rule: the rounded world origin of the lowest-step-id product that
+    // sits further than 10 km from the origin. Lowest step id rather
+    // than `work` order because `work` follows the entity table's order
+    // and the parallel phases may not preserve it; the pin has to be a
+    // property of the file, not of the scheduler. Products without
+    // geometry count — the shift only has to land near the model, and
+    // including them makes the value independent of which products a
+    // given sink emits.
+    //
+    // `[0, 0, 0]` when nothing qualifies, which leaves the sink's
+    // first-emitted-anchor fallback to handle the files whose
+    // georeference lives in the representation geometry instead of the
+    // placements.
+    let shift_unit_scale = profile::length_scale(&table) as f64;
+    let mut shift_pin: Option<(u64, [f64; 3])> = None;
+    for w in &work {
+        let candidate = rebase::global_shift_for(&w.world_origin, shift_unit_scale);
+        if candidate == [0.0, 0.0, 0.0] {
+            continue;
+        }
+        if shift_pin.is_none_or(|(sid, _)| w.step_id < sid) {
+            shift_pin = Some((w.step_id, candidate));
+        }
+    }
+    let model_shift = shift_pin.map(|(_, c)| c).unwrap_or([0.0, 0.0, 0.0]);
+    stats.global_shift = model_shift;
+    sink.on_global_shift(model_shift);
 
     // Phase 2 + 3 (interleaved): bounded ordered channel between
     // parallel tessellation workers and the serial drain. Workers send
@@ -916,6 +1018,22 @@ fn tessellate_one(
                         local.rep_origin[2],
                     );
                     let precise_anchor_f64 = effective_f64.transform_point3(rep_origin_f64);
+                    // The product anchor is the FIRST fragment's — it
+                    // defines the `Local` bake frame, so it cannot be
+                    // chosen by any later criterion without moving every
+                    // vertex. A fragment that carries vertices but no
+                    // triangles (point-only `IfcGeometricCurveSet`,
+                    // degenerate handler) therefore still pins it, and
+                    // still contributes to `combined_v` and the product
+                    // bbox, exactly as before.
+                    //
+                    // What such a fragment does NOT do is push an
+                    // `InstancePart` — it never reaches the
+                    // `seg_index_count > 0` guard below. So `mesh_anchor`
+                    // and `parts[0]` can be anchored at different points,
+                    // and a consumer that places `parts[i]`'s own geometry
+                    // must use `parts[i].anchor` (GH #188 review — the
+                    // glTF instanced path does).
                     let _ = mesh_anchor_f64.get_or_insert(precise_anchor_f64);
                     // Per-frame affine bake map. Every frame bakes as
                     // `v = bake_linear.transform_vector3(p) + bake_translation`
@@ -1054,6 +1172,14 @@ fn tessellate_one(
                             ));
                         parts.push(InstancePart {
                             rep_step_id,
+                            // This fragment's own f64 anchor — not the
+                            // product's, which the first fragment pinned
+                            // even if it pushed no part (GH #188).
+                            anchor: [
+                                precise_anchor_f64.x,
+                                precise_anchor_f64.y,
+                                precise_anchor_f64.z,
+                            ],
                             instance_transform: part_transform.to_cols_array(),
                             local_vertices: local.vertices,
                             local_indices: local.indices,

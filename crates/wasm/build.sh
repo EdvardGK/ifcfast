@@ -37,21 +37,24 @@ ls -l "$out"
 # Node gates. `IFCFAST_WASM_SKIP_TESTS=1` opts out entirely.
 #
 # limits.mjs (the GH #175 zip-bomb guard) builds its own archives from
-# `tests/fixtures/minimal.ifc`, so it runs on a clean checkout. parity
-# and stream need `.local-samples/Duplex_A_20110907.ifc` (not in the
-# repo); those are skipped with a note when it is absent.
+# `tests/fixtures/minimal.ifc`, so it runs on a clean checkout. So does
+# stream.mjs's far-origin section (GH #188), which uses the in-repo
+# `tests/fixtures/far_origin_duct_mm.ifc`; the rest of stream.mjs and
+# all of parity.mjs need `.local-samples/Duplex_A_20110907.ifc` (not in
+# the repo) and are skipped with a note when it is absent.
 if [[ "${IFCFAST_WASM_SKIP_TESTS:-0}" == "1" ]]; then
   echo "==> tests skipped (IFCFAST_WASM_SKIP_TESTS=1)"
 else
   echo "==> node test/limits.mjs"
   node "$here/test/limits.mjs"
 
+  echo "==> node test/stream.mjs"
+  node "$here/test/stream.mjs"
+
   if [[ ! -f "$root/.local-samples/Duplex_A_20110907.ifc" ]]; then
-    echo "==> parity/stream skipped — .local-samples/Duplex_A_20110907.ifc not present"
+    echo "==> parity skipped — .local-samples/Duplex_A_20110907.ifc not present"
   else
     echo "==> node test/parity.mjs"
     node "$here/test/parity.mjs"
-    echo "==> node test/stream.mjs"
-    node "$here/test/stream.mjs"
   fi
 fi
