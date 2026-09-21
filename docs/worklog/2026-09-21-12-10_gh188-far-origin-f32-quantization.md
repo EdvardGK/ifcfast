@@ -74,3 +74,18 @@ implementer's test caught it; per-part `anchor` field instead.
 - #170 32-segment ceiling binds on Ø2500 (6 mm sagitta) — separate
   issue if tester reports it.
 - ifcfast-site pushed `ef2f72d` (wasm + sidecars) → Vercel deploy.
+
+## Addendum — CI red on `72b0f95`, fixed `11353b1`
+
+- rust-lint: rustfmt diffs (5 files) — `cargo fmt --all`.
+- macOS pytest: the far-origin duct gate failed with spread 0.077 mm,
+  mean 200.6066. Decoded as 16 + 17 chords on the two `IfcArcIndex`
+  semicircles (200·arc_area_scale(π,16)=200.644, (π,17)=200.571 →
+  mean 200.606, spread 0.073 ✓). Apple libm f32 `atan2` returns π+1 ulp
+  for an exact semicircle; `ceil(delta/step)` → 17. Tessellation was
+  platform-dependent before this session; the new gate exposed it.
+- Fix: `profile::chord_count(x) = ceil(x − 1e-4)` at all three
+  segment-count sites. A/B vs 0.5.2: RIV identical, ARK 10/12 221 move
+  ~1e-6 (boundary arcs, one fewer chord, volume analytic). wasm gates
+  5/5, 22/22, 18/18. Site wasm re-synced `ec53a08`.
+- Branch end sha now `11353b1`; worklog commit follows.
