@@ -7,6 +7,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.3] - 2026-09-21
+
+### Fixed — geometry precision (GH #188 #189 #190, cache schema v34)
+
+- **Huge-radius trimmed arcs no longer become full circles (GH #190).**
+  A Geometry Gym IFC2X3 export authors near-straight beam-profile edges
+  as `IfcTrimmedCurve` segments on `IfcCircle`s of 6 500–16 000 km
+  radius. Two defects: the "coincident trims → full revolution" rule in
+  `arc_span` used an absolute 1e-6 rad epsilon, so a 6 m chord sweeping
+  9.7e-7 rad was promoted to the whole 41 000 km circle (five beams
+  meshed to 13 000–32 000 km with `volume_reliable = True`); and the
+  conic path sampled `centre + R·cos t` in `f32`, where the ulp at a
+  6.2e6 m centre is 0.5 m, so every arc on a circle over ~10 km radius
+  landed up to ~1 m off its neighbouring polyline vertex — a silent
+  QTO error on ~75 more beams in the same file (one read 0.455 m³
+  against an ifcopenshell 1.319 m³). The trimmed-conic path is now
+  `f64` end-to-end with a 1e-9 rad coincidence rule; chord count and
+  sector-area scale are unchanged so ordinary arcs keep their segment
+  count. Oracle gate: `IfcBeam` class ratio on the repro model
+  2.7e19 → 1.0000; 80 of 851 products moved, all carrying a trimmed
+  conic, none more than 0.5 % from the oracle afterwards; zero
+  per-class drift on four G55 models. Regression fixture is the repro
+  profile chain verbatim.
+- **glTF: all-instanced files declare `KHR_mesh_quantization` (GH #189).**
+  The extension was gated on the baked-mesh count only, so a file where
+  every product landed in an `EXT_mesh_gpu_instancing` group shipped u16
+  positions with no declaration in `extensionsUsed` /
+  `extensionsRequired`. Strict loaders may have rejected such files.
+- **Far-origin f32 quantization in the World-frame consumers (GH #188).**
+  wasm `streamMeshes` / `toGlb`, `m.to_gltf()` and `m.drift` cast to
+  `f32` at absolute magnitude and subtracted the global shift after the
+  cast, so a millimetre model on a Norwegian NTM placement came back on
+  an 8 mm / 128 mm lattice (a Ø400 duct wobbled ±4.4 mm with 9–13 % of
+  faces at zero area) while `m.meshes()` was already right. All
+  World-frame consumers now bake Local and rebase in `f64` through one
+  `mesh::rebase`; the model-level shift is pinned before the first
+  product is emitted (lowest-step-id product beyond 10 km) instead of
+  from the first emitted product, whose grid placement could zero the
+  shift for the whole model. glTF instanced TRS translation comes from
+  the `f64` `InstancePart.anchor`, which also fixes instanced nodes
+  1000× out on non-metre files. `m.drift` reports in the Local frame.
+  Arc chord counts are platform-independent (`profile::chord_count`
+  absorbs the last-ulp `atan2` difference on macOS libm).
+- Cache: `_CACHE_SCHEMA_VERSION` 32 → 34 (33 for #188, 34 for #190;
+  wasm mirrored). CI: mmap-only source tests gated, `crossbeam-epoch`
+  bumped for RUSTSEC-2026-0204.
+
 ## [0.5.2] - 2026-09-18
 
 ### Fixed — tester-issue sweep (GH #177 #178 #179 #180 #183, cache schema v32)
@@ -1779,6 +1826,7 @@ for the trail and rename table.
   IFCs from Skiplum projects (issue #1).
 - Warm-cache speedup vs `ifcopenshell.open()`: 59-678× on production files.
 
+[0.5.3]: https://github.com/EdvardGK/ifcfast/releases/tag/v0.5.3
 [0.5.2]: https://github.com/EdvardGK/ifcfast/releases/tag/v0.5.2
 [0.5.1]: https://github.com/EdvardGK/ifcfast/releases/tag/v0.5.1
 [0.5.0]: https://github.com/EdvardGK/ifcfast/releases/tag/v0.5.0
