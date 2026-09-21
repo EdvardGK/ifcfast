@@ -956,12 +956,14 @@ fn build_json(
     //   - EXT_mesh_gpu_instancing: declared whenever ≥1 instance group
     //     exists. Required because without it the viewer would
     //     silently render each shared mesh at its local origin.
-    //   - KHR_mesh_quantization: declared whenever ≥1 baked mesh
-    //     exists (always, on real files). Required because the
+    //   - KHR_mesh_quantization: declared whenever ≥1 baked mesh OR
+    //     ≥1 instance group exists (GH #189 — the instanced path's
+    //     shared local mesh is quantized too, via
+    //     `pack_one_local_quantized`). Required because the
     //     position accessors are u16 — a viewer that doesn't know
     //     to apply node.translation + node.scale would render
     //     geometry in [0, 65535]³, several km from origin.
-    let want_quant = n_baked > 0;
+    let want_quant = n_baked > 0 || n_groups > 0;
     let want_instancing = n_groups > 0;
     if want_quant || want_instancing {
         s.push_str(r#""extensionsUsed":["#);
@@ -1863,5 +1865,141 @@ mod far_origin_instancing_tests {
         let (bin, layout) = pack_binary(&meshes, &plan, &options);
         let t = read_vec3(&bin, &layout.instanced[0].translation, 0);
         assert_eq!(t, [3.0, 4.0, 5.0]);
+    }
+}
+
+/// GH #189: `pack_one_local_quantized` (the instanced path's shared
+/// local mesh) packs POSITION as normalized u16 just like the baked
+/// path does, so `want_quant` must not gate on `n_baked` alone — an
+/// all-instanced file (no baked products at all) still needs
+/// `KHR_mesh_quantization` in `extensionsUsed`/`extensionsRequired`.
+#[cfg(test)]
+mod quantization_extension_tests {
+    use super::*;
+    use crate::mesh::{InstancePart, ProductMesh};
+
+    const IDENTITY: [f32; 16] = [
+        1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+    ];
+
+    /// A unit cube whose single fragment points at rep 7. Two of these
+    /// (below) share the rep and clear `INSTANCE_THRESHOLD`, so they
+    /// form one `EXT_mesh_gpu_instancing` group with zero baked
+    /// products in the plan.
+    fn instanced_cube(guid: &str) -> ProductMesh {
+        let local: Vec<f32> = vec![
+            0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 1.0, 0.0,
+            1.0, 1.0, 1.0, 1.0, 0.0, 1.0, 1.0,
+        ];
+        let indices: Vec<u32> = vec![
+            0, 2, 1, 0, 3, 2, 4, 5, 6, 4, 6, 7, 0, 1, 5, 0, 5, 4, 1, 2, 6, 1, 6, 5, 2, 3, 7, 2, 7,
+            6, 3, 0, 4, 3, 4, 7,
+        ];
+        ProductMesh {
+            guid: guid.into(),
+            entity: "IfcWall".into(),
+            ifc_id: 1,
+            vertices: local.clone(),
+            indices: indices.clone(),
+            source: "extrusion",
+            segments: Vec::new(),
+            placement_origin: [0.0; 3],
+            parts: vec![InstancePart {
+                rep_step_id: 7,
+                anchor: [0.0; 3],
+                instance_transform: IDENTITY,
+                local_vertices: local,
+                local_indices: indices,
+                index_start: 0,
+                index_count: 36,
+                source: "extrusion".into(),
+                surface_color: None,
+            }],
+            world_transform: IDENTITY,
+            world_origin: [0.0; 3],
+            mesh_anchor: [0.0; 3],
+            surface_color: None,
+            bounded_halfspaces: Vec::new(),
+        }
+    }
+
+    /// Values of a top-level JSON array-of-strings key, e.g.
+    /// `"extensionsUsed":["A","B"]` -> `["A", "B"]`. Empty if the key
+    /// is absent (both extension arrays are omitted together when
+    /// neither is wanted).
+    fn string_array(json: &str, key: &str) -> Vec<String> {
+        let needle = format!(r#""{key}":["#);
+        let Some(pos) = json.find(&needle) else {
+            return Vec::new();
+        };
+        let start = pos + needle.len();
+        let end = json[start..].find(']').unwrap() + start;
+        if json[start..end].is_empty() {
+            return Vec::new();
+        }
+        json[start..end]
+            .split(',')
+            .map(|s| s.trim_matches('"').to_string())
+            .collect()
+    }
+
+    #[test]
+    fn all_instanced_file_declares_quantization_extension() {
+        // Two products sharing one identical representation (rep 7) and
+        // no baked mesh at all.
+        let meshes = [
+            instanced_cube("0AAAAAAAAAAAAAAAAAAAAA"),
+            instanced_cube("0BBBBBBBBBBBBBBBBBBBBB"),
+        ];
+        let options = WriteOptions {
+            instancing: true,
+            ..WriteOptions::default()
+        };
+        let plan = Plan::classify(&meshes, options.instancing);
+        assert!(
+            plan.baked.is_empty(),
+            "fixture must produce zero baked products"
+        );
+        assert_eq!(plan.instanced.len(), 1, "both cubes share rep 7");
+
+        let mut buf = Vec::new();
+        write_with_options(&meshes, &options, &mut buf).unwrap();
+        let json_len = u32::from_le_bytes(buf[12..16].try_into().unwrap()) as usize;
+        let json = String::from_utf8(buf[20..20 + json_len].to_vec()).unwrap();
+
+        let used = string_array(&json, "extensionsUsed");
+        let required = string_array(&json, "extensionsRequired");
+        assert!(
+            used.iter().any(|s| s == "KHR_mesh_quantization"),
+            "extensionsUsed must declare quantization for an all-instanced file: {used:?}"
+        );
+        assert!(
+            required.iter().any(|s| s == "KHR_mesh_quantization"),
+            "extensionsRequired must declare quantization for an all-instanced file: {required:?}"
+        );
+        assert!(used.iter().any(|s| s == "EXT_mesh_gpu_instancing"));
+    }
+
+    #[test]
+    fn baked_only_file_still_declares_quantization_extension() {
+        // Pre-existing behaviour, guarded against regressing while
+        // fixing the instanced-only gap above: a product with no
+        // rep-sharing partner goes down the baked path (parts.len() !=
+        // 1 after clearing `parts`) and must still declare the
+        // extension.
+        let mut m = instanced_cube("0CCCCCCCCCCCCCCCCCCCCC");
+        m.parts.clear();
+        let meshes = [m];
+        let options = WriteOptions::default();
+        let plan = Plan::classify(&meshes, options.instancing);
+        assert_eq!(plan.baked.len(), 1);
+        assert!(plan.instanced.is_empty());
+
+        let mut buf = Vec::new();
+        write_with_options(&meshes, &options, &mut buf).unwrap();
+        let json_len = u32::from_le_bytes(buf[12..16].try_into().unwrap()) as usize;
+        let json = String::from_utf8(buf[20..20 + json_len].to_vec()).unwrap();
+        let used = string_array(&json, "extensionsUsed");
+        assert!(used.iter().any(|s| s == "KHR_mesh_quantization"));
     }
 }
