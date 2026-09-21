@@ -371,7 +371,17 @@ describing via `pq.read_schema(...)`):
   2–4× fewer triangles on MEP-heavy models and a uniform +0.64 % on
   circular-profile volumes versus v30; every circular product
   re-extracts. A file with no resolvable `LENGTHUNIT` samples at the
-  full 32 (unchanged output).
+  full 32 (unchanged output). **GH #190 (cache schema v34):** trimmed
+  conic arcs are resolved and sampled in `f64` and the "coincident
+  trims → full revolution" rule is now 1e-9 rad, not 1e-6. A Geometry
+  Gym export authors near-straight profile edges as `IfcTrimmedCurve`
+  segments on circles of 6 500–16 000 km radius; a 6 m chord there
+  sweeps under 1e-6 rad, so the old rule promoted it to the full circle
+  (beams meshed to 13 000–32 000 km with `volume_reliable = True`), and
+  `f32` sampling at that centre distance put every such arc's endpoints
+  up to ~1 m off its neighbouring polyline vertices. Ordinary arcs keep
+  the same chord count and area scale; only profiles with a trimmed
+  conic re-extract, and only huge-radius ones move visibly.
 - Semantic payload: `materials`, `psets`, `quantities`,
   `classifications` (list-of-struct columns — `UNNEST` in DuckDB).
   Each `psets` and `quantities` struct carries `source`
@@ -1667,7 +1677,11 @@ range/65535, the runtime reconstructs world coords as `translation
 denorm is baked into each per-instance TRS via
 `(T, R, S) := (T_inst + R_inst*(S_inst⊙T_quant), R_inst, S_inst⊙S_quant)`
 so the instanced node carries no local TRS and the per-instance
-TRS goes straight from u16 to world. Quantization error is
+TRS goes straight from u16 to world. The extension is declared in
+`extensionsUsed` / `extensionsRequired` whenever the file holds a
+baked mesh **or** an instanced group; before v0.5.3 an all-instanced
+file shipped u16 positions with no declaration (GH #189), which strict
+loaders may reject. Quantization error is
 ±range/131070 — for a 1 m-spanning mesh that's ±15 μm, well under
 the precision an IFC-authored model carries anyway. Combined size
 savings on real files: LBK_RIBp_C 118.5 MB → 56 MB (52% smaller,

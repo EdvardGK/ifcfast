@@ -17,7 +17,7 @@
 //! version ([`arc_area_scale`]) so a Revit pipe authored as two
 //! semicircles is exact too; only 3D directrix arcs stay on the curve.
 
-use glam::{Mat3, Vec2, Vec3};
+use glam::{DVec2, Mat3, Vec2, Vec3};
 
 use crate::entity_table::EntityTable;
 use crate::lexer::{parse_field, parse_ref_list, split_top_level_args, Field};
@@ -526,15 +526,15 @@ fn trimmed_curve_2d(table: &EntityTable, fields: &[&[u8]]) -> Option<Vec<Vec2>> 
     let basis_fields = split_top_level_args(basis_args);
     if basis_type.eq_ignore_ascii_case(b"IFCCIRCLE") {
         // (Position, Radius)
-        let radius = number_at(&basis_fields, 1)? as f32;
+        let radius = number_at(&basis_fields, 1)?;
         if !(radius.is_finite() && radius > 0.0) {
             return None;
         }
         conic_arc(table, fields, &basis_fields, radius, radius)
     } else if basis_type.eq_ignore_ascii_case(b"IFCELLIPSE") {
         // (Position, SemiAxis1, SemiAxis2)
-        let a = number_at(&basis_fields, 1)? as f32;
-        let b = number_at(&basis_fields, 2)? as f32;
+        let a = number_at(&basis_fields, 1)?;
+        let b = number_at(&basis_fields, 2)?;
         if !(a.is_finite() && a > 0.0 && b.is_finite() && b > 0.0) {
             return None;
         }
@@ -551,22 +551,30 @@ fn trimmed_curve_2d(table: &EntityTable, fields: &[&[u8]]) -> Option<Vec<Vec2>> 
 /// (equal for a circle); the trim parameters are angles in the conic's local
 /// frame. Shared by the circle and ellipse basis paths of
 /// [`trimmed_curve_2d`].
+///
+/// The whole path is f64 (GH #190) and casts to `Vec2` only for the output
+/// points. Geometry Gym exports near-straight beam edges as arcs on circles
+/// of radius 6.5e6–1.6e7 m centred millions of metres away: at 6.5e6 the f32
+/// ulp is 0.5 m, so `centre + R·cos(t)` in f32 landed the arc's endpoints up
+/// to ~1 m off the neighbouring polyline vertices of the same profile. The
+/// chord count and the sector-area scale stay on the f32 rounding path so
+/// ordinary arcs keep their existing tessellation exactly.
 fn conic_arc(
     table: &EntityTable,
     fields: &[&[u8]],
     basis_fields: &[&[u8]],
-    a: f32,
-    b: f32,
+    a: f64,
+    b: f64,
 ) -> Option<Vec<Vec2>> {
     let (center, ref_dir) = match basis_fields.first().copied().map(parse_field) {
-        Some(Field::Ref(pid)) => placement2d_origin_dir(table, pid),
-        _ => (Vec2::ZERO, Vec2::X),
+        Some(Field::Ref(pid)) => placement2d_origin_dir_f64(table, pid),
+        _ => (DVec2::ZERO, DVec2::X),
     };
     // Radians per authored PARAMETER trim unit. Resolved once per arc — only
     // trimmed conic profiles (a rare curved-wall case) pay for the unit walk;
     // the thousands of ordinary products never reach here.
-    let pa = resolve_plane_angle_scale(table);
-    let semi = Vec2::new(a, b);
+    let pa = resolve_plane_angle_scale(table) as f64;
+    let semi = DVec2::new(a, b);
     let a1 = trim_angle(table, fields.get(1).copied(), center, ref_dir, semi, pa)?;
     let a2 = trim_angle(table, fields.get(2).copied(), center, ref_dir, semi, pa)?;
     let sense = matches!(
@@ -576,24 +584,26 @@ fn conic_arc(
     let (start, end) = arc_span(a1, a2, sense)?;
     let sweep = (end - start).abs();
     // Segments per full turn from the larger semi-axis (GH #170), scaled
-    // by the swept angle.
-    let per_turn = circle_samples(a.abs().max(b.abs()), length_scale(table));
-    let n = chord_count((per_turn as f32) * sweep / std::f32::consts::TAU).max(2);
+    // by the swept angle. Deliberately the same f32 rounding as before the
+    // f64 move, so no ordinary arc changes its chord count.
+    let per_turn = circle_samples(a.abs().max(b.abs()) as f32, length_scale(table));
+    let sweep32 = sweep as f32;
+    let n = chord_count((per_turn as f32) * sweep32 / std::f32::consts::TAU).max(2);
     // Sector-area-preserving radius (see `arc_area_scale`): the profile's
     // volume no longer depends on the chord count. The ellipse is the
     // affine image of the circle, so the same factor on both semi-axes
     // preserves its sector area too.
-    let k = arc_area_scale(sweep, n);
+    let k = arc_area_scale(sweep32, n) as f64;
     let (a, b) = (a * k, b * k);
     let (cos, sin) = (ref_dir.x, ref_dir.y);
     let pts = (0..=n)
         .map(|i| {
-            let t = start + (end - start) * (i as f32 / n as f32);
+            let t = start + (end - start) * (i as f64 / n as f64);
             let lx = a * t.cos();
             let ly = b * t.sin();
             Vec2::new(
-                center.x + cos * lx - sin * ly,
-                center.y + sin * lx + cos * ly,
+                (center.x + cos * lx - sin * ly) as f32,
+                (center.y + sin * lx + cos * ly) as f32,
             )
         })
         .collect();
@@ -642,14 +652,19 @@ fn trimmed_line_2d(
 /// recovered — a no-op for a circle where `semi.x == semi.y`); otherwise
 /// reads an `IfcParameterValue` and scales it by `pa` (radians per authored
 /// plane-angle unit, from [`resolve_plane_angle_scale`]).
+///
+/// f64 throughout (GH #190): `p - center` is a catastrophic cancellation for
+/// a far-origin conic (a 6 m chord on a circle centred 6.5e6 m away), and in
+/// f32 the recovered angle was quantized to ~1e-7 rad — the whole sweep of a
+/// near-straight Geometry Gym arc.
 fn trim_angle(
     table: &EntityTable,
     field: Option<&[u8]>,
-    center: Vec2,
-    ref_dir: Vec2,
-    semi: Vec2,
-    pa: f32,
-) -> Option<f32> {
+    center: DVec2,
+    ref_dir: DVec2,
+    semi: DVec2,
+    pa: f64,
+) -> Option<f64> {
     let body = match parse_field(field?) {
         Field::List(b) => b,
         _ => return None,
@@ -658,7 +673,7 @@ fn trim_angle(
     for sel in split_top_level_args(body) {
         match parse_field(sel) {
             Field::Ref(pid) => {
-                if let Some(p) = cartesian_point_2d(table, pid) {
+                if let Some(p) = cartesian_point_2d_f64(table, pid) {
                     // Un-rotate the world point into the conic's local frame,
                     // then divide out the semi-axes so an ellipse recovers its
                     // parameter t (identity for a circle).
@@ -676,7 +691,7 @@ fn trim_angle(
             }
         }
     }
-    param.map(|v| (v as f32) * pa)
+    param.map(|v| v * pa)
 }
 
 /// Resolve one `IfcTrimmingSelect` to a line parameter `u` (a dimensionless
@@ -936,9 +951,19 @@ pub(crate) fn resolve_plane_angle_scale_opt(table: &EntityTable) -> Option<f32> 
 /// ~1.3e8 (TAU is below the f32 ULP there, so `e` stops advancing) and
 /// hangs outright on an infinite or NaN trim angle. The modular form
 /// below is O(1) and total.
-fn arc_span(a1: f32, a2: f32, sense: bool) -> Option<(f32, f32)> {
-    use std::f32::consts::TAU;
-    const EPS: f32 = 1e-6;
+///
+/// `EPS` is the "coincident trims → full revolution" threshold, and it is
+/// an *absolute angular* epsilon, which is the wrong unit for a sweep on a
+/// huge circle: GH #190's Geometry Gym beams trim circles of radius
+/// 6.5e6 m, where the old `EPS = 1e-6` rad is 6.5 m of arc — the entire
+/// real edge. Six such arcs in one file were promoted to full 41 000 km
+/// circles. 1e-9 rad keeps the behaviour (authored `(0, 2π)` and `(a, a)`
+/// still give a full turn) while sitting far below any real arc: f64 trim
+/// angles recovered from authored parameters, or from cartesian points
+/// quoted to 1e-8, carry only ~1e-14 rad of noise.
+fn arc_span(a1: f64, a2: f64, sense: bool) -> Option<(f64, f64)> {
+    use std::f64::consts::TAU;
+    const EPS: f64 = 1e-9;
     if !a1.is_finite() || !a2.is_finite() {
         return None;
     }
@@ -992,6 +1017,37 @@ fn circle_curve_2d(table: &EntityTable, fields: &[&[u8]]) -> Option<Vec<Vec2>> {
         })
         .collect();
     Some(pts)
+}
+
+/// f64 twin of [`placement2d_origin_dir`], for the trimmed-conic path
+/// (GH #190) — a far-origin centre must survive as f64 all the way to the
+/// sampling loop.
+fn placement2d_origin_dir_f64(table: &EntityTable, pid: u64) -> (DVec2, DVec2) {
+    let (type_name, args) = match table.get(pid) {
+        Some(x) => x,
+        None => return (DVec2::ZERO, DVec2::X),
+    };
+    if !type_name.eq_ignore_ascii_case(b"IFCAXIS2PLACEMENT2D") {
+        return (DVec2::ZERO, DVec2::X);
+    }
+    let pf = split_top_level_args(args);
+    let loc = pf
+        .first()
+        .copied()
+        .and_then(|f| match parse_field(f) {
+            Field::Ref(p) => cartesian_point_2d_f64(table, p),
+            _ => None,
+        })
+        .unwrap_or(DVec2::ZERO);
+    let dir = pf
+        .get(1)
+        .copied()
+        .and_then(|f| match parse_field(f) {
+            Field::Ref(d) => direction_2d_f64(table, d),
+            _ => None,
+        })
+        .unwrap_or(DVec2::X);
+    (loc, dir)
 }
 
 /// Extract `(location, ref_direction)` from an `IfcAxis2Placement2D`.
@@ -1133,6 +1189,29 @@ fn list_body(field: Option<&[u8]>) -> Option<&[u8]> {
     }
 }
 
+/// f64 twin of [`cartesian_point_2d`] (GH #190).
+fn cartesian_point_2d_f64(table: &EntityTable, id: u64) -> Option<DVec2> {
+    let (type_name, args) = table.get(id)?;
+    if !type_name.eq_ignore_ascii_case(b"IFCCARTESIANPOINT") {
+        return None;
+    }
+    let fields = split_top_level_args(args);
+    let body = match parse_field(fields.first()?) {
+        Field::List(b) => b,
+        _ => return None,
+    };
+    let coords: Vec<f64> = split_top_level_args(body)
+        .into_iter()
+        .filter_map(|f| match parse_field(f) {
+            Field::Number(n) => Some(n),
+            _ => None,
+        })
+        .collect();
+    let x = *coords.first().unwrap_or(&0.0);
+    let y = *coords.get(1).unwrap_or(&0.0);
+    Some(DVec2::new(x, y))
+}
+
 fn cartesian_point_2d(table: &EntityTable, id: u64) -> Option<Vec2> {
     let (type_name, args) = table.get(id)?;
     if !type_name.eq_ignore_ascii_case(b"IFCCARTESIANPOINT") {
@@ -1210,6 +1289,29 @@ fn apply_profile_position(table: &EntityTable, fields: &[&[u8]], poly: Polygon2D
             .map(|h| h.into_iter().map(map).collect())
             .collect(),
     }
+}
+
+/// f64 twin of [`direction_2d`] (GH #190), normalized.
+fn direction_2d_f64(table: &EntityTable, id: u64) -> Option<DVec2> {
+    let (type_name, args) = table.get(id)?;
+    if !type_name.eq_ignore_ascii_case(b"IFCDIRECTION") {
+        return None;
+    }
+    let fields = split_top_level_args(args);
+    let body = match parse_field(fields.first()?) {
+        Field::List(b) => b,
+        _ => return None,
+    };
+    let ratios: Vec<f64> = split_top_level_args(body)
+        .into_iter()
+        .filter_map(|f| match parse_field(f) {
+            Field::Number(n) => Some(n),
+            _ => None,
+        })
+        .collect();
+    let x = *ratios.first().unwrap_or(&1.0);
+    let y = *ratios.get(1).unwrap_or(&0.0);
+    Some(DVec2::new(x, y).normalize_or_zero())
 }
 
 fn direction_2d(table: &EntityTable, id: u64) -> Option<Vec2> {
@@ -1341,7 +1443,7 @@ END-ISO-10303-21;
     /// GH #160: `arc_span` is modular and total.
     #[test]
     fn arc_span_is_modular_and_total() {
-        use std::f32::consts::{PI, TAU};
+        use std::f64::consts::{PI, TAU};
         let (s, e) = arc_span(0.0, PI, true).unwrap();
         assert!((s - 0.0).abs() < 1e-5 && (e - PI).abs() < 1e-5);
         // Coincident trims → a full turn, in both senses.
@@ -1356,11 +1458,40 @@ END-ISO-10303-21;
         let (_, e) = arc_span(0.0, PI, false).unwrap();
         assert!((e + PI).abs() < 1e-4, "got {e}");
         // Non-finite input is rejected, never looped on.
-        assert!(arc_span(f32::INFINITY, 0.0, true).is_none());
-        assert!(arc_span(0.0, f32::NAN, true).is_none());
+        assert!(arc_span(f64::INFINITY, 0.0, true).is_none());
+        assert!(arc_span(0.0, f64::NAN, true).is_none());
         // A huge angle terminates (the old `while e += TAU` never did:
         // TAU is below the f32 ULP at this magnitude).
         assert!(arc_span(2.0e8, 2.0e8, true).is_some());
+    }
+
+    /// GH #190: a sub-microradian sweep is a real arc, not a coincident
+    /// pair of trims. The verbatim trim parameters of a Geometry Gym beam
+    /// edge on a 6 514 797.59 m circle — 9.7e-7 rad is 6.3 m of arc there.
+    /// The old absolute `EPS = 1e-6` rad promoted it to a full revolution
+    /// (a 41 000 km circle in the profile plane).
+    // The trim parameter is quoted exactly as the exporter wrote it; the
+    // shorter round-trip spelling clippy suggests would make the fixture
+    // stop being a verbatim copy of the file that exposed the bug.
+    #[allow(clippy::excessive_precision)]
+    #[test]
+    fn arc_span_keeps_a_sub_microradian_sweep() {
+        use std::f64::consts::{PI, TAU};
+        let (s, e) = arc_span(9.7179201739999999e-7, 0.0, false).unwrap();
+        let sweep = (e - s).abs();
+        assert!(
+            (sweep - 9.7179201739999999e-7).abs() < 1e-15,
+            "sub-microradian sweep collapsed to {sweep}"
+        );
+        // The full-revolution convention survives for genuinely
+        // coincident trims, authored either way round.
+        let (s, e) = arc_span(0.0, TAU, true).unwrap();
+        assert!(((e - s).abs() - TAU).abs() < 1e-12, "got {}", e - s);
+        let (s, e) = arc_span(1.0, 1.0, true).unwrap();
+        assert!(((e - s).abs() - TAU).abs() < 1e-12, "got {}", e - s);
+        // And an ordinary half turn is untouched.
+        let (s, e) = arc_span(0.0, PI, true).unwrap();
+        assert!(((e - s).abs() - PI).abs() < 1e-12, "got {}", e - s);
     }
 }
 
@@ -1568,5 +1699,90 @@ ENDSEC;\nEND-ISO-10303-21;\n";
         let m = units_ifc("#1=IFCUNITASSIGNMENT((#2));\n#2=IFCSIUNIT(*,.LENGTHUNIT.,$,.METRE.);");
         let table = EntityTable::build(m.as_bytes());
         assert_eq!(extract(&table, 50).unwrap().outer.len(), CURVE_SAMPLES);
+    }
+
+    /// GH #190 regression, verbatim from `knm_rib_196789.ifc` (Geometry
+    /// Gym, IFC2X3, metres + radians). The beam profile is a composite of
+    /// four polylines plus one `IfcTrimmedCurve` on an `IfcCircle` of
+    /// radius 6 514 797.59 m centred 6.5e6 m from the profile origin,
+    /// trimmed over 9.7179e-7 rad — a ~6 m near-straight chord.
+    ///
+    /// Two defects met here before the fix:
+    ///  1. `arc_span`'s absolute `EPS = 1e-6` rad read the sweep as
+    ///     "coincident trims" and swept a FULL revolution: a 41 000 km
+    ///     circle, ~13 000 km of profile bbox.
+    ///  2. sampling in f32 at a centre of 6.2e6 quantizes to ~0.5 m, so
+    ///     the arc's endpoints missed the polyline vertices they join.
+    // Same reason as above: the expected endpoints are the file's own
+    // `IFCCARTESIANPOINT` coordinates, not a re-spelling of them.
+    #[allow(clippy::excessive_precision)]
+    #[test]
+    fn geometry_gym_huge_radius_trimmed_arc_stays_a_six_metre_chord() {
+        let ifc = "ISO-10303-21;\nHEADER;\n\
+FILE_DESCRIPTION(('ViewDefinition [CoordinationView_V2.0]'),'2;1');\n\
+FILE_NAME('knm_rib_196789.ifc','2026-08-07T16:33:16',('test'),('skiplum'),'ifcfast','ifcfast','');\n\
+FILE_SCHEMA(('IFC2X3'));\nENDSEC;\nDATA;\n\
+#1=IFCUNITASSIGNMENT((#2,#5));\n\
+#2=IFCSIUNIT(*,.LENGTHUNIT.,$,.METRE.);\n\
+#5=IFCSIUNIT(*,.PLANEANGLEUNIT.,$,.RADIAN.);\n\
+#196790=IFCCOMPOSITECURVE((#196794,#196797,#196800,#196803,#196809),.T.);\n\
+#196791=IFCCARTESIANPOINT((-0.18291676000000001,3.02086006));\n\
+#196792=IFCCARTESIANPOINT((-0.98291675999999994,3.02086006));\n\
+#196793=IFCPOLYLINE((#196792,#196791));\n\
+#196794=IFCCOMPOSITECURVESEGMENT(.CONTINUOUS.,.T.,#196793);\n\
+#196795=IFCCARTESIANPOINT((0.98291675999999994,-0.70206228000000004));\n\
+#196796=IFCPOLYLINE((#196791,#196795));\n\
+#196797=IFCCOMPOSITECURVESEGMENT(.CONTINUOUS.,.T.,#196796);\n\
+#196798=IFCCARTESIANPOINT((0.98291675999999994,-3.02086006));\n\
+#196799=IFCPOLYLINE((#196795,#196798));\n\
+#196800=IFCCOMPOSITECURVESEGMENT(.CONTINUOUS.,.T.,#196799);\n\
+#196801=IFCCARTESIANPOINT((0.90904974999999999,-3.02086006));\n\
+#196802=IFCPOLYLINE((#196798,#196801));\n\
+#196803=IFCCOMPOSITECURVESEGMENT(.CONTINUOUS.,.T.,#196802);\n\
+#196804=IFCTRIMMEDCURVE(#196808,(IFCPARAMETERVALUE(9.7179201739999999E-07),#196801),(IFCPARAMETERVALUE(0.),#196792),.F.,.PARAMETER.);\n\
+#196805=IFCAXIS2PLACEMENT2D(#196806,#196807);\n\
+#196806=IFCCARTESIANPOINT((6217091.6984334802,1946884.1825136801));\n\
+#196807=IFCDIRECTION((-0.95430327549764804,-0.29883985405976199));\n\
+#196808=IFCCIRCLE(#196805,6514797.5921052601);\n\
+#196809=IFCCOMPOSITECURVESEGMENT(.CONTINUOUS.,.T.,#196804);\n\
+#196810=IFCARBITRARYCLOSEDPROFILEDEF(.AREA.,$,#196790);\n\
+ENDSEC;\nEND-ISO-10303-21;\n";
+        let table = EntityTable::build(ifc.as_bytes());
+        let poly = extract(&table, 196810).expect("beam profile resolves");
+
+        // 1. The profile stays inside the beam's own cross-section. Before
+        //    the fix the loop spanned ~13 000 km.
+        for p in &poly.outer {
+            assert!(
+                p.x.abs() <= 1.0 && p.y.abs() <= 3.1,
+                "vertex escaped the profile: {p:?} (of {} vertices)",
+                poly.outer.len()
+            );
+        }
+
+        // 2. Area matches the ifcopenshell oracle: 1.3979 m³ over the
+        //    0.35 m extrusion → 3.994 m². The arc's sagitta is ~1e-6 m,
+        //    so the chord is the exact edge.
+        let want = 3.994f32;
+        let got = polygon_area(&poly.outer).abs();
+        assert!(
+            ((got - want) / want).abs() < 2e-3,
+            "profile area {got} vs oracle {want}"
+        );
+
+        // 3. f64 precision claim: the arc's endpoints land on the two
+        //    polyline vertices they join. In f32 (ulp 0.5 m at 6.5e6)
+        //    they were off by ~0.5 m.
+        for want in [
+            Vec2::new(0.90904974999999999, -3.02086006),
+            Vec2::new(-0.98291675999999994, 3.02086006),
+        ] {
+            let d = poly
+                .outer
+                .iter()
+                .map(|p| (*p - want).length())
+                .fold(f32::INFINITY, f32::min);
+            assert!(d < 1e-3, "nearest vertex to {want:?} is {d} m away");
+        }
     }
 }

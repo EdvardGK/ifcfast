@@ -772,7 +772,22 @@ def _resolve_step_escapes(s: str) -> str:
 #       streamed positions the browser draws from move for the same
 #       reason. A cache written before this bump would keep serving the
 #       pre-fix numbers under the old key.
-_CACHE_SCHEMA_VERSION = 33
+#   34: GH #190 — trimmed conic arcs are resolved and sampled in f64
+#       (centre, ref direction, semi-axes and trim angles), and the
+#       "coincident trims -> full revolution" rule in `arc_span` moved
+#       from an absolute 1e-6 rad to 1e-9 rad. Geometry Gym exports
+#       near-straight profile edges as `IfcTrimmedCurve` segments on
+#       circles of 6 500-16 000 km radius: a real 6 m chord there sweeps
+#       under 1e-6 rad, so the old rule promoted it to a full
+#       revolution, and f32 sampling at a centre 6.5e6 m away (0.5 m
+#       ulp) put the arc's endpoints up to ~1 m off the polyline
+#       vertices they join. Mesh vertices, `volume_abs_m3`, the bbox
+#       columns and `mesh_quality` therefore move on any product whose
+#       profile carries a huge-radius trimmed arc; ordinary arcs keep
+#       their chord count and sector-area scale (still computed on the
+#       f32 path) and move by at most a last-ulp cast. A cache written
+#       before this bump would keep serving the 13 000 km beams.
+_CACHE_SCHEMA_VERSION = 34
 
 _FIELD_RE = re.compile(r"\(\s*(.*?)\s*\)\s*;", re.DOTALL)
 

@@ -43,7 +43,7 @@ pub type Rollup = HashMap<String, (Option<f64>, Option<f64>, Option<f64>)>;
 /// Mirrors `python/ifcfast/header.py::_CACHE_SCHEMA_VERSION`. Bump in
 /// lockstep — it is hashed into `cache_key`, so a mismatch shows up as a
 /// changed key rather than stale data.
-const CACHE_SCHEMA_VERSION: u32 = 33;
+const CACHE_SCHEMA_VERSION: u32 = 34;
 const HASH_HEAD_BYTES: usize = 4 * 1024 * 1024;
 const HASH_TAIL_BYTES: usize = 4 * 1024 * 1024;
 /// `header.py::_HEADER_READ_BYTES` — the window FILE_SCHEMA is read from.
