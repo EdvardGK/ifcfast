@@ -51,6 +51,12 @@ else
   echo "==> node test/stream.mjs"
   node "$here/test/stream.mjs"
 
+  # types.mjs pins the in-repo `type_objects.ifc` fixture always, and
+  # additionally walks every `.ifc` in `.local-samples/` when the box has
+  # real models to feed it.
+  echo "==> node test/types.mjs"
+  node "$here/test/types.mjs"
+
   if [[ ! -f "$root/.local-samples/Duplex_A_20110907.ifc" ]]; then
     echo "==> parity skipped — .local-samples/Duplex_A_20110907.ifc not present"
   else

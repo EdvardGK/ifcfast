@@ -114,8 +114,46 @@ pub struct ProductRow {
     pub tag: Option<String>,
     pub storey_guid: Option<String>,
     pub parent_guid: Option<String>,
+    /// GlobalId of the `IfcTypeObject` this occurrence is defined by
+    /// through `IfcRelDefinesByType` — the wheel's
+    /// `ProductRow.type_guid`, and the join key from a graph product row
+    /// to a [`TypeObjectRow`].
+    ///
+    /// `None` whenever `type_source` is not `"ifctype"`: an
+    /// `ObjectType` string names a type the file never declared as an
+    /// object, so there is no GUID to point at. Never derived from
+    /// `type_name` — two distinct `IfcWallType`s may share a name.
+    pub type_guid: Option<String>,
     pub type_name: Option<String>,
     pub type_source: &'static str,
+}
+
+/// One `IfcTypeObject` (or any `IfcXxxType` subclass) DECLARED by the
+/// file — `model.type_objects` / `TypeObjectRow` on the Python side.
+///
+/// Declared is not used. A Revit or MagiCAD export routinely carries
+/// type objects no occurrence references, and telling the two apart is
+/// the whole point of exposing this: `typesJson()` rolls USED types up
+/// by name over occurrences and can only ever see what something points
+/// at, while this is the roster the exporter actually wrote. Unused
+/// types are `type_objects` minus the distinct `type_guid` over
+/// products.
+pub struct TypeObjectRow {
+    pub guid: String,
+    /// Proper-cased entity name, straight from the core indexer, e.g.
+    /// `IfcTypeProduct`.
+    ///
+    /// The core's spelling map is backed by the PRODUCT whitelist, which
+    /// by construction holds no `*Type` class, so most type classes take
+    /// the first-letter-only fallback and arrive as `Ifcwalltype`, not
+    /// `IfcWallType`. That is what the wheel reports for the same file
+    /// (both read the same indexer field), so it is what the browser
+    /// reports: a second, prettier implementation here would make the
+    /// two disagree. Compare it case-insensitively until GH #186 gives
+    /// the core a full-schema entity list.
+    pub entity: String,
+    pub name: Option<String>,
+    pub step_id: u64,
 }
 
 pub struct StoreyRow {
@@ -216,7 +254,12 @@ pub struct Analysis {
     /// viewer export drops them (see `IfcModel::to_glb`); every table
     /// and counter still reveals them.
     pub opening_guids: HashSet<String>,
-    pub type_object_count: usize,
+    /// Every `IfcTypeObject` the file declares, in file order — the
+    /// roster `typeObjectsJson()` serialises. Kept as rows rather than
+    /// the bare count it used to be: the count could say 398 while
+    /// nothing could name one of them, and `typesJson()`'s 84 used names
+    /// are a different number about a different thing.
+    pub type_objects: Vec<TypeObjectRow>,
 
     /// The four long-format data layers, retained verbatim so
     /// `psetsJson` / `quantitiesJson` / `materialsJson` /
@@ -403,16 +446,27 @@ impl Analysis {
             storey_guid_by_step.insert(*sid, graph.walk_to_storey(guid));
         }
 
-        // Type linkage (IfcRelDefinesByType → type guid/name).
-        let mut type_meta_by_step: HashMap<u64, Option<String>> = HashMap::new();
-        for (tsid, tname) in idx
-            .type_object_step_id
-            .iter()
-            .zip(idx.type_object_name.iter())
-        {
-            type_meta_by_step.insert(*tsid, tname.clone());
+        // Type linkage (IfcRelDefinesByType → type guid/name), plus the
+        // declared roster itself. Both come off the same four parallel
+        // index vectors, so a type object either reaches BOTH surfaces
+        // or neither — a product can never carry a `type_guid` that
+        // `type_objects` cannot resolve.
+        let mut type_objects: Vec<TypeObjectRow> =
+            Vec::with_capacity(idx.type_object_step_id.len());
+        let mut type_meta_by_step: HashMap<u64, (String, Option<String>)> = HashMap::new();
+        for i in 0..idx.type_object_step_id.len() {
+            let sid = idx.type_object_step_id[i];
+            let guid = idx.type_object_guid[i].clone();
+            let name = idx.type_object_name[i].clone();
+            type_meta_by_step.insert(sid, (guid.clone(), name.clone()));
+            type_objects.push(TypeObjectRow {
+                guid,
+                entity: idx.type_object_entity[i].clone(),
+                name,
+                step_id: sid,
+            });
         }
-        let mut product_type_by_step: HashMap<u64, Option<String>> = HashMap::new();
+        let mut product_type_by_step: HashMap<u64, (String, Option<String>)> = HashMap::new();
         for (psid, tsid) in idx
             .defines_by_type_product
             .iter()
@@ -429,10 +483,14 @@ impl Analysis {
         for i in 0..idx.product_guid.len() {
             let sid = idx.product_step_id[i];
             let object_type = idx.product_object_type[i].clone();
-            let (type_name, type_source) = match product_type_by_step.get(&sid) {
-                Some(tn) => (tn.clone(), "ifctype"),
-                None if truthy(&object_type) => (object_type.clone(), "objecttype"),
-                None => (None, "none"),
+            // `model.py`'s three-way rule verbatim: a resolved
+            // IfcRelDefinesByType wins and carries the type's GUID; an
+            // ObjectType string is a name with no object behind it, so
+            // no GUID; otherwise untyped.
+            let (type_guid, type_name, type_source) = match product_type_by_step.get(&sid) {
+                Some((tg, tn)) => (Some(tg.clone()), tn.clone(), "ifctype"),
+                None if truthy(&object_type) => (None, object_type.clone(), "objecttype"),
+                None => (None, None, "none"),
             };
             let row = ProductRow {
                 guid: idx.product_guid[i].clone(),
@@ -443,6 +501,7 @@ impl Analysis {
                 tag: idx.product_tag[i].clone(),
                 storey_guid: storey_guid_by_step.get(&sid).cloned().flatten(),
                 parent_guid: parent_lookup.get(&sid).cloned(),
+                type_guid,
                 type_name,
                 type_source,
             };
@@ -566,7 +625,7 @@ impl Analysis {
             parse_seconds: t_total.elapsed().as_secs_f64(),
             unit_resolved,
             duplicate_step_ids,
-            type_object_count: idx.type_object_step_id.len(),
+            type_objects,
             products,
             storeys,
             spaces,
@@ -1293,7 +1352,7 @@ impl Analysis {
         tables.insert("spaces".into(), table_meta("spaces", self.spaces.len()));
         tables.insert(
             "type_objects".into(),
-            table_meta("type_objects", self.type_object_count),
+            table_meta("type_objects", self.type_objects.len()),
         );
         tables.insert(
             "contained_in".into(),
@@ -1484,6 +1543,12 @@ impl Analysis {
                 "storey_guid": jstr(&p.storey_guid),
                 "parent_guid": jstr(&p.parent_guid),
                 "typed": p.type_source == "ifctype",
+                // The join key into `typeObjectsJson()`. `type_name`
+                // above falls back to `object_type` when the file only
+                // named a type; `type_guid` has no fallback and is null
+                // there, which is exactly what makes "typed by a real
+                // type object" checkable.
+                "type_guid": jstr(&p.type_guid),
                 "type_name": jstr(&type_name),
                 "type_source": p.type_source,
                 "materials": self.materials_by_guid.get(&p.guid).cloned().unwrap_or_default(),
@@ -1850,6 +1915,33 @@ impl Analysis {
                 "assignment_source".into(),
                 Value::String(t.assignment_source[i].to_string()),
             );
+            rows.push(Value::Object(r));
+        }
+        Value::Array(rows)
+    }
+
+    /// `[{guid, entity, name, step_id}]` — `model.type_objects`, every
+    /// `IfcTypeObject` the file DECLARES, in file order.
+    ///
+    /// The companion to `graphJson()`'s per-product `type_guid`. Those
+    /// two together are what `typesJson()` cannot answer: it groups the
+    /// USED types by name over occurrences, so on a Revit export that
+    /// declares 398 type objects of which 339 are referenced under 84
+    /// distinct names, it reports 84 entries — and each one's `guid` is
+    /// a representative OCCURRENCE's GlobalId, not the type's. Unused
+    /// types are this roster minus the distinct non-null `type_guid`
+    /// over `graphJson().products`.
+    ///
+    /// Mesh-free, like the four GH #183 layers: the roster was built in
+    /// `fromBytes`, so this is a serialise.
+    pub fn type_objects_json(&self) -> Value {
+        let mut rows = Vec::with_capacity(self.type_objects.len());
+        for t in &self.type_objects {
+            let mut r = Map::new();
+            r.insert("guid".into(), Value::String(t.guid.clone()));
+            r.insert("entity".into(), Value::String(t.entity.clone()));
+            r.insert("name".into(), jstr(&t.name));
+            r.insert("step_id".into(), json!(t.step_id));
             rows.push(Value::Object(r));
         }
         Value::Array(rows)
@@ -2317,6 +2409,128 @@ mod tests {
         assert_eq!(r["identification"], json!("232.1"));
         assert_eq!(r["name"], json!("Yttervegger"));
         assert_eq!(r["assignment_source"], json!("instance"));
+    }
+
+    // ----- type objects: declared roster + per-product type_guid ---
+    //
+    // `tests/fixtures/type_objects.ifc` declares three IfcTypeObjects
+    // and references exactly one, so declared (3) ≠ used (1) ≠ distinct
+    // used NAMES (1 of the 2 'Ubrukt' names) — the three numbers that
+    // collapsed into `typesJson()`'s single roster before this. Two of
+    // the walls are typed through the relation, one carries only an
+    // ObjectType string, one is untyped.
+
+    fn typed() -> Analysis {
+        fixture("type_objects.ifc")
+    }
+
+    #[test]
+    fn type_objects_json_matches_summary_and_columns() {
+        let a = typed();
+        let rows = a.type_objects_json();
+        check_layer(
+            &a,
+            "type_objects",
+            &rows,
+            &["guid", "entity", "name", "step_id"],
+        );
+        let rows = rows.as_array().expect("an array").clone();
+        assert_eq!(rows.len(), 3, "three declared type objects");
+        // File order, not HashMap order.
+        assert_eq!(rows[0]["step_id"], json!(80));
+        assert_eq!(rows[0]["guid"], json!("TYP0000000000000000001"));
+        assert_eq!(rows[0]["name"], json!("Yttervegg 300"));
+        assert_eq!(rows[2]["step_id"], json!(82));
+        // The core's spelling map is backed by the PRODUCT whitelist, so
+        // a `*Type` class takes the first-letter-only fallback. Pinned
+        // as the wheel reports it rather than prettified here (GH #186);
+        // when the core gains a full-schema entity list this assertion
+        // is the one that says so.
+        assert_eq!(rows[0]["entity"], json!("IfcWalltype"));
+        assert_eq!(rows[2]["entity"], json!("IfcDoortype"));
+    }
+
+    #[test]
+    fn product_type_guid_points_into_the_declared_roster() {
+        let mut a = typed();
+        let graph = a.graph_json();
+        let products = graph["products"].as_array().expect("graph.products");
+        let by_name = |n: &str| -> Value {
+            products
+                .iter()
+                .find(|p| p["name"] == json!(n))
+                .unwrap_or_else(|| panic!("no product named {n}"))
+                .clone()
+        };
+
+        let w1 = by_name("Wall-001");
+        assert_eq!(w1["type_source"], json!("ifctype"));
+        assert_eq!(w1["type_guid"], json!("TYP0000000000000000001"));
+        assert_eq!(w1["type_name"], json!("Yttervegg 300"));
+
+        // An ObjectType string names a type the file never declared as
+        // an object: `type_name` falls back to it, `type_guid` must NOT
+        // be invented from the name.
+        let w4 = by_name("Wall-004");
+        assert_eq!(w4["type_source"], json!("objecttype"));
+        assert_eq!(w4["type_name"], json!("Yttervegg 250"));
+        assert_eq!(w4["type_guid"], Value::Null);
+
+        // Every non-null type_guid resolves — the two surfaces are built
+        // from the same index vectors, so a dangling one is a bug, not
+        // model data.
+        let declared: std::collections::BTreeSet<String> = a
+            .type_objects_json()
+            .as_array()
+            .expect("roster")
+            .iter()
+            .map(|t| t["guid"].as_str().unwrap().to_string())
+            .collect();
+        let used: std::collections::BTreeSet<String> = products
+            .iter()
+            .filter_map(|p| p["type_guid"].as_str().map(str::to_string))
+            .collect();
+        assert!(used.is_subset(&declared), "{used:?} ⊄ {declared:?}");
+        assert_eq!(used.len(), 1, "one type object is referenced");
+        assert_eq!(declared.len() - used.len(), 2, "two declared types unused");
+    }
+
+    /// The reason the roster had to be exposed: `typesJson()` answers a
+    /// different question, in a different key space. Its `guid` is an
+    /// occurrence's, and it cannot see a type nothing points at.
+    #[test]
+    fn types_json_is_the_used_roster_keyed_by_an_occurrence() {
+        let a = typed();
+        let types = a.types_json("test");
+        let entries = types["types"].as_array().expect("types");
+        // Two NAMES over the occurrences: the declared type's, and the
+        // bare ObjectType string on Wall-004 — which is not a type
+        // object at all. Neither count is the declared roster's 3, and
+        // the second entry has no type object behind it whatsoever.
+        assert_eq!(entries.len(), 2);
+        let used = entries
+            .iter()
+            .find(|e| e["type_name"] == json!("Yttervegg 300"))
+            .expect("the declared type's group");
+        assert_eq!(used["count"], json!(3));
+        // An occurrence GlobalId, not the IfcWallType's — the trap this
+        // whole pair of surfaces exists to close.
+        assert_eq!(used["guid"], json!("7XvctVUKr0kugbFTf53O9L"));
+        assert_ne!(used["guid"], json!("TYP0000000000000000001"));
+        assert_eq!(a.type_objects.len(), 3);
+    }
+
+    /// A file with no type objects at all (KNM_RIB on Mottakskontroll is
+    /// the real one) must serialise an empty array, not `null` and not a
+    /// row of nulls.
+    #[test]
+    fn type_objects_json_is_empty_not_null_without_types() {
+        let mut a = minimal();
+        assert_eq!(a.type_objects_json(), json!([]));
+        assert_eq!(a.summary_json()["tables"]["type_objects"]["rows"], json!(0));
+        for p in a.graph_json()["products"].as_array().expect("products") {
+            assert_eq!(p["type_guid"], Value::Null);
+        }
     }
 
     // ----- GH #181: StoreyRow.elevation_m -------------------------

@@ -28,6 +28,13 @@
 //! they simply had no accessor. A browser-side IDS `PropertyFacet` /
 //! `ClassificationFacet` reads them.
 //!
+//! The same fault, fifth table: `type_objects` was counted in
+//! `summaryJson().tables` and the `products` column list advertised a
+//! `type_guid` that no payload carried. [`IfcModel::type_objects_json`]
+//! is the declared roster and `graphJson().products[].type_guid` is the
+//! join into it, so "declared but never used" is now a set difference a
+//! browser can compute rather than a number only the wheel could reach.
+//!
 //! v2 (GH #172, streaming geometry): [`IfcModel::from_bytes`] no longer
 //! meshes. It parses, indexes and runs the extractors — everything the
 //! identity + roster surfaces need — and the tessellation is either
@@ -173,6 +180,26 @@ impl IfcModel {
     #[wasm_bindgen(js_name = classificationsJson)]
     pub fn classifications_json(&self) -> String {
         self.inner.classifications_json().to_string()
+    }
+
+    /// `[{guid, entity, name, step_id}]` — every `IfcTypeObject` the
+    /// file DECLARES, i.e. `model.type_objects`.
+    ///
+    /// Not the same roster as [`IfcModel::types_json`], and the
+    /// difference is the point. `typesJson()` groups the types products
+    /// actually point at, by NAME, and hands back a representative
+    /// OCCURRENCE's GlobalId as `guid` — on a Revit export declaring 398
+    /// type objects, 339 of them referenced under 84 distinct names, it
+    /// has 84 entries and none of their `guid`s is a type's. This is the
+    /// declared roster, one row per type object, keyed by the type's own
+    /// GlobalId, which is what `graphJson()`'s per-product `type_guid`
+    /// points at. Unused types = this minus the distinct non-null
+    /// `type_guid` over the products.
+    ///
+    /// Mesh-free: built during `fromBytes`, so this is a serialise.
+    #[wasm_bindgen(js_name = typeObjectsJson)]
+    pub fn type_objects_json(&self) -> String {
+        self.inner.type_objects_json().to_string()
     }
 
     /// `types/manifest.json` — the type roster. `glb` / `bytes` are empty

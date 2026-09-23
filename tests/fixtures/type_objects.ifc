@@ -1,0 +1,41 @@
+ISO-10303-21;
+HEADER;
+FILE_DESCRIPTION(('ViewDefinition [ReferenceView]'),'2;1');
+FILE_NAME('type_objects.ifc','2026-09-23T00:00:00',('ifcfast tests'),('Skiplum'),'ifcfast','ifcfast-tests','');
+FILE_SCHEMA(('IFC4'));
+ENDSEC;
+DATA;
+/* Declared-vs-used type objects. Three IfcTypeObjects are declared;
+   only #80 is referenced by an IfcRelDefinesByType, so the file carries
+   two unused types — the shape a Revit export has at scale (KNM_ARK:
+   398 declared, 339 used, 59 unused). #32 is typed through the relation
+   and gets a type_guid; #33 carries only an ObjectType string, which
+   names a type that is not an object, so its type_guid must stay null.
+   #81 and #82 share the name 'Ubrukt' deliberately: a name is not a
+   key, and grouping by name cannot tell them apart. */
+#1=IFCPROJECT('0YvctVUKr0kugbFTf53O9L',$,'Type Objects',$,$,$,$,(#5),#2);
+#2=IFCUNITASSIGNMENT((#3,#4));
+#3=IFCSIUNIT(*,.LENGTHUNIT.,$,.METRE.);
+#4=IFCSIUNIT(*,.PLANEANGLEUNIT.,$,.RADIAN.);
+#5=IFCGEOMETRICREPRESENTATIONCONTEXT($,'Model',3,1.0E-5,#6,$);
+#6=IFCAXIS2PLACEMENT3D(#7,$,$);
+#7=IFCCARTESIANPOINT((0.,0.,0.));
+#10=IFCSITE('1XvctVUKr0kugbFTf53O9L',$,'Site',$,$,#15,$,$,.ELEMENT.,(59,56,0),(10,45,0),0.,$,$);
+#11=IFCBUILDING('2XvctVUKr0kugbFTf53O9L',$,'Building A',$,$,#15,$,$,.ELEMENT.,$,$,$);
+#12=IFCBUILDINGSTOREY('3XvctVUKr0kugbFTf53O9L',$,'Plan 01',$,$,#15,$,'Plan 01',.ELEMENT.,0.0);
+#15=IFCLOCALPLACEMENT($,#6);
+#16=IFCLOCALPLACEMENT(#15,#6);
+#20=IFCRELAGGREGATES('4XvctVUKr0kugbFTf53O9L',$,$,$,#1,(#10));
+#21=IFCRELAGGREGATES('5XvctVUKr0kugbFTf53O9L',$,$,$,#10,(#11));
+#22=IFCRELAGGREGATES('6XvctVUKr0kugbFTf53O9L',$,$,$,#11,(#12));
+#30=IFCWALL('7XvctVUKr0kugbFTf53O9L',$,'Wall-001',$,$,#16,$,'tag-001',.STANDARD.);
+#31=IFCWALL('8XvctVUKr0kugbFTf53O9L',$,'Wall-002',$,$,#16,$,'tag-002',.STANDARD.);
+#32=IFCWALL('9XvctVUKr0kugbFTf53O9L',$,'Wall-003',$,$,#16,$,'tag-003',.STANDARD.);
+#33=IFCWALL('AXvctVUKr0kugbFTf53O9L',$,'Wall-004',$,'Yttervegg 250',#16,$,'tag-004',.STANDARD.);
+#34=IFCRELCONTAINEDINSPATIALSTRUCTURE('BXvctVUKr0kugbFTf53O9L',$,$,$,(#30,#31,#32,#33),#12);
+#80=IFCWALLTYPE('TYP0000000000000000001',$,'Yttervegg 300',$,$,$,$,$,$,.STANDARD.);
+#81=IFCWALLTYPE('TYP0000000000000000002',$,'Ubrukt',$,$,$,$,$,$,.STANDARD.);
+#82=IFCDOORTYPE('TYP0000000000000000003',$,'Ubrukt',$,$,$,$,$,$,.DOOR.,.SINGLE_SWING_LEFT.,$);
+#90=IFCRELDEFINESBYTYPE('CXvctVUKr0kugbFTf53O9L',$,$,$,(#30,#31,#32),#80);
+ENDSEC;
+END-ISO-10303-21;

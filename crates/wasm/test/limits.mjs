@@ -17,7 +17,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import zlib from 'node:zlib';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const repo = path.resolve(here, '../../..');
@@ -28,7 +28,10 @@ if (!fs.existsSync(path.join(pkg, 'ifcfast_wasm.js'))) {
   process.exit(1);
 }
 
-const wasmMod = await import(path.join(pkg, 'ifcfast_wasm.js'));
+// `pathToFileURL`, not the bare path: Node's ESM loader reads a
+// Windows absolute path as the URL scheme `c:` and refuses it, so on
+// Windows this gate could not run at all.
+const wasmMod = await import(pathToFileURL(path.join(pkg, 'ifcfast_wasm.js')).href);
 await wasmMod.default({
   module_or_path: fs.readFileSync(path.join(pkg, 'ifcfast_wasm_bg.wasm')),
 });

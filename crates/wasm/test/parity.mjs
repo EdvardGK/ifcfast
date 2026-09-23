@@ -32,7 +32,7 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const repo = path.resolve(here, '../../..');
@@ -45,7 +45,10 @@ if (!fs.existsSync(path.join(pkg, 'ifcfast_wasm.js'))) {
   process.exit(1);
 }
 
-const wasmMod = await import(path.join(pkg, 'ifcfast_wasm.js'));
+// `pathToFileURL`, not the bare path: Node's ESM loader reads a
+// Windows absolute path as the URL scheme `c:` and refuses it, so on
+// Windows this gate could not run at all.
+const wasmMod = await import(pathToFileURL(path.join(pkg, 'ifcfast_wasm.js')).href);
 await wasmMod.default({
   module_or_path: fs.readFileSync(path.join(pkg, 'ifcfast_wasm_bg.wasm')),
 });
@@ -181,6 +184,19 @@ if (!ref181) {
   for (const st of graph.storeys) delete st.elevation_m;
 }
 
+// Same guard for the per-product `type_guid` (type-object join key).
+// `summary.tables.products.columns` has always advertised it — the
+// wheel's `ProductRow` carries it — but the generator only started
+// WRITING it into graph.json products with this change, so an older
+// sidecar is a version behind on exactly that key. Detected on a row,
+// not on the column list, for that reason.
+const refTypeGuid = !graph.products.length || !refGraph.products?.length
+  || 'type_guid' in refGraph.products[0];
+if (!refTypeGuid) {
+  console.log('SKIP  graph.products[].type_guid — sidecars predate the type-object join key; regenerate');
+  for (const p of graph.products) delete p.type_guid;
+}
+
 check(
   'summary.json',
   diff(refSummary, summary, {
@@ -243,6 +259,33 @@ for (const [layer, rows] of Object.entries(layers)) {
     continue;
   }
   check(`${layer}.json`, diff(JSON.parse(fs.readFileSync(ref, 'utf8')), rows, { cap: 60 }, layer));
+}
+
+// ---- declared type objects ------------------------------------------
+//
+// Fifth table, same fault as the four above: counted in
+// `summaryJson().tables`, unreadable. No sidecar to diff against (the
+// generator writes no `duplex.type_objects.json`), so the gate is the
+// self-check plus the invariant that matters to a consumer — every
+// `type_guid` a product carries resolves in the roster. See types.mjs
+// for the declared-vs-used arithmetic on real models.
+{
+  const rows = JSON.parse(m.typeObjectsJson());
+  const meta = summary.tables.type_objects;
+  const d = [];
+  if (!Array.isArray(rows)) d.push('type_objects: not an array');
+  else {
+    if (rows.length !== meta.rows) d.push(`type_objects: ${rows.length} rows != summary ${meta.rows}`);
+    const want = [...meta.columns].sort().join(',');
+    const bad = rows.findIndex((r) => Object.keys(r).sort().join(',') !== want);
+    if (bad >= 0) d.push(`type_objects[${bad}]: columns ${Object.keys(rows[bad]).sort().join(',')} != ${want}`);
+    const declared = new Set(rows.map((r) => r.guid));
+    const used = new Set(graph.products.map((p) => p.type_guid).filter(Boolean));
+    const dangling = [...used].filter((gd) => !declared.has(gd));
+    if (dangling.length) d.push(`type_guid not in the roster: ${dangling.slice(0, 5).join(', ')}`);
+    console.log(`INFO  type_objects: ${declared.size} declared, ${used.size} used, ${declared.size - used.size} unused`);
+  }
+  check('type_objects vs summaryJson() + graph.products[].type_guid', d);
 }
 
 const stripTypes = (o) => ({

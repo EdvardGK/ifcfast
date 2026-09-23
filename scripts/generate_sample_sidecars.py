@@ -198,7 +198,7 @@ def _build_graph(model, spaces, containers, mesh_stats_by_guid, pset_attrs_by_gu
     are now represented (Phase 2 will let products include them
     directly; for now they're a sibling collection).
 
-    Per-product columns enriched: typed (bool), type_name,
+    Per-product columns enriched: typed (bool), type_guid, type_name,
     type_source, materials (list), layer_set, predefined_type,
     object_type.
     """
@@ -209,6 +209,7 @@ def _build_graph(model, spaces, containers, mesh_stats_by_guid, pset_attrs_by_gu
     typed_by_guid: dict[str, bool] = {}
     type_name_by_guid: dict[str, str | None] = {}
     type_source_by_guid: dict[str, str] = {}
+    type_guid_by_guid: dict[str, str | None] = {}
 
     # Materials → per-product list + layer_set link
     layer_set_defs: dict[str, dict] = {}
@@ -261,6 +262,7 @@ def _build_graph(model, spaces, containers, mesh_stats_by_guid, pset_attrs_by_gu
         typed_by_guid[guid] = type_source == "ifctype"
         type_name_by_guid[guid] = p.get("type_name") or p.get("object_type")
         type_source_by_guid[guid] = type_source
+        type_guid_by_guid[guid] = p.get("type_guid")
 
     for p in _df_to_records(model.products_df):
         guid = p["guid"]
@@ -297,6 +299,12 @@ def _build_graph(model, spaces, containers, mesh_stats_by_guid, pset_attrs_by_gu
             "storey_guid": p.get("storey_guid"),
             "parent_guid": p.get("parent_guid"),
             "typed": typed_by_guid.get(guid, False),
+            # The join key into the declared type roster. Null unless
+            # `type_source == "ifctype"`: an ObjectType string names a
+            # type that is not an object, so there is no GUID to point
+            # at (the wasm build's `graphJson()` agrees, by the same
+            # rule).
+            "type_guid": type_guid_by_guid.get(guid),
             "type_name": type_name_by_guid.get(guid),
             "type_source": type_source_by_guid.get(guid, "none"),
             "materials": mats_by_guid.get(guid, []),
