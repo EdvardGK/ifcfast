@@ -71,6 +71,7 @@ today; IfcRelNests/groups are not indexed but their positions are pinned in
 | `cargo fmt --check`, `cargo clippy --all-targets -D warnings` | clean |
 | `cargo test -p ifcfast-core` (default features) | 24 targets, 532 passed, 0 failed |
 | `pytest tests/ -q` with G55 corpus | 727 passed, 3 skipped (debug build, 73 min) |
+| CI on `8f8a72c` | `ci` + `csg-smoke` green (runs 36036768814, 36036768822) |
 
 **Design amendments from suite evidence** (all in the doc): `invalid-*` truth =
 fail OR typed invalid error (suite `scripts.md`: "at least one requirement fails …
