@@ -1,0 +1,135 @@
+# Known IDS conformance failures — tests/oracle/ids_conformance.py.
+#
+# One [[xfail]] per test case, keyed "<folder>/<stem>" (no .ids suffix).
+# Only benign labels may be registered:
+#   label = "ifctester_bug"    ifcfast matches the filename truth, IfcTester does not
+#   label = "test_case_drift"  both engines agree with each other, against the filename
+#                              (triaged by a human; the case itself is believed wrong)
+# `issue` is required ("#NNN" on the ifcfast tracker), `note` says why, with a source cite.
+#
+# Strict: an entry whose case turns green, whose IfcTester verdict starts agreeing
+# with the filename, or whose observed label changes FAILS the run — remove the xfail.
+# An ifcfast_bug can never be registered here; it blocks until fixed.
+#
+# Example:
+# [[xfail]]
+# case  = "tolerance/pass-comparison_tolerance_for_floating_point_one_lower_bound"
+# label = "ifctester_bug"
+# issue = "#NNN"
+# note  = "IfcTester is_x() is relative-only (ifctester/facet.py:54-60); IDS tolerance.md adds an absolute 1e-6 term"
+
+# --- IfcTester 0.8.5 divergences, attributed by source reading (GH #193) ---
+
+[[xfail]]
+case = "tolerance/pass-comparison_tolerance_for_floating_point_negative_high_number_lower_bound"
+label = "ifctester_bug"
+issue = "#193"
+note = "IfcTester is_x() is relative-only (ifctester/facet.py:53-60); tolerance.md requires v ± (|v|·1e-6 + 1e-6)"
+
+[[xfail]]
+case = "tolerance/pass-comparison_tolerance_for_floating_point_negative_high_number_upper_bound"
+label = "ifctester_bug"
+issue = "#193"
+note = "IfcTester is_x() is relative-only (ifctester/facet.py:53-60); tolerance.md requires v ± (|v|·1e-6 + 1e-6)"
+
+[[xfail]]
+case = "tolerance/pass-comparison_tolerance_for_floating_point_negative_low_number_lower_bound"
+label = "ifctester_bug"
+issue = "#193"
+note = "IfcTester is_x() is relative-only (ifctester/facet.py:53-60); tolerance.md requires v ± (|v|·1e-6 + 1e-6)"
+
+[[xfail]]
+case = "tolerance/pass-comparison_tolerance_for_floating_point_negative_low_number_upper_bound"
+label = "ifctester_bug"
+issue = "#193"
+note = "IfcTester is_x() is relative-only (ifctester/facet.py:53-60); tolerance.md requires v ± (|v|·1e-6 + 1e-6)"
+
+[[xfail]]
+case = "tolerance/pass-comparison_tolerance_for_floating_point_negative_one_lower_bound"
+label = "ifctester_bug"
+issue = "#193"
+note = "IfcTester is_x() is relative-only (ifctester/facet.py:53-60); tolerance.md requires v ± (|v|·1e-6 + 1e-6)"
+
+[[xfail]]
+case = "tolerance/pass-comparison_tolerance_for_floating_point_negative_one_upper_bound"
+label = "ifctester_bug"
+issue = "#193"
+note = "IfcTester is_x() is relative-only (ifctester/facet.py:53-60); tolerance.md requires v ± (|v|·1e-6 + 1e-6)"
+
+[[xfail]]
+case = "tolerance/pass-comparison_tolerance_for_floating_point_one_lower_bound"
+label = "ifctester_bug"
+issue = "#193"
+note = "IfcTester is_x() is relative-only (ifctester/facet.py:53-60); tolerance.md requires v ± (|v|·1e-6 + 1e-6)"
+
+[[xfail]]
+case = "tolerance/pass-comparison_tolerance_for_floating_point_one_upper_bound"
+label = "ifctester_bug"
+issue = "#193"
+note = "IfcTester is_x() is relative-only (ifctester/facet.py:53-60); tolerance.md requires v ± (|v|·1e-6 + 1e-6)"
+
+[[xfail]]
+case = "tolerance/pass-comparison_tolerance_for_floating_point_positive_high_number_lower_bound"
+label = "ifctester_bug"
+issue = "#193"
+note = "IfcTester is_x() is relative-only (ifctester/facet.py:53-60); tolerance.md requires v ± (|v|·1e-6 + 1e-6)"
+
+[[xfail]]
+case = "tolerance/pass-comparison_tolerance_for_floating_point_positive_high_number_upper_bound"
+label = "ifctester_bug"
+issue = "#193"
+note = "IfcTester is_x() is relative-only (ifctester/facet.py:53-60); tolerance.md requires v ± (|v|·1e-6 + 1e-6)"
+
+[[xfail]]
+case = "tolerance/pass-comparison_tolerance_for_floating_point_positive_low_number_lower_bound"
+label = "ifctester_bug"
+issue = "#193"
+note = "IfcTester is_x() is relative-only (ifctester/facet.py:53-60); tolerance.md requires v ± (|v|·1e-6 + 1e-6)"
+
+[[xfail]]
+case = "tolerance/pass-comparison_tolerance_for_floating_point_positive_low_number_upper_bound"
+label = "ifctester_bug"
+issue = "#193"
+note = "IfcTester is_x() is relative-only (ifctester/facet.py:53-60); tolerance.md requires v ± (|v|·1e-6 + 1e-6)"
+
+[[xfail]]
+case = "tolerance/pass-comparison_tolerance_for_floating_point_zero_lower_bound"
+label = "ifctester_bug"
+issue = "#193"
+note = "IfcTester is_x() is relative-only (ifctester/facet.py:53-60); tolerance.md requires v ± (|v|·1e-6 + 1e-6)"
+
+[[xfail]]
+case = "tolerance/pass-comparison_tolerance_for_floating_point_zero_upper_bound"
+label = "ifctester_bug"
+issue = "#193"
+note = "IfcTester is_x() is relative-only (ifctester/facet.py:53-60); tolerance.md requires v ± (|v|·1e-6 + 1e-6)"
+
+[[xfail]]
+case = "restriction/pass-regex_patterns_work_in_OR_1_3"
+label = "ifctester_bug"
+issue = "#193"
+note = "IfcTester requires every xs:pattern to match (ifctester/facet.py:1056-1058); XSD ORs patterns in one restriction"
+
+[[xfail]]
+case = "restriction/pass-regex_patterns_work_in_OR_2_3"
+label = "ifctester_bug"
+issue = "#193"
+note = "IfcTester requires every xs:pattern to match (ifctester/facet.py:1056-1058); XSD ORs patterns in one restriction"
+
+[[xfail]]
+case = "attribute/pass-an_optional_attribute_passes_if_null"
+label = "ifctester_bug"
+issue = "#193"
+note = "IfcTester optional short-circuit (ifctester/facet.py:327-329) fires only when the attribute is absent; a null value falls into the empty check (facet.py:332-357) and fails"
+
+[[xfail]]
+case = "ids/pass-specification_optionality_and_facet_optionality_can_be_combined"
+label = "ifctester_bug"
+issue = "#193"
+note = "Same root cause as the optional-null attribute case: Description is null on the IFCWALL, the cardinality=optional requirement should pass, IfcTester routes the null into the empty check (ifctester/facet.py:327-357)"
+
+[[xfail]]
+case = "property/pass-material_properties_are_supported_under_ifc2x3_via_extendedmaterialproperties"
+label = "ifctester_bug"
+issue = "#193"
+note = "IfcTester reads pset.Properties for every IfcMaterialProperties (ifctester/facet.py:912-913); IFC2X3 IfcExtendedMaterialProperties has ExtendedProperties, so it raises AttributeError; ifcopenshell.util.element.get_psets resolves the pset correctly and the requirement is met"

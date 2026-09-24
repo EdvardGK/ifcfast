@@ -38,6 +38,9 @@ dev = [
                                 #     agent-visible surfaces (quantities/psets/materials).
                                 # Pinned for reproducible oracle ground truth.
                                 # Test-only / codegen-only — NEVER a runtime dep, never in the wheel.
+    "ifctester==0.8.5",         # (oracle only — IDS conformance differential; never a runtime dep)
+                                # tests/oracle/ids_conformance.py + ids_parse_differential.py.
+                                # Pinned in lockstep with ifcopenshell above.
 ]
 mcp = [
     "mcp[cli]>=1.0",            # ifcfast-mcp server (Claude Desktop / Cursor / etc.)

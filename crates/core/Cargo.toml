@@ -39,7 +39,7 @@ path = "src/bin/clash.rs"
 required-features = ["clash"]
 
 [features]
-default = ["python", "mmap", "bundle", "geom", "clash", "csg"]
+default = ["python", "mmap", "bundle", "geom", "clash", "csg", "ids"]
 python = ["dep:pyo3"]
 # Filesystem loading via `memmap2` (`source::open`, `Doc::open_editable`,
 # the `IfcSource::Mmap` variant). Default-on: every native consumer —
@@ -78,6 +78,12 @@ csg = ["geom", "dep:manifold-csg"]
 # linux-aarch64 (GH #28). Composes with `csg` (manifold stays the
 # long-tail fallback while this earns trust).
 prism-csg-fast = ["mesh", "dep:i_overlay"]
+# Native IDS 1.0 validation (docs/plans/2026-09-24_ids-validation-design.md).
+# Strict XML parse via `roxmltree`, XSD-regex translation onto `regex`
+# (Unicode-aware, NOT regex-lite: \d / \p{..} must behave the same in
+# wasm as on native), serde for the canonical IR JSON used by the parse
+# differential against IfcTester. All pure Rust, wasm32-safe.
+ids = ["dep:roxmltree", "dep:regex", "dep:serde", "dep:serde_json"]
 
 [dependencies]
 pyo3 = { version = "0.29", features = ["extension-module", "abi3-py310"], optional = true }
@@ -108,6 +114,12 @@ manifold-csg = { version = "0.2", optional = true, default-features = false, fea
 # Pre-1.0-style churn across majors — quarantined behind
 # `mesh/polygon_bool.rs` so a bump or swap is a one-file change.
 i_overlay = { version = "7.0", optional = true }
+# IDS validation (`ids` feature). roxmltree: small, dependency-free,
+# read-only DOM with node positions (line numbers in IdsError).
+roxmltree = { version = "0.20", optional = true }
+regex = { version = "1", optional = true }
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
 
 # GH #172 — browser target. `web-time` is a drop-in `std::time` shim
 # backed by `performance.now()`; `std::time::Instant::now()` compiles on

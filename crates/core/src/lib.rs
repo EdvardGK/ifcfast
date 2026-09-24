@@ -57,6 +57,9 @@ pub mod geom;
 #[cfg(feature = "clash")]
 pub mod clash;
 
+#[cfg(feature = "ids")]
+pub mod ids;
+
 /// Stringify a panic payload (`Box<dyn Any + Send>`) the way the
 /// default Rust panic hook would, so a wrapped error message carries
 /// the actual panic text instead of `<non-string payload>`.

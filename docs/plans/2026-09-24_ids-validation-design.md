@@ -1,6 +1,6 @@
 # Design: native IDS 1.0 validation in ifcfast
 
-**Status:** proposal (2026-09-24), awaiting Ed's pick. Nothing built.
+**Status:** approved by Ed 2026-09-24 (`ad251b1`), epic GH #192. Slice 1 in progress. Amended same day: invalid-case truth semantics (§4) after reading the suite's `scripts.md`.
 **Provenance:** drafted by an opus code-architect agent from a coordinator brief; coordinator
 spot-checked every [V] claim cited below against `main` @ `1db78ad` (v0.5.3). External PR #24
 (jonatanjacobsson, 2026-05-31, "Native Rust IDS 1.0 validation pipeline") was an input to this
@@ -221,7 +221,7 @@ SPEC_PROHIBITED_APPLICABLE`.
 | Layer | Design |
 |---|---|
 | **Suite source** | `scripts/fetch_ids_testcases.py` downloads `Documentation/ImplementersDocumentation/TestCases` at a **pinned commit SHA**, checks a committed sha256 manifest, stores under `~/.cache/ifcfast/ids-testcases/<sha>/`. CI caches that directory. Checksum mismatch fails loudly. Not a submodule (repo is large, carries docs we don't need). Not vendored (licence CC BY-ND 4.0 allows verbatim copies with attribution, but keeping third-party-licensed files out of the MIT tree and the sdist is cleaner). |
-| **Truth** | From the filename. `pass-*` / `fail-*` = expected overall result. `invalid-*` = `IdsInvalidError` must be raised. Folders: attribute, classification, entity, ids, material, partof, property, restriction, tolerance. |
+| **Truth** | From the filename. `pass-*` / `fail-*` = expected overall result. `invalid-*`: the suite's `scripts.md` defines it as "at least one requirement fails (invalid files do not comply with the Audit tool, they could not be satisfied regardless of IFC contents)", so the accepted outcomes are `fail` **or** `IdsInvalidError`; a `pass` is the bug. Policy: raise `IdsInvalidError` for audit violations detectable in the IDS alone (unknown entity/attribute name for the target schema, derived/inverse attribute, lowercase entity, uppercase boolean literal, float literal on an integer base, pattern on a numeric base, prohibited spec carrying requirements); everything else validates and fails. The harness reports a `strict` column (how many invalid cases were rejected outright) as information. Suite pinned at buildingSMART/IDS `development` @ `a670477` (334 cases: 187 pass, 120 fail, 27 invalid). |
 | **Harness** | `tests/oracle/ids_conformance.py` runs **ifcfast and IfcTester** on every case. Both agree with truth → green. Only IfcTester wrong → `ifctester_bug`. Both wrong → triage `ifcfast_bug` or `test_case_drift`. Only ifcfast wrong → `ifcfast_bug`, blocks. Reuses `Classification` / `Collector` from tests/oracle/report.py:50-74, 138-186 [V], adds the two labels. IfcTester is a dev-extra next to ifcopenshell 0.8.5 (pyproject.toml:30-39 [V]), imported only inside the test (conftest.py:34-39 pattern [V]). |
 | **Parse differential** | Every `.ids` is parsed by both engines, each emits canonical IR JSON, compared. Keeps our XML semantics from diverging silently. |
 | **Known failures** | `tests/oracle/ids_xfail.toml`, one entry per case `{case, label, issue="#NNN", note}`. `strict=True`: an xfail that starts passing turns red. Only `ifctester_bug` and `test_case_drift` count as benign. |

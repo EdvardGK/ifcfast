@@ -12,7 +12,8 @@ Public API
 ----------
 ``Classification`` — enum:
     ``expected_drift`` | ``ifcfast_bug`` | ``ifcopenshell_quirk`` |
-    ``tolerance`` | ``schema_drift`` | ``unknown``.
+    ``tolerance`` | ``schema_drift`` | ``unknown`` |
+    ``ifctester_bug`` | ``test_case_drift`` | ``both_error`` (IDS conformance).
 
 ``DisagreementRecord`` — frozen dataclass:
     fields ``surface``, ``fixture``, ``guid``, ``group``, ``kind``,
@@ -26,7 +27,8 @@ Public API
 ``Collector`` — accumulates records across surfaces/fixtures:
     ``.record(rec)`` / ``.extend_from_diffs(diffs, *, surface, fixture,``
     ``classify=None)`` / ``.records`` / ``.blocking()`` /
-    ``.is_clean()`` / ``.summary()`` / ``.assert_clean()``.
+    ``.is_clean()`` / ``.summary()`` / ``.summary_by_group()`` /
+    ``.assert_clean()``.
 
 ``BENIGN`` — frozenset of classifications that do NOT fail CI.
 
@@ -58,6 +60,15 @@ class Classification(enum.Enum):
     - ``schema_drift``       — IFC schema-version shape change (blocking;
                                needs a deliberate mapping update).
     - ``unknown``            — not yet triaged (blocking by default).
+
+    IDS conformance labels (tests/oracle/ids_conformance.py; truth is the
+    buildingSMART test-case filename, IfcTester is the second voice):
+
+    - ``ifctester_bug``      — ifcfast matches truth, IfcTester does not (benign).
+    - ``test_case_drift``    — both engines agree with each other against the
+                               filename truth (benign once triaged).
+    - ``both_error``         — neither engine produced an outcome (blocking in
+                               the Collector; needs triage).
     """
 
     expected_drift = "expected_drift"
@@ -66,11 +77,19 @@ class Classification(enum.Enum):
     tolerance = "tolerance"
     schema_drift = "schema_drift"
     unknown = "unknown"
+    ifctester_bug = "ifctester_bug"
+    test_case_drift = "test_case_drift"
+    both_error = "both_error"
 
 
 #: Classifications that are accepted and do NOT fail CI.
 BENIGN: frozenset[Classification] = frozenset(
-    {Classification.expected_drift, Classification.ifcopenshell_quirk}
+    {
+        Classification.expected_drift,
+        Classification.ifcopenshell_quirk,
+        Classification.ifctester_bug,
+        Classification.test_case_drift,
+    }
 )
 
 
@@ -182,6 +201,18 @@ class Collector:
         for r in self.records:
             out[r.classification.value] += 1
         return out
+
+    def summary_by_group(self) -> dict[str, dict[str, int]]:
+        """``{group: {classification: count}}`` — only non-zero labels.
+
+        The IDS conformance harness records ``group=<test-case folder>`` so
+        this is its per-folder table.
+        """
+        out: dict[str, dict[str, int]] = {}
+        for r in self.records:
+            g = out.setdefault(r.group, {})
+            g[r.classification.value] = g.get(r.classification.value, 0) + 1
+        return dict(sorted(out.items()))
 
     def assert_clean(self) -> None:
         """Raise ``AssertionError`` listing every blocking record."""
