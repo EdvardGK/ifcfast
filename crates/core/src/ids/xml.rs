@@ -21,11 +21,11 @@
 
 use roxmltree::{Document, Node, NodeType, ParsingOptions};
 
-use super::ir::{
-    EntityFacet, Facet, FacetCardinality, IdsDocument, IdsInfo, Relation, Requirement,
-    Restriction, Schema, Spec, SpecCardinality, Val, XsdBase,
-};
 use super::audit::{audit_facet, audit_requirement_entities, facet_allowed, lexical_ok};
+use super::ir::{
+    EntityFacet, Facet, FacetCardinality, IdsDocument, IdsInfo, Relation, Requirement, Restriction,
+    Schema, Spec, SpecCardinality, Val, XsdBase,
+};
 use super::restriction::CompiledVal;
 use super::xsd_regex::compile_xsd_pattern;
 use super::IdsError;
@@ -61,24 +61,29 @@ pub fn parse_ids(xml: &[u8]) -> Result<IdsDocument, IdsError> {
 
 fn decode(xml: &[u8]) -> Result<String, IdsError> {
     if let Some(rest) = xml.strip_prefix(&[0xEF, 0xBB, 0xBF]) {
-        return String::from_utf8(rest.to_vec())
-            .map_err(|e| IdsError::invalid(format!("IDS has a UTF-8 BOM but is not valid UTF-8: {e}")));
+        return String::from_utf8(rest.to_vec()).map_err(|e| {
+            IdsError::invalid(format!("IDS has a UTF-8 BOM but is not valid UTF-8: {e}"))
+        });
     }
     let utf16 = |rest: &[u8], le: bool| -> Result<String, IdsError> {
-        if rest.len() % 2 != 0 {
-            return Err(IdsError::invalid("IDS has a UTF-16 BOM but an odd byte length"));
+        if !rest.len().is_multiple_of(2) {
+            return Err(IdsError::invalid(
+                "IDS has a UTF-16 BOM but an odd byte length",
+            ));
         }
-        let units: Vec<u16> = rest
-            .chunks_exact(2)
+        let (pairs, _) = rest.as_chunks::<2>();
+        let units: Vec<u16> = pairs
+            .iter()
             .map(|c| {
                 if le {
-                    u16::from_le_bytes([c[0], c[1]])
+                    u16::from_le_bytes(*c)
                 } else {
-                    u16::from_be_bytes([c[0], c[1]])
+                    u16::from_be_bytes(*c)
                 }
             })
             .collect();
-        String::from_utf16(&units).map_err(|e| IdsError::invalid(format!("IDS is not valid UTF-16: {e}")))
+        String::from_utf16(&units)
+            .map_err(|e| IdsError::invalid(format!("IDS is not valid UTF-16: {e}")))
     };
     if let Some(rest) = xml.strip_prefix(&[0xFF, 0xFE]) {
         return utf16(rest, true);
@@ -104,14 +109,21 @@ fn decode(xml: &[u8]) -> Result<String, IdsError> {
 /// `encoding="..."` from an ASCII-compatible XML declaration.
 fn declared_encoding(xml: &[u8]) -> Option<String> {
     let head = &xml[..xml.len().min(200)];
-    let head: String = head.iter().take_while(|b| b.is_ascii()).map(|&b| b as char).collect();
+    let head: String = head
+        .iter()
+        .take_while(|b| b.is_ascii())
+        .map(|&b| b as char)
+        .collect();
     if !head.starts_with("<?xml") {
         return None;
     }
     let decl_end = head.find("?>")?;
     let decl = &head[..decl_end];
     let at = decl.find("encoding")?;
-    let rest = decl[at + "encoding".len()..].trim_start().strip_prefix('=')?.trim_start();
+    let rest = decl[at + "encoding".len()..]
+        .trim_start()
+        .strip_prefix('=')?
+        .trim_start();
     let quote = rest.chars().next()?;
     if quote != '"' && quote != '\'' {
         return None;
@@ -164,7 +176,8 @@ impl<'d, 'input: 'd> Parser<'d, 'input> {
         for a in n.attributes() {
             match a.namespace() {
                 None if allowed.contains(&a.name()) => {}
-                Some(XSI_NS) if matches!(a.name(), "schemaLocation" | "noNamespaceSchemaLocation") => {}
+                Some(XSI_NS)
+                    if matches!(a.name(), "schemaLocation" | "noNamespaceSchemaLocation") => {}
                 ns => {
                     let q = match ns {
                         Some(XSI_NS) => format!("xsi:{}", a.name()),
@@ -179,7 +192,10 @@ impl<'d, 'input: 'd> Parser<'d, 'input> {
                     return Err(self.err(
                         n,
                         path,
-                        format!("unexpected attribute '{q}' on {} (allowed: {expected})", Self::describe(n)),
+                        format!(
+                            "unexpected attribute '{q}' on {} (allowed: {expected})",
+                            Self::describe(n)
+                        ),
                     ));
                 }
             }
@@ -206,7 +222,11 @@ impl<'d, 'input: 'd> Parser<'d, 'input> {
                         return Err(self.err(
                             c,
                             path,
-                            format!("unexpected text '{}' inside {}", t.trim(), Self::describe(n)),
+                            format!(
+                                "unexpected text '{}' inside {}",
+                                t.trim(),
+                                Self::describe(n)
+                            ),
                         ));
                     }
                 }
@@ -226,7 +246,11 @@ impl<'d, 'input: 'd> Parser<'d, 'input> {
                     return Err(self.err(
                         c,
                         path,
-                        format!("{} must contain text only, found {}", Self::describe(n), Self::describe(c)),
+                        format!(
+                            "{} must contain text only, found {}",
+                            Self::describe(n),
+                            Self::describe(c)
+                        ),
                     ))
                 }
                 _ => {}
@@ -253,7 +277,10 @@ impl<'d, 'input: 'd> Parser<'d, 'input> {
                     return Err(self.err(
                         children[i],
                         path,
-                        format!("<{name}> may appear at most {} time(s) here", max.unwrap_or(0)),
+                        format!(
+                            "<{name}> may appear at most {} time(s) here",
+                            max.unwrap_or(0)
+                        ),
                     ));
                 }
                 out[k].push(children[i]);
@@ -263,7 +290,10 @@ impl<'d, 'input: 'd> Parser<'d, 'input> {
                 return Err(self.err(
                     parent,
                     path,
-                    format!("missing required element <{name}> in {}", Self::describe(parent)),
+                    format!(
+                        "missing required element <{name}> in {}",
+                        Self::describe(parent)
+                    ),
                 ));
             }
         }
@@ -298,13 +328,23 @@ impl<'d, 'input: 'd> Parser<'d, 'input> {
         }
         self.check_attrs(root, path, &[])?;
         let kids = self.elements(root, path)?;
-        let slots = self.sequence(root, path, &kids, &[("info", 1, Some(1)), ("specifications", 1, Some(1))])?;
+        let slots = self.sequence(
+            root,
+            path,
+            &kids,
+            &[("info", 1, Some(1)), ("specifications", 1, Some(1))],
+        )?;
         let info = self.info(slots[0][0], "/ids/info")?;
         let specs_node = slots[1][0];
         let specs_path = "/ids/specifications";
         self.check_attrs(specs_node, specs_path, &[])?;
         let spec_kids = self.elements(specs_node, specs_path)?;
-        let spec_slots = self.sequence(specs_node, specs_path, &spec_kids, &[("specification", 1, None)])?;
+        let spec_slots = self.sequence(
+            specs_node,
+            specs_path,
+            &spec_kids,
+            &[("specification", 1, None)],
+        )?;
         let mut specs = Vec::with_capacity(spec_slots[0].len());
         for (i, s) in spec_slots[0].iter().enumerate() {
             let sp = format!("{specs_path}/specification[{}]", i + 1);
@@ -359,7 +399,9 @@ impl<'d, 'input: 'd> Parser<'d, 'input> {
                 return Err(self.err(
                     node,
                     &format!("{path}/author"),
-                    format!("author '{a}' is not an e-mail address (XSD pattern [^@]+@[^\\.]+\\..+)"),
+                    format!(
+                        "author '{a}' is not an e-mail address (XSD pattern [^@]+@[^\\.]+\\..+)"
+                    ),
                 ));
             }
         }
@@ -386,12 +428,33 @@ impl<'d, 'input: 'd> Parser<'d, 'input> {
     }
 
     fn spec(&self, n: Node<'d, 'input>, path: &str, idx: u32) -> Result<Spec, IdsError> {
-        self.check_attrs(n, path, &["name", "ifcVersion", "identifier", "description", "instructions"])?;
+        self.check_attrs(
+            n,
+            path,
+            &[
+                "name",
+                "ifcVersion",
+                "identifier",
+                "description",
+                "instructions",
+            ],
+        )?;
         let name = Self::attr(n, "name")
-            .ok_or_else(|| self.err(n, path, "<specification> is missing required attribute 'name'"))?
+            .ok_or_else(|| {
+                self.err(
+                    n,
+                    path,
+                    "<specification> is missing required attribute 'name'",
+                )
+            })?
             .to_string();
-        let ver_raw = Self::attr(n, "ifcVersion")
-            .ok_or_else(|| self.err(n, path, "<specification> is missing required attribute 'ifcVersion'"))?;
+        let ver_raw = Self::attr(n, "ifcVersion").ok_or_else(|| {
+            self.err(
+                n,
+                path,
+                "<specification> is missing required attribute 'ifcVersion'",
+            )
+        })?;
         let mut ifc_versions = Vec::new();
         for tok in ver_raw.split_ascii_whitespace() {
             let s = Schema::from_ids_token(tok).ok_or_else(|| {
@@ -411,7 +474,12 @@ impl<'d, 'input: 'd> Parser<'d, 'input> {
             ));
         }
         let kids = self.elements(n, path)?;
-        let slots = self.sequence(n, path, &kids, &[("applicability", 1, Some(1)), ("requirements", 0, Some(1))])?;
+        let slots = self.sequence(
+            n,
+            path,
+            &kids,
+            &[("applicability", 1, Some(1)), ("requirements", 0, Some(1))],
+        )?;
 
         let app = slots[0][0];
         let app_path = format!("{path}/applicability");
@@ -464,7 +532,11 @@ impl<'d, 'input: 'd> Parser<'d, 'input> {
     /// forms: min 1 with max 1|unbounded = required, min 0 with max
     /// 1|unbounded = optional, 0/0 = prohibited. Anything else (min > 1,
     /// other finite max, min > max) is rejected.
-    fn spec_cardinality(&self, app: Node, path: &str) -> Result<(SpecCardinality, u32, Option<u32>), IdsError> {
+    fn spec_cardinality(
+        &self,
+        app: Node,
+        path: &str,
+    ) -> Result<(SpecCardinality, u32, Option<u32>), IdsError> {
         let parse = |attr: &str, v: &str| -> Result<u32, IdsError> {
             parse_non_negative_integer(v)
                 .and_then(|x| u32::try_from(x).ok())
@@ -474,7 +546,11 @@ impl<'d, 'input: 'd> Parser<'d, 'input> {
                         &format!("{path}/@{attr}"),
                         format!(
                             "{attr} '{v}' is not a non-negative integer{}",
-                            if attr == "maxOccurs" { " or 'unbounded'" } else { "" }
+                            if attr == "maxOccurs" {
+                                " or 'unbounded'"
+                            } else {
+                                ""
+                            }
                         ),
                     )
                 })
@@ -541,7 +617,14 @@ impl<'d, 'input: 'd> Parser<'d, 'input> {
         let mut out = Vec::with_capacity(kids.len());
         for k in kids {
             let local = k.tag_name().name();
-            let known = ["entity", "partOf", "classification", "attribute", "property", "material"];
+            let known = [
+                "entity",
+                "partOf",
+                "classification",
+                "attribute",
+                "property",
+                "material",
+            ];
             if k.tag_name().namespace() != Some(IDS_NS) || !known.contains(&local) {
                 return Err(self.err(
                     k,
@@ -586,8 +669,21 @@ impl<'d, 'input: 'd> Parser<'d, 'input> {
                 Facet::Entity(self.entity_body(n, path, &kids)?)
             }
             "attribute" => {
-                self.check_attrs(n, path, if req { &["cardinality", "instructions"] } else { &[] })?;
-                let s = self.sequence(n, path, &kids, &[("name", 1, Some(1)), ("value", 0, Some(1))])?;
+                self.check_attrs(
+                    n,
+                    path,
+                    if req {
+                        &["cardinality", "instructions"]
+                    } else {
+                        &[]
+                    },
+                )?;
+                let s = self.sequence(
+                    n,
+                    path,
+                    &kids,
+                    &[("name", 1, Some(1)), ("value", 0, Some(1))],
+                )?;
                 Facet::Attribute {
                     name: self.val(s[0][0], &format!("{path}/name"))?,
                     value: self.opt_val(&s[1], &format!("{path}/value"))?,
@@ -607,7 +703,11 @@ impl<'d, 'input: 'd> Parser<'d, 'input> {
                     n,
                     path,
                     &kids,
-                    &[("propertySet", 1, Some(1)), ("baseName", 1, Some(1)), ("value", 0, Some(1))],
+                    &[
+                        ("propertySet", 1, Some(1)),
+                        ("baseName", 1, Some(1)),
+                        ("value", 0, Some(1)),
+                    ],
                 )?;
                 let data_type = match Self::attr(n, "dataType") {
                     None => None,
@@ -615,7 +715,13 @@ impl<'d, 'input: 'd> Parser<'d, 'input> {
                         // upperCaseName: xs:normalizedString, pattern [A-Z]+.
                         let norm: String = dt
                             .chars()
-                            .map(|c| if matches!(c, '\t' | '\n' | '\r') { ' ' } else { c })
+                            .map(|c| {
+                                if matches!(c, '\t' | '\n' | '\r') {
+                                    ' '
+                                } else {
+                                    c
+                                }
+                            })
                             .collect();
                         if norm.is_empty() || !norm.chars().all(|c| c.is_ascii_uppercase()) {
                             return Err(self.err(
@@ -632,28 +738,69 @@ impl<'d, 'input: 'd> Parser<'d, 'input> {
                     base_name: self.val(s[1][0], &format!("{path}/baseName"))?,
                     value: self.opt_val(&s[2], &format!("{path}/value"))?,
                     data_type,
-                    uri: if req { Self::attr(n, "uri").map(str::to_string) } else { None },
+                    uri: if req {
+                        Self::attr(n, "uri").map(str::to_string)
+                    } else {
+                        None
+                    },
                 }
             }
             "classification" => {
-                self.check_attrs(n, path, if req { &["uri", "cardinality", "instructions"] } else { &[] })?;
-                let s = self.sequence(n, path, &kids, &[("value", 0, Some(1)), ("system", 1, Some(1))])?;
+                self.check_attrs(
+                    n,
+                    path,
+                    if req {
+                        &["uri", "cardinality", "instructions"]
+                    } else {
+                        &[]
+                    },
+                )?;
+                let s = self.sequence(
+                    n,
+                    path,
+                    &kids,
+                    &[("value", 0, Some(1)), ("system", 1, Some(1))],
+                )?;
                 Facet::Classification {
                     value: self.opt_val(&s[0], &format!("{path}/value"))?,
                     system: self.val(s[1][0], &format!("{path}/system"))?,
-                    uri: if req { Self::attr(n, "uri").map(str::to_string) } else { None },
+                    uri: if req {
+                        Self::attr(n, "uri").map(str::to_string)
+                    } else {
+                        None
+                    },
                 }
             }
             "material" => {
-                self.check_attrs(n, path, if req { &["uri", "cardinality", "instructions"] } else { &[] })?;
+                self.check_attrs(
+                    n,
+                    path,
+                    if req {
+                        &["uri", "cardinality", "instructions"]
+                    } else {
+                        &[]
+                    },
+                )?;
                 let s = self.sequence(n, path, &kids, &[("value", 0, Some(1))])?;
                 Facet::Material {
                     value: self.opt_val(&s[0], &format!("{path}/value"))?,
-                    uri: if req { Self::attr(n, "uri").map(str::to_string) } else { None },
+                    uri: if req {
+                        Self::attr(n, "uri").map(str::to_string)
+                    } else {
+                        None
+                    },
                 }
             }
             "partOf" => {
-                self.check_attrs(n, path, if req { &["relation", "cardinality", "instructions"] } else { &["relation"] })?;
+                self.check_attrs(
+                    n,
+                    path,
+                    if req {
+                        &["relation", "cardinality", "instructions"]
+                    } else {
+                        &["relation"]
+                    },
+                )?;
                 let s = self.sequence(n, path, &kids, &[("entity", 1, Some(1))])?;
                 let ent = s[0][0];
                 let ep = format!("{path}/entity");
@@ -698,7 +845,9 @@ impl<'d, 'input: 'd> Parser<'d, 'input> {
                     return Err(self.err(
                         n,
                         &format!("{path}/@cardinality"),
-                        format!("cardinality '{c}' is not allowed on <{local}> (allowed: {allowed})"),
+                        format!(
+                            "cardinality '{c}' is not allowed on <{local}> (allowed: {allowed})"
+                        ),
                     ));
                 }
             }
@@ -714,7 +863,12 @@ impl<'d, 'input: 'd> Parser<'d, 'input> {
         path: &str,
         kids: &[Node<'d, 'input>],
     ) -> Result<EntityFacet, IdsError> {
-        let s = self.sequence(n, path, kids, &[("name", 1, Some(1)), ("predefinedType", 0, Some(1))])?;
+        let s = self.sequence(
+            n,
+            path,
+            kids,
+            &[("name", 1, Some(1)), ("predefinedType", 0, Some(1))],
+        )?;
         Ok(EntityFacet {
             name: self.val(s[0][0], &format!("{path}/name"))?,
             predefined_type: self.opt_val(&s[1], &format!("{path}/predefinedType"))?,
@@ -813,7 +967,10 @@ impl<'d, 'input: 'd> Parser<'d, 'input> {
                 return Err(self.err(
                     c,
                     path,
-                    format!("unexpected element {} inside <xs:restriction>", Self::describe(c)),
+                    format!(
+                        "unexpected element {} inside <xs:restriction>",
+                        Self::describe(c)
+                    ),
                 ));
             }
             let local = c.tag_name().name();
@@ -822,12 +979,16 @@ impl<'d, 'input: 'd> Parser<'d, 'input> {
                 "annotation" => continue,
                 "enumeration" | "pattern" | "minInclusive" | "minExclusive" | "maxInclusive"
                 | "maxExclusive" | "length" | "minLength" | "maxLength" => {}
-                "totalDigits" | "fractionDigits" | "whiteSpace" | "assertion" | "explicitTimezone"
-                | "simpleType" => {
+                "totalDigits" | "fractionDigits" | "whiteSpace" | "assertion"
+                | "explicitTimezone" | "simpleType" => {
                     return Err(IdsError::unsupported(format!("xsd-restriction:{local}")));
                 }
                 other => {
-                    return Err(self.err(c, &fp, format!("<xs:{other}> is not an xs:restriction facet")));
+                    return Err(self.err(
+                        c,
+                        &fp,
+                        format!("<xs:{other}> is not an xs:restriction facet"),
+                    ));
                 }
             }
             if !facet_allowed(base, local) {
@@ -847,19 +1008,40 @@ impl<'d, 'input: 'd> Parser<'d, 'input> {
                     return Err(self.err(
                         gc,
                         &fp,
-                        format!("unexpected element {} inside <xs:{local}>", Self::describe(gc)),
+                        format!(
+                            "unexpected element {} inside <xs:{local}>",
+                            Self::describe(gc)
+                        ),
                     ));
                 }
             }
             let v = Self::attr(c, "value")
-                .ok_or_else(|| self.err(c, &fp, format!("<xs:{local}> is missing required attribute 'value'")))?
+                .ok_or_else(|| {
+                    self.err(
+                        c,
+                        &fp,
+                        format!("<xs:{local}> is missing required attribute 'value'"),
+                    )
+                })?
                 .to_string();
             n_facets += 1;
-            let dup = |this: &Self| this.err(c, &fp, format!("<xs:{local}> may appear at most once per restriction"));
+            let dup = |this: &Self| {
+                this.err(
+                    c,
+                    &fp,
+                    format!("<xs:{local}> may appear at most once per restriction"),
+                )
+            };
             let len = |this: &Self, v: &str| -> Result<u32, IdsError> {
                 parse_non_negative_integer(v)
                     .and_then(|x| u32::try_from(x).ok())
-                    .ok_or_else(|| this.err(c, &fp, format!("<xs:{local}> value '{v}' is not a non-negative integer")))
+                    .ok_or_else(|| {
+                        this.err(
+                            c,
+                            &fp,
+                            format!("<xs:{local}> value '{v}' is not a non-negative integer"),
+                        )
+                    })
             };
             match local {
                 "enumeration" => {
@@ -867,7 +1049,10 @@ impl<'d, 'input: 'd> Parser<'d, 'input> {
                         return Err(self.err(
                             c,
                             &fp,
-                            format!("enumeration value '{v}' is not a valid xs:{} literal", base.local_name()),
+                            format!(
+                                "enumeration value '{v}' is not a valid xs:{} literal",
+                                base.local_name()
+                            ),
                         ));
                     }
                     r.enumeration.get_or_insert_with(Vec::new).push(v);
@@ -878,7 +1063,10 @@ impl<'d, 'input: 'd> Parser<'d, 'input> {
                         return Err(self.err(
                             c,
                             &fp,
-                            format!("<xs:{local}> value '{v}' is not a valid xs:{} literal", base.local_name()),
+                            format!(
+                                "<xs:{local}> value '{v}' is not a valid xs:{} literal",
+                                base.local_name()
+                            ),
                         ));
                     }
                     let slot = match local {

@@ -114,7 +114,10 @@ fn temporal_regex(base: XsdBase) -> &'static Regex {
 /// string → pattern, enumeration, lengths; boolean → pattern only;
 /// every other base → pattern, enumeration, bounds.
 pub fn facet_allowed(base: XsdBase, local: &str) -> bool {
-    let bound = matches!(local, "minInclusive" | "minExclusive" | "maxInclusive" | "maxExclusive");
+    let bound = matches!(
+        local,
+        "minInclusive" | "minExclusive" | "maxInclusive" | "maxExclusive"
+    );
     let length = matches!(local, "length" | "minLength" | "maxLength");
     match (base, local) {
         (_, "pattern") => true,
@@ -176,7 +179,11 @@ fn entity_name_uppercase(e: &EntityFacet) -> Result<(), String> {
             "entity name '{s}' must be an uppercase IFC class name (e.g. '{}')",
             s.to_uppercase()
         )),
-        Val::Restriction(r) => match r.enumeration.as_ref().and_then(|en| en.iter().find(|s| bad(s))) {
+        Val::Restriction(r) => match r
+            .enumeration
+            .as_ref()
+            .and_then(|en| en.iter().find(|s| bad(s)))
+        {
             Some(s) => Err(format!(
                 "entity name enumeration value '{s}' must be an uppercase IFC class name"
             )),
@@ -367,12 +374,17 @@ mod tests {
         let same = vec![req(ent(Val::Simple("IFCWALL".into())))];
         assert!(audit_requirement_entities(&app, &same).is_ok());
         let other = vec![req(ent(Val::Simple("IFCSLAB".into())))];
-        assert_eq!(audit_requirement_entities(&app, &other).map_err(|e| e.0), Err(0));
+        assert_eq!(
+            audit_requirement_entities(&app, &other).map_err(|e| e.0),
+            Err(0)
+        );
         let pat = Restriction {
             patterns: Some(vec!["IFC.*TYPE".into()]),
             ..Restriction::default()
         };
-        assert!(audit_requirement_entities(&app, &[req(ent(Val::Restriction(pat.clone())))]).is_err());
+        assert!(
+            audit_requirement_entities(&app, &[req(ent(Val::Restriction(pat.clone())))]).is_err()
+        );
         let app_type = vec![ent(Val::Simple("IFCWALLTYPE".into()))];
         assert!(audit_requirement_entities(&app_type, &[req(ent(Val::Restriction(pat)))]).is_ok());
         // Applicability without a simple entity: nothing to check.

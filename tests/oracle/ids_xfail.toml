@@ -133,3 +133,21 @@ case = "property/pass-material_properties_are_supported_under_ifc2x3_via_extende
 label = "ifctester_bug"
 issue = "#193"
 note = "IfcTester reads pset.Properties for every IfcMaterialProperties (ifctester/facet.py:912-913); IFC2X3 IfcExtendedMaterialProperties has ExtendedProperties, so it raises AttributeError; ifcopenshell.util.element.get_psets resolves the pset correctly and the requirement is met"
+
+[[xfail]]
+case = "attribute/invalid-integers_cannot_be_expressed_as_floating_point_numbers_2_2"
+label = "ifctester_bug"
+issue = "#193"
+note = "Float literal on an integer attribute; IfcTester accepts it (XSD-only check, no audit) and passes, the suite expects fail-or-invalid; ifcfast rejects at parse-time audit"
+
+[[xfail]]
+case = "property/invalid-integer_values_cannot_be_stored_with_decimal_2_4"
+label = "ifctester_bug"
+issue = "#193"
+note = "Decimal literal on an IFCINTEGER dataType; IfcTester passes it, ifcfast rejects at parse-time audit"
+
+[[xfail]]
+case = "property/invalid-integer_values_cannot_be_stored_with_decimal_3_4"
+label = "ifctester_bug"
+issue = "#193"
+note = "Decimal literal on an IFCINTEGER dataType; IfcTester passes it, ifcfast rejects at parse-time audit"

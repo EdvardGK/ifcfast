@@ -15,8 +15,11 @@ Citations are against the pinned references:
   `tests/oracle/ids_testcases.lock`). Case ids are `<folder>/<stem>` under
   `Documentation/ImplementersDocumentation/TestCases/`.
 
-Status: seeded skeleton. The "ifcfast" column is the *intended* behaviour until the native
-engine lands. Once it lands, each row needs a green conformance case that pins it.
+Status: the native engine implements the Entity and Attribute facets (GH #192 slice 1,
+`crates/core/src/ids/{compile,candidates,attrs,eval,report}.rs`); rows for those facets
+describe shipped behaviour, pinned by `crates/core/tests/ids_eval.rs` (all 334 suite cases
+agree with the filename truth: slice-1 folders by result, the rest as `Unsupported`). Rows
+for other facets stay *intended* until their slice lands.
 
 ## Ambiguous in the text: follow IfcTester
 
@@ -62,3 +65,35 @@ from a semantic audit: unknown entity or attribute names, upper-case booleans, f
 literals where the dataType is an integer, patterns on numeric bases, and prohibited
 specifications that carry requirements. The CLI's `rejct` column counts those rejections
 for information. They are not required for agreement.
+
+## Slice 1 (Entity + Attribute) decisions, 2026-09-24
+
+Rows A6–A13 follow the same rule (ambiguous → IfcTester). R1–R3 record where the slice-1
+brief or the design doc said one thing and the suite pinned another; the suite won. Open
+questions are marked **open**.
+
+| # | Point | IfcTester reading (source) | ifcfast | Pinning case(s) |
+|---|---|---|---|---|
+| A6 | IFC2X3 `<NAME>TYPE` rule with a restriction entity name | `Entity.__call__` calls `self.name.endswith("TYPE")` (`ifctester/facet.py:234-238`); on a `Restriction` that raises `AttributeError` | The mapping rule applies to plain names only; a restriction name matches the occurrence class exactly | none (**open**: no suite case) |
+| A7 | Candidates when applicability has no entity facet | `Attribute.filter` (`facet.py:277-303`): every entity declaring an attribute of that name, `by_type(..., include_subtypes=True)`. A name restriction matching two attributes declared at different levels collects a record twice | Every record whose class has a matching attribute (inherited included), deduplicated | none (**open**: no attribute-first case in the suite) |
+| A8 | Several `IfcRelDefinesByType` on one occurrence (invalid IFC) | `get_type`: IFC4 `IsTypedBy[0]`, IFC2X3 the first `IfcRelDefinesByType` in `IsDefinedBy` (`ifcopenshell/util/element.py:629-641`); inverse order is ifcopenshell's | The first rel in file order | none |
+| A9 | `predefinedType` resolution order when BOTH type and occurrence carry a concrete value | Type first (A1; `util/element.py:565-576`) | Type first, as IfcTester. Design §2.4 lists the occurrence first; the suite cases (`entity/pass-inherited_predefined_types_should_pass`, `…overridden…`) are consistent with both orders | **open**: no case with a concrete value on both. The design text should be amended to "type first" or a case added |
+| A10 | Optional attribute facet on `''`, an empty list, or LOGICAL `.U.` | Fails (`FALSEY`, `facet.py:332-357`); only a non-resolvable name short-circuits to pass | Only null (`$`) or a derived slot (`*`) passes an optional facet (D3); `''`, `()` and `.U.` are written values and fail | `attribute/fail-an_optional_attribute_fails_if_empty` (`''`); `()` and `.U.` under optional: **open** |
+| A11 | Value checks on references, lists and typed selects | Entity instances fail outright; a tuple never equals a cast IDS string (`facet.py:359-385`) | Always `ATTR_VALUE_MISMATCH` at run time; at compile time, a value on an attribute whose every resolution is object / list / select is `IdsInvalidError` | `attribute/invalid-value_checks_always_fail_for_{objects,lists,selects}` |
+| A12 | An attribute-name restriction that matches no attribute of the applicability entity | `values=[]` → `NOVALUE` fail (`facet.py:306-330`) | Same (evaluated, not rejected). A plain unknown name is `IdsInvalidError` | `attribute/invalid-invalid_attribute_names_always_fail` (plain name) |
+| A13 | File schemas `IFC4X3`, `IFC4X3_ADD1`, `IFC4X3_TC1` | `check_ifc_version`: exact `schema_identifier in ifcVersion` (`ids.py:278-280`); only matters when filtering | All map to the IFC4X3_ADD2 tables (ifcopenshell 0.8.5 resolves `IFC4X3` to ADD2); other schemas are an error | none |
+| R1 | `ifcVersion` vs the file schema | `Ids.validate(..., should_filter_version=False)` by default (`ids.py:167-180`, `:282-284`): every spec is validated whatever its `ifcVersion` | Same by default. `filter_ifc_version=True` opts into `status="skipped_ifc_version"`. The slice brief asked to skip mismatches by default; that fails 10 `ids/` cases (IFC4 files under `ifcVersion="IFC2X3"`) | `ids/pass-specification_version_is_purely_metadata_and_does_not_impact_pass_or_fail_result` and the other 9 `ids/` cases |
+| R2 | `predefinedType` literal outside the entity's enumeration | Compared as a user-defined type (ObjectType / ElementType / ProcessType) | Legal; never `IdsInvalidError`. The slice brief asked to reject it; that would fail user-defined cases. `partof/invalid-a_group_predefined_type_must_match_exactly_1_2` (`BUNNARY` vs `BUNNY`) fails on its own once PartOf lands | `entity/pass-a_predefined_type_may_specify_a_user_defined_object_type` (`WALDO`), `entity/fail-a_predefined_type_from_an_enumeration_must_be_uppercase` (must be `fail`, not invalid) |
+| R3 | Attribute-name validation scope | No audit (only XSD decode) | A plain attribute name must be an explicit, non-derived attribute of the applicability entity (of some schema entity when there is none); inverse and derived names are `IdsInvalidError`. Applied to applicability and requirement facets alike | `attribute/invalid-{invalid_attribute_names,inverse_attributes,derived_attributes}_*` |
+
+Also resolved by slice 1: D3's second case,
+`ids/pass-specification_optionality_and_facet_optionality_can_be_combined`, is green in
+ifcfast (it needs no separate registration; IfcTester's `ifctester_bug` label covers it once
+the harness runs both legs).
+
+Label parity (`expected`, `applicability_label`, `requirement_labels`): the English
+templates are ported verbatim (`facet.py:123-158`, `:182-197`, `:260-275`). A restriction
+prints as IfcTester's `str(options)` dict, but with a fixed key order (enumeration, pattern,
+bounds, lengths) where IfcTester keeps document order (`facet.py:1007-1022`). **open**,
+gated in slice 4 by `to_ifctester_json` equality.
+

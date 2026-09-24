@@ -49,7 +49,11 @@ wrong (the only label that fails pytest) · ``ifctester_bug`` ifcfast right,
 IfcTester wrong · ``test_case_drift`` both wrong and both give the same
 answer · ``both_error`` both raised. Both wrong with *different* answers is
 ``ifcfast_bug`` until triaged into ``tests/oracle/ids_xfail.toml`` as
-``test_case_drift``.
+``test_case_drift``. ``unsupported_facet`` ifcfast raised
+``IdsUnsupportedError`` — the case needs a facet the native engine does not
+implement yet (slice 1 = Entity + Attribute; GH #192 slices 2–3 add the
+rest). It does NOT fail pytest and is counted per folder; it is coverage,
+not a verdict, and the IfcTester half is still checked.
 
 Known failures
 --------------
@@ -93,7 +97,7 @@ ENV_OVERRIDE = "IFCFAST_IDS_TESTCASES"
 FETCH_HINT = "python scripts/fetch_ids_testcases.py  (downloads + verifies the pinned suite)"
 
 Expected = Literal["pass", "fail", "invalid"]
-Status = Literal["pass", "fail", "invalid", "error"]
+Status = Literal["pass", "fail", "invalid", "unsupported", "error"]
 _PREFIX = re.compile(r"^(pass|fail|invalid)-")
 
 
@@ -125,6 +129,7 @@ class Label(enum.Enum):
     ifctester_bug = "ifctester_bug"
     test_case_drift = "test_case_drift"
     both_error = "both_error"
+    unsupported_facet = "unsupported_facet"
 
 
 class IfcfastUnavailable(RuntimeError):
@@ -211,6 +216,8 @@ def _ifcfast_api():
     fn = getattr(ifcfast, "validate_ids", None)
     if fn is None:
         raise IfcfastUnavailable("ifcfast.validate_ids not built yet")
+    if not hasattr(ifcfast._core, "validate_ids"):
+        raise IfcfastUnavailable("ifcfast native module built without the `ids` feature (rebuild the wheel)")
     try:
         return fn, ifcfast.IdsInvalidError, ifcfast.IdsUnsupportedError
     except AttributeError as e:
@@ -228,8 +235,9 @@ def ifcfast_available() -> bool:
 def run_ifcfast(case: Case) -> Outcome:
     """ifcfast overall outcome. Raises :class:`IfcfastUnavailable` if not built.
 
-    ``IdsInvalidError`` -> ``invalid``; ``IdsUnsupportedError`` -> ``error``
-    (a coverage gap is a failure, never a skip); ``report.ok`` -> pass/fail.
+    ``IdsInvalidError`` -> ``invalid``; ``IdsUnsupportedError`` ->
+    ``unsupported`` (labelled ``unsupported_facet``: a named coverage gap,
+    never a fabricated pass or fail); ``report.ok`` -> pass/fail.
     """
     validate_ids, IdsInvalidError, IdsUnsupportedError = _ifcfast_api()
     if case.ifc_path is None:
@@ -240,7 +248,7 @@ def run_ifcfast(case: Case) -> Outcome:
     except IdsInvalidError as e:
         return Outcome("invalid", _err(e))
     except IdsUnsupportedError as e:
-        return Outcome("error", "unsupported: " + _err(e))
+        return Outcome("unsupported", _err(e))
     except Exception as e:
         return Outcome("error", _err(e))
     if report.ok:
@@ -271,6 +279,8 @@ ifcfast_agrees = agrees
 
 
 def classify(expected: Expected, ifctester: Outcome, ifcfast: Outcome) -> Label:
+    if ifcfast.status == "unsupported":
+        return Label.unsupported_facet
     t_ok = ifctester_agrees(expected, ifctester)
     f_ok = ifcfast_agrees(expected, ifcfast)
     if t_ok and f_ok:
@@ -371,6 +381,8 @@ def xfail_verdict(xf: XFail, expected: Expected, t: Outcome, observed: Label | N
         )
     if observed is None:
         return None
+    if observed is Label.unsupported_facet:
+        return None  # ifcfast cannot judge the case yet; the IfcTester half ran above
     if observed is Label.green:
         return f"xfail stale: {xf.case} is green — remove the xfail ({xf.issue})"
     if xf.label is Label.test_case_drift and observed in (Label.test_case_drift, Label.ifcfast_bug):
@@ -530,12 +542,30 @@ def main(argv: list[str] | None = None) -> int:
 
     bugs = 0
     if with_fast:
+        print("\nifcfast leg per folder (unsup = unsupported_facet: facet not implemented yet, not a failure):")
+        h2 = f"{'folder':<15}{'total':>6}{'green':>7}{'unsup':>7}{'rejct':>7}{'bug':>6}{'other':>7}"
+        print(h2)
+        print("-" * len(h2))
+        for fo in folders + ["TOTAL"]:
+            rs = rows if fo == "TOTAL" else [r for r in rows if r["folder"] == fo]
+            lab = [r["label"] for r in rs]
+            vals = [
+                len(rs),
+                lab.count("green"),
+                lab.count("unsupported_facet"),
+                sum(r["expected"] == "invalid" and (r["ifcfast"] or {}).get("status") == "invalid" for r in rs),
+                sum(1 for r in rs if r["label"] == "ifcfast_bug" and not r["xfail"]),
+                sum(1 for x in lab if x not in ("green", "unsupported_facet", "ifcfast_bug")),
+            ]
+            if fo == "TOTAL":
+                print("-" * len(h2))
+            print(f"{fo:<15}" + "".join(f"{v:>{w}}" for v, w in zip(vals, (6, 7, 7, 7, 6, 7))))
         print("\nifcfast vs IfcTester vs truth (non-green, per folder):")
         for g, cnt in collector.summary_by_group().items():
             print(f"  {g}: {cnt}")
         bugs = sum(1 for r in rows if r["label"] == "ifcfast_bug" and not r["xfail"])
         for r in rows:
-            if r["label"] not in (None, "green"):
+            if r["label"] not in (None, "green", "unsupported_facet"):
                 print(f"  [{r['label']}] {r['case']}: expected {r['expected']}, "
                       f"ifcfast {r['ifcfast']['status']}, IfcTester {r['ifctester']['status']}")
 

@@ -222,6 +222,7 @@ elevation_m`; `diff()`'s `storey_deltas` carry both `elevation` and
 | Clash detection within one model | `ifcfast.clash("model.bundle/")` |
 | Cross-discipline clash (N models) | `ifcfast.clash(["ark.bundle/", "rib.bundle/"])` — federates, then clashes |
 | Merge N bundles into one substrate | `ifcfast.federate([a, b, …], out_dir)` |
+| Check a model against an IDS (buildingSMART IDS 1.0) | `m.validate_ids("spec.ids")` / `ifcfast.validate_ids(ids, ifc)` → `IdsReport(specs, elements, failures)`; `rep.ok`. Entity + Attribute facets today; other facets raise `IdsUnsupportedError` — see [IDS validation](#ids-validation-mvalidate_ids) |
 
 ## Substrate output (DuckDB-queryable parquet)
 
@@ -687,6 +688,103 @@ WHERE c.kind = 'hard'
 regardless of the source IFC's linear unit. The substrate records
 the project's unit scale as parquet schema metadata
 (`ifcfast.unit_scale`) and the clash engine converts at load time.
+
+## IDS validation (`m.validate_ids`)
+
+Native IDS 1.0 checking (GH #192). **IfcTester is the reference
+implementation**; ifcfast is the speed-first companion (same relationship
+as `m.mesh_qto()` to ifcopenshell geometry): one EntityTable pass, no
+ifcopenshell at runtime, typed errors instead of guesses. Conformance is
+gated against the buildingSMART IDS test suite with IfcTester as the
+second voice (`tests/oracle/ids_conformance.py`).
+
+**Coverage today (slice 1): Entity and Attribute facets.** Property,
+Classification, Material and PartOf raise `IdsUnsupportedError` until
+GH #192 slices 2–3. Decide:
+
+| Your IDS uses… | Do this |
+|---|---|
+| only `entity` / `attribute` facets | `m.validate_ids(ids)` — full result |
+| any other facet, and you need every spec checked | run IfcTester for those specs (the error names the facet) |
+| a mix, and a partial answer is useful | `m.validate_ids(ids, on_unsupported="mark")` — those specs come back `status="unsupported"` with **no element rows**; `rep.ok` is `False` while any spec is unsupported |
+
+```python
+import ifcfast
+rep = ifcfast.validate_ids("spec.ids", "model.ifc")      # path | XML str | bytes | list thereof
+rep = m.validate_ids(["a.ids", "b.ids"])                  # a list shares ONE parse of the IFC
+rep.ok                                                    # every spec pass (or skipped_ifc_version)
+rep.specs[rep.specs.status == "fail"]
+rep.failures.groupby("reason_code", observed=True).size()
+rep.to_parquet("ids_out/")                                # specs/elements/failures.parquet
+```
+
+Keyword args: `on_unsupported="raise"|"mark"`, `filter_ifc_version=False`
+(IfcTester default: every spec is checked whatever its `ifcVersion`;
+`True` skips specs whose `ifcVersion` excludes the file's schema →
+`status="skipped_ifc_version"`). Each call stands alone — nothing is cached
+on the Model. `rep.to_ifctester_json()` raises `NotImplementedError`
+until slice 4.
+
+**`specs`** — one row per specification:
+
+| column | dtype | meaning |
+|---|---|---|
+| `ids_index` | int32 | which IDS document of the call |
+| `spec_index` | int32 | running index across all documents; join key |
+| `name`, `identifier`, `description`, `instructions` | string | from the IDS |
+| `ifc_versions` | string | space-separated `ifcVersion` tokens |
+| `cardinality` | category | `required` / `optional` / `prohibited` |
+| `status` | category | `pass` / `fail` / `skipped_ifc_version` / `unsupported` |
+| `reason_code` | category | `SPEC_NO_APPLICABLE` (required, nothing applicable) / `SPEC_PROHIBITED_APPLICABLE` / null |
+| `unsupported_feature` | string | e.g. `facet:property`, `xsd-regex:block:IsThai`; null otherwise |
+| `applicable`, `passed`, `failed` | int64 | element counts |
+| `applicability_label` | string | IfcTester-style label, e.g. `All IFCWALL data` |
+| `requirement_labels` | list[str] | one label per requirement |
+
+**`elements`** — one row per spec × applicable element: `spec_index`,
+`step_id` (int64), `guid` (null for non-IfcRoot classes), `entity`
+(title case, exact class), `predefined_type` (IfcTester
+`get_predefined_type`: type first, then occurrence; USERDEFINED resolves
+to ElementType / ObjectType), `name`, `description`, `tag`,
+`type_step_id` (Int64, the `IfcRelDefinesByType` type), `status`
+(`pass`/`fail`), `n_failed` (int16). Every applicable element of a
+prohibited spec is `fail`.
+
+**`failures`** — one row per spec × element × failing requirement:
+`spec_index`, `step_id`, `guid`, `requirement_index` (int16),
+`facet_type` (`entity`/`attribute`), `facet_cardinality`,
+`reason_code`, `expected` (the requirement's IfcTester label), `actual`
+(Python-`str` of the value found; null when nothing was found),
+`value_source` (`instance` / `type`; null when no value).
+
+**Reason codes.** Emitted today: `ENTITY_MISMATCH`, `PREDEFINED_MISMATCH`,
+`ATTR_MISSING` (no such attribute on the class, or null / `''` / empty
+list / LOGICAL UNKNOWN), `ATTR_VALUE_MISMATCH` (also: any value check on a
+reference, list or typed select value), `PROHIBITED_PRESENT`,
+`SPEC_NO_APPLICABLE`, `SPEC_PROHIBITED_APPLICABLE`. Reserved for slices
+2–3: `PSET_MISSING`, `PROP_MISSING`, `PROP_NULL`, `PROP_DATATYPE_MISMATCH`,
+`PROP_VALUE_MISMATCH`, `CLASS_MISSING`, `CLASS_SYSTEM_MISMATCH`,
+`CLASS_VALUE_MISMATCH`, `MATERIAL_MISSING`, `MATERIAL_VALUE_MISMATCH`,
+`PARTOF_MISSING`, `PARTOF_ENTITY_MISMATCH`.
+
+**Semantics you can rely on.** Entity matching is exact class (no
+subtypes), as IDS 1.0 and IfcTester. In IFC2X3 an IFC4 occurrence name
+(`IFCAIRTERMINAL`) matches occurrences typed by `<NAME>TYPE` (the
+type-mapping table). Candidates come from every record in the file, not
+the product whitelist. Reals compare with the IDS tolerance
+(`|x−v| ≤ 1e-6·|v| + 1e-6`); several `xs:pattern`s are ORed (XSD); both
+are places IfcTester 0.8.5 differs — see `docs/ids/ambiguities.md`. An
+`optional` attribute facet passes on a null (`$`) attribute but fails on
+`''`.
+
+**Errors** (all subclass `ifcfast.IfcfastError`):
+
+| Exception | When | Attributes |
+|---|---|---|
+| `IdsInvalidError` | malformed IDS, or one that can never be satisfied for the file's schema: unknown entity / attribute, inverse or derived attribute, a value of the wrong literal type (`42.0` for an integer, `FALSE`), a pattern on a numeric attribute, a value check on an object / list / select attribute | `.path`, `.line` |
+| `IdsUnsupportedError` | valid IDS construct ifcfast does not implement (a facet above, some XSD regex constructs); the message points to IfcTester | `.feature`, `.spec_index` |
+| `IdsUnitError` | a requirement needs a unit the model does not declare (slice 2) | `.unit_type` |
+| `IfcfastError` | the IFC is truncated or its `FILE_SCHEMA` is not IFC2X3 / IFC4 / IFC4X3* | — |
 
 ## Strict mode (loud failure — default ON)
 
@@ -1579,6 +1677,11 @@ Decision rules:
 
 ## What `ifcfast` does NOT do (yet)
 
+- IDS Property, Classification, Material and PartOf facets
+  (`IdsUnsupportedError`, GH #192 slices 2–3), `to_ifctester_json()`
+  (slice 4), and XSD regex constructs with no Rust `regex` equivalent
+  (e.g. some `\p{Is…}` blocks, complex class subtraction) —
+  `IdsUnsupportedError` names the construct. Use IfcTester for those.
 - Mutate quantity values (`IfcElementQuantity`), enumerated / bounded /
   list properties, or type-level psets; `m.mutate` covers
   `IfcPropertySingleValue`, Name/Description, and `IfcLocalPlacement`

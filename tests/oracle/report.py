@@ -69,6 +69,10 @@ class Classification(enum.Enum):
                                filename truth (benign once triaged).
     - ``both_error``         — neither engine produced an outcome (blocking in
                                the Collector; needs triage).
+    - ``unsupported_facet``  — ifcfast raised ``IdsUnsupportedError``: the case
+                               uses a facet the native engine does not implement
+                               yet (GH #192 slices 2–3). Coverage, not a verdict
+                               (benign; counted per folder).
     """
 
     expected_drift = "expected_drift"
@@ -80,6 +84,7 @@ class Classification(enum.Enum):
     ifctester_bug = "ifctester_bug"
     test_case_drift = "test_case_drift"
     both_error = "both_error"
+    unsupported_facet = "unsupported_facet"
 
 
 #: Classifications that are accepted and do NOT fail CI.
@@ -89,6 +94,7 @@ BENIGN: frozenset[Classification] = frozenset(
         Classification.ifcopenshell_quirk,
         Classification.ifctester_bug,
         Classification.test_case_drift,
+        Classification.unsupported_facet,
     }
 )
 

@@ -3497,6 +3497,215 @@ mod python {
         })
     }
 
+    // ----- IDS validation (feature `ids`, GH #192) ----------------------
+
+    #[cfg(feature = "ids")]
+    pyo3::create_exception!(_core, IdsInvalidError, IfcfastError);
+    #[cfg(feature = "ids")]
+    pyo3::create_exception!(_core, IdsUnsupportedError, IfcfastError);
+    #[cfg(feature = "ids")]
+    pyo3::create_exception!(_core, IdsUnitError, IfcfastError);
+
+    /// Map an `IdsError` onto the typed Python exceptions, with the
+    /// structured fields as attributes: `IdsInvalidError.path/.line`,
+    /// `IdsUnsupportedError.feature/.spec_index`, `IdsUnitError.unit_type`.
+    /// `IfcInput` (truncated file, unknown schema, malformed record) is
+    /// the base `IfcfastError`.
+    #[cfg(feature = "ids")]
+    fn ids_err(py: Python<'_>, e: crate::ids::IdsError) -> PyErr {
+        use crate::ids::IdsError as E;
+        use pyo3::IntoPyObjectExt;
+        let msg = e.to_string();
+        let built: PyResult<(PyErr, Vec<(&str, Bound<'_, PyAny>)>)> = (|| {
+            Ok(match e {
+                E::InvalidIds { path, line, .. } => (
+                    PyErr::new::<IdsInvalidError, _>(msg),
+                    vec![
+                        ("path", path.into_bound_py_any(py)?),
+                        ("line", line.into_bound_py_any(py)?),
+                    ],
+                ),
+                E::Unsupported {
+                    feature,
+                    spec_index,
+                } => (
+                    PyErr::new::<IdsUnsupportedError, _>(msg),
+                    vec![
+                        ("feature", feature.into_bound_py_any(py)?),
+                        ("spec_index", spec_index.into_bound_py_any(py)?),
+                    ],
+                ),
+                E::UnresolvedUnit { unit_type } => (
+                    PyErr::new::<IdsUnitError, _>(msg),
+                    vec![("unit_type", unit_type.into_bound_py_any(py)?)],
+                ),
+                E::IfcInput { .. } => (PyErr::new::<IfcfastError, _>(msg), Vec::new()),
+            })
+        })();
+        let (err, attrs) = match built {
+            Ok(v) => v,
+            Err(conv) => return conv,
+        };
+        let value = err.value(py);
+        for (k, v) in attrs {
+            if let Err(se) = value.setattr(k, v) {
+                return se;
+            }
+        }
+        err
+    }
+
+    /// Validate one IFC against one or more IDS documents (native IDS 1.0,
+    /// slice 1: Entity + Attribute facets). `ifc` is a path (`str` /
+    /// `os.PathLike`) or the file's `bytes` (plain STEP or ifczip);
+    /// `ids_list` holds each IDS document's bytes. One EntityTable is built
+    /// and shared across the list.
+    ///
+    /// Returns `{"specs": {col: list}, "elements": {…}, "failures": {…},
+    /// "schema", "warnings", "entity_table_ms", "validate_ms"}`; column
+    /// meanings in `ids::report`. Raises `IdsInvalidError`,
+    /// `IdsUnsupportedError` (`on_unsupported="raise"`), `IdsUnitError`,
+    /// or `IfcfastError` (truncated IFC, unknown FILE_SCHEMA).
+    #[cfg(feature = "ids")]
+    #[pyfunction]
+    #[pyo3(signature = (ifc, ids_list, on_unsupported = "raise", filter_ifc_version = false))]
+    fn validate_ids<'py>(
+        py: Python<'py>,
+        ifc: &Bound<'py, PyAny>,
+        ids_list: Vec<Vec<u8>>,
+        on_unsupported: &str,
+        filter_ifc_version: bool,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        catch_panic(|| {
+            use crate::ids::{OnUnsupported, ValidateOptions};
+            let mode = OnUnsupported::from_name(on_unsupported).ok_or_else(|| {
+                pyo3::exceptions::PyValueError::new_err(format!(
+                    "on_unsupported must be 'raise' or 'mark', got {on_unsupported:?}"
+                ))
+            })?;
+            if ids_list.is_empty() {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "validate_ids: no IDS documents given",
+                ));
+            }
+            let src = if ifc.is_instance_of::<pyo3::types::PyBytes>() {
+                let bytes: Vec<u8> = ifc.extract()?;
+                crate::source::open_bytes(bytes)
+                    .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("IFC bytes: {e}")))?
+            } else {
+                let path: std::path::PathBuf = ifc.extract().map_err(|_| {
+                    pyo3::exceptions::PyTypeError::new_err(
+                        "validate_ids: ifc must be a path (str / os.PathLike) or bytes",
+                    )
+                })?;
+                crate::source::open(&path).map_err(|e| {
+                    pyo3::exceptions::PyIOError::new_err(format!("open {}: {e}", path.display()))
+                })?
+            };
+            let opts = ValidateOptions {
+                on_unsupported: mode,
+                filter_ifc_version,
+            };
+            let buf: &[u8] = src.as_bytes();
+            let result = py.detach(|| {
+                let schema = crate::ids::schema_from_header(buf)?;
+                let t_table = Instant::now();
+                let table = crate::entity_table::EntityTable::build(buf);
+                let table_ms = t_table.elapsed().as_secs_f64() * 1000.0;
+                let t_val = Instant::now();
+                let docs: Vec<&[u8]> = ids_list.iter().map(|d| d.as_slice()).collect();
+                let rep = crate::ids::validate_with(&docs, &table, schema, opts)?;
+                let val_ms = t_val.elapsed().as_secs_f64() * 1000.0;
+                Ok::<_, crate::ids::IdsError>((
+                    rep,
+                    schema,
+                    table.warnings().to_vec(),
+                    table_ms,
+                    val_ms,
+                ))
+            });
+            let (rep, schema, warnings, table_ms, val_ms) = result.map_err(|e| ids_err(py, e))?;
+
+            let out = PyDict::new(py);
+            let s = &rep.specs;
+            let d = PyDict::new(py);
+            d.set_item("ids_index", PyList::new(py, &s.ids_index)?)?;
+            d.set_item("spec_index", PyList::new(py, &s.spec_index)?)?;
+            d.set_item("name", PyList::new(py, &s.name)?)?;
+            d.set_item("identifier", PyList::new(py, &s.identifier)?)?;
+            d.set_item("description", PyList::new(py, &s.description)?)?;
+            d.set_item("instructions", PyList::new(py, &s.instructions)?)?;
+            d.set_item("ifc_versions", PyList::new(py, &s.ifc_versions)?)?;
+            d.set_item("cardinality", PyList::new(py, &s.cardinality)?)?;
+            d.set_item("status", PyList::new(py, &s.status)?)?;
+            d.set_item("reason_code", PyList::new(py, &s.reason_code)?)?;
+            d.set_item(
+                "unsupported_feature",
+                PyList::new(py, &s.unsupported_feature)?,
+            )?;
+            d.set_item("applicable", PyList::new(py, &s.applicable)?)?;
+            d.set_item("passed", PyList::new(py, &s.passed)?)?;
+            d.set_item("failed", PyList::new(py, &s.failed)?)?;
+            d.set_item(
+                "applicability_label",
+                PyList::new(py, &s.applicability_label)?,
+            )?;
+            d.set_item(
+                "requirement_labels",
+                PyList::new(py, &s.requirement_labels)?,
+            )?;
+            out.set_item("specs", d)?;
+
+            let e = &rep.elements;
+            let d = PyDict::new(py);
+            d.set_item("spec_index", PyList::new(py, &e.spec_index)?)?;
+            d.set_item("step_id", PyList::new(py, &e.step_id)?)?;
+            d.set_item("guid", PyList::new(py, &e.guid)?)?;
+            d.set_item("entity", PyList::new(py, &e.entity)?)?;
+            d.set_item("predefined_type", PyList::new(py, &e.predefined_type)?)?;
+            d.set_item("name", PyList::new(py, &e.name)?)?;
+            d.set_item("description", PyList::new(py, &e.description)?)?;
+            d.set_item("tag", PyList::new(py, &e.tag)?)?;
+            d.set_item("type_step_id", PyList::new(py, &e.type_step_id)?)?;
+            d.set_item("status", PyList::new(py, &e.status)?)?;
+            d.set_item("n_failed", PyList::new(py, &e.n_failed)?)?;
+            out.set_item("elements", d)?;
+
+            let f = &rep.failures;
+            let d = PyDict::new(py);
+            d.set_item("spec_index", PyList::new(py, &f.spec_index)?)?;
+            d.set_item("step_id", PyList::new(py, &f.step_id)?)?;
+            d.set_item("guid", PyList::new(py, &f.guid)?)?;
+            d.set_item("requirement_index", PyList::new(py, &f.requirement_index)?)?;
+            d.set_item("facet_type", PyList::new(py, &f.facet_type)?)?;
+            d.set_item("facet_cardinality", PyList::new(py, &f.facet_cardinality)?)?;
+            d.set_item("reason_code", PyList::new(py, &f.reason_code)?)?;
+            d.set_item("expected", PyList::new(py, &f.expected)?)?;
+            d.set_item("actual", PyList::new(py, &f.actual)?)?;
+            d.set_item("value_source", PyList::new(py, &f.value_source)?)?;
+            out.set_item("failures", d)?;
+
+            out.set_item("schema", schema.ids_token())?;
+            out.set_item("warnings", warnings)?;
+            out.set_item("entity_table_ms", table_ms)?;
+            out.set_item("validate_ms", val_ms)?;
+            Ok(out)
+        })
+    }
+
+    /// The parse-differential projection of an IDS document (schema
+    /// `ifcfast.ids.canonical/1`, see `tests/oracle/ids_parse_differential.py`).
+    /// Raises `IdsInvalidError` / `IdsUnsupportedError` like `validate_ids`.
+    #[cfg(feature = "ids")]
+    #[pyfunction]
+    fn _ids_canonical_json(py: Python<'_>, ids: Vec<u8>) -> PyResult<String> {
+        catch_panic(|| {
+            crate::ids::parse_ids(&ids)
+                .map(|d| d.to_canonical_json())
+                .map_err(|e| ids_err(py, e))
+        })
+    }
+
     #[pymodule]
     fn _core(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add("IfcfastError", _py.get_type::<IfcfastError>())?;
@@ -3530,6 +3739,14 @@ mod python {
         m.add_function(wrap_pyfunction!(subset_ifc, m)?)?;
         m.add_function(wrap_pyfunction!(hotswap_ifc, m)?)?;
         m.add_function(wrap_pyfunction!(mutate_ifc, m)?)?;
+        #[cfg(feature = "ids")]
+        {
+            m.add("IdsInvalidError", _py.get_type::<IdsInvalidError>())?;
+            m.add("IdsUnsupportedError", _py.get_type::<IdsUnsupportedError>())?;
+            m.add("IdsUnitError", _py.get_type::<IdsUnitError>())?;
+            m.add_function(wrap_pyfunction!(validate_ids, m)?)?;
+            m.add_function(wrap_pyfunction!(_ids_canonical_json, m)?)?;
+        }
         m.add("__version__", env!("CARGO_PKG_VERSION"))?;
         Ok(())
     }

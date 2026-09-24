@@ -26,7 +26,10 @@ pub const DATATYPE_BASES: &[(&str, Option<XsdBase>)] = &[
     ("IFCAIRTOAIRHEATRECOVERYTYPEENUM", Some(XsdBase::String)),
     ("IFCALARMTYPEENUM", Some(XsdBase::String)),
     ("IFCALIGNMENTCANTSEGMENTTYPEENUM", Some(XsdBase::String)),
-    ("IFCALIGNMENTHORIZONTALSEGMENTTYPEENUM", Some(XsdBase::String)),
+    (
+        "IFCALIGNMENTHORIZONTALSEGMENTTYPEENUM",
+        Some(XsdBase::String),
+    ),
     ("IFCALIGNMENTTYPEENUM", Some(XsdBase::String)),
     ("IFCALIGNMENTVERTICALSEGMENTTYPEENUM", Some(XsdBase::String)),
     ("IFCAMOUNTOFSUBSTANCEMEASURE", Some(XsdBase::Double)),
@@ -70,9 +73,18 @@ pub const DATATYPE_BASES: &[(&str, Option<XsdBase>)] = &[
     ("IFCCONDENSERTYPEENUM", Some(XsdBase::String)),
     ("IFCCONNECTIONTYPEENUM", Some(XsdBase::String)),
     ("IFCCONSTRAINTENUM", Some(XsdBase::String)),
-    ("IFCCONSTRUCTIONEQUIPMENTRESOURCETYPEENUM", Some(XsdBase::String)),
-    ("IFCCONSTRUCTIONMATERIALRESOURCETYPEENUM", Some(XsdBase::String)),
-    ("IFCCONSTRUCTIONPRODUCTRESOURCETYPEENUM", Some(XsdBase::String)),
+    (
+        "IFCCONSTRUCTIONEQUIPMENTRESOURCETYPEENUM",
+        Some(XsdBase::String),
+    ),
+    (
+        "IFCCONSTRUCTIONMATERIALRESOURCETYPEENUM",
+        Some(XsdBase::String),
+    ),
+    (
+        "IFCCONSTRUCTIONPRODUCTRESOURCETYPEENUM",
+        Some(XsdBase::String),
+    ),
     ("IFCCONTEXTDEPENDENTMEASURE", Some(XsdBase::Double)),
     ("IFCCONTROLLERTYPEENUM", Some(XsdBase::String)),
     ("IFCCONVEYORSEGMENTTYPEENUM", Some(XsdBase::String)),
@@ -101,7 +113,10 @@ pub const DATATYPE_BASES: &[(&str, Option<XsdBase>)] = &[
     ("IFCDIRECTIONSENSEENUM", Some(XsdBase::String)),
     ("IFCDISCRETEACCESSORYTYPEENUM", Some(XsdBase::String)),
     ("IFCDISTRIBUTIONBOARDTYPEENUM", Some(XsdBase::String)),
-    ("IFCDISTRIBUTIONCHAMBERELEMENTTYPEENUM", Some(XsdBase::String)),
+    (
+        "IFCDISTRIBUTIONCHAMBERELEMENTTYPEENUM",
+        Some(XsdBase::String),
+    ),
     ("IFCDISTRIBUTIONPORTTYPEENUM", Some(XsdBase::String)),
     ("IFCDISTRIBUTIONSYSTEMENUM", Some(XsdBase::String)),
     ("IFCDOCUMENTCONFIDENTIALITYENUM", Some(XsdBase::String)),
@@ -126,10 +141,22 @@ pub const DATATYPE_BASES: &[(&str, Option<XsdBase>)] = &[
     ("IFCELECTRICCONDUCTANCEMEASURE", Some(XsdBase::Double)),
     ("IFCELECTRICCURRENTENUM", Some(XsdBase::String)),
     ("IFCELECTRICCURRENTMEASURE", Some(XsdBase::Double)),
-    ("IFCELECTRICDISTRIBUTIONBOARDTYPEENUM", Some(XsdBase::String)),
-    ("IFCELECTRICDISTRIBUTIONPOINTFUNCTIONENUM", Some(XsdBase::String)),
-    ("IFCELECTRICFLOWSTORAGEDEVICETYPEENUM", Some(XsdBase::String)),
-    ("IFCELECTRICFLOWTREATMENTDEVICETYPEENUM", Some(XsdBase::String)),
+    (
+        "IFCELECTRICDISTRIBUTIONBOARDTYPEENUM",
+        Some(XsdBase::String),
+    ),
+    (
+        "IFCELECTRICDISTRIBUTIONPOINTFUNCTIONENUM",
+        Some(XsdBase::String),
+    ),
+    (
+        "IFCELECTRICFLOWSTORAGEDEVICETYPEENUM",
+        Some(XsdBase::String),
+    ),
+    (
+        "IFCELECTRICFLOWTREATMENTDEVICETYPEENUM",
+        Some(XsdBase::String),
+    ),
     ("IFCELECTRICGENERATORTYPEENUM", Some(XsdBase::String)),
     ("IFCELECTRICHEATERTYPEENUM", Some(XsdBase::String)),
     ("IFCELECTRICMOTORTYPEENUM", Some(XsdBase::String)),
@@ -185,7 +212,10 @@ pub const DATATYPE_BASES: &[(&str, Option<XsdBase>)] = &[
     ("IFCINTERNALOREXTERNALENUM", Some(XsdBase::String)),
     ("IFCINVENTORYTYPEENUM", Some(XsdBase::String)),
     ("IFCIONCONCENTRATIONMEASURE", Some(XsdBase::Double)),
-    ("IFCISOTHERMALMOISTURECAPACITYMEASURE", Some(XsdBase::Double)),
+    (
+        "IFCISOTHERMALMOISTURECAPACITYMEASURE",
+        Some(XsdBase::Double),
+    ),
     ("IFCJUNCTIONBOXTYPEENUM", Some(XsdBase::String)),
     ("IFCKERBTYPEENUM", Some(XsdBase::String)),
     ("IFCKINEMATICVISCOSITYMEASURE", Some(XsdBase::Double)),
@@ -207,7 +237,10 @@ pub const DATATYPE_BASES: &[(&str, Option<XsdBase>)] = &[
     ("IFCLOGICAL", Some(XsdBase::String)),
     ("IFCLOGICALOPERATORENUM", Some(XsdBase::String)),
     ("IFCLUMINOUSFLUXMEASURE", Some(XsdBase::Double)),
-    ("IFCLUMINOUSINTENSITYDISTRIBUTIONMEASURE", Some(XsdBase::Double)),
+    (
+        "IFCLUMINOUSINTENSITYDISTRIBUTIONMEASURE",
+        Some(XsdBase::Double),
+    ),
     ("IFCLUMINOUSINTENSITYMEASURE", Some(XsdBase::Double)),
     ("IFCMAGNETICFLUXDENSITYMEASURE", Some(XsdBase::Double)),
     ("IFCMAGNETICFLUXMEASURE", Some(XsdBase::Double)),
@@ -221,10 +254,19 @@ pub const DATATYPE_BASES: &[(&str, Option<XsdBase>)] = &[
     ("IFCMEDICALDEVICETYPEENUM", Some(XsdBase::String)),
     ("IFCMEMBERTYPEENUM", Some(XsdBase::String)),
     ("IFCMINUTEINHOUR", Some(XsdBase::Integer)),
-    ("IFCMOBILETELECOMMUNICATIONSAPPLIANCETYPEENUM", Some(XsdBase::String)),
+    (
+        "IFCMOBILETELECOMMUNICATIONSAPPLIANCETYPEENUM",
+        Some(XsdBase::String),
+    ),
     ("IFCMODULUSOFELASTICITYMEASURE", Some(XsdBase::Double)),
-    ("IFCMODULUSOFLINEARSUBGRADEREACTIONMEASURE", Some(XsdBase::Double)),
-    ("IFCMODULUSOFROTATIONALSUBGRADEREACTIONMEASURE", Some(XsdBase::Double)),
+    (
+        "IFCMODULUSOFLINEARSUBGRADEREACTIONMEASURE",
+        Some(XsdBase::Double),
+    ),
+    (
+        "IFCMODULUSOFROTATIONALSUBGRADEREACTIONMEASURE",
+        Some(XsdBase::Double),
+    ),
     ("IFCMODULUSOFSUBGRADEREACTIONMEASURE", Some(XsdBase::Double)),
     ("IFCMOISTUREDIFFUSIVITYMEASURE", Some(XsdBase::Double)),
     ("IFCMOLECULARWEIGHTMEASURE", Some(XsdBase::Double)),
@@ -272,7 +314,10 @@ pub const DATATYPE_BASES: &[(&str, Option<XsdBase>)] = &[
     ("IFCPROJECTORDERTYPEENUM", Some(XsdBase::String)),
     ("IFCPROPERTYSETTEMPLATETYPEENUM", Some(XsdBase::String)),
     ("IFCPROPERTYSOURCEENUM", Some(XsdBase::String)),
-    ("IFCPROTECTIVEDEVICETRIPPINGUNITTYPEENUM", Some(XsdBase::String)),
+    (
+        "IFCPROTECTIVEDEVICETRIPPINGUNITTYPEENUM",
+        Some(XsdBase::String),
+    ),
     ("IFCPROTECTIVEDEVICETYPEENUM", Some(XsdBase::String)),
     ("IFCPUMPTYPEENUM", Some(XsdBase::String)),
     ("IFCRADIOACTIVITYMEASURE", Some(XsdBase::Double)),
@@ -337,7 +382,10 @@ pub const DATATYPE_BASES: &[(&str, Option<XsdBase>)] = &[
     ("IFCSTRUCTURALCURVEACTIVITYTYPEENUM", Some(XsdBase::String)),
     ("IFCSTRUCTURALCURVEMEMBERTYPEENUM", Some(XsdBase::String)),
     ("IFCSTRUCTURALCURVETYPEENUM", Some(XsdBase::String)),
-    ("IFCSTRUCTURALSURFACEACTIVITYTYPEENUM", Some(XsdBase::String)),
+    (
+        "IFCSTRUCTURALSURFACEACTIVITYTYPEENUM",
+        Some(XsdBase::String),
+    ),
     ("IFCSTRUCTURALSURFACEMEMBERTYPEENUM", Some(XsdBase::String)),
     ("IFCSTRUCTURALSURFACETYPEENUM", Some(XsdBase::String)),
     ("IFCSUBCONTRACTRESOURCETYPEENUM", Some(XsdBase::String)),
@@ -360,7 +408,10 @@ pub const DATATYPE_BASES: &[(&str, Option<XsdBase>)] = &[
     ("IFCTEXTTRANSFORMATION", Some(XsdBase::String)),
     ("IFCTHERMALADMITTANCEMEASURE", Some(XsdBase::Double)),
     ("IFCTHERMALCONDUCTIVITYMEASURE", Some(XsdBase::Double)),
-    ("IFCTHERMALEXPANSIONCOEFFICIENTMEASURE", Some(XsdBase::Double)),
+    (
+        "IFCTHERMALEXPANSIONCOEFFICIENTMEASURE",
+        Some(XsdBase::Double),
+    ),
     ("IFCTHERMALLOADSOURCEENUM", Some(XsdBase::String)),
     ("IFCTHERMALLOADTYPEENUM", Some(XsdBase::String)),
     ("IFCTHERMALRESISTANCEMEASURE", Some(XsdBase::Double)),
@@ -425,9 +476,15 @@ mod tests {
         assert!(DATATYPE_BASES.windows(2).all(|w| w[0].0 < w[1].0));
         assert_eq!(datatype_base("IFCLABEL"), Some(Some(XsdBase::String)));
         assert_eq!(datatype_base("IFCREAL"), Some(Some(XsdBase::Double)));
-        assert_eq!(datatype_base("IFCLENGTHMEASURE"), Some(Some(XsdBase::Double)));
+        assert_eq!(
+            datatype_base("IFCLENGTHMEASURE"),
+            Some(Some(XsdBase::Double))
+        );
         assert_eq!(datatype_base("IFCINTEGER"), Some(Some(XsdBase::Integer)));
-        assert_eq!(datatype_base("IFCCOUNTMEASURE"), Some(Some(XsdBase::Integer)));
+        assert_eq!(
+            datatype_base("IFCCOUNTMEASURE"),
+            Some(Some(XsdBase::Integer))
+        );
         assert_eq!(datatype_base("IFCBOOLEAN"), Some(Some(XsdBase::Boolean)));
         assert_eq!(datatype_base("IFCDATE"), Some(Some(XsdBase::Date)));
         assert_eq!(datatype_base("IFCBINARY"), Some(None));

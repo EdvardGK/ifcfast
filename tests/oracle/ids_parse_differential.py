@@ -234,7 +234,7 @@ def ifctester_canonical(ids_path: Path) -> dict[str, Any]:
 
 
 # --------------------------------------------------------------------------- #
-# ifcfast -> canonical (not built yet)
+# ifcfast -> canonical (`ifcfast._ids_canonical_json`)
 # --------------------------------------------------------------------------- #
 def ifcfast_canonical(ids_path: Path) -> dict[str, Any]:
     """ifcfast's canonical IR for ``ids_path``.
@@ -247,8 +247,8 @@ def ifcfast_canonical(ids_path: Path) -> dict[str, Any]:
     import ifcfast
 
     fn = getattr(ifcfast, "_ids_canonical_json", None)
-    if fn is None:
-        raise NotImplementedError("ifcfast IDS IR canonical JSON binding not built yet")
+    if fn is None or not hasattr(ifcfast._core, "_ids_canonical_json"):
+        raise NotImplementedError("ifcfast IDS IR canonical JSON binding not built into this wheel")
     return json.loads(fn(str(ids_path)))
 
 
@@ -273,10 +273,19 @@ def test_ids_parse_differential(case: Case):
     except IdsXmlValidationError:
         pytest.skip("IDS fails the XSD in IfcTester; there is no IR to compare")
     canonical_dumps(ours_ref)  # must serialise
+    import ifcfast
+
     try:
         fast = ifcfast_canonical(case.ids_path)
     except NotImplementedError as e:
         pytest.skip(str(e))
+    except ifcfast.IdsInvalidError as e:
+        # ifcfast's parse applies the schema-free audit (ids/audit.rs), which
+        # refuses some `invalid-` IDS that pass IfcTester's XSD-only decode.
+        # There is no ifcfast IR to compare; any other case refused is a bug.
+        if case.expected == "invalid":
+            pytest.skip(f"ifcfast audit rejects this invalid- IDS: {e}")
+        raise
     assert canonical_dumps(fast) == canonical_dumps(ours_ref)
 
 

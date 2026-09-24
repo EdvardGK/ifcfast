@@ -169,7 +169,9 @@ impl<'a> Translator<'a> {
             }
             Some('{') => {
                 self.i += 1;
-                let min = self.digits().ok_or_else(|| self.err("'{' must start a {n}, {n,} or {n,m} quantifier"))?;
+                let min = self
+                    .digits()
+                    .ok_or_else(|| self.err("'{' must start a {n}, {n,} or {n,m} quantifier"))?;
                 let mut q = format!("{{{min}");
                 if self.peek() == Some(',') {
                     self.i += 1;
@@ -178,7 +180,9 @@ impl<'a> Translator<'a> {
                         let (lo, hi) = (min.parse::<u64>(), max.parse::<u64>());
                         match (lo, hi) {
                             (Ok(lo), Ok(hi)) if lo <= hi => {}
-                            (Ok(_), Ok(_)) => return Err(self.err("quantifier {n,m} requires n <= m")),
+                            (Ok(_), Ok(_)) => {
+                                return Err(self.err("quantifier {n,m} requires n <= m"))
+                            }
                             _ => return Err(self.err("quantifier bound too large")),
                         }
                         q.push_str(&max);
@@ -216,9 +220,8 @@ impl<'a> Translator<'a> {
             '(' => {
                 self.i += 1;
                 if self.peek() == Some('?') {
-                    return Err(self.err(
-                        "'(?' groups (non-capturing, lookaround, flags) are not XSD regex",
-                    ));
+                    return Err(self
+                        .err("'(?' groups (non-capturing, lookaround, flags) are not XSD regex"));
                 }
                 let inner = self.reg_exp()?;
                 if self.peek() != Some(')') {
@@ -316,17 +319,16 @@ impl<'a> Translator<'a> {
         self.i += 1;
         if let Some(block) = name.strip_prefix("Is") {
             return match BLOCKS.iter().find(|(n, _, _)| *n == block) {
-                Some((_, lo, hi)) => Ok(format!(
-                    "\\u{{{:X}}}-\\u{{{:X}}}",
-                    *lo as u32, *hi as u32
-                )),
+                Some((_, lo, hi)) => Ok(format!("\\u{{{:X}}}-\\u{{{:X}}}", *lo as u32, *hi as u32)),
                 None => Err(IdsError::unsupported(format!("xsd-regex:block:{name}"))),
             };
         }
         if CATEGORIES.contains(&name.as_str()) {
             Ok(format!("\\p{{{name}}}"))
         } else {
-            Err(self.err(&format!("'{name}' is not an XSD character category or Is-block")))
+            Err(self.err(&format!(
+                "'{name}' is not an XSD character category or Is-block"
+            )))
         }
     }
 
@@ -357,7 +359,8 @@ impl<'a> Translator<'a> {
                     self.i += 2;
                     subtraction = Some(self.char_class_expr_body()?);
                     if self.peek() != Some(']') {
-                        return Err(self.err("class subtraction must be the last part of a character class"));
+                        return Err(self
+                            .err("class subtraction must be the last part of a character class"));
                     }
                     break;
                 }
@@ -368,7 +371,9 @@ impl<'a> Translator<'a> {
                     n_items += 1;
                     continue;
                 }
-                return Err(self.err("'-' must be escaped unless it is first or last in a character class"));
+                return Err(
+                    self.err("'-' must be escaped unless it is first or last in a character class")
+                );
             }
             if c == '[' {
                 return Err(self.err("unescaped '[' inside a character class"));
@@ -385,11 +390,15 @@ impl<'a> Translator<'a> {
                         let hi = match self.class_char_or_esc()? {
                             ClassItem::Char(h) => h,
                             ClassItem::Set(_) => {
-                                return Err(self.err("a character range cannot end in a multi-character escape"))
+                                return Err(self.err(
+                                    "a character range cannot end in a multi-character escape",
+                                ))
                             }
                         };
                         if hi < lo {
-                            return Err(self.err(&format!("character range '{lo}-{hi}' is reversed")));
+                            return Err(
+                                self.err(&format!("character range '{lo}-{hi}' is reversed"))
+                            );
                         }
                         body.push_str(&class_lit(lo));
                         body.push('-');
@@ -515,7 +524,9 @@ mod tests {
         assert!(ok(r"\P{IsBasicLatin}").is_match("ø"));
         assert!(ok(r"[\p{IsBasicLatin}\p{IsLatin-1Supplement}]+").is_match("Blåbær"));
         match compile_xsd_pattern(r"\p{IsThai}") {
-            Err(IdsError::Unsupported { feature, .. }) => assert_eq!(feature, "xsd-regex:block:IsThai"),
+            Err(IdsError::Unsupported { feature, .. }) => {
+                assert_eq!(feature, "xsd-regex:block:IsThai")
+            }
             other => panic!("{other:?}"),
         }
         assert!(is_invalid(r"\p{Xx}"));
@@ -534,10 +545,14 @@ mod tests {
     fn ids_regex_rejects_non_xsd() {
         for p in [
             "a*?", "a+?", "a??", "a{2}?", "a*+", "a{2}{3}", "(?:a)", "(?=a)", "(?!a)", "(?i)a",
-            r"(a)\1", r"\b", r"\A", r"\x41", "a{,3}", "a{3,2}", "*a", "a|*", "(a",
-            "a)", "[a", "[]", "[a-]b-]", "[z-a]", "a]", "a}", r"a\", "[a[b]]", r"[\d-z]",
+            r"(a)\1", r"\b", r"\A", r"\x41", "a{,3}", "a{3,2}", "*a", "a|*", "(a", "a)", "[a",
+            "[]", "[a-]b-]", "[z-a]", "a]", "a}", r"a\", "[a[b]]", r"[\d-z]",
         ] {
-            assert!(is_invalid(p), "should reject {p:?}: {:?}", translate_xsd_pattern(p));
+            assert!(
+                is_invalid(p),
+                "should reject {p:?}: {:?}",
+                translate_xsd_pattern(p)
+            );
         }
         // `\u0041` (built at runtime so no layer unescapes it).
         let u_esc = format!("{}u0041", '\\');

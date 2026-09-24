@@ -148,7 +148,9 @@ fn compile_restriction(r: &Restriction) -> Result<CompiledRestriction, IdsError>
 /// other unparseable bound is an invalid IDS.
 pub(crate) fn parse_bound(base: XsdBase, facet: &str, lexical: &str) -> Result<f64, IdsError> {
     if base.is_temporal() {
-        return Err(IdsError::unsupported(format!("xsd-restriction:{facet}-on-temporal-base")));
+        return Err(IdsError::unsupported(format!(
+            "xsd-restriction:{facet}-on-temporal-base"
+        )));
     }
     match py_float(lexical) {
         Some(v) if !v.is_nan() => Ok(v),
@@ -292,7 +294,11 @@ pub(crate) fn py_float_repr(x: f64) -> String {
         return if x > 0.0 { "inf".into() } else { "-inf".into() };
     }
     if x == 0.0 {
-        return if x.is_sign_negative() { "-0.0".into() } else { "0.0".into() };
+        return if x.is_sign_negative() {
+            "-0.0".into()
+        } else {
+            "0.0".into()
+        };
     }
     // Rust `{:e}` gives shortest round-trip digits: "-1.2345e-7".
     let sci = format!("{x:e}");

@@ -377,7 +377,8 @@ impl IdsDocument {
             .specs
             .iter()
             .map(|sp| {
-                let mut versions: Vec<&str> = sp.ifc_versions.iter().map(|s| s.ids_token()).collect();
+                let mut versions: Vec<&str> =
+                    sp.ifc_versions.iter().map(|s| s.ids_token()).collect();
                 versions.sort_unstable();
                 let min = sp.min_occurs;
                 let max: Value = match sp.max_occurs {
@@ -534,7 +535,11 @@ fn canonical_val(v: Option<&Val>) -> serde_json::Value {
                     m.insert(k.into(), json!(v));
                 }
             }
-            let lens = [("length", r.length), ("minLength", r.min_length), ("maxLength", r.max_length)];
+            let lens = [
+                ("length", r.length),
+                ("minLength", r.min_length),
+                ("maxLength", r.max_length),
+            ];
             for (k, v) in lens {
                 if let Some(v) = v {
                     m.insert(k.into(), json!(v.to_string()));

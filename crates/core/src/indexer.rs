@@ -779,7 +779,7 @@ pub struct IndexedFile {
 // HEADER section — extract schema, originating app, etc.
 // ----------------------------------------------------------------------
 
-fn extract_header(buf: &[u8]) -> (String, Option<String>) {
+pub(crate) fn extract_header(buf: &[u8]) -> (String, Option<String>) {
     let mut schema = String::new();
     let mut originating: Option<String> = None;
 

@@ -1133,6 +1133,28 @@ class Model:
             bool(per_product_materials),
         )
 
+    def validate_ids(self, ids, *, on_unsupported: str = "raise", filter_ifc_version: bool = False):
+        """Validate this model against one or more IDS 1.0 documents.
+
+        ``ids`` is a path, an XML string, ``bytes``, or a list of those
+        (validated over one parse of the IFC). Returns an
+        :class:`ifcfast.ids.IdsReport` — ``(specs, elements, failures)``
+        DataFrames plus ``.ok`` and ``.to_parquet(dir)``. Each call stands
+        alone; nothing is cached on the Model.
+
+        Slice 1 checks the Entity and Attribute facets; other facets raise
+        :class:`ifcfast.IdsUnsupportedError` unless
+        ``on_unsupported="mark"``. See :func:`ifcfast.validate_ids`.
+        """
+        from .ids import validate_ids as _validate_ids
+
+        return _validate_ids(
+            ids,
+            self.header.path,
+            on_unsupported=on_unsupported,
+            filter_ifc_version=filter_ifc_version,
+        )
+
     def subset(self, guids: Iterable[str], *, out_path=None):
         """Carve a self-contained IFC subset seeded by ``guids``.
 

@@ -61,6 +61,8 @@ Public API:
 * :func:`bundle` — write the parquet substrate for one IFC.
 * :func:`federate` — merge N substrate bundles into one clash-able bundle.
 * :func:`clash` — clash detection against a bundle (or a list of them).
+* :func:`validate_ids` — check a model against IDS 1.0 files (Entity +
+  Attribute facets today; others raise :class:`IdsUnsupportedError`).
 * :class:`Model` — parsed index, lazy data layers, spatial-graph helpers.
 * :class:`ProductRow`, :class:`StoreyRow` — row dataclasses.
 * :mod:`ifcfast.classify` — element-mode policy.
@@ -77,6 +79,14 @@ from .bundle import bundle
 from .clash import clash
 from .federate import federate
 from . import cache, classify
+from .ids import (
+    IdsInvalidError,
+    IdsReport,
+    IdsUnitError,
+    IdsUnsupportedError,
+    validate_ids,
+    _ids_canonical_json,
+)
 
 # Re-export the Rust-side IfcfastError so callers can
 # `from ifcfast import IfcfastError` without reaching into `_core`.
@@ -93,6 +103,10 @@ except ImportError:  # pragma: no cover
 
 __all__ = [
     "IFCHeader",
+    "IdsInvalidError",
+    "IdsReport",
+    "IdsUnitError",
+    "IdsUnsupportedError",
     "IfcfastError",
     "Model",
     "ProductRow",
@@ -107,6 +121,7 @@ __all__ = [
     "header",
     "open",
     "system_prompt",
+    "validate_ids",
 ]
 
 # Single source of truth: read the version from the installed package
@@ -292,6 +307,10 @@ All traversal methods return None / [] on unknown guids — they never
 raise. Filter ProductRow iteration via m.filter(entity=..., mode=...,
 storey_guid=...). Compare two models with m.diff(other_path).
 Recoverable native failures raise ifcfast.IfcfastError.
+
+IDS 1.0 checks (Entity + Attribute facets; others raise IdsUnsupportedError):
+    rep = m.validate_ids("spec.ids")   # or ifcfast.validate_ids(ids, ifc)
+    rep.ok; rep.specs; rep.elements; rep.failures   # failures.reason_code
 
 CLI (all subcommands accept --json for machine output):
     ifcfast demo                  # showcase against the bundled IFC
