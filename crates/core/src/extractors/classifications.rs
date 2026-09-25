@@ -77,6 +77,7 @@ pub(crate) struct ClassificationIndex {
     /// relating reference), file order: how non-rooted resources
     /// (IfcMaterial, …) carry classification references. Not used by the
     /// public table.
+    #[cfg_attr(not(feature = "ids"), allow(dead_code))]
     pub(crate) external_ref_pairs: Vec<(u64, u64)>,
 }
 

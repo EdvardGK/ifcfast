@@ -399,6 +399,7 @@ pub(crate) struct MaterialIndex {
     pub(crate) profiles: HashMap<u64, ConstituentRecord>,
     /// LayerSetName / IfcMaterialConstituentSet.Name /
     /// IfcMaterialProfileSet.Name by set step id (IDS only).
+    #[cfg_attr(not(feature = "ids"), allow(dead_code))]
     pub(crate) set_names: HashMap<u64, Option<String>>,
 }
 
