@@ -1,7 +1,7 @@
 ## Agent signature
 - **Agent**: `claude-fable-5-1` (coordinator) with opus sub-agents (2A refactor, semantics spec, 2B facets, #194 diagnosis)
 - **Working tree**: `/home/edkjo/workspace/inbox/ifcfast`
-- **Branch**: `main` @ `7792bdc` → `cda4f78` (commits: `d8bf1d1` slice 2A, `cda4f78` slice 2B)
+- **Branch**: `main` @ `7792bdc` → `cda4f78` (commits: `d8bf1d1` slice 2A, `cda4f78` slice 2B, `93669e6` worklog, `c843201` csg-smoke fix)
 - **Session scope**: IDS slice 2 (Property / Classification / Material facets, PropertyGraph + UnitTable) shipped to main; GH #194 diagnosed (contract, not math)
 - **Touched paths**: `crates/core/src/extractors/{property_graph.rs (new),psets.rs,quantities.rs,materials.rs,classifications.rs,mod.rs}`, `crates/core/src/units.rs` (new), `crates/core/src/indexer.rs`, `crates/core/src/lib.rs`, `crates/core/src/ids/{graph.rs (new),eval,compile,report,restriction,candidates,mod,schema_tables}.rs`, `crates/core/tests/ids_eval.rs`, `crates/core/tests/fixtures/ids/props_units.ifc`, `.gitignore`, `scripts/{gen_schema_tables.py,dump_tables_ab.py (new)}`, `python/ifcfast/{ids.py,model.py}`, `AGENTS.md` + `python/ifcfast/data/AGENTS.md`, `docs/ids/{facet-semantics-slice2.md (new),ambiguities.md}`, `docs/plans/2026-09-24_ids-validation-design.md`
 - **Parallel sessions observed**: GH #194 filed 2026-09-24 15:54 by Ed from the edkjo box (signed "edkjo, revit-plugin/personal"); no commits on origin/main from others
@@ -60,7 +60,7 @@ beams in both modes.
 | `cargo test -p ifcfast-core` | 24 targets, 552 passed, 0 failed |
 | quick pytest (harness, parse differential, agent surface, guide, drift, mcp) | 676 passed, 13 skipped |
 | `pytest tests/` with G55 corpus | 727 passed, 3 skipped (debug build, 82 min) |
-| CI | pending at push |
+| CI on `c843201` | `ci` + `csg-smoke` green (runs 36181555909, 36181555826); first push `93669e6` failed csg-smoke on dead_code for two IDS-only fields in a `--no-default-features --features csg` build → `c843201` cfg_attr gate |
 
 ## Ledger
 No spruceledger node changed an action this session.
