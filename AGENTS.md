@@ -222,7 +222,7 @@ elevation_m`; `diff()`'s `storey_deltas` carry both `elevation` and
 | Clash detection within one model | `ifcfast.clash("model.bundle/")` |
 | Cross-discipline clash (N models) | `ifcfast.clash(["ark.bundle/", "rib.bundle/"])` — federates, then clashes |
 | Merge N bundles into one substrate | `ifcfast.federate([a, b, …], out_dir)` |
-| Check a model against an IDS (buildingSMART IDS 1.0) | `m.validate_ids("spec.ids")` / `ifcfast.validate_ids(ids, ifc)` → `IdsReport(specs, elements, failures)`; `rep.ok`. Entity + Attribute facets today; other facets raise `IdsUnsupportedError` — see [IDS validation](#ids-validation-mvalidate_ids) |
+| Check a model against an IDS (buildingSMART IDS 1.0) | `m.validate_ids("spec.ids")` / `ifcfast.validate_ids(ids, ifc)` → `IdsReport(specs, elements, failures)`; `rep.ok`. Entity, Attribute, Property, Classification and Material facets today; PartOf raises `IdsUnsupportedError` — see [IDS validation](#ids-validation-mvalidate_ids) |
 
 ## Substrate output (DuckDB-queryable parquet)
 
@@ -698,14 +698,14 @@ ifcopenshell at runtime, typed errors instead of guesses. Conformance is
 gated against the buildingSMART IDS test suite with IfcTester as the
 second voice (`tests/oracle/ids_conformance.py`).
 
-**Coverage today (slice 1): Entity and Attribute facets.** Property,
-Classification, Material and PartOf raise `IdsUnsupportedError` until
-GH #192 slices 2–3. Decide:
+**Coverage today (slices 1–2): Entity, Attribute, Property,
+Classification and Material facets.** PartOf raises
+`IdsUnsupportedError` until GH #192 slice 3. Decide:
 
 | Your IDS uses… | Do this |
 |---|---|
-| only `entity` / `attribute` facets | `m.validate_ids(ids)` — full result |
-| any other facet, and you need every spec checked | run IfcTester for those specs (the error names the facet) |
+| no `partOf` facet | `m.validate_ids(ids)` — full result |
+| `partOf`, and you need every spec checked | run IfcTester for those specs (the error names the facet) |
 | a mix, and a partial answer is useful | `m.validate_ids(ids, on_unsupported="mark")` — those specs come back `status="unsupported"` with **no element rows**; `rep.ok` is `False` while any spec is unsupported |
 
 ```python
@@ -736,7 +736,7 @@ until slice 4.
 | `cardinality` | category | `required` / `optional` / `prohibited` |
 | `status` | category | `pass` / `fail` / `skipped_ifc_version` / `unsupported` |
 | `reason_code` | category | `SPEC_NO_APPLICABLE` (required, nothing applicable) / `SPEC_PROHIBITED_APPLICABLE` / null |
-| `unsupported_feature` | string | e.g. `facet:property`, `xsd-regex:block:IsThai`; null otherwise |
+| `unsupported_feature` | string | e.g. `facet:part_of`, `xsd-regex:block:IsThai`, `unit:THERMODYNAMICTEMPERATUREUNIT`; null otherwise |
 | `applicable`, `passed`, `failed` | int64 | element counts |
 | `applicability_label` | string | IfcTester-style label, e.g. `All IFCWALL data` |
 | `requirement_labels` | list[str] | one label per requirement |
@@ -752,7 +752,7 @@ prohibited spec is `fail`.
 
 **`failures`** — one row per spec × element × failing requirement:
 `spec_index`, `step_id`, `guid`, `requirement_index` (int16),
-`facet_type` (`entity`/`attribute`), `facet_cardinality`,
+`facet_type` (`entity`/`attribute`/`property`/`classification`/`material`), `facet_cardinality`,
 `reason_code`, `expected` (the requirement's IfcTester label), `actual`
 (Python-`str` of the value found; null when nothing was found),
 `value_source` (`instance` / `type`; null when no value).
@@ -760,12 +760,18 @@ prohibited spec is `fail`.
 **Reason codes.** Emitted today: `ENTITY_MISMATCH`, `PREDEFINED_MISMATCH`,
 `ATTR_MISSING` (no such attribute on the class, or null / `''` / empty
 list / LOGICAL UNKNOWN), `ATTR_VALUE_MISMATCH` (also: any value check on a
-reference, list or typed select value), `PROHIBITED_PRESENT`,
-`SPEC_NO_APPLICABLE`, `SPEC_PROHIBITED_APPLICABLE`. Reserved for slices
-2–3: `PSET_MISSING`, `PROP_MISSING`, `PROP_NULL`, `PROP_DATATYPE_MISMATCH`,
-`PROP_VALUE_MISMATCH`, `CLASS_MISSING`, `CLASS_SYSTEM_MISMATCH`,
-`CLASS_VALUE_MISMATCH`, `MATERIAL_MISSING`, `MATERIAL_VALUE_MISMATCH`,
-`PARTOF_MISSING`, `PARTOF_ENTITY_MISMATCH`.
+reference, list or typed select value), `PSET_MISSING` (no property /
+quantity set of that name), `PROP_MISSING` (set present, property not),
+`PROP_NULL` (property present with null / `''` / LOGICAL UNKNOWN / empty
+list / bounded value with no bound), `PROP_UNSUPPORTED` (a complex
+property or quantity, or a reference value: IDS 1.0 cannot check them,
+so they count as absent — `optional` and `prohibited` pass),
+`PROP_DATATYPE_MISMATCH` (`actual` = the value's wrapper, e.g.
+`IFCTEXT`), `PROP_VALUE_MISMATCH`, `CLASS_MISSING`,
+`CLASS_VALUE_MISMATCH`, `CLASS_SYSTEM_MISMATCH`, `MATERIAL_MISSING`,
+`MATERIAL_VALUE_MISMATCH` (`actual` = the sorted candidate set),
+`PROHIBITED_PRESENT`, `SPEC_NO_APPLICABLE`, `SPEC_PROHIBITED_APPLICABLE`.
+Reserved for slice 3: `PARTOF_MISSING`, `PARTOF_ENTITY_MISMATCH`.
 
 **Semantics you can rely on.** Entity matching is exact class (no
 subtypes), as IDS 1.0 and IfcTester. In IFC2X3 an IFC4 occurrence name
@@ -777,13 +783,50 @@ are places IfcTester 0.8.5 differs — see `docs/ids/ambiguities.md`. An
 `optional` attribute facet passes on a null (`$`) attribute but fails on
 `''`.
 
+- **Property sets** come from `IfcRelDefinesByProperties` (incl. the
+  project), a type's `HasPropertySets`, `IfcMaterialProperties` /
+  IFC2X3 `IfcExtendedMaterialProperties`, `IfcProfileProperties`, and
+  `IfcPreDefinedPropertySet` attributes (`IfcDoorPanelProperties.PanelOperation`;
+  its dataType is the attribute's declared type). An occurrence inherits
+  its type's sets, merged per property (the occurrence value wins); a
+  type object sees only its own. When a `propertySet` / `baseName`
+  restriction matches several sets or properties, **every** match must
+  satisfy.
+- **dataType** must equal the value's IfcValue wrapper or the quantity's
+  measure exactly (no subtype widening: `IFCLABEL` ≠ `IFCTEXT`), checked
+  on type-inherited values too.
+- **Units.** IDS numbers are SI. A measure value is converted with the
+  property's own `Unit`, else the project unit of the measure's unit type
+  (conversion-based units via their factor, °C/°F with offset, derived
+  units by exponent; mass in kg). A comparison that needs a unit the file
+  does not declare raises `IdsUnitError`, or with `on_unsupported="mark"`
+  marks that spec `status="unsupported"`, `unsupported_feature="unit:<UNITTYPE>"`
+  with no element rows. SI is never assumed. Presence-only checks need no unit.
+- **Multi-valued properties.** Enumerated and list values pass when any
+  element matches; bounded values when any of lower / upper / set point
+  equals the value (not a range test); tables use the columns whose
+  values carry the dataType (all columns without one). A restriction
+  with bounds (`minInclusive` …) must hold for **every** value;
+  enumeration and pattern restrictions stay any-of.
+- **Classification.** `system` matches the root `IfcClassification.Name`
+  via `ReferencedSource`; `value` matches a reference's `Identification`
+  / `ItemReference` exactly, and parent references count (`2` matches a
+  leaf `22` under `2`), with no prefix matching. An occurrence inherits
+  its type's references per system; a directly associated
+  `IfcClassification` counts with no value.
+- **Material.** The first `IfcRelAssociatesMaterial` (usage → its set),
+  else the type's. `value` matches any of: material Name / Category, set
+  name, layer / profile / constituent Name / Category and their
+  material's Name / Category, list members.
+
 **Errors** (all subclass `ifcfast.IfcfastError`):
 
 | Exception | When | Attributes |
 |---|---|---|
 | `IdsInvalidError` | malformed IDS, or one that can never be satisfied for the file's schema: unknown entity / attribute, inverse or derived attribute, a value of the wrong literal type (`42.0` for an integer, `FALSE`), a pattern on a numeric attribute, a value check on an object / list / select attribute | `.path`, `.line` |
-| `IdsUnsupportedError` | valid IDS construct ifcfast does not implement (a facet above, some XSD regex constructs); the message points to IfcTester | `.feature`, `.spec_index` |
-| `IdsUnitError` | a requirement needs a unit the model does not declare (slice 2) | `.unit_type` |
+| `IdsInvalidError` also | a property `dataType` that is not an IDS dataType, or an IfcValue / measure type the file's schema lacks | |
+| `IdsUnsupportedError` | valid IDS construct ifcfast does not implement (`partOf`, some XSD regex constructs); the message points to IfcTester | `.feature`, `.spec_index` |
+| `IdsUnitError` | a value comparison needs a unit the model does not declare (`on_unsupported="raise"`) | `.unit_type` |
 | `IfcfastError` | the IFC is truncated or its `FILE_SCHEMA` is not IFC2X3 / IFC4 / IFC4X3* | — |
 
 ## Strict mode (loud failure — default ON)
@@ -1677,8 +1720,8 @@ Decision rules:
 
 ## What `ifcfast` does NOT do (yet)
 
-- IDS Property, Classification, Material and PartOf facets
-  (`IdsUnsupportedError`, GH #192 slices 2–3), `to_ifctester_json()`
+- IDS PartOf facet (`IdsUnsupportedError`, GH #192 slice 3),
+  `to_ifctester_json()`
   (slice 4), and XSD regex constructs with no Rust `regex` equivalent
   (e.g. some `\p{Is…}` blocks, complex class subtraction) —
   `IdsUnsupportedError` names the construct. Use IfcTester for those.

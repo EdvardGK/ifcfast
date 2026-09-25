@@ -16,10 +16,11 @@ Citations are against the pinned references:
   `Documentation/ImplementersDocumentation/TestCases/`.
 
 Status: the native engine implements the Entity and Attribute facets (GH #192 slice 1,
-`crates/core/src/ids/{compile,candidates,attrs,eval,report}.rs`); rows for those facets
+`crates/core/src/ids/{compile,candidates,attrs,eval,report}.rs`) and the Property,
+Classification and Material facets (slice 2, plus `ids/graph.rs`); rows for those facets
 describe shipped behaviour, pinned by `crates/core/tests/ids_eval.rs` (all 334 suite cases
-agree with the filename truth: slice-1 folders by result, the rest as `Unsupported`). Rows
-for other facets stay *intended* until their slice lands.
+agree with the filename truth: every folder but `partof` by result, `partof` as
+`Unsupported`). PartOf rows stay *intended* until slice 3 lands.
 
 ## Ambiguous in the text: follow IfcTester
 
@@ -103,7 +104,8 @@ gated in slice 4 by `to_ifctester_json` equality.
 Research pass for slice 2 (`docs/ids/facet-semantics-slice2.md`, which has the full rule → case
 → line table). All rows below are **intended** until slice 2 lands. Paths as above, plus
 `element.py` / `cls.py` / `unit.py` = `ifcopenshell/util/{element,classification,unit}.py`
-0.8.5. None of these points is decided by a suite case. **open** = the recommendation departs
+0.8.5. None of these points is decided by a suite case. Shipped 2026-09-25 as decided in the
+last section (A14, A16, A26, D8 as the coordinator ruled; the rest as the `ifcfast` column says). **open** = the recommendation departs
 from IfcTester, or the IfcTester reading is an artifact, so it needs a sign-off.
 
 | # | Point | IfcTester reading (source) | ifcfast | Pinning case(s) |
@@ -153,3 +155,22 @@ implementer codes against decisions, not options. All reversible.
 | D8 | A restriction **with bound facets** (min/max inclusive/exclusive) must hold for **all** values of a multi-valued property; enumeration and pattern restrictions stay any-of. | The docs are explicit and no case contradicts them; IfcTester's any-of is a gap, not a reading. |
 | real_eq | Widen each tolerance edge outward by **1 ulp** (`next_down` / `next_up`) so `tol = |v|·1e-6 + 1e-6` is inclusive in f64; add the 14 tolerance point cases as unit rows. | Two suite pass cases fail on the exact-edge f64 comparison; the rule is inclusive by intent. |
 | PROP_UNSUPPORTED | Added to the reason-code list (report.rs, `python/ifcfast/ids.py` REASON_CODES, design §3.2, AGENTS.md). | Needed by A16. |
+
+## Slice 2 implementation rows, 2026-09-25
+
+Points the implementation had to decide that the rows above leave open. No suite case pins any
+of them (all 174 slice-2 cases agree either way). Code paths are `crates/core/src/ids/`.
+
+| # | Point | IfcTester reading (source) | ifcfast | Pinning |
+|---|---|---|---|---|
+| A29 | A measure with no unit type (`IFCMONETARYMEASURE`, `IFCREAL`, `IFCCOUNTMEASURE`, `IFCNUMERICMEASURE`) whose property carries a `Unit` | `get_property_unit` returns the unit and `convert` runs on it (`facet.py:740-750`, `unit.py:456-502`); a monetary unit has no SI name and the value comes back unchanged | No conversion: a value is converted only when its measure has a unit type (`schema_tables.rs` `MEASURE_UNIT_TYPE`, hand-mapped rows name why). Currency has no SI unit, so nothing is assumed | `eval.rs` `to_si`; none |
+| A30 | IFC2X3 "predefined" sets (`IfcDoorPanelProperties`, `IfcDoorLiningProperties`, … are direct `IfcPropertySetDefinition` subtypes; IFC2X3 has no `IfcPreDefinedPropertySet`) | `get_properties` has no branch for them and returns `None`, so the loop at `facet.py:726` raises `TypeError` | Not read: only IFC4+ `IfcPreDefinedPropertySet` subtypes (the generated `PREDEF_PSET_ATTR_TYPE` table is empty for IFC2X3), so a spec naming one gets `PSET_MISSING` | `graph.rs` `predefined_set`; none |
+| A31 | Quantity classes the shared `PropertyGraph` has no reader for (IFC4X3 `IfcQuantityNumber`, spec §1.3 → `IFCNUMERICMEASURE`) | Read through attribute 3 like every `IfcPhysicalSimpleQuantity` (`facet.py:752-768`) | `PROP_UNSUPPORTED` (the graph records them as `UnhandledQuantity` without a value, and the public QuantityTable's `unhandled:` marker rows must not change). **Follow-up**: give the graph a value slot for them | `eval.rs` `extract`; none |
+| A32 | dataType of a table column | The first member's class (`facet.py:829-833`) | Every present member of the column must carry the dataType (the A17 rule applied per column); identical for homogeneous data | `eval.rs` `check_prop`; none |
+| A33 | `IfcRelDefinesByProperties` whose related object is a type object | `get_psets` reads a type's `HasPropertySets` only (`element.py:186-192`) | Read as well (the relation is what the file declares). Occurrence sets still never flow up to the type (P19) | `graph.rs` `PropData::build`; none |
+| A34 | Type used for inheritance when an occurrence has several `IfcRelDefinesByType` (invalid IFC) | First (`element.py:629-641`) | First in file order (A8), for properties, classifications and materials alike. The public tables keep their last-wins map; they differ only on such invalid files | `eval.rs` `Ctx::build_type_map`; none |
+| A35 | `actual` of `PROP_DATATYPE_MISMATCH` | The CamelCase class, `IfcText` (`facet.py:737`) | The STEP token as written, `IFCTEXT` (the schema tables carry no CamelCase type names). **open** for the slice-4 `to_ifctester_json` parity gate | `eval.rs` `check_prop`; none |
+| A36 | A required facet whose name restriction matches only unsupported and null properties | NOVALUE either way | `PROP_UNSUPPORTED` wins over `PROP_NULL`: the actionable fact is that IDS cannot check the kind | `eval.rs` `eval_property`; none |
+| A37 | A list, enumerated, bounded or table member that is not comparable (a nested list or reference inside an `IfcValue` list) | Compared as a tuple and never equal (`facet.py:871-884`) | Never matches; under a bounded restriction (D8, all-of) it fails the check | `eval.rs` `check_prop`; none |
+| A38 | A property `dataType` that names an IFC4-only IfcValue / measure type in an IFC2X3 file (e.g. `IFCDATE`) | Not checked (no audit beyond the XSD, `ids.py:56-65`); the value simply never matches | `IdsInvalidError` at compile when the name is an IfcValue / measure type of some schema but not the file's (design §2.5). Enumeration dataTypes are only checked against `DataTypes.md` (the tables carry no full type list) | `compile.rs` `resolve_data_type`; `ids_compile_data_facets_and_datatypes` |
+

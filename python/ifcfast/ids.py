@@ -4,11 +4,14 @@ Design: ``docs/plans/2026-09-24_ids-validation-design.md`` (GH #192).
 
 IfcTester is the reference implementation; ifcfast is the speed-first
 companion (the same relationship ``m.mesh_qto()`` has to ifcopenshell
-geometry). Slice 1 implements the **Entity** and **Attribute** facets.
-An IDS that uses Property, Classification, Material or PartOf raises
-:class:`IdsUnsupportedError` (``on_unsupported="raise"``, the default) or
-marks that specification ``status="unsupported"`` (``on_unsupported="mark"``)
-until GH #192 slices 2-3 land. Nothing is ever guessed.
+geometry). Slices 1-2 implement the **Entity**, **Attribute**,
+**Property**, **Classification** and **Material** facets. An IDS that uses
+PartOf raises :class:`IdsUnsupportedError` (``on_unsupported="raise"``, the
+default) or marks that specification ``status="unsupported"``
+(``on_unsupported="mark"``) until GH #192 slice 3 lands. A value comparison
+that needs a unit the model does not declare raises :class:`IdsUnitError`
+(or, under ``"mark"``, marks the spec ``unsupported_feature="unit:<TYPE>"``).
+Nothing is ever guessed.
 
 Usage::
 
@@ -66,7 +69,8 @@ FACET_TYPE = ["entity", "part_of", "classification", "attribute", "property", "m
 FACET_CARDINALITY = ["required", "optional", "prohibited"]
 REASON_CODES = [
     "ENTITY_MISMATCH", "PREDEFINED_MISMATCH", "ATTR_MISSING", "ATTR_VALUE_MISMATCH",
-    "PSET_MISSING", "PROP_MISSING", "PROP_NULL", "PROP_DATATYPE_MISMATCH", "PROP_VALUE_MISMATCH",
+    "PSET_MISSING", "PROP_MISSING", "PROP_NULL", "PROP_UNSUPPORTED", "PROP_DATATYPE_MISMATCH",
+    "PROP_VALUE_MISMATCH",
     "CLASS_MISSING", "CLASS_SYSTEM_MISMATCH", "CLASS_VALUE_MISMATCH", "MATERIAL_MISSING",
     "MATERIAL_VALUE_MISMATCH", "PARTOF_MISSING", "PARTOF_ENTITY_MISMATCH", "PROHIBITED_PRESENT",
     "SPEC_NO_APPLICABLE", "SPEC_PROHIBITED_APPLICABLE",
@@ -228,7 +232,9 @@ def validate_ids(
             :class:`IdsUnsupportedError` for a spec using a facet or construct
             ifcfast does not implement yet; ``"mark"`` reports that spec with
             ``status="unsupported"`` and ``unsupported_feature`` set, and no
-            element rows.
+            element rows. A value comparison needing an undeclared unit
+            follows the same switch (``IdsUnitError`` vs
+            ``unsupported_feature="unit:<UNITTYPE>"``).
         filter_ifc_version: skip specs whose ``ifcVersion`` excludes the
             file's schema (``status="skipped_ifc_version"``). Off by default,
             like IfcTester, which validates every spec regardless.
@@ -237,7 +243,8 @@ def validate_ids(
         IdsInvalidError: malformed IDS, or an IDS that can never be satisfied
             for this schema (unknown entity/attribute, value of the wrong type).
         IdsUnsupportedError: see ``on_unsupported``.
-        IdsUnitError: a requirement needs a unit the model does not declare.
+        IdsUnitError: a value comparison needs a unit the model does not
+            declare (``on_unsupported="raise"``).
         IfcfastError: the IFC is truncated or declares an unsupported schema.
     """
     native = _native("validate_ids")

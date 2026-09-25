@@ -69,6 +69,7 @@ pub struct SchemaTables {
     pub elemtype_pos: &'static [(&'static str, u16)],
     pub predef_enum: &'static [(&'static str, &'static [&'static str])],
     pub measure_unit_type: &'static [(&'static str, Option<&'static str>)],
+    pub predef_pset_attr_type: &'static [(&'static str, &'static [(&'static str, &'static str)])],
 }
 
 /// The tables for `schema`.
@@ -182,6 +183,16 @@ impl SchemaTables {
     pub fn unit_type_for_measure(&self, measure: &str) -> Option<Option<&'static str>> {
         find_pair(self.measure_unit_type, measure)
     }
+
+    /// `IfcPreDefinedPropertySet` subtypes only: the attributes from STEP
+    /// index 4 on that have a named declared type, as (attribute, declared
+    /// type UPPERCASE). `None` when `entity` is not such a subtype.
+    pub fn predef_pset_attrs(
+        &self,
+        entity: &str,
+    ) -> Option<&'static [(&'static str, &'static str)]> {
+        find_pair(self.predef_pset_attr_type, entity)
+    }
 }
 
 static IFC2X3: SchemaTables = SchemaTables {
@@ -195,6 +206,7 @@ static IFC2X3: SchemaTables = SchemaTables {
     elemtype_pos: gen::ifc2x3::ELEMTYPE_POS,
     predef_enum: gen::ifc2x3::PREDEF_ENUM,
     measure_unit_type: gen::ifc2x3::MEASURE_UNIT_TYPE,
+    predef_pset_attr_type: gen::ifc2x3::PREDEF_PSET_ATTR_TYPE,
 };
 
 static IFC4: SchemaTables = SchemaTables {
@@ -208,6 +220,7 @@ static IFC4: SchemaTables = SchemaTables {
     elemtype_pos: gen::ifc4::ELEMTYPE_POS,
     predef_enum: gen::ifc4::PREDEF_ENUM,
     measure_unit_type: gen::ifc4::MEASURE_UNIT_TYPE,
+    predef_pset_attr_type: gen::ifc4::PREDEF_PSET_ATTR_TYPE,
 };
 
 static IFC4X3: SchemaTables = SchemaTables {
@@ -221,6 +234,7 @@ static IFC4X3: SchemaTables = SchemaTables {
     elemtype_pos: gen::ifc4x3::ELEMTYPE_POS,
     predef_enum: gen::ifc4x3::PREDEF_ENUM,
     measure_unit_type: gen::ifc4x3::MEASURE_UNIT_TYPE,
+    predef_pset_attr_type: gen::ifc4x3::PREDEF_PSET_ATTR_TYPE,
 };
 
 // ---------------------------------------------------------------------------
@@ -4491,6 +4505,9 @@ mod gen {
             ("IFCVOLUMETRICFLOWRATEMEASURE", Some("VOLUMETRICFLOWRATEUNIT")),
             ("IFCWARPINGCONSTANTMEASURE", Some("WARPINGCONSTANTUNIT")),
             ("IFCWARPINGMOMENTMEASURE", Some("WARPINGMOMENTUNIT")),
+        ];
+
+        pub static PREDEF_PSET_ATTR_TYPE: &[(&str, &[(&str, &str)])] = &[
         ];
     }
 
@@ -10305,6 +10322,60 @@ mod gen {
             ("IFCVOLUMETRICFLOWRATEMEASURE", Some("VOLUMETRICFLOWRATEUNIT")),
             ("IFCWARPINGCONSTANTMEASURE", Some("WARPINGCONSTANTUNIT")),
             ("IFCWARPINGMOMENTMEASURE", Some("WARPINGMOMENTUNIT")),
+        ];
+
+        pub static PREDEF_PSET_ATTR_TYPE: &[(&str, &[(&str, &str)])] = &[
+            ("IFCDOORLININGPROPERTIES", &[
+                ("LiningDepth", "IFCPOSITIVELENGTHMEASURE"),
+                ("LiningThickness", "IFCNONNEGATIVELENGTHMEASURE"),
+                ("ThresholdDepth", "IFCPOSITIVELENGTHMEASURE"),
+                ("ThresholdThickness", "IFCNONNEGATIVELENGTHMEASURE"),
+                ("TransomThickness", "IFCNONNEGATIVELENGTHMEASURE"),
+                ("TransomOffset", "IFCLENGTHMEASURE"), ("LiningOffset", "IFCLENGTHMEASURE"),
+                ("ThresholdOffset", "IFCLENGTHMEASURE"),
+                ("CasingThickness", "IFCPOSITIVELENGTHMEASURE"),
+                ("CasingDepth", "IFCPOSITIVELENGTHMEASURE"), ("ShapeAspectStyle", "IFCSHAPEASPECT"),
+                ("LiningToPanelOffsetX", "IFCLENGTHMEASURE"),
+                ("LiningToPanelOffsetY", "IFCLENGTHMEASURE"),
+            ]),
+            ("IFCDOORPANELPROPERTIES", &[
+                ("PanelDepth", "IFCPOSITIVELENGTHMEASURE"),
+                ("PanelOperation", "IFCDOORPANELOPERATIONENUM"),
+                ("PanelWidth", "IFCNORMALISEDRATIOMEASURE"),
+                ("PanelPosition", "IFCDOORPANELPOSITIONENUM"),
+                ("ShapeAspectStyle", "IFCSHAPEASPECT"),
+            ]),
+            ("IFCPERMEABLECOVERINGPROPERTIES", &[
+                ("OperationType", "IFCPERMEABLECOVERINGOPERATIONENUM"),
+                ("PanelPosition", "IFCWINDOWPANELPOSITIONENUM"),
+                ("FrameDepth", "IFCPOSITIVELENGTHMEASURE"),
+                ("FrameThickness", "IFCPOSITIVELENGTHMEASURE"),
+                ("ShapeAspectStyle", "IFCSHAPEASPECT"),
+            ]),
+            ("IFCPREDEFINEDPROPERTYSET", &[]),
+            ("IFCREINFORCEMENTDEFINITIONPROPERTIES", &[
+                ("DefinitionType", "IFCLABEL"),
+            ]),
+            ("IFCWINDOWLININGPROPERTIES", &[
+                ("LiningDepth", "IFCPOSITIVELENGTHMEASURE"),
+                ("LiningThickness", "IFCNONNEGATIVELENGTHMEASURE"),
+                ("TransomThickness", "IFCNONNEGATIVELENGTHMEASURE"),
+                ("MullionThickness", "IFCNONNEGATIVELENGTHMEASURE"),
+                ("FirstTransomOffset", "IFCNORMALISEDRATIOMEASURE"),
+                ("SecondTransomOffset", "IFCNORMALISEDRATIOMEASURE"),
+                ("FirstMullionOffset", "IFCNORMALISEDRATIOMEASURE"),
+                ("SecondMullionOffset", "IFCNORMALISEDRATIOMEASURE"),
+                ("ShapeAspectStyle", "IFCSHAPEASPECT"), ("LiningOffset", "IFCLENGTHMEASURE"),
+                ("LiningToPanelOffsetX", "IFCLENGTHMEASURE"),
+                ("LiningToPanelOffsetY", "IFCLENGTHMEASURE"),
+            ]),
+            ("IFCWINDOWPANELPROPERTIES", &[
+                ("OperationType", "IFCWINDOWPANELOPERATIONENUM"),
+                ("PanelPosition", "IFCWINDOWPANELPOSITIONENUM"),
+                ("FrameDepth", "IFCPOSITIVELENGTHMEASURE"),
+                ("FrameThickness", "IFCPOSITIVELENGTHMEASURE"),
+                ("ShapeAspectStyle", "IFCSHAPEASPECT"),
+            ]),
         ];
     }
 
@@ -17062,6 +17133,60 @@ mod gen {
             ("IFCWARPINGCONSTANTMEASURE", Some("WARPINGCONSTANTUNIT")),
             ("IFCWARPINGMOMENTMEASURE", Some("WARPINGMOMENTUNIT")),
         ];
+
+        pub static PREDEF_PSET_ATTR_TYPE: &[(&str, &[(&str, &str)])] = &[
+            ("IFCDOORLININGPROPERTIES", &[
+                ("LiningDepth", "IFCPOSITIVELENGTHMEASURE"),
+                ("LiningThickness", "IFCNONNEGATIVELENGTHMEASURE"),
+                ("ThresholdDepth", "IFCPOSITIVELENGTHMEASURE"),
+                ("ThresholdThickness", "IFCNONNEGATIVELENGTHMEASURE"),
+                ("TransomThickness", "IFCNONNEGATIVELENGTHMEASURE"),
+                ("TransomOffset", "IFCLENGTHMEASURE"), ("LiningOffset", "IFCLENGTHMEASURE"),
+                ("ThresholdOffset", "IFCLENGTHMEASURE"),
+                ("CasingThickness", "IFCPOSITIVELENGTHMEASURE"),
+                ("CasingDepth", "IFCPOSITIVELENGTHMEASURE"), ("ShapeAspectStyle", "IFCSHAPEASPECT"),
+                ("LiningToPanelOffsetX", "IFCLENGTHMEASURE"),
+                ("LiningToPanelOffsetY", "IFCLENGTHMEASURE"),
+            ]),
+            ("IFCDOORPANELPROPERTIES", &[
+                ("PanelDepth", "IFCPOSITIVELENGTHMEASURE"),
+                ("PanelOperation", "IFCDOORPANELOPERATIONENUM"),
+                ("PanelWidth", "IFCNORMALISEDRATIOMEASURE"),
+                ("PanelPosition", "IFCDOORPANELPOSITIONENUM"),
+                ("ShapeAspectStyle", "IFCSHAPEASPECT"),
+            ]),
+            ("IFCPERMEABLECOVERINGPROPERTIES", &[
+                ("OperationType", "IFCPERMEABLECOVERINGOPERATIONENUM"),
+                ("PanelPosition", "IFCWINDOWPANELPOSITIONENUM"),
+                ("FrameDepth", "IFCPOSITIVELENGTHMEASURE"),
+                ("FrameThickness", "IFCPOSITIVELENGTHMEASURE"),
+                ("ShapeAspectStyle", "IFCSHAPEASPECT"),
+            ]),
+            ("IFCPREDEFINEDPROPERTYSET", &[]),
+            ("IFCREINFORCEMENTDEFINITIONPROPERTIES", &[
+                ("DefinitionType", "IFCLABEL"),
+            ]),
+            ("IFCWINDOWLININGPROPERTIES", &[
+                ("LiningDepth", "IFCPOSITIVELENGTHMEASURE"),
+                ("LiningThickness", "IFCNONNEGATIVELENGTHMEASURE"),
+                ("TransomThickness", "IFCNONNEGATIVELENGTHMEASURE"),
+                ("MullionThickness", "IFCNONNEGATIVELENGTHMEASURE"),
+                ("FirstTransomOffset", "IFCNORMALISEDRATIOMEASURE"),
+                ("SecondTransomOffset", "IFCNORMALISEDRATIOMEASURE"),
+                ("FirstMullionOffset", "IFCNORMALISEDRATIOMEASURE"),
+                ("SecondMullionOffset", "IFCNORMALISEDRATIOMEASURE"),
+                ("ShapeAspectStyle", "IFCSHAPEASPECT"), ("LiningOffset", "IFCLENGTHMEASURE"),
+                ("LiningToPanelOffsetX", "IFCLENGTHMEASURE"),
+                ("LiningToPanelOffsetY", "IFCLENGTHMEASURE"),
+            ]),
+            ("IFCWINDOWPANELPROPERTIES", &[
+                ("OperationType", "IFCWINDOWPANELOPERATIONENUM"),
+                ("PanelPosition", "IFCWINDOWPANELPOSITIONENUM"),
+                ("FrameDepth", "IFCPOSITIVELENGTHMEASURE"),
+                ("FrameThickness", "IFCPOSITIVELENGTHMEASURE"),
+                ("ShapeAspectStyle", "IFCSHAPEASPECT"),
+            ]),
+        ];
     }
 }
 
@@ -17094,6 +17219,7 @@ mod tests {
             assert!(sorted(t.elemtype_pos, |p| p.0));
             assert!(sorted(t.predef_enum, |p| p.0));
             assert!(sorted(t.measure_unit_type, |p| p.0));
+            assert!(sorted(t.predef_pset_attr_type, |p| p.0));
             assert_eq!(t.attrs.len(), t.entities.len());
         }
     }
@@ -17142,6 +17268,10 @@ mod tests {
         assert_eq!(t4.unit_type_for_measure("IFCCOUNTMEASURE"), Some(None));
         assert_eq!(t4.unit_type_for_measure("IFCLABEL"), Some(None));
         assert_eq!(t4.unit_type_for_measure("IFCNOSUCHMEASURE"), None);
+        let panel = t4.predef_pset_attrs("IFCDOORPANELPROPERTIES").unwrap();
+        assert!(panel.contains(&("PanelOperation", "IFCDOORPANELOPERATIONENUM")));
+        assert!(t4.predef_pset_attrs("IFCPROPERTYSET").is_none());
+        assert!(tables(Schema::Ifc2x3).predef_pset_attr_type.is_empty());
         // IFC2X3 IfcReinforcingBar has BarRole, not PredefinedType.
         let t2 = tables(Schema::Ifc2x3);
         assert_eq!(t2.predef_pos("IFCREINFORCINGBAR"), None);

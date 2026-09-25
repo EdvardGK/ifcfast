@@ -171,7 +171,7 @@ xs:restriction"; ranges are excluded). `restriction.rs` already does this (D7).
 | Complex property, complex quantity, reference value | **PROP_UNSUPPORTED (new)** | NOVALUE `:858` / absent | `fail-complex_properties_are_not_supported_1_2`, `fail-reference_properties_…` |
 | Wrapper or measure ≠ dataType; table with no matching column | PROP_DATATYPE_MISMATCH | DATATYPE `:737`, `:757`, `:850` | `fail-measures_…_1_2`, `fail-quantities_must_also_match…` |
 | Value mismatch (any P8–P11) | PROP_VALUE_MISMATCH | VALUE `:869-900` | 14 `fail-comparison_tolerance_*`, the list/bounded/table/enum fails, `fail-dates_…`, `fail-booleans_…_1_3` |
-| A measure's unit can't be resolved and a value comparison needs it | **PROP_UNIT_UNRESOLVED (new, proposed)** | none (compares raw) | none (A26) |
+| A measure's unit can't be resolved and a value comparison needs it | ~~PROP_UNIT_UNRESOLVED (proposed)~~ — superseded by the coordinator's A26 decision: `IdsError::UnresolvedUnit` through `on_unsupported` (`unit:<TYPE>`), no reason code | none (compares raw) | none (A26) |
 | No classification | CLASS_MISSING | NOVALUE `:432` | C1 cases |
 | No reference or ancestor value matches | CLASS_VALUE_MISMATCH | VALUE `:438` | `fail-both_system_and_value…_2_2`, `fail-occurrences_override…_2_3`, `fail-an_optional_classification_value_fails_if_no_match`, `fail-restrictions_can_be_used_for_values_3_3` |
 | Value OK, no root system matches | CLASS_SYSTEM_MISMATCH | SYSTEM `:445` | `fail-a_required_classification_system_fails_if_no_match` |

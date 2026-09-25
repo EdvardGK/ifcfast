@@ -58,11 +58,31 @@ impl ClassificationTable {
     }
 }
 
-pub fn build(
-    table: &EntityTable,
-    product_step_to_guid: &HashMap<u64, String>,
-) -> ClassificationTable {
-    // Pass 1: collect classification records.
+/// Pass 1 of [`build`], shared with the IDS classification facet
+/// (`ids::graph`): every classification record and association edge, in
+/// file order, with nothing resolved or emitted.
+pub(crate) struct ClassificationIndex {
+    /// IfcClassification by step id.
+    pub(crate) systems: HashMap<u64, SystemRecord>,
+    /// IfcClassificationReference by step id.
+    pub(crate) refs: HashMap<u64, RefRecord>,
+    /// IfcRelAssociatesClassification as (related object, relating
+    /// classification), relations in file order.
+    pub(crate) rel_pairs: Vec<(u64, u64)>,
+    /// IfcRelDefinesByType: object → type (a later relation wins).
+    pub(crate) product_to_type: HashMap<u64, u64>,
+    /// Step ids of type objects (`is_type_object` name rule).
+    pub(crate) type_object_ids: std::collections::HashSet<u64>,
+    /// IFC4+ IfcExternalReferenceRelationship as (related resource,
+    /// relating reference), file order: how non-rooted resources
+    /// (IfcMaterial, …) carry classification references. Not used by the
+    /// public table.
+    pub(crate) external_ref_pairs: Vec<(u64, u64)>,
+}
+
+/// One pass over the table collecting everything [`ClassificationIndex`]
+/// holds.
+pub(crate) fn collect(table: &EntityTable) -> ClassificationIndex {
     // - IfcClassification (id → metadata: source, edition, name)
     // - IfcClassificationReference (id → ref details + parent system id)
     let mut systems: HashMap<u64, SystemRecord> = HashMap::with_capacity(64);
@@ -74,6 +94,7 @@ pub fn build(
     let mut product_to_type: HashMap<u64, u64> = HashMap::with_capacity(16_384);
     let mut type_object_ids: std::collections::HashSet<u64> =
         std::collections::HashSet::with_capacity(512);
+    let mut external_ref_pairs: Vec<(u64, u64)> = Vec::new();
 
     for (step_id, type_name, args) in table.iter() {
         if type_name.eq_ignore_ascii_case(b"IFCCLASSIFICATION") {
@@ -141,10 +162,49 @@ pub fn build(
             for obj_id in relateds {
                 product_to_type.insert(obj_id, type_id);
             }
+        } else if type_name.eq_ignore_ascii_case(b"IFCEXTERNALREFERENCERELATIONSHIP") {
+            // IFC4: (Name, Description, RelatingReference, RelatedResourceObjects)
+            let fields = split_top_level_args(args);
+            let relating = match fields.get(2).copied().map(parse_field) {
+                Some(Field::Ref(id)) => id,
+                _ => continue,
+            };
+            let relateds = match fields.get(3).copied().map(parse_field) {
+                Some(Field::List(body)) => parse_ref_list(body),
+                Some(Field::Ref(id)) => vec![id],
+                _ => continue,
+            };
+            for obj_id in relateds {
+                external_ref_pairs.push((obj_id, relating));
+            }
         } else if is_type_object(type_name) {
             type_object_ids.insert(step_id);
         }
     }
+
+    ClassificationIndex {
+        systems,
+        refs,
+        rel_pairs,
+        product_to_type,
+        type_object_ids,
+        external_ref_pairs,
+    }
+}
+
+pub fn build(
+    table: &EntityTable,
+    product_step_to_guid: &HashMap<u64, String>,
+) -> ClassificationTable {
+    // Pass 1: collect classification records.
+    let ClassificationIndex {
+        systems,
+        refs,
+        rel_pairs,
+        product_to_type,
+        type_object_ids,
+        external_ref_pairs: _,
+    } = collect(table);
 
     let mut out = ClassificationTable::default();
 
@@ -306,17 +366,20 @@ fn resolve_system<'a>(
     None
 }
 
-struct SystemRecord {
-    source: Option<String>,
-    edition: Option<String>,
-    name: Option<String>,
+pub(crate) struct SystemRecord {
+    pub(crate) source: Option<String>,
+    pub(crate) edition: Option<String>,
+    /// `IfcClassification.Name`; `''` reads as `None`.
+    pub(crate) name: Option<String>,
 }
 
-struct RefRecord {
-    location: Option<String>,
-    identification: Option<String>,
-    name: Option<String>,
-    parent_id: Option<u64>,
+pub(crate) struct RefRecord {
+    pub(crate) location: Option<String>,
+    /// IFC4 `Identification` / IFC2X3 `ItemReference`; `''` reads as `None`.
+    pub(crate) identification: Option<String>,
+    pub(crate) name: Option<String>,
+    /// `ReferencedSource` (an IfcClassification or a parent reference).
+    pub(crate) parent_id: Option<u64>,
 }
 
 /// String-at-position, matching ifcopenshell's NULL semantics:

@@ -24,11 +24,12 @@
 //!   buffer, and no decode cost unless a consumer asks via
 //!   [`TypedValue::raw`]);
 //! - every property-set-like container ([`SetDef`]): `IfcPropertySet`,
-//!   `IfcElementQuantity`, IFC4 `IfcMaterialProperties` and IFC2X3
-//!   `IfcExtendedMaterialProperties` (GH #193 D4);
+//!   `IfcElementQuantity`, IFC4 `IfcMaterialProperties`, IFC2X3
+//!   `IfcExtendedMaterialProperties` (GH #193 D4) and IFC4
+//!   `IfcProfileProperties`;
 //! - the edges: `IfcRelDefinesByProperties` (object → set, file order),
 //!   `IfcRelDefinesByType` (object → type), `HasPropertySets`
-//!   (type → sets) and material → material-property sets.
+//!   (type → sets) and material / profile → properties sets.
 //!
 //! `psets::build` / `quantities::build` read the graph and format their
 //! rows exactly as they always have (their string rules, row order,
@@ -63,6 +64,8 @@ pub enum PsetKind {
     ElementQuantity,
     /// IFC4 `IfcMaterialProperties` / IFC2X3 `IfcExtendedMaterialProperties`.
     MaterialProperties,
+    /// IFC4+ `IfcProfileProperties` (a profile's named property set).
+    ProfileProperties,
 }
 
 impl PsetKind {
@@ -72,7 +75,9 @@ impl PsetKind {
     /// treated it.
     pub fn family(self) -> Family {
         match self {
-            PsetKind::PropertySet | PsetKind::MaterialProperties => Family::Property,
+            PsetKind::PropertySet | PsetKind::MaterialProperties | PsetKind::ProfileProperties => {
+                Family::Property
+            }
             PsetKind::ElementQuantity => Family::Quantity,
         }
     }
@@ -350,7 +355,10 @@ pub struct PropertyGraph<'a> {
     pub object_type: HashMap<u64, u64>,
     /// `IfcTypeObject.HasPropertySets` (non-empty only): type → definitions.
     pub type_sets: HashMap<u64, Vec<u64>>,
-    /// (material, material-properties set), file order.
+    /// (material or profile, its properties set), file order: IFC4
+    /// `IfcMaterialProperties.Material`, IFC2X3
+    /// `IfcExtendedMaterialProperties.Material`, IFC4
+    /// `IfcProfileProperties.ProfileDefinition`.
     pub material_sets: Vec<(u64, u64)>,
     /// `QuantityTable.unit_step_id` fallback: the `IfcSIUnit` per unit
     /// type reachable from any `IfcUnitAssignment` (GH #43 / #76 item 4).
@@ -520,6 +528,21 @@ impl<'a> PropertyGraph<'a> {
                 g.insert_set(
                     step,
                     PsetKind::MaterialProperties,
+                    string_at(&f, 0),
+                    ref_list_at(&f, 2),
+                );
+                g.link_material(step, ref_at(&f, 3));
+            } else if t.eq_ignore_ascii_case(b"IFCPROFILEPROPERTIES") {
+                if !scope.material_properties {
+                    continue;
+                }
+                // IFC4: (Name, Description, Properties, ProfileDefinition).
+                // Abstract in IFC2X3 (its subtypes are attribute-style and
+                // unnamed), so it never appears there.
+                let f = split_top_level_args(args);
+                g.insert_set(
+                    step,
+                    PsetKind::ProfileProperties,
                     string_at(&f, 0),
                     ref_list_at(&f, 2),
                 );
@@ -746,7 +769,11 @@ fn is_candidate(t: &[u8]) -> bool {
     }
     let starts = |p: &[u8]| t.len() >= p.len() && t[..p.len()].eq_ignore_ascii_case(p);
     match t[3].to_ascii_uppercase() {
-        b'P' => starts(b"IFCPROPERTY") || t.eq_ignore_ascii_case(b"IFCPHYSICALCOMPLEXQUANTITY"),
+        b'P' => {
+            starts(b"IFCPROPERTY")
+                || t.eq_ignore_ascii_case(b"IFCPHYSICALCOMPLEXQUANTITY")
+                || t.eq_ignore_ascii_case(b"IFCPROFILEPROPERTIES")
+        }
         b'C' => t.eq_ignore_ascii_case(b"IFCCOMPLEXPROPERTY"),
         b'Q' => starts(b"IFCQUANTITY"),
         b'R' => starts(b"IFCRELDEFINESBY"),

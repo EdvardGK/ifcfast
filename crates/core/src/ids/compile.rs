@@ -22,6 +22,7 @@
 //! Lowercase literals only fail (`entity/fail-a_predefined_type_from_an_enumeration_must_be_uppercase`).
 
 use super::audit::lexical_ok;
+use super::datatypes::datatype_base;
 use super::ir::{
     EntityFacet, Facet, FacetCardinality, IdsDocument, Schema, Spec, SpecCardinality, Val, XsdBase,
 };
@@ -35,9 +36,16 @@ use super::{IdsError, OnUnsupported, ValidateOptions};
 pub struct Needs {
     /// The occurrence → type map from `IfcRelDefinesByType` (predefinedType
     /// resolution, the IFC2X3 type-mapping table, the `type_step_id` and
-    /// `predefined_type` columns of the elements table — so every active
-    /// spec needs it in slice 1).
+    /// `predefined_type` columns of the elements table, and the type
+    /// inheritance of properties, classifications and materials — so every
+    /// active spec needs it).
     pub type_map: bool,
+    /// Property records + units ([`super::graph::PropData`]).
+    pub properties: bool,
+    /// Classification chains ([`super::graph::ClassData`]).
+    pub classifications: bool,
+    /// Material strings ([`super::graph::MaterialData`]).
+    pub materials: bool,
 }
 
 /// A compiled IDS document.
@@ -46,6 +54,9 @@ pub struct Plan {
     pub schema: Schema,
     pub specs: Vec<CompiledSpec>,
     pub needs: Needs,
+    /// What evaluation does with an [`IdsError::UnresolvedUnit`] (A26):
+    /// raise it, or mark the spec `unsupported` (`unit:<UNITTYPE>`).
+    pub on_unsupported: OnUnsupported,
 }
 
 /// A specification ready for evaluation, or the reason it will not be.
@@ -82,6 +93,9 @@ pub enum SpecState {
 pub enum CFacet {
     Entity(CEntity),
     Attribute(CAttribute),
+    Property(CProperty),
+    Classification(CClassification),
+    Material(CMaterial),
 }
 
 impl CFacet {
@@ -89,8 +103,38 @@ impl CFacet {
         match self {
             CFacet::Entity(_) => "entity",
             CFacet::Attribute(_) => "attribute",
+            CFacet::Property(_) => "property",
+            CFacet::Classification(_) => "classification",
+            CFacet::Material(_) => "material",
         }
     }
+}
+
+/// A property facet (`docs/ids/facet-semantics-slice2.md` §1).
+#[derive(Debug)]
+pub struct CProperty {
+    /// `propertySet`: exact, case-sensitive, or a restriction (P1).
+    pub pset: AttrName,
+    /// `baseName`, same matching.
+    pub base_name: AttrName,
+    pub value: Option<CompiledVal>,
+    /// Canonical UPPERCASE dataType (`IFCLENGTHMEASURE`), compared
+    /// case-insensitively against the value's wrapper (P7).
+    pub data_type: Option<String>,
+}
+
+/// A classification facet (§2). `system` is required by the XSD; an
+/// empty simple value is "no constraint".
+#[derive(Debug)]
+pub struct CClassification {
+    pub system: Option<CompiledVal>,
+    pub value: Option<CompiledVal>,
+}
+
+/// A material facet (§3).
+#[derive(Debug)]
+pub struct CMaterial {
+    pub value: Option<CompiledVal>,
 }
 
 #[derive(Debug)]
@@ -228,6 +272,17 @@ pub fn compile_with(
             match compile_spec(sp, schema, t) {
                 Ok((applicability, requirements)) => {
                     needs.type_map = true;
+                    for f in applicability
+                        .iter()
+                        .chain(requirements.iter().map(|r| &r.facet))
+                    {
+                        match f {
+                            CFacet::Property(_) => needs.properties = true,
+                            CFacet::Classification(_) => needs.classifications = true,
+                            CFacet::Material(_) => needs.materials = true,
+                            CFacet::Entity(_) | CFacet::Attribute(_) => {}
+                        }
+                    }
                     SpecState::Active {
                         applicability,
                         requirements,
@@ -258,15 +313,17 @@ pub fn compile_with(
         schema,
         specs,
         needs,
+        on_unsupported: opts.on_unsupported,
     })
 }
 
-/// The first facet slice 1 does not implement, as `facet:<kind>`.
+/// The first facet this engine does not implement (PartOf until slice 3),
+/// as `facet:<kind>`.
 fn unsupported_feature(sp: &Spec) -> Option<String> {
     sp.applicability
         .iter()
         .chain(sp.requirements.iter().map(|r| &r.facet))
-        .find(|f| !matches!(f, Facet::Entity(_) | Facet::Attribute { .. }))
+        .find(|f| matches!(f, Facet::PartOf { .. }))
         .map(|f| format!("facet:{}", f.kind()))
 }
 
@@ -302,15 +359,20 @@ fn compile_spec(sp: &Spec, schema: Schema, t: &'static SchemaTables) -> Result<C
         }
     }
     for (i, f) in sp.applicability.iter().enumerate() {
-        if let Facet::Attribute { name, value } = f {
-            let ca =
-                compile_attribute(name, value.as_ref(), context.as_deref(), t).map_err(|e| {
-                    e.at(
-                        &format!("{}/applicability/*[{}]", spec_path(sp), i + 1),
-                        None,
-                    )
-                })?;
-            applicability.push((i, CFacet::Attribute(ca)));
+        let at = |e: IdsError| {
+            e.at(
+                &format!("{}/applicability/*[{}]", spec_path(sp), i + 1),
+                None,
+            )
+        };
+        match f {
+            Facet::Attribute { name, value } => {
+                let ca =
+                    compile_attribute(name, value.as_ref(), context.as_deref(), t).map_err(at)?;
+                applicability.push((i, CFacet::Attribute(ca)));
+            }
+            Facet::Entity(_) | Facet::PartOf { .. } => {}
+            other => applicability.push((i, compile_data_facet(other, t).map_err(at)?)),
         }
     }
     applicability.sort_by_key(|(i, _)| *i);
@@ -339,6 +401,16 @@ fn compile_spec(sp: &Spec, schema: Schema, t: &'static SchemaTables) -> Result<C
                 ),
                 r.cardinality,
             ),
+            f
+            @ (Facet::Property { .. } | Facet::Classification { .. } | Facet::Material { .. }) => (
+                compile_data_facet(f, t).map_err(|e| {
+                    e.at(
+                        &format!("{}/requirements/*[{}]", spec_path(sp), i + 1),
+                        None,
+                    )
+                })?,
+                r.cardinality,
+            ),
             // unsupported_feature() ran first.
             other => {
                 return Err(IdsError::Unsupported {
@@ -363,6 +435,71 @@ fn nonempty(v: Option<&Val>) -> Option<&Val> {
         Some(Val::Simple(s)) if s.is_empty() => None,
         other => other,
     }
+}
+
+/// A plain name or a restriction, for `propertySet` / `baseName`.
+fn compile_name(v: &Val) -> Result<AttrName, IdsError> {
+    Ok(match v {
+        Val::Simple(s) => AttrName::Exact(s.clone()),
+        r @ Val::Restriction(_) => AttrName::Pattern(CompiledVal::new(r)?),
+    })
+}
+
+/// Property, classification and material facets.
+fn compile_data_facet(f: &Facet, t: &'static SchemaTables) -> Result<CFacet, IdsError> {
+    let cv = |v: Option<&Val>| nonempty(v).map(CompiledVal::new).transpose();
+    Ok(match f {
+        Facet::Property {
+            property_set,
+            base_name,
+            value,
+            data_type,
+            ..
+        } => {
+            let data_type = match data_type.as_deref().filter(|d| !d.is_empty()) {
+                None => None,
+                Some(d) => Some(resolve_data_type(d, t)?),
+            };
+            CFacet::Property(CProperty {
+                pset: compile_name(property_set)?,
+                base_name: compile_name(base_name)?,
+                value: cv(value.as_ref())?,
+                data_type,
+            })
+        }
+        Facet::Classification { system, value, .. } => CFacet::Classification(CClassification {
+            system: cv(Some(system))?,
+            value: cv(value.as_ref())?,
+        }),
+        Facet::Material { value, .. } => CFacet::Material(CMaterial {
+            value: cv(value.as_ref())?,
+        }),
+        other => {
+            return Err(IdsError::unsupported(format!("facet:{}", other.kind())));
+        }
+    })
+}
+
+/// A property `dataType` must be an IDS dataType (DataTypes.md), and one
+/// the file's schema has when it is a measure or an IfcValue member
+/// (design §2.5). Enumeration and other defined types are only checked
+/// against DataTypes.md (the schema tables carry no full type list).
+fn resolve_data_type(d: &str, t: &'static SchemaTables) -> Result<String, IdsError> {
+    let up = d.to_ascii_uppercase();
+    if datatype_base(&up).is_none() {
+        return Err(IdsError::invalid(format!(
+            "dataType '{d}' is not an IDS 1.0 dataType (DataTypes.md)"
+        )));
+    }
+    let in_any_schema_vocab = [Schema::Ifc2x3, Schema::Ifc4, Schema::Ifc4x3]
+        .iter()
+        .any(|s| tables(*s).unit_type_for_measure(&up).is_some());
+    if in_any_schema_vocab && t.unit_type_for_measure(&up).is_none() {
+        return Err(IdsError::invalid(format!(
+            "dataType '{d}' does not exist in the file's schema"
+        )));
+    }
+    Ok(up)
 }
 
 fn compile_entity(
@@ -607,14 +744,14 @@ mod tests {
 
     #[test]
     fn ids_compile_unsupported_facets_raise_or_mark() {
-        let prop = r#"<property><propertySet><simpleValue>P</simpleValue></propertySet><baseName><simpleValue>B</simpleValue></baseName></property>"#;
-        let d = doc("IFC4", &ent("IFCWALL"), prop);
+        let part_of = r#"<partOf><entity><name><simpleValue>IFCBUILDINGSTOREY</simpleValue></name></entity></partOf>"#;
+        let d = doc("IFC4", &ent("IFCWALL"), part_of);
         match compile(&d, Schema::Ifc4) {
             Err(IdsError::Unsupported {
                 feature,
                 spec_index,
             }) => {
-                assert_eq!(feature, "facet:property");
+                assert_eq!(feature, "facet:part_of");
                 assert_eq!(spec_index, Some(0));
             }
             other => panic!("{other:?}"),
@@ -629,8 +766,41 @@ mod tests {
         )
         .unwrap_or_else(|e| panic!("{e}"));
         assert!(
-            matches!(&p.specs[0].state, SpecState::Unsupported { feature } if feature == "facet:property")
+            matches!(&p.specs[0].state, SpecState::Unsupported { feature } if feature == "facet:part_of")
         );
+    }
+
+    fn prop(dt: &str) -> String {
+        format!(
+            r#"<property dataType="{dt}"><propertySet><simpleValue>P</simpleValue></propertySet><baseName><simpleValue>B</simpleValue></baseName></property>"#
+        )
+    }
+
+    #[test]
+    fn ids_compile_data_facets_and_datatypes() {
+        let d = doc("IFC4", &ent("IFCWALL"), &prop("IFCLENGTHMEASURE"));
+        let p = compile(&d, Schema::Ifc4).unwrap_or_else(|e| panic!("{e}"));
+        assert!(p.needs.properties && !p.needs.classifications && !p.needs.materials);
+        match &p.specs[0].state {
+            SpecState::Active { requirements, .. } => match &requirements[0].facet {
+                CFacet::Property(cp) => {
+                    assert_eq!(cp.data_type.as_deref(), Some("IFCLENGTHMEASURE"))
+                }
+                other => panic!("{other:?}"),
+            },
+            other => panic!("{other:?}"),
+        }
+        // Not an IDS dataType at all.
+        let d = doc("IFC4", &ent("IFCWALL"), &prop("IFCRABBITMEASURE"));
+        assert!(err(&d, Schema::Ifc4).contains("IFCRABBITMEASURE"));
+        // An IFC4 IfcValue member that IFC2X3 does not have.
+        let d = doc("IFC2X3", &ent("IFCWALL"), &prop("IFCDATE"));
+        assert!(err(&d, Schema::Ifc2x3).contains("schema"));
+        // Classification + material facets compile and set their needs.
+        let c = r#"<classification><system><simpleValue>S</simpleValue></system></classification><material/>"#;
+        let d = doc("IFC4", &ent("IFCWALL"), c);
+        let p = compile(&d, Schema::Ifc4).unwrap_or_else(|e| panic!("{e}"));
+        assert!(!p.needs.properties && p.needs.classifications && p.needs.materials);
     }
 
     #[test]

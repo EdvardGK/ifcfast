@@ -97,6 +97,21 @@ impl CompiledVal {
         Ok(CompiledVal { kind })
     }
 
+    /// A restriction with any of min/max inclusive/exclusive. Against a
+    /// multi-valued property such a restriction must hold for every value
+    /// (ambiguity register D8); enumerations and patterns stay any-of.
+    pub fn has_bounds(&self) -> bool {
+        match &self.kind {
+            CompiledKind::Simple(_) => false,
+            CompiledKind::Restriction(r) => {
+                r.min_inclusive.is_some()
+                    || r.min_exclusive.is_some()
+                    || r.max_inclusive.is_some()
+                    || r.max_exclusive.is_some()
+            }
+        }
+    }
+
     /// Does `actual` satisfy this value?
     pub fn matches(&self, actual: &Actual) -> bool {
         if let Actual::List(items) = actual {
@@ -232,13 +247,20 @@ fn simple_eq(ids: &str, actual: &Actual) -> bool {
     }
 }
 
-/// IDS tolerance equality (tolerance.md), inclusive.
+/// IDS tolerance equality (tolerance.md), inclusive. Each edge of
+/// `v ± (|v|·ε + ε)` is moved one ulp outward: the suite puts the actual
+/// exactly on the edge, and the f64 rounding of `v - tol` / `v + tol` can
+/// land one ulp inside it
+/// (`tolerance/pass-comparison_tolerance_for_floating_point_{negative_low_number_upper,positive_low_number_lower}_bound`;
+/// a 1-ulp widening passes all 28 point cases, slice-2 doc §4).
 pub fn real_eq(actual: f64, expected: f64) -> bool {
     if !actual.is_finite() || !expected.is_finite() {
         return actual == expected;
     }
     let tol = expected.abs() * REAL_TOLERANCE + REAL_TOLERANCE;
-    actual >= expected - tol && actual <= expected + tol
+    let lo = (expected - tol).next_down();
+    let hi = (expected + tol).next_up();
+    actual >= lo && actual <= hi
 }
 
 /// XSD `xs:boolean` lexical space: `true`, `false`, `1`, `0`.
@@ -384,6 +406,89 @@ mod tests {
         ];
         for (ids, x, want) in rows {
             assert_eq!(m(&s(ids), Actual::Num(*x)), *want, "{ids} vs {x}");
+        }
+    }
+
+    /// The 14 `tolerance/{pass,fail}-comparison_tolerance_for_floating_point_*_bound`
+    /// point cases (suite @ a67047736aa9): the pass actual sits exactly on
+    /// the tolerance.md edge, the fail actual just outside it. Both are
+    /// parsed from their STEP text with Rust's correctly-rounded parse, as
+    /// the lexer does. `negative_low_number_upper` and
+    /// `positive_low_number_lower` fail without the 1-ulp widening.
+    #[test]
+    fn ids_tolerance_suite_point_cases() {
+        let rows: &[(&str, &str, &str, &str)] = &[
+            ("zero_lower", "0.", "-0.000001", "-0.0000011"),
+            ("zero_upper", "0.", "0.000001", "0.0000011"),
+            ("one_lower", "1.", "0.999998", "0.9999979"),
+            ("one_upper", "1.", "1.000002", "1.0000021"),
+            (
+                "negative_one_lower",
+                "-1.",
+                "-1.0000020000",
+                "-1.00000200001",
+            ),
+            ("negative_one_upper", "-1.", "-0.999998", "-0.9999979"),
+            (
+                "positive_low_number_lower",
+                "0.0000001",
+                "-0.0000009000001",
+                "-0.00000090000011",
+            ),
+            (
+                "positive_low_number_upper",
+                "0.0000001",
+                "0.0000011000001",
+                "0.00000110000011",
+            ),
+            (
+                "negative_low_number_lower",
+                "-0.0000001",
+                "-0.0000011000001",
+                "-0.00000110000011",
+            ),
+            (
+                "negative_low_number_upper",
+                "-0.0000001",
+                "0.0000009000001",
+                "0.00000090000011",
+            ),
+            (
+                "positive_high_number_lower",
+                "100000.",
+                "99999.899999",
+                "99999.8999989",
+            ),
+            (
+                "positive_high_number_upper",
+                "100000.",
+                "100000.100001",
+                "100000.1000011",
+            ),
+            (
+                "negative_high_number_lower",
+                "-1000000.",
+                "-1000001.0000010000",
+                "-1000001.0000011",
+            ),
+            (
+                "negative_high_number_upper",
+                "-1000000.",
+                "-999998.999999",
+                "-999998.9999989",
+            ),
+        ];
+        for (case, ids, on_edge, outside) in rows {
+            let x: f64 = on_edge.parse().unwrap_or(f64::NAN);
+            assert!(
+                m(&s(ids), Actual::Num(x)),
+                "pass-…{case}: {ids} vs {on_edge}"
+            );
+            let y: f64 = outside.parse().unwrap_or(f64::NAN);
+            assert!(
+                !m(&s(ids), Actual::Num(y)),
+                "fail-…{case}: {ids} vs {outside}"
+            );
         }
     }
 

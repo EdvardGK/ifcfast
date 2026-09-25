@@ -62,33 +62,24 @@ impl MaterialTable {
     }
 }
 
-/// Build the material table. `unit_scale` is the IFC project's
-/// linear-unit-to-metres factor as reported by the indexer (0.001 for
-/// millimetre files, 1.0 for metre files).
-///
-/// When the indexer could not resolve a scale it reports `None`, and
-/// callers currently pass `1.0`. That is a GUESS, not a safe default:
-/// `1.0` claims the file is authored in metres, so on the far more
-/// common millimetre file every `layer_thickness_mm` comes out 1000×
-/// too large (a 200 mm layer reads as 200 000 mm). The indexer emits a
-/// loud warning in exactly that case — see `IndexedFile::warnings` and
-/// GH #149 — and consumers should treat the column as unusable rather
-/// than trust it silently.
-///
-/// The `LayerThickness` IFC field carries a raw value in the project's
-/// linear unit. The output column is named `layer_thickness_mm` so we
-/// scale at parse time: `raw * unit_scale * 1000` gives millimetres
-/// regardless of the source unit. Pre-fix this column held the raw
-/// value (e.g. `0.003` for a 3 mm layer on a metres-authored file like
-/// Duplex), making downstream code that trusted the name silently
-/// wrong by 1000×.
-pub fn build(
-    table: &EntityTable,
-    product_step_to_guid: &HashMap<u64, String>,
-    unit_scale: f64,
-) -> MaterialTable {
-    // Pass 1: index every material-related entity by step_id so we can
-    //         resolve refs cheaply during the second pass.
+/// Pass 1 of [`build`], shared with the IDS material facet (`ids::graph`):
+/// every material container by step id plus the association edges, in
+/// file order, with nothing resolved or emitted.
+pub(crate) struct MaterialScan {
+    pub(crate) index: MaterialIndex,
+    /// IfcRelAssociatesMaterial as (related object, relating material),
+    /// relations in file order.
+    pub(crate) rel_pairs: Vec<(u64, u64)>,
+    /// IfcRelDefinesByType: object → type (a later relation wins).
+    pub(crate) product_to_type: HashMap<u64, u64>,
+    /// Step ids of type objects (`is_type_object` name rule).
+    pub(crate) type_object_ids: std::collections::HashSet<u64>,
+}
+
+/// One pass over the table collecting everything [`MaterialScan`] holds.
+pub(crate) fn collect(table: &EntityTable) -> MaterialScan {
+    // Index every material-related entity by step_id so refs resolve
+    // cheaply afterwards.
     let mut materials: HashMap<u64, MaterialRecord> = HashMap::with_capacity(2048);
     let mut layer_sets: HashMap<u64, Vec<u64>> = HashMap::with_capacity(512);
     let mut layer_set_usages: HashMap<u64, u64> = HashMap::with_capacity(512);
@@ -109,6 +100,9 @@ pub fn build(
     // the material binding.
     let mut profile_sets: HashMap<u64, Vec<u64>> = HashMap::with_capacity(256);
     let mut profiles: HashMap<u64, ConstituentRecord> = HashMap::with_capacity(1024);
+    // LayerSetName / ConstituentSet.Name / ProfileSet.Name, by set step id.
+    // Not in the public table (the IDS material facet matches on them).
+    let mut set_names: HashMap<u64, Option<String>> = HashMap::with_capacity(512);
 
     // Collect rel-pairs: (related_object_step_ids, relating_material_ref)
     let mut rel_pairs: Vec<(u64, u64)> = Vec::with_capacity(8192);
@@ -141,9 +135,8 @@ pub fn build(
                 _ => None,
             };
             // IFC stores LayerThickness in the project's linear unit;
-            // normalize to mm via the indexer-derived `unit_scale`
-            // (raw-to-metres factor) so the output column matches its name.
-            let thickness = number_at(&fields, 1).map(|t| t * unit_scale * 1000.0);
+            // `emit` normalises it to mm (see `LayerRecord::thickness_raw`).
+            let thickness_raw = number_at(&fields, 1);
             // IFC4 layer-name overrides Material.Name when present.
             let name_override = string_at(&fields, 3);
             let category_override = string_at(&fields, 5);
@@ -151,7 +144,7 @@ pub fn build(
                 step_id,
                 LayerRecord {
                     material_ref,
-                    thickness_mm: thickness,
+                    thickness_raw,
                     name_override,
                     category_override,
                 },
@@ -160,6 +153,7 @@ pub fn build(
             // (MaterialLayers, LayerSetName, ...)
             let fields = split_top_level_args(args);
             layer_sets.insert(step_id, ref_list_at(&fields, 0));
+            set_names.insert(step_id, string_at(&fields, 1));
         } else if type_name.eq_ignore_ascii_case(b"IFCMATERIALLAYERSETUSAGE") {
             // (ForLayerSet, LayerSetDirection, DirectionSense, OffsetFromReferenceLine)
             let fields = split_top_level_args(args);
@@ -176,6 +170,7 @@ pub fn build(
             // IfcMaterialConstituent refs.
             let fields = split_top_level_args(args);
             constituent_sets.insert(step_id, ref_list_at(&fields, 2));
+            set_names.insert(step_id, string_at(&fields, 0));
         } else if type_name.eq_ignore_ascii_case(b"IFCMATERIALCONSTITUENT") {
             // IFC4: (Name, Description, Material, Fraction, Category)
             let fields = split_top_level_args(args);
@@ -199,6 +194,7 @@ pub fn build(
             // IFC4: (Name, Description, MaterialProfiles, CompositeProfile)
             let fields = split_top_level_args(args);
             profile_sets.insert(step_id, ref_list_at(&fields, 2));
+            set_names.insert(step_id, string_at(&fields, 0));
         } else if type_name.eq_ignore_ascii_case(b"IFCMATERIALPROFILE") {
             // IFC4: (Name, Description, Material, Profile, Priority, Category)
             // The Profile (arg 3) is an IfcProfileDef ref carrying the
@@ -272,17 +268,56 @@ pub fn build(
         }
     }
 
-    let index = MaterialIndex {
-        materials,
-        layer_sets,
-        layer_set_usages,
-        layers,
-        material_lists,
-        constituent_sets,
-        constituents,
-        profile_sets,
-        profiles,
-    };
+    MaterialScan {
+        index: MaterialIndex {
+            materials,
+            layer_sets,
+            layer_set_usages,
+            layers,
+            material_lists,
+            constituent_sets,
+            constituents,
+            profile_sets,
+            profiles,
+            set_names,
+        },
+        rel_pairs,
+        product_to_type,
+        type_object_ids,
+    }
+}
+
+/// Build the material table. `unit_scale` is the IFC project's
+/// linear-unit-to-metres factor as reported by the indexer (0.001 for
+/// millimetre files, 1.0 for metre files).
+///
+/// When the indexer could not resolve a scale it reports `None`, and
+/// callers currently pass `1.0`. That is a GUESS, not a safe default:
+/// `1.0` claims the file is authored in metres, so on the far more
+/// common millimetre file every `layer_thickness_mm` comes out 1000×
+/// too large (a 200 mm layer reads as 200 000 mm). The indexer emits a
+/// loud warning in exactly that case — see `IndexedFile::warnings` and
+/// GH #149 — and consumers should treat the column as unusable rather
+/// than trust it silently.
+///
+/// The `LayerThickness` IFC field carries a raw value in the project's
+/// linear unit. The output column is named `layer_thickness_mm` so we
+/// scale at emit time: `raw * unit_scale * 1000` gives millimetres
+/// regardless of the source unit. Pre-fix this column held the raw
+/// value (e.g. `0.003` for a 3 mm layer on a metres-authored file like
+/// Duplex), making downstream code that trusted the name silently
+/// wrong by 1000×.
+pub fn build(
+    table: &EntityTable,
+    product_step_to_guid: &HashMap<u64, String>,
+    unit_scale: f64,
+) -> MaterialTable {
+    let MaterialScan {
+        index,
+        rel_pairs,
+        product_to_type,
+        type_object_ids,
+    } = collect(table);
 
     let mut out = MaterialTable::default();
 
@@ -310,7 +345,7 @@ pub fn build(
                 .push(*relating_id);
         }
         if let Some(guid) = product_step_to_guid.get(obj_step_id) {
-            index.emit(&mut out, guid, *relating_id, "instance");
+            index.emit(&mut out, guid, *relating_id, "instance", unit_scale);
             has_instance_material.insert(*obj_step_id);
         }
         // Anything else (a group, a rel pointing at an entity we don't
@@ -339,7 +374,7 @@ pub fn build(
                 None => continue,
             };
             for relating_id in relating_ids {
-                index.emit(&mut out, guid, *relating_id, "type");
+                index.emit(&mut out, guid, *relating_id, "type", unit_scale);
             }
         }
     }
@@ -350,16 +385,21 @@ pub fn build(
 /// Every material-container map, so the resolution of one
 /// `RelatingMaterial` ref is written once and used by both the instance
 /// pass and the type-inheritance pass (GH #165).
-struct MaterialIndex {
-    materials: HashMap<u64, MaterialRecord>,
-    layer_sets: HashMap<u64, Vec<u64>>,
-    layer_set_usages: HashMap<u64, u64>,
-    layers: HashMap<u64, LayerRecord>,
-    material_lists: HashMap<u64, Vec<u64>>,
-    constituent_sets: HashMap<u64, Vec<u64>>,
-    constituents: HashMap<u64, ConstituentRecord>,
-    profile_sets: HashMap<u64, Vec<u64>>,
-    profiles: HashMap<u64, ConstituentRecord>,
+pub(crate) struct MaterialIndex {
+    pub(crate) materials: HashMap<u64, MaterialRecord>,
+    pub(crate) layer_sets: HashMap<u64, Vec<u64>>,
+    /// IfcMaterialLayerSetUsage → ForLayerSet and
+    /// IfcMaterialProfileSetUsage → ForProfileSet.
+    pub(crate) layer_set_usages: HashMap<u64, u64>,
+    pub(crate) layers: HashMap<u64, LayerRecord>,
+    pub(crate) material_lists: HashMap<u64, Vec<u64>>,
+    pub(crate) constituent_sets: HashMap<u64, Vec<u64>>,
+    pub(crate) constituents: HashMap<u64, ConstituentRecord>,
+    pub(crate) profile_sets: HashMap<u64, Vec<u64>>,
+    pub(crate) profiles: HashMap<u64, ConstituentRecord>,
+    /// LayerSetName / IfcMaterialConstituentSet.Name /
+    /// IfcMaterialProfileSet.Name by set step id (IDS only).
+    pub(crate) set_names: HashMap<u64, Option<String>>,
 }
 
 impl MaterialIndex {
@@ -367,7 +407,14 @@ impl MaterialIndex {
     /// and push the resulting row(s). Always emits at least one row —
     /// an unresolvable ref becomes a `role = "unknown"` marker so the
     /// association is visible rather than dropped.
-    fn emit(&self, out: &mut MaterialTable, guid: &str, relating_id: u64, source: &'static str) {
+    fn emit(
+        &self,
+        out: &mut MaterialTable,
+        guid: &str,
+        relating_id: u64,
+        source: &'static str,
+        unit_scale: f64,
+    ) {
         if let Some(mat) = self.materials.get(&relating_id) {
             push_row(
                 out,
@@ -478,7 +525,7 @@ impl MaterialIndex {
                         "layer",
                         i as i32,
                         name,
-                        layer.thickness_mm,
+                        layer.thickness_raw.map(|t| t * unit_scale * 1000.0),
                         category,
                         None,
                         source,
@@ -530,22 +577,26 @@ fn push_row(
     out.source.push(source);
 }
 
-struct MaterialRecord {
-    name: Option<String>,
-    category: Option<String>,
+pub(crate) struct MaterialRecord {
+    pub(crate) name: Option<String>,
+    /// IFC4+ only (IFC2X3 IfcMaterial has just a Name).
+    pub(crate) category: Option<String>,
 }
 
-struct LayerRecord {
-    material_ref: Option<u64>,
-    thickness_mm: Option<f64>,
-    name_override: Option<String>,
-    category_override: Option<String>,
+pub(crate) struct LayerRecord {
+    pub(crate) material_ref: Option<u64>,
+    /// `LayerThickness` as written, in the project's length unit; the
+    /// public table's `layer_thickness_mm` is `raw * unit_scale * 1000`.
+    pub(crate) thickness_raw: Option<f64>,
+    /// IFC4 `IfcMaterialLayer.Name` / `.Category`.
+    pub(crate) name_override: Option<String>,
+    pub(crate) category_override: Option<String>,
 }
 
-struct ConstituentRecord {
-    material_ref: Option<u64>,
-    name_override: Option<String>,
-    category_override: Option<String>,
+pub(crate) struct ConstituentRecord {
+    pub(crate) material_ref: Option<u64>,
+    pub(crate) name_override: Option<String>,
+    pub(crate) category_override: Option<String>,
     /// IfcMaterialConstituent.Fraction. None on IfcMaterialProfile,
     /// which reuses this struct but has Priority (an integer 0-100)
     /// at a different arg index that we don't currently capture.

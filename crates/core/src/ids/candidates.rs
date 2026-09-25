@@ -22,13 +22,20 @@
 //!   IfcTester can collect a record twice when a name restriction matches
 //!   two attributes declared at different levels (ambiguity register A7).
 //!
+//! * Property: every `IfcObjectDefinition` (subtypes included), plus in
+//!   IFC4+ every `IfcMaterialDefinition` and `IfcProfileDef`
+//!   (`Property.filter`, `facet.py:668-679`; ambiguity register A24).
+//! * Classification / Material: every `IfcObjectDefinition`
+//!   (`facet.py:412-417`, `:939-944`).
+//!
 //! The entity facet's `predefinedType`, and every other applicability
 //! facet, are then applied per candidate by `eval`.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use super::compile::{AttrName, CFacet, EntityName};
 use super::eval::Ctx;
+use super::ir::Schema;
 
 /// Candidate step-ids for `first`, sorted ascending, unique.
 pub fn seed(ctx: &Ctx, first: &CFacet) -> Vec<u64> {
@@ -68,6 +75,25 @@ pub fn seed(ctx: &Ctx, first: &CFacet) -> Vec<u64> {
                 occ
             }
         },
+        CFacet::Property(_) | CFacet::Classification(_) | CFacet::Material(_) => {
+            let mut roots: Vec<&str> = vec!["IFCOBJECTDEFINITION"];
+            if matches!(first, CFacet::Property(_)) && ctx.schema != Schema::Ifc2x3 {
+                roots.extend(["IFCMATERIALDEFINITION", "IFCPROFILEDEF"]);
+            }
+            let mut memo: HashMap<&'static str, bool> = HashMap::new();
+            table
+                .order()
+                .iter()
+                .copied()
+                .filter(|id| {
+                    ctx.class_of(*id).is_some_and(|c| {
+                        *memo
+                            .entry(c)
+                            .or_insert_with(|| roots.iter().any(|r| ctx.t.is_subtype_of(c, r)))
+                    })
+                })
+                .collect()
+        }
         CFacet::Attribute(a) => {
             let classes: HashSet<&'static str> = ctx
                 .t

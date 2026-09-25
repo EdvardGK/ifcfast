@@ -187,10 +187,16 @@ Model.validate_ids(ids, *, on_unsupported="raise", filter_ifc_version=False) -> 
 | value_source | category {instance, type, null} |
 
 **Reason codes:** `ENTITY_MISMATCH, PREDEFINED_MISMATCH, ATTR_MISSING, ATTR_VALUE_MISMATCH,
-PSET_MISSING, PROP_MISSING, PROP_NULL, PROP_DATATYPE_MISMATCH, PROP_VALUE_MISMATCH, CLASS_MISSING,
+PSET_MISSING, PROP_MISSING, PROP_NULL, PROP_UNSUPPORTED, PROP_DATATYPE_MISMATCH, PROP_VALUE_MISMATCH, CLASS_MISSING,
 CLASS_SYSTEM_MISMATCH, CLASS_VALUE_MISMATCH, MATERIAL_MISSING, MATERIAL_VALUE_MISMATCH,
 PARTOF_MISSING, PARTOF_ENTITY_MISMATCH, PROHIBITED_PRESENT, SPEC_NO_APPLICABLE,
 SPEC_PROHIBITED_APPLICABLE`.
+
+`PROP_UNSUPPORTED` (added 2026-09-25, ambiguity register A16): a complex property or quantity, or a
+reference value, matched a required property facet. IDS 1.0 cannot check these kinds, so they count
+as absent (`optional` and `prohibited` pass). A unit that cannot be resolved is not a reason code: it is
+`IdsError::UnresolvedUnit` routed through `on_unsupported` (A26; `mark` → `status="unsupported"`,
+`unsupported_feature="unit:<UNITTYPE>"`).
 
 ### 3.3 IfcTester interop: `to_ifctester_json()`
 

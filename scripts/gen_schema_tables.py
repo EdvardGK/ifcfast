@@ -18,6 +18,11 @@ tables the IDS engine (docs/plans/2026-09-24_ids-validation-design.md
                         defined type plus every defined type reachable
                         from the IfcValue select (the IDS dataType
                         vocabulary); ``None`` = no unit applies
+* ``PREDEF_PSET_ATTR_TYPE`` (entity, [(attribute, declared type)]) for every
+                        IfcPreDefinedPropertySet subtype: its attributes
+                        from STEP index 4 on whose type is a named type
+                        (the IDS property facet reads these attributes as
+                        properties; the declared type is their dataType)
 
 Same sanctioned pattern as ``scripts/gen_schema_supertypes.py``:
 ifcopenshell is used at GENERATION time only, the output is committed,
@@ -304,6 +309,22 @@ def extract(schema_name: str, expected: str) -> dict:
         if m not in vocab:
             die(f"{schema_name}: hand-mapped {m} does not exist in schema")
 
+    # IfcPreDefinedPropertySet subtypes: attributes from index 4 on (after
+    # GlobalId, OwnerHistory, Name, Description) with a named declared type.
+    predef_pset: list[tuple[str, list[tuple[str, str]]]] = []
+    for e in entities:
+        if not is_subtype(e, "IfcPreDefinedPropertySet"):
+            continue
+        rows_t: list[tuple[str, str]] = []
+        for pos, a in enumerate(e.all_attributes()):
+            if pos < 4:
+                continue
+            named = a.type_of_attribute().as_named_type()
+            if named is None:
+                continue
+            rows_t.append((a.name(), named.declared_type().name().upper()))
+        predef_pset.append((e.name().upper(), rows_t))
+
     return {
         "entities": names,
         "type_objects": type_objects,
@@ -315,6 +336,7 @@ def extract(schema_name: str, expected: str) -> dict:
         "elemtype_pos": elemtype_pos,
         "predef_enum": predef_enum,
         "measures": measures,
+        "predef_pset": predef_pset,
         "hand_rows": hand_rows,
         "measure_count": len(measure_names),
     }
@@ -396,6 +418,7 @@ pub struct SchemaTables {
     pub elemtype_pos: &'static [(&'static str, u16)],
     pub predef_enum: &'static [(&'static str, &'static [&'static str])],
     pub measure_unit_type: &'static [(&'static str, Option<&'static str>)],
+    pub predef_pset_attr_type: &'static [(&'static str, &'static [(&'static str, &'static str)])],
 }
 
 /// The tables for `schema`.
@@ -509,6 +532,16 @@ impl SchemaTables {
     pub fn unit_type_for_measure(&self, measure: &str) -> Option<Option<&'static str>> {
         find_pair(self.measure_unit_type, measure)
     }
+
+    /// `IfcPreDefinedPropertySet` subtypes only: the attributes from STEP
+    /// index 4 on that have a named declared type, as (attribute, declared
+    /// type UPPERCASE). `None` when `entity` is not such a subtype.
+    pub fn predef_pset_attrs(
+        &self,
+        entity: &str,
+    ) -> Option<&'static [(&'static str, &'static str)]> {
+        find_pair(self.predef_pset_attr_type, entity)
+    }
 }
 
 '''
@@ -543,6 +576,7 @@ mod tests {
             assert!(sorted(t.elemtype_pos, |p| p.0));
             assert!(sorted(t.predef_enum, |p| p.0));
             assert!(sorted(t.measure_unit_type, |p| p.0));
+            assert!(sorted(t.predef_pset_attr_type, |p| p.0));
             assert_eq!(t.attrs.len(), t.entities.len());
         }
     }
@@ -591,6 +625,10 @@ mod tests {
         assert_eq!(t4.unit_type_for_measure("IFCCOUNTMEASURE"), Some(None));
         assert_eq!(t4.unit_type_for_measure("IFCLABEL"), Some(None));
         assert_eq!(t4.unit_type_for_measure("IFCNOSUCHMEASURE"), None);
+        let panel = t4.predef_pset_attrs("IFCDOORPANELPROPERTIES").unwrap();
+        assert!(panel.contains(&("PanelOperation", "IFCDOORPANELOPERATIONENUM")));
+        assert!(t4.predef_pset_attrs("IFCPROPERTYSET").is_none());
+        assert!(tables(Schema::Ifc2x3).predef_pset_attr_type.is_empty());
         // IFC2X3 IfcReinforcingBar has BarRole, not PredefinedType.
         let t2 = tables(Schema::Ifc2x3);
         assert_eq!(t2.predef_pos("IFCREINFORCINGBAR"), None);
@@ -696,6 +734,19 @@ def render_schema(mod: str, d: dict) -> list[str]:
             row += f" // hand-mapped: {hand[m]}"
         out.append(row)
     out.append("        ];")
+    out.append("")
+
+    out.append(f"        pub static PREDEF_PSET_ATTR_TYPE: &[(&str, &[(&str, &str)])] = &[")
+    for ent, rows_t in d["predef_pset"]:
+        cells = [f"({rs_str(n)}, {rs_str(t)})" for n, t in rows_t]
+        head = f"{ind}    ({rs_str(ent)}, &["
+        if not cells:
+            out.append(head + "]),")
+            continue
+        out.append(head)
+        out += wrap(cells, ind + "        ")
+        out.append(f"{ind}    ]),")
+    out.append("        ];")
     out.append("    }")
     return out
 
@@ -727,6 +778,7 @@ def render() -> str:
             f"    elemtype_pos: gen::{m}::ELEMTYPE_POS,\n"
             f"    predef_enum: gen::{m}::PREDEF_ENUM,\n"
             f"    measure_unit_type: gen::{m}::MEASURE_UNIT_TYPE,\n"
+            f"    predef_pset_attr_type: gen::{m}::PREDEF_PSET_ATTR_TYPE,\n"
             f"}};\n\n"
         )
 

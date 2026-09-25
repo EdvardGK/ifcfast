@@ -9,9 +9,12 @@
 //! (column-major specs / elements / failures). [`validate`] is the single
 //! entry point.
 //!
-//! Slice 1 implements the Entity and Attribute facets. Property,
-//! Classification, Material and PartOf raise [`IdsError::Unsupported`]
-//! (`facet:<kind>`) until GH #192 slices 2–3.
+//! Slices 1–2 implement the Entity, Attribute, Property, Classification
+//! and Material facets (the last three read the lazy data layer in
+//! [`graph`]). PartOf raises [`IdsError::Unsupported`] (`facet:part_of`)
+//! until GH #192 slice 3. A value comparison that needs an undeclared
+//! unit raises [`IdsError::UnresolvedUnit`], or under
+//! [`OnUnsupported::Mark`] marks that spec `unsupported` (`unit:<TYPE>`).
 //!
 //! IfcTester is the reference implementation and a test-time oracle
 //! only; it is never a runtime dependency.
@@ -22,6 +25,7 @@ pub mod candidates;
 pub mod compile;
 pub mod datatypes;
 pub mod eval;
+pub mod graph;
 pub mod ir;
 pub mod report;
 pub mod restriction;
@@ -176,8 +180,11 @@ pub enum IdsError {
         feature: String,
         spec_index: Option<u32>,
     },
-    /// A requirement needs a unit the model does not declare. We never
-    /// assume SI (same policy as GH #149).
+    /// A value comparison needs a unit the model does not declare (or
+    /// declares in a form that does not resolve). We never assume SI (same
+    /// policy as GH #149). Routed through [`OnUnsupported`] at evaluation:
+    /// `Raise` returns it, `Mark` reports the spec `unsupported` with
+    /// `unsupported_feature = "unit:<unit_type>"` (ambiguity register A26).
     UnresolvedUnit { unit_type: String },
     /// The IFC side cannot be validated: truncated file, unknown or
     /// missing FILE_SCHEMA, or a record whose arguments do not fit the

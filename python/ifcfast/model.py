@@ -1142,9 +1142,9 @@ class Model:
         DataFrames plus ``.ok`` and ``.to_parquet(dir)``. Each call stands
         alone; nothing is cached on the Model.
 
-        Slice 1 checks the Entity and Attribute facets; other facets raise
-        :class:`ifcfast.IdsUnsupportedError` unless
-        ``on_unsupported="mark"``. See :func:`ifcfast.validate_ids`.
+        Checks the Entity, Attribute, Property, Classification and
+        Material facets; PartOf raises :class:`ifcfast.IdsUnsupportedError`
+        unless ``on_unsupported="mark"``. See :func:`ifcfast.validate_ids`.
         """
         from .ids import validate_ids as _validate_ids
 

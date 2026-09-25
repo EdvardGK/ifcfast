@@ -15,13 +15,32 @@
 use super::attrs::py_repr_str;
 use super::ir::{Facet, FacetCardinality, Restriction, SpecCardinality, Val};
 
-/// Reason codes (design §3.2). Slice 1 emits the entity, attribute,
-/// prohibited and spec-level ones.
+/// Reason codes (design §3.2). Emitted today: entity, attribute,
+/// property, classification, material, prohibited and spec-level ones
+/// (PartOf arrives in slice 3). Mapping from IfcTester's reasons:
+/// `docs/ids/facet-semantics-slice2.md` §5.
 pub mod reason {
     pub const ENTITY_MISMATCH: &str = "ENTITY_MISMATCH";
     pub const PREDEFINED_MISMATCH: &str = "PREDEFINED_MISMATCH";
     pub const ATTR_MISSING: &str = "ATTR_MISSING";
     pub const ATTR_VALUE_MISMATCH: &str = "ATTR_VALUE_MISMATCH";
+    /// No property set / quantity set of that name (IfcTester NOPSET).
+    pub const PSET_MISSING: &str = "PSET_MISSING";
+    /// The set exists, the property does not (NOVALUE).
+    pub const PROP_MISSING: &str = "PROP_MISSING";
+    /// The property exists with a null / `''` / `.U.` / empty value (NOVALUE).
+    pub const PROP_NULL: &str = "PROP_NULL";
+    /// A complex property / quantity or a reference value: not checkable
+    /// by IDS 1.0, counted as absent (ambiguity register A16).
+    pub const PROP_UNSUPPORTED: &str = "PROP_UNSUPPORTED";
+    /// Value wrapper / quantity measure ≠ dataType (DATATYPE).
+    pub const PROP_DATATYPE_MISMATCH: &str = "PROP_DATATYPE_MISMATCH";
+    pub const PROP_VALUE_MISMATCH: &str = "PROP_VALUE_MISMATCH";
+    pub const CLASS_MISSING: &str = "CLASS_MISSING";
+    pub const CLASS_SYSTEM_MISMATCH: &str = "CLASS_SYSTEM_MISMATCH";
+    pub const CLASS_VALUE_MISMATCH: &str = "CLASS_VALUE_MISMATCH";
+    pub const MATERIAL_MISSING: &str = "MATERIAL_MISSING";
+    pub const MATERIAL_VALUE_MISMATCH: &str = "MATERIAL_VALUE_MISMATCH";
     pub const PROHIBITED_PRESENT: &str = "PROHIBITED_PRESENT";
     pub const SPEC_NO_APPLICABLE: &str = "SPEC_NO_APPLICABLE";
     pub const SPEC_PROHIBITED_APPLICABLE: &str = "SPEC_PROHIBITED_APPLICABLE";
@@ -54,6 +73,54 @@ pub struct SpecsTable {
     pub requirement_labels: Vec<Vec<String>>,
 }
 
+impl ElementsTable {
+    pub fn len(&self) -> usize {
+        self.step_id.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.step_id.is_empty()
+    }
+
+    /// Drop every row from `n` on (a spec that turned out unsupported).
+    pub(crate) fn truncate(&mut self, n: usize) {
+        self.spec_index.truncate(n);
+        self.step_id.truncate(n);
+        self.guid.truncate(n);
+        self.entity.truncate(n);
+        self.predefined_type.truncate(n);
+        self.name.truncate(n);
+        self.description.truncate(n);
+        self.tag.truncate(n);
+        self.type_step_id.truncate(n);
+        self.status.truncate(n);
+        self.n_failed.truncate(n);
+    }
+}
+
+impl FailuresTable {
+    pub fn len(&self) -> usize {
+        self.step_id.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.step_id.is_empty()
+    }
+
+    pub(crate) fn truncate(&mut self, n: usize) {
+        self.spec_index.truncate(n);
+        self.step_id.truncate(n);
+        self.guid.truncate(n);
+        self.requirement_index.truncate(n);
+        self.facet_type.truncate(n);
+        self.facet_cardinality.truncate(n);
+        self.reason_code.truncate(n);
+        self.expected.truncate(n);
+        self.actual.truncate(n);
+        self.value_source.truncate(n);
+    }
+}
+
 /// One row per spec × applicable element.
 #[derive(Debug, Default, Clone)]
 pub struct ElementsTable {
@@ -83,7 +150,8 @@ pub struct FailuresTable {
     pub step_id: Vec<i64>,
     pub guid: Vec<Option<String>>,
     pub requirement_index: Vec<i16>,
-    /// `entity` / `attribute` (later slices: `property`, …).
+    /// `entity` / `attribute` / `property` / `classification` /
+    /// `material` (`part_of` in slice 3).
     pub facet_type: Vec<&'static str>,
     pub facet_cardinality: Vec<&'static str>,
     pub reason_code: Vec<&'static str>,
@@ -187,7 +255,67 @@ pub fn facet_label(
                     ("value", py_str_val(value.as_ref())),
                 ],
             ),
-            // Slices 2-3 port the other facets' templates.
+            // facet.py:654-665; dataType never appears in a template.
+            Facet::Property {
+                property_set,
+                base_name,
+                value,
+                ..
+            } => (
+                &[
+                    "Elements with {baseName} data of {value} in the dataset {propertySet}",
+                    "Elements with {baseName} data in the dataset {propertySet}",
+                ],
+                &[
+                    "{baseName} data shall be {value} and in the dataset {propertySet}",
+                    "{baseName} data shall be provided in the dataset {propertySet}",
+                ],
+                &[
+                    "{baseName} data shall not be {value} and in the dataset {propertySet}",
+                    "{baseName} data shall not be provided in the dataset {propertySet}",
+                ],
+                vec![
+                    ("propertySet", py_str_val(Some(property_set))),
+                    ("baseName", py_str_val(Some(base_name))),
+                    ("value", py_str_val(nonempty(value.as_ref()))),
+                ],
+            ),
+            // facet.py:394-408; parameter order value, system.
+            Facet::Classification { system, value, .. } => (
+                &[
+                    "Data having a {system} reference of {value}",
+                    "Data classified using {system}",
+                    "Data classified as {value}",
+                ],
+                &[
+                    "Shall have a {system} reference of {value}",
+                    "Shall be classified using {system}",
+                    "Shall be classified as {value}",
+                ],
+                &[
+                    "Shall not have a {system} reference of {value}",
+                    "Shall not be classified using {system}",
+                    "Shall not be classified as {value}",
+                ],
+                vec![
+                    ("value", py_str_val(nonempty(value.as_ref()))),
+                    ("system", py_str_val(nonempty(Some(system)))),
+                ],
+            ),
+            // facet.py:925-936
+            Facet::Material { value, .. } => (
+                &[
+                    "All data with a {value} material",
+                    "All data with a material",
+                ],
+                &["Shall have a material of {value}", "Shall have a material"],
+                &[
+                    "Shall not have a material of {value}",
+                    "Shall not have a material",
+                ],
+                vec![("value", py_str_val(nonempty(value.as_ref())))],
+            ),
+            // Slice 3 ports the PartOf templates.
             other => return format!("{} facet", other.kind()),
         };
     // facet.py:128-145
@@ -240,6 +368,14 @@ fn fill_template(templates: &[String], params: &[(&str, Option<String>)]) -> Str
         }
     }
     "This facet cannot be interpreted".into()
+}
+
+/// IfcTester drops falsy parameters: an empty simple value is no value.
+fn nonempty(v: Option<&Val>) -> Option<&Val> {
+    match v {
+        Some(Val::Simple(s)) if s.is_empty() => None,
+        other => other,
+    }
 }
 
 /// Python `str()` of a parsed IfcTester parameter: a simple value is the
