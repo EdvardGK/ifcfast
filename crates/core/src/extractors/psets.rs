@@ -10,15 +10,23 @@
 //! For the "all external load-bearing walls" class of query. Stays in
 //! column-major form so the PyO3 bridge marshalling stays cheap.
 //!
-//! Phase 1 scope: `IfcPropertySet` + `IfcPropertySingleValue` only. Covers
-//! 90%+ of psets seen on Revit/Archicad/Tekla/MagiCAD exports. Bounded,
-//! enumerated, list, and complex property variants are future work
-//! (Phase 2 if any query actually needs them).
+//! Single, enumerated, list, bounded, table and complex properties are
+//! flattened to one string per row; any other `IfcProperty*Value` class
+//! surfaces as an `unhandled:IFCXXX` marker row (GH #38).
+//!
+//! Discovery is the shared typed pass in [`super::property_graph`]; this
+//! module is the flattened public view of it. Its formatting rules, row
+//! order and marker rows predate the graph and are kept byte for byte.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
+use super::property_graph::{
+    split_type_wrapper, trim, GraphScope, PropClass, PropDef, PropertyGraph, PsetKind, TypedValue,
+};
 use crate::entity_table::EntityTable;
-use crate::lexer::{parse_field, split_top_level_args, Field};
+#[cfg(test)]
+use crate::lexer::split_top_level_args;
+use crate::lexer::{parse_field, Field};
 
 /// Long-format pset rows in column-major layout.
 ///
@@ -53,125 +61,178 @@ impl PsetTable {
 /// resolver for the products you care about (typically the products
 /// the indexer already extracted).
 pub fn build(table: &EntityTable, product_step_to_guid: &HashMap<u64, String>) -> PsetTable {
-    // Pass 1: collect IfcPropertySet records (id → (name, prop_ids))
-    //         and IfcPropertySingleValue records (id → Prop).
-    let mut psets: HashMap<u64, (String, Vec<u64>)> = HashMap::with_capacity(2048);
-    let mut props: HashMap<u64, Prop> = HashMap::with_capacity(8192);
-    // IfcComplexProperty groups inner properties under a named "complex"
-    // wrapper. We flatten in pass 2 via dot-joined names: a complex
-    // "ProfileGeometry" containing "Width" + "Height" produces rows
-    // named "ProfileGeometry.Width" + "ProfileGeometry.Height".
-    let mut complex_props: HashMap<u64, (String, Vec<u64>)> = HashMap::with_capacity(256);
-    // Pass 2 input: (related_object_step_ids, pset_step_id) — many rels share
-    // a single pset, and many objects share a single rel.
-    let mut rel_pairs: Vec<(u64, u64)> = Vec::with_capacity(16_384);
-    // IfcRelDefinesByType: (product_step_id → type_step_id). One type
-    // per product; the relation fans out N products per type.
-    let mut product_to_type: HashMap<u64, u64> = HashMap::with_capacity(16_384);
-    // IfcTypeObject.HasPropertySets: (type_step_id → [pset_step_id]).
-    // Captured for any IfcXxxType entity (suffix-detected so new schema
-    // additions surface automatically, same convention as the indexer).
-    let mut type_psets: HashMap<u64, Vec<u64>> = HashMap::with_capacity(256);
-    // Reveal-all marker for IfcProperty* subclasses we don't know how
-    // to parse. Pre-GH-#38 such properties were silently dropped — an
-    // agent calling `m.psets` couldn't tell whether a pset was empty
-    // by author intent or because ifcfast had a blind spot. Capturing
-    // every unrecognised `IfcProperty*` here and emitting a marker
-    // row tagged `value_type = "unhandled:IFCXXX"` makes the loss
-    // visible. The shape mirrors a real Prop so the existing pass-2
-    // recursion can emit it without a special path.
-    let mut unhandled_props: HashMap<u64, UnhandledProp> = HashMap::with_capacity(64);
+    let graph = PropertyGraph::build_scoped(table, GraphScope::PROPERTIES);
+    build_from_graph(&graph, product_step_to_guid)
+}
 
-    for (step_id, type_name, args) in table.iter() {
-        if type_name.eq_ignore_ascii_case(b"IFCPROPERTYSET") {
-            // (GlobalId, OwnerHistory, Name, Description, HasProperties)
-            let fields = split_top_level_args(args);
-            let name = string_at(&fields, 2).unwrap_or_default();
-            let prop_ids = ref_list_at(&fields, 4);
-            psets.insert(step_id, (name, prop_ids));
-        } else if type_name.eq_ignore_ascii_case(b"IFCPROPERTYSINGLEVALUE") {
-            // (Name, Description, NominalValue, Unit)
-            let fields = split_top_level_args(args);
-            let name = string_at(&fields, 0).unwrap_or_default();
-            let (val_str, val_type) = parse_nominal_value(fields.get(2).copied());
-            props.insert(
-                step_id,
-                Prop {
-                    name,
-                    value: val_str,
-                    value_type: val_type,
-                },
-            );
-        } else if type_name.eq_ignore_ascii_case(b"IFCPROPERTYENUMERATEDVALUE")
-            || type_name.eq_ignore_ascii_case(b"IFCPROPERTYLISTVALUE")
-        {
-            // IfcPropertyEnumeratedValue: (Name, Description, EnumerationValues, EnumerationReference)
-            // IfcPropertyListValue:       (Name, Description, ListValues, Unit)
-            // Both carry a LIST of IfcValue at arg 2. Joined with `, `
-            // for the row's value string; value_type follows the first
-            // member's type since enumerated/list values must be
-            // homogeneous in the IFC schema.
-            //
-            // A common Norwegian-export pattern: fire ratings declared
-            // as IfcPropertyEnumeratedValue with a single member like
-            // IFCLABEL('R60'). Pre-fix these were silently dropped; now
-            // they surface alongside IfcPropertySingleValue properties.
-            let fields = split_top_level_args(args);
-            let name = string_at(&fields, 0).unwrap_or_default();
-            let (val_str, val_type) = parse_value_list(fields.get(2).copied());
-            props.insert(
-                step_id,
-                Prop {
-                    name,
-                    value: val_str,
-                    value_type: val_type,
-                },
-            );
-        } else if type_name.eq_ignore_ascii_case(b"IFCPROPERTYBOUNDEDVALUE") {
-            // (Name, Description, UpperBoundValue, LowerBoundValue, Unit, SetPointValue)
-            // Three optional IfcValues. Format: "lower..upper" if both
-            // bounds present, or "..upper" / "lower.." if one-sided.
-            // SetPointValue (IFC4) appended as "@setpoint" when present.
-            //
-            // MEP exports use this for temperature ranges, pressure
-            // tolerances, flow rate windows. Pre-fix all of these were
-            // silently dropped from psets.
-            let fields = split_top_level_args(args);
-            let name = string_at(&fields, 0).unwrap_or_default();
-            let (upper_val, upper_type) = parse_nominal_value(fields.get(2).copied());
-            let (lower_val, _) = parse_nominal_value(fields.get(3).copied());
-            let (setpoint_val, _) = parse_nominal_value(fields.get(5).copied());
+/// [`build`] from an already-built graph (which must include
+/// [`GraphScope::properties`]).
+///
+/// Rows: first every `(object, IfcPropertySet)` pair of
+/// `IfcRelDefinesByProperties` in relation order, one row per leaf
+/// property (complex properties flatten to dot-joined names, e.g.
+/// `"ProfileGeometry.Width"`); then, by product step id, the leaves of
+/// each product's type `HasPropertySets` whose `(pset_name, prop_name)`
+/// no instance row on the same guid already carries (instance wins,
+/// ifcopenshell `should_inherit=True`).
+pub fn build_from_graph(
+    graph: &PropertyGraph,
+    product_step_to_guid: &HashMap<u64, String>,
+) -> PsetTable {
+    assert!(
+        graph.scope.properties,
+        "psets::build_from_graph needs a PropertyGraph built with properties in scope"
+    );
+    // The flattened (value, value_type) of every leaf definition, once per
+    // definition (many rows share one definition).
+    let mut formatted: Vec<Option<(Option<String>, Option<String>)>> =
+        vec![None; graph.props.len()];
+    for def in graph.props.values() {
+        formatted[def.ord] = flatten_value(def);
+    }
+
+    let mut out = PsetTable::default();
+    let est = graph.defines.len() * 8 + graph.object_type.len() * 4;
+    out.guid.reserve(est);
+    out.pset_name.reserve(est);
+    out.prop_name.reserve(est);
+    out.value.reserve(est);
+    out.value_type.reserve(est);
+    out.source.reserve(est);
+
+    // (guid → "pset_name\tprop_name" keys emitted on the instance side).
+    // Keyed by guid, not step id, so two steps sharing a guid shadow each
+    // other exactly as they always have.
+    let mut seen_per_product: HashMap<&str, HashSet<String>> =
+        HashMap::with_capacity(product_step_to_guid.len());
+
+    for (obj_step_id, set_step_id) in &graph.defines {
+        let guid = match product_step_to_guid.get(obj_step_id) {
+            Some(g) => g.as_str(),
+            None => continue, // rel pointed at a non-product (type, group, etc.)
+        };
+        let set = match graph.sets.get(set_step_id) {
+            Some(s) if s.kind == PsetKind::PropertySet => s,
+            _ => continue,
+        };
+        let mut emitted_names: Vec<String> = Vec::new();
+        graph.walk_set_leaves(set, &mut |path, def| {
+            let Some((value, value_type)) = &formatted[def.ord] else {
+                return;
+            };
+            let name = prop_name(path, &def.name);
+            out.guid.push(guid.to_string());
+            out.pset_name.push(set.name.clone());
+            out.prop_name.push(name.clone());
+            out.value.push(value.clone());
+            out.value_type.push(value_type.clone());
+            out.source.push("instance".to_string());
+            emitted_names.push(name);
+        });
+        if !emitted_names.is_empty() {
+            let seen = seen_per_product.entry(guid).or_default();
+            for n in emitted_names {
+                seen.insert(format!("{}\t{n}", set.name));
+            }
+        }
+    }
+
+    // Type inheritance. Sorted by product step id: iterating the HashMap
+    // leaked std's per-process RandomState into the ROW ORDER of this half
+    // of the table (GH #152).
+    if !graph.type_sets.is_empty() && !graph.object_type.is_empty() {
+        let mut inherit: Vec<(u64, u64)> = graph
+            .object_type
+            .iter()
+            .map(|(product, type_id)| (*product, *type_id))
+            .collect();
+        inherit.sort_unstable();
+        let empty = HashSet::new();
+        for (product_step_id, type_step_id) in &inherit {
+            let guid = match product_step_to_guid.get(product_step_id) {
+                Some(g) => g.as_str(),
+                None => continue,
+            };
+            let type_set_ids = match graph.type_sets.get(type_step_id) {
+                Some(v) => v,
+                None => continue,
+            };
+            let already_seen = seen_per_product.get(guid).unwrap_or(&empty);
+            for set_id in type_set_ids {
+                let set = match graph.sets.get(set_id) {
+                    Some(s) if s.kind == PsetKind::PropertySet => s,
+                    _ => continue,
+                };
+                graph.walk_set_leaves(set, &mut |path, def| {
+                    let Some((value, value_type)) = &formatted[def.ord] else {
+                        return;
+                    };
+                    let name = prop_name(path, &def.name);
+                    if already_seen.contains(&format!("{}\t{name}", set.name)) {
+                        return;
+                    }
+                    out.guid.push(guid.to_string());
+                    out.pset_name.push(set.name.clone());
+                    out.prop_name.push(name);
+                    out.value.push(value.clone());
+                    out.value_type.push(value_type.clone());
+                    out.source.push("type".to_string());
+                });
+            }
+        }
+    }
+
+    out
+}
+
+/// `"{complex}.{complex}.{leaf}"`: each enclosing complex name followed by
+/// a dot, then the leaf name (an unnamed complex contributes a bare `.`).
+fn prop_name(path: &[&str], leaf: &str) -> String {
+    if path.is_empty() {
+        return leaf.to_string();
+    }
+    let mut s = String::new();
+    for p in path {
+        s.push_str(p);
+        s.push('.');
+    }
+    s.push_str(leaf);
+    s
+}
+
+/// The row's `(value, value_type)` for a leaf property definition; `None`
+/// for anything that is not a property-family leaf.
+///
+/// - single: the NominalValue unwrapped (`IFCLABEL('x')` → `"x"`,
+///   `"IfcLabel"`);
+/// - enumerated / list: members joined with `", "`, type from the first
+///   typed member (IFC requires homogeneous lists);
+/// - bounded: `"lower..upper"`, `"..upper"`, `"lower.."`, `@setpoint`
+///   appended when present; type from the upper bound;
+/// - table: `"d1=>v1, d2=>v2"` (`?` for a null member); type from
+///   DefinedValues;
+/// - reference and unknown `IfcProperty*Value` classes: value `None`,
+///   value_type `"unhandled:IFCXXX"` (GH #38) — the blind spot stays
+///   visible.
+fn flatten_value(def: &PropDef) -> Option<(Option<String>, Option<String>)> {
+    Some(match def.class {
+        PropClass::SingleValue => parse_nominal_value(def.values.first().map(|v| v.src)),
+        PropClass::EnumeratedValue | PropClass::ListValue => parse_value_list(&def.values),
+        PropClass::BoundedValue => {
+            let at = |i: usize| def.values.get(i).map(|v| v.src);
+            let (lower_val, _) = parse_nominal_value(at(0));
+            let (upper_val, upper_type) = parse_nominal_value(at(1));
+            let (setpoint_val, _) = parse_nominal_value(at(2));
             let val_str = format_bounded(
                 lower_val.as_deref(),
                 upper_val.as_deref(),
                 setpoint_val.as_deref(),
             );
-            props.insert(
-                step_id,
-                Prop {
-                    name,
-                    value: val_str,
-                    value_type: upper_type,
-                },
-            );
-        } else if type_name.eq_ignore_ascii_case(b"IFCPROPERTYTABLEVALUE") {
-            // (Name, Description, DefiningValues, DefinedValues,
-            //  Expression, DefiningUnit, DefinedUnit, CurveInterpolation)
-            // Two parallel `LIST OF IfcValue`s form a lookup table —
-            // e.g. (temperature → pressure) curves on MEP fittings or
-            // (depth → bearing capacity) on geotechnical reports.
-            //
-            // Serialised as `"d1=>v1, d2=>v2, ..."` so the row stays
-            // queryable by `prop_name` (the table's name as-authored)
-            // while the value preserves the full table for consumers
-            // that need both axes. value_type takes the DefinedValues
-            // type (the dependent axis) — that's the type of the
-            // looked-up payload. Same convention as bounded/enumerated:
-            // one row, value-as-string, type from the payload axis.
-            let fields = split_top_level_args(args);
-            let name = string_at(&fields, 0).unwrap_or_default();
-            let defining_vals = parse_value_list_raw(fields.get(2).copied());
-            let (defined_vals, defined_type) = parse_value_list_with_each(fields.get(3).copied());
+            (val_str, upper_type)
+        }
+        PropClass::TableValue => {
+            let defining_vals = parse_value_list_raw(&def.defining_values);
+            let (defined_vals, defined_type) = parse_value_list_with_each(&def.values);
             let val_str = if defining_vals.is_empty() && defined_vals.is_empty() {
                 None
             } else {
@@ -190,438 +251,19 @@ pub fn build(table: &EntityTable, product_step_to_guid: &HashMap<u64, String>) -
                     Some(pairs.join(", "))
                 }
             };
-            props.insert(
-                step_id,
-                Prop {
-                    name,
-                    value: val_str,
-                    value_type: defined_type,
-                },
-            );
-        } else if type_name.eq_ignore_ascii_case(b"IFCCOMPLEXPROPERTY") {
-            // (Name, Description, UsageName, HasProperties)
-            // Note: IfcComplexProperty does NOT inherit IfcRoot — no
-            // GlobalId here. The leading arg is the property name.
-            let fields = split_top_level_args(args);
-            let name = string_at(&fields, 0).unwrap_or_default();
-            let inner_ids = ref_list_at(&fields, 3);
-            complex_props.insert(step_id, (name, inner_ids));
-        } else if type_name.eq_ignore_ascii_case(b"IFCRELDEFINESBYPROPERTIES") {
-            // (GlobalId, OwnerHistory, Name, Description, RelatedObjects, RelatingPropertyDefinition)
-            let fields = split_top_level_args(args);
-            // RelatingPropertyDefinition is `IfcPropertySetDefinitionSelect`
-            // in IFC4 = a single IfcPropertySetDefinition OR an
-            // IfcPropertySetDefinitionSet (a LIST of them). Accept the bare
-            // ref, an inline list `((#1,#2))`, and the typed wrapper
-            // `IFCPROPERTYSETDEFINITIONSET((#1,#2))` (GH #76 item 5) — the
-            // same list-or-ref tolerance already applied to RelatedObjects.
-            let pset_ids = relating_def_refs(fields.get(5).copied());
-            if pset_ids.is_empty() {
-                continue;
-            }
-            // RelatedObjects can be a list OR a single ref in IFC2X3
-            // (some authoring tools emit a bare ref). Handle both.
-            let relateds = match fields.get(4).copied().map(parse_field) {
-                Some(Field::List(body)) => parse_ref_list(body),
-                Some(Field::Ref(id)) => vec![id],
-                _ => continue,
-            };
-            for obj_id in relateds {
-                for pset_id in &pset_ids {
-                    rel_pairs.push((obj_id, *pset_id));
-                }
-            }
-        } else if type_name.eq_ignore_ascii_case(b"IFCRELDEFINESBYTYPE") {
-            // (GlobalId, OwnerHistory, Name, Description, RelatedObjects, RelatingType)
-            // Same shape as RelDefinesByProperties but the trailing ref
-            // is an IfcTypeObject (instead of a pset definition). We
-            // need this to look up type-inherited psets per product in
-            // pass 2.
-            let fields = split_top_level_args(args);
-            let type_id = match fields.get(5).copied().map(parse_field) {
-                Some(Field::Ref(id)) => id,
-                _ => continue,
-            };
-            let relateds = match fields.get(4).copied().map(parse_field) {
-                Some(Field::List(body)) => parse_ref_list(body),
-                Some(Field::Ref(id)) => vec![id],
-                _ => continue,
-            };
-            for obj_id in relateds {
-                product_to_type.insert(obj_id, type_id);
-            }
-        } else if is_unhandled_simple_property(type_name) {
-            // Any IFCPROPERTY*VALUE we didn't match above. The
-            // `*VALUE` suffix filter restricts to IfcSimpleProperty
-            // leaves (single / enumerated / list / bounded / table /
-            // reference / future *Value classes) — IfcPropertySet,
-            // IfcPropertySetTemplate, IfcPropertyEnumeration, etc.
-            // are not properties and never reach this arm. Capturing
-            // these as marker rows means an agent calling `m.psets`
-            // can distinguish "this pset has no value for Foo" from
-            // "ifcfast doesn't know how to parse this property class
-            // yet". value_type carries `unhandled:IFCXXX` so the
-            // distinction is queryable.
-            let fields = split_top_level_args(args);
-            let name = string_at(&fields, 0).unwrap_or_default();
+            (val_str, defined_type)
+        }
+        PropClass::ReferenceValue | PropClass::UnhandledProperty => {
             let marker = format!(
                 "unhandled:{}",
-                std::str::from_utf8(type_name)
+                std::str::from_utf8(def.entity)
                     .map(|s| s.to_ascii_uppercase())
                     .unwrap_or_else(|_| "IFCPROPERTY?".to_string())
             );
-            unhandled_props.insert(step_id, UnhandledProp { name, marker });
-        } else if is_type_object(type_name) {
-            // IfcTypeObject + every IfcXxxType subclass (suffix match,
-            // mirrors `indexer::index`'s TypeObject classifier). The
-            // schema places `HasPropertySets : SET OF IfcPropertySet`
-            // at attribute 6 (index 5) on IfcTypeObject — every subtype
-            // inherits this slot at the same index, so a positional
-            // read works across IFC2x3 and IFC4. Empty / `$` means the
-            // type has no psets, which is fine (most don't).
-            let fields = split_top_level_args(args);
-            let pset_ids = ref_list_at(&fields, 5);
-            if !pset_ids.is_empty() {
-                type_psets.insert(step_id, pset_ids);
-            }
+            (None, Some(marker))
         }
-    }
-
-    // Pass 2: for each (object, pset) pair, expand to one row per
-    //         property in the pset. Instance-declared psets first; then
-    //         walk products with an associated IfcTypeObject and emit
-    //         any type-side properties that don't collide.
-    let mut out = PsetTable::default();
-    let est = rel_pairs.len() * 8 + product_to_type.len() * 4;
-    out.guid.reserve(est);
-    out.pset_name.reserve(est);
-    out.prop_name.reserve(est);
-    out.value.reserve(est);
-    out.value_type.reserve(est);
-    out.source.reserve(est);
-
-    // (guid → set of "pset_name\tprop_name" keys already emitted from
-    // the instance side). Used to suppress same-named type psets so
-    // instance values win on collision, matching ifcopenshell's
-    // `should_inherit=True` semantics.
-    let mut seen_per_product: HashMap<&str, std::collections::HashSet<String>> =
-        HashMap::with_capacity(product_step_to_guid.len());
-
-    for (obj_step_id, pset_step_id) in &rel_pairs {
-        let guid = match product_step_to_guid.get(obj_step_id) {
-            Some(g) => g.as_str(),
-            None => continue, // rel pointed at a non-product (type, group, etc.)
-        };
-        let (pset_name, prop_ids) = match psets.get(pset_step_id) {
-            Some(x) => x,
-            None => continue,
-        };
-        // Each top-level property in the pset resolves to one of:
-        //   - A leaf IfcProperty* (single, enumerated, list, bounded)
-        //     → in `props` → one output row.
-        //   - An IfcComplexProperty wrapping more inner property refs
-        //     → in `complex_props` → recurse, prefixing each leaf name
-        //       with the complex's own name joined by `.`.
-        let mut emitted_names: Vec<String> = Vec::new();
-        for pid in prop_ids {
-            emit_property(
-                pid,
-                "",
-                guid,
-                pset_name,
-                "instance",
-                &props,
-                &complex_props,
-                &unhandled_props,
-                &mut out,
-                &mut emitted_names,
-                0,
-            );
-        }
-        if !emitted_names.is_empty() {
-            let set = seen_per_product.entry(guid).or_default();
-            for n in emitted_names {
-                set.insert(format!("{pset_name}\t{n}"));
-            }
-        }
-    }
-
-    // Type inheritance pass. Skip silently if either map is empty —
-    // a file with no IfcTypeObjects or no IfcRelDefinesByType has
-    // nothing to inherit.
-    if !type_psets.is_empty() && !product_to_type.is_empty() {
-        // Sort by product step id before emitting. Iterating the
-        // HashMap directly leaked std's per-process RandomState seeding
-        // into the ROW ORDER of the type-inherited half of the table —
-        // two runs on the same file produced the same rows in a
-        // different order, which the bitwise parity gates read as drift
-        // (GH #152).
-        let mut inherit: Vec<(u64, u64)> = product_to_type
-            .iter()
-            .map(|(product, type_id)| (*product, *type_id))
-            .collect();
-        inherit.sort_unstable();
-        for (product_step_id, type_step_id) in &inherit {
-            let guid = match product_step_to_guid.get(product_step_id) {
-                Some(g) => g.as_str(),
-                None => continue,
-            };
-            let type_pset_ids = match type_psets.get(type_step_id) {
-                Some(v) => v,
-                None => continue,
-            };
-            // Default `seen` to an empty set: the product may have had
-            // zero instance-declared properties, in which case there's
-            // no possibility of collision.
-            let empty = std::collections::HashSet::new();
-            let already_seen = seen_per_product.get(guid).unwrap_or(&empty);
-            for pset_id in type_pset_ids {
-                let (pset_name, prop_ids) = match psets.get(pset_id) {
-                    Some(x) => x,
-                    None => continue,
-                };
-                for pid in prop_ids {
-                    emit_property_dedup(
-                        pid,
-                        "",
-                        guid,
-                        pset_name,
-                        "type",
-                        &props,
-                        &complex_props,
-                        &unhandled_props,
-                        &mut out,
-                        already_seen,
-                        0,
-                    );
-                }
-            }
-        }
-    }
-
-    out
-}
-
-#[derive(Debug)]
-struct Prop {
-    name: String,
-    value: Option<String>,
-    value_type: Option<String>,
-}
-
-/// Marker payload for an IfcSimpleProperty leaf that ifcfast doesn't
-/// have a per-class parser for yet. Emitted as a row with
-/// `value = None` and `value_type = "unhandled:IFCXXX"` so the
-/// blind spot is visible without breaking the long-format shape.
-#[derive(Debug)]
-struct UnhandledProp {
-    name: String,
-    marker: String,
-}
-
-/// Detect any IfcSimpleProperty subclass we didn't explicitly handle
-/// above. The IFC schema names every IfcSimpleProperty concrete leaf
-/// with a `…Value` suffix (`IfcPropertySingleValue`,
-/// `IfcPropertyTableValue`, future additions), and that suffix is
-/// shared by no other entity in the IFC schema family, which is what
-/// makes it a safe "is this a property we missed" probe.
-fn is_unhandled_simple_property(type_name: &[u8]) -> bool {
-    type_name.len() > 16
-        && type_name[..11].eq_ignore_ascii_case(b"IFCPROPERTY")
-        && type_name[type_name.len() - 5..].eq_ignore_ascii_case(b"VALUE")
-}
-
-/// Cap on IfcComplexProperty nesting depth. The schema allows
-/// arbitrary recursion; real-world exports rarely go past 2-3 levels.
-/// A bounded walk protects against pathological / cyclic files.
-const COMPLEX_PROP_MAX_DEPTH: usize = 8;
-
-/// Emit one or more rows into `out` for the property at `pid`.
-///
-/// - Leaf property (single / enum / list / bounded) → one row with
-///   `prop_name = "{prefix}{leaf.name}"`. `prefix` is empty for top-
-///   level properties, or `"OuterComplex.InnerComplex."` for nested.
-/// - Complex property → recurse over its inner refs with an extended
-///   prefix `"{prefix}{complex.name}."`.
-/// - Anything else (unknown ref target) → silently dropped, same as
-///   pre-fix behaviour for leaf-only lookups.
-///
-/// `source` is stamped on every emitted row ("instance" or "type").
-/// `emitted_names` is appended with the final `prop_name` (post-prefix)
-/// for each leaf row written — callers use it to populate the
-/// instance-side dedup set that suppresses colliding type-inherited
-/// rows in the inheritance pass.
-#[allow(clippy::too_many_arguments)]
-fn emit_property(
-    pid: &u64,
-    prefix: &str,
-    guid: &str,
-    pset_name: &str,
-    source: &str,
-    props: &HashMap<u64, Prop>,
-    complex_props: &HashMap<u64, (String, Vec<u64>)>,
-    unhandled_props: &HashMap<u64, UnhandledProp>,
-    out: &mut PsetTable,
-    emitted_names: &mut Vec<String>,
-    depth: usize,
-) {
-    if let Some(prop) = props.get(pid) {
-        let name = if prefix.is_empty() {
-            prop.name.clone()
-        } else {
-            format!("{prefix}{}", prop.name)
-        };
-        out.guid.push(guid.to_string());
-        out.pset_name.push(pset_name.to_string());
-        out.prop_name.push(name.clone());
-        out.value.push(prop.value.clone());
-        out.value_type.push(prop.value_type.clone());
-        out.source.push(source.to_string());
-        emitted_names.push(name);
-        return;
-    }
-    if let Some((complex_name, inner_ids)) = complex_props.get(pid) {
-        if depth >= COMPLEX_PROP_MAX_DEPTH {
-            return;
-        }
-        let new_prefix = format!("{prefix}{complex_name}.");
-        for inner in inner_ids {
-            emit_property(
-                inner,
-                &new_prefix,
-                guid,
-                pset_name,
-                source,
-                props,
-                complex_props,
-                unhandled_props,
-                out,
-                emitted_names,
-                depth + 1,
-            );
-        }
-        return;
-    }
-    if let Some(unhandled) = unhandled_props.get(pid) {
-        // Marker row for an IfcSimpleProperty subclass ifcfast doesn't
-        // know how to parse. value stays None (we'd be guessing
-        // otherwise); value_type carries the `unhandled:IFCXXX` tag
-        // so consumers can filter / detect blind spots.
-        let name = if prefix.is_empty() {
-            unhandled.name.clone()
-        } else {
-            format!("{prefix}{}", unhandled.name)
-        };
-        out.guid.push(guid.to_string());
-        out.pset_name.push(pset_name.to_string());
-        out.prop_name.push(name.clone());
-        out.value.push(None);
-        out.value_type.push(Some(unhandled.marker.clone()));
-        out.source.push(source.to_string());
-        emitted_names.push(name);
-    }
-}
-
-/// Type-inheritance variant of `emit_property`. Skips any leaf whose
-/// `(pset_name, prop_name)` already appeared on the instance side
-/// (instance wins on collision, per ifcopenshell). Always recurses
-/// through complex wrappers — collisions are checked leaf-by-leaf so a
-/// type's `Group.A` can still surface even if the instance shadowed
-/// `Group.B`.
-#[allow(clippy::too_many_arguments)]
-fn emit_property_dedup(
-    pid: &u64,
-    prefix: &str,
-    guid: &str,
-    pset_name: &str,
-    source: &str,
-    props: &HashMap<u64, Prop>,
-    complex_props: &HashMap<u64, (String, Vec<u64>)>,
-    unhandled_props: &HashMap<u64, UnhandledProp>,
-    out: &mut PsetTable,
-    already_seen: &std::collections::HashSet<String>,
-    depth: usize,
-) {
-    if let Some(prop) = props.get(pid) {
-        let name = if prefix.is_empty() {
-            prop.name.clone()
-        } else {
-            format!("{prefix}{}", prop.name)
-        };
-        let key = format!("{pset_name}\t{name}");
-        if already_seen.contains(&key) {
-            return;
-        }
-        out.guid.push(guid.to_string());
-        out.pset_name.push(pset_name.to_string());
-        out.prop_name.push(name);
-        out.value.push(prop.value.clone());
-        out.value_type.push(prop.value_type.clone());
-        out.source.push(source.to_string());
-        return;
-    }
-    if let Some((complex_name, inner_ids)) = complex_props.get(pid) {
-        if depth >= COMPLEX_PROP_MAX_DEPTH {
-            return;
-        }
-        let new_prefix = format!("{prefix}{complex_name}.");
-        for inner in inner_ids {
-            emit_property_dedup(
-                inner,
-                &new_prefix,
-                guid,
-                pset_name,
-                source,
-                props,
-                complex_props,
-                unhandled_props,
-                out,
-                already_seen,
-                depth + 1,
-            );
-        }
-        return;
-    }
-    if let Some(unhandled) = unhandled_props.get(pid) {
-        // Type-side marker. Same dedup rule: if the instance side
-        // already emitted any row (handled or marker) at this
-        // (pset_name, prop_name), the type's marker is suppressed.
-        let name = if prefix.is_empty() {
-            unhandled.name.clone()
-        } else {
-            format!("{prefix}{}", unhandled.name)
-        };
-        let key = format!("{pset_name}\t{name}");
-        if already_seen.contains(&key) {
-            return;
-        }
-        out.guid.push(guid.to_string());
-        out.pset_name.push(pset_name.to_string());
-        out.prop_name.push(name);
-        out.value.push(None);
-        out.value_type.push(Some(unhandled.marker.clone()));
-        out.source.push(source.to_string());
-    }
-}
-
-/// Detect an IfcTypeObject or any subclass by name. Mirrors the same
-/// "IFCxxxTYPE" suffix rule + IFC2x3 IfcDoorStyle / IfcWindowStyle
-/// exceptions that `indexer::index` uses for its `EntityKind::TypeObject`
-/// classifier — anything that can be the target of `IfcRelDefinesByType
-/// .RelatingType` qualifies.
-fn is_type_object(t: &[u8]) -> bool {
-    let suffix_ok = t.len() > 7
-        && t[..3].eq_ignore_ascii_case(b"IFC")
-        && t[t.len() - 4..].eq_ignore_ascii_case(b"TYPE");
-    let ifc2x3_style =
-        t.eq_ignore_ascii_case(b"IFCDOORSTYLE") || t.eq_ignore_ascii_case(b"IFCWINDOWSTYLE");
-    // Bare base classes `IfcTypeProduct` / `IfcTypeObject` are non-abstract
-    // and emitted by Revit for types with no schema-specific `*Type`
-    // subtype; they end in `PRODUCT` / `OBJECT`, miss the suffix check, and
-    // would silently drop their inherited psets. See #69.
-    let bare_base =
-        t.eq_ignore_ascii_case(b"IFCTYPEPRODUCT") || t.eq_ignore_ascii_case(b"IFCTYPEOBJECT");
-    suffix_ok || ifc2x3_style || bare_base
+        _ => return None,
+    })
 }
 
 /// Parse an `IfcValue` field. STEP wraps these with a type tag:
@@ -662,31 +304,15 @@ fn parse_nominal_value(raw: Option<&[u8]>) -> (Option<String>, Option<String>) {
     (scalar_to_string(trimmed), None)
 }
 
-/// Parse a `LIST OF IfcValue` field. Splits the list, runs each element
-/// through `parse_nominal_value`, joins the resulting value strings with
-/// `", "`. Type comes from the first member (the IFC schema requires
-/// homogeneous element types within a property's value list).
-///
-/// Returns `(None, None)` for `$`, `*`, empty list, or a list whose
-/// members all parse to None.
-fn parse_value_list(raw: Option<&[u8]>) -> (Option<String>, Option<String>) {
-    let raw = match raw {
-        Some(r) => r,
-        None => return (None, None),
-    };
-    let trimmed = trim(raw);
-    if trimmed.is_empty() || trimmed == b"$" || trimmed == b"*" {
-        return (None, None);
-    }
-    // The list body sits between '(' and ')'.
-    let inner = match (trimmed.first(), trimmed.last()) {
-        (Some(&b'('), Some(&b')')) if trimmed.len() >= 2 => &trimmed[1..trimmed.len() - 1],
-        _ => return (None, None),
-    };
+/// Flatten a `LIST OF IfcValue`'s members: each through
+/// `parse_nominal_value`, values joined with `", "`, type from the first
+/// member that has one. `(None, None)` for no members; `(None, type)` when
+/// every member is null.
+fn parse_value_list(items: &[TypedValue]) -> (Option<String>, Option<String>) {
     let mut values: Vec<String> = Vec::new();
     let mut value_type: Option<String> = None;
-    for item in split_top_level_args(inner) {
-        let (v, t) = parse_nominal_value(Some(item));
+    for item in items {
+        let (v, t) = parse_nominal_value(Some(item.src));
         if value_type.is_none() {
             value_type = t;
         }
@@ -701,51 +327,21 @@ fn parse_value_list(raw: Option<&[u8]>) -> (Option<String>, Option<String>) {
     }
 }
 
-/// Parse a `LIST OF IfcValue` like `parse_value_list` but return the
-/// elements as `Vec<Option<String>>` so a caller can match them up
-/// positionally against a parallel list (e.g. `IfcPropertyTableValue`
-/// pairs the `DefiningValues` and `DefinedValues` lists element-by-
-/// element).
-fn parse_value_list_raw(raw: Option<&[u8]>) -> Vec<Option<String>> {
-    let raw = match raw {
-        Some(r) => r,
-        None => return Vec::new(),
-    };
-    let trimmed = trim(raw);
-    if trimmed.is_empty() || trimmed == b"$" || trimmed == b"*" {
-        return Vec::new();
-    }
-    let inner = match (trimmed.first(), trimmed.last()) {
-        (Some(&b'('), Some(&b')')) if trimmed.len() >= 2 => &trimmed[1..trimmed.len() - 1],
-        _ => return Vec::new(),
-    };
-    split_top_level_args(inner)
-        .into_iter()
-        .map(|item| parse_nominal_value(Some(item)).0)
+/// Each member's value, nulls kept, so two lists can be paired by
+/// position (`IfcPropertyTableValue`'s DefiningValues / DefinedValues).
+fn parse_value_list_raw(items: &[TypedValue]) -> Vec<Option<String>> {
+    items
+        .iter()
+        .map(|item| parse_nominal_value(Some(item.src)).0)
         .collect()
 }
 
-/// Variant that also returns the homogeneous value_type taken from the
-/// first non-null member. Same use case as `parse_value_list_raw` but
-/// for the side of the table whose type defines the row's
-/// `value_type` column.
-fn parse_value_list_with_each(raw: Option<&[u8]>) -> (Vec<Option<String>>, Option<String>) {
-    let raw = match raw {
-        Some(r) => r,
-        None => return (Vec::new(), None),
-    };
-    let trimmed = trim(raw);
-    if trimmed.is_empty() || trimmed == b"$" || trimmed == b"*" {
-        return (Vec::new(), None);
-    }
-    let inner = match (trimmed.first(), trimmed.last()) {
-        (Some(&b'('), Some(&b')')) if trimmed.len() >= 2 => &trimmed[1..trimmed.len() - 1],
-        _ => return (Vec::new(), None),
-    };
-    let mut values: Vec<Option<String>> = Vec::new();
+/// [`parse_value_list_raw`] plus the type of the first member that has one.
+fn parse_value_list_with_each(items: &[TypedValue]) -> (Vec<Option<String>>, Option<String>) {
+    let mut values: Vec<Option<String>> = Vec::with_capacity(items.len());
     let mut value_type: Option<String> = None;
-    for item in split_top_level_args(inner) {
-        let (v, t) = parse_nominal_value(Some(item));
+    for item in items {
+        let (v, t) = parse_nominal_value(Some(item.src));
         if value_type.is_none() {
             value_type = t;
         }
@@ -787,21 +383,6 @@ fn format_bounded(
     Some(out)
 }
 
-/// `TYPENAME(inner)` → (TYPENAME bytes, inner bytes). Returns None if
-/// the field doesn't match the wrapper shape.
-fn split_type_wrapper(field: &[u8]) -> Option<(&[u8], &[u8])> {
-    // Must start with IFC (case-insensitive) and contain a parenthesis.
-    if field.len() < 5 || !field[..3].eq_ignore_ascii_case(b"IFC") {
-        return None;
-    }
-    let open = field.iter().position(|&b| b == b'(')?;
-    // Last char must be `)`.
-    if *field.last()? != b')' {
-        return None;
-    }
-    Some((&field[..open], &field[open + 1..field.len() - 1]))
-}
-
 /// Render the inner scalar (string, number, enum, ref) as a normalised
 /// Python-friendly value.
 fn scalar_to_string(raw: &[u8]) -> Option<String> {
@@ -825,98 +406,6 @@ fn format_number(n: f64) -> String {
         return format!("{}", n as i64);
     }
     format!("{}", n)
-}
-
-fn trim(s: &[u8]) -> &[u8] {
-    let mut start = 0;
-    while start < s.len() && (s[start] as char).is_whitespace() {
-        start += 1;
-    }
-    let mut end = s.len();
-    while end > start && (s[end - 1] as char).is_whitespace() {
-        end -= 1;
-    }
-    &s[start..end]
-}
-
-fn string_at(fields: &[&[u8]], idx: usize) -> Option<String> {
-    match parse_field(fields.get(idx)?) {
-        Field::String(s) => Some(s),
-        _ => None,
-    }
-}
-
-fn ref_list_at(fields: &[&[u8]], idx: usize) -> Vec<u64> {
-    match fields.get(idx).copied().map(parse_field) {
-        Some(Field::List(body)) => parse_ref_list(body),
-        _ => Vec::new(),
-    }
-}
-
-fn parse_ref_list(body: &[u8]) -> Vec<u64> {
-    split_top_level_args(body)
-        .into_iter()
-        .filter_map(|f| match parse_field(f) {
-            Field::Ref(id) => Some(id),
-            _ => None,
-        })
-        .collect()
-}
-
-/// Resolve the `RelatingPropertyDefinition` field of an
-/// `IfcRelDefinesByProperties` to the pset-definition step ids it points
-/// at. The field is an `IfcPropertySetDefinitionSelect` (IFC4), which is
-/// either a single `IfcPropertySetDefinition` ref or an
-/// `IfcPropertySetDefinitionSet` (a LIST of them). Three on-disk shapes
-/// are accepted (GH #76 item 5):
-///
-/// - `#5`                              → bare ref → `[5]`
-/// - `(#1,#2)`                         → inline list → `[1, 2]`
-/// - `IFCPROPERTYSETDEFINITIONSET((#1,#2))` → typed wrapper → `[1, 2]`
-///
-/// The same list-or-ref tolerance the loop already applies to
-/// `RelatedObjects`, extended with the typed-wrapper case.
-fn relating_def_refs(raw: Option<&[u8]>) -> Vec<u64> {
-    let raw = match raw {
-        Some(r) => r,
-        None => return Vec::new(),
-    };
-    match parse_field(raw) {
-        Field::Ref(id) => vec![id],
-        Field::List(body) => parse_ref_list(body),
-        // `IFCPROPERTYSETDEFINITIONSET((...))` — a typed defined-type
-        // wrapper parses as `Field::Other`. Peel the type name and the
-        // outer `(...)`, then read the inner list of refs.
-        Field::Other(bytes) => relating_def_typed_wrapper_refs(bytes),
-        _ => Vec::new(),
-    }
-}
-
-/// Peel `IFCPROPERTYSETDEFINITIONSET((#1,#2))` to its inner ref list.
-/// The on-disk shape is the type name followed by the entity arg list
-/// `( <value> )`, whose single value is itself the `(#1,#2)` LIST — i.e.
-/// two paren layers. We strip the entity-arg layer, then parse the inner
-/// value as a `Field::List` to read its refs.
-fn relating_def_typed_wrapper_refs(bytes: &[u8]) -> Vec<u64> {
-    let t = crate::lexer::trim_ws(bytes);
-    let prefix = b"IFCPROPERTYSETDEFINITIONSET";
-    if t.len() <= prefix.len() || !t[..prefix.len()].eq_ignore_ascii_case(prefix) {
-        return Vec::new();
-    }
-    // After the type name: ` ( (#1,#2) ) `. Strip the outer entity-arg
-    // parens, leaving the inner value `(#1,#2)`.
-    let outer = crate::lexer::trim_ws(&t[prefix.len()..]);
-    if outer.first() != Some(&b'(') || outer.last() != Some(&b')') {
-        return Vec::new();
-    }
-    let inner = crate::lexer::trim_ws(&outer[1..outer.len() - 1]);
-    // `inner` is the IfcPropertySetDefinitionSet list value itself; it may
-    // be a `(#1,#2)` list (the common case) or a single bare ref.
-    match parse_field(inner) {
-        Field::List(body) => parse_ref_list(body),
-        Field::Ref(id) => vec![id],
-        _ => Vec::new(),
-    }
 }
 
 #[cfg(test)]

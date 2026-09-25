@@ -27,11 +27,20 @@
 //!                      IfcPropertySetDefinition — IfcElementQuantity
 //!                      is one such subtype — so types can carry
 //!                      authored quantities exactly like psets.
+//!
+//! Discovery is the shared typed pass in [`super::property_graph`]; this
+//! module is the flattened public view of it, with its row order, number
+//! formatting, SI-only `unit_step_id` fallback and marker rows unchanged.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
+#[cfg(test)]
+use super::property_graph::is_unhandled_quantity;
+use super::property_graph::{GraphScope, PropClass, PropDef, PropertyGraph, PsetKind};
 use crate::entity_table::EntityTable;
-use crate::lexer::{parse_field, split_top_level_args, Field};
+#[cfg(test)]
+use crate::lexer::split_top_level_args;
+use crate::lexer::{parse_field, Field};
 
 #[derive(Debug, Default)]
 pub struct QuantityTable {
@@ -55,319 +64,106 @@ impl QuantityTable {
 }
 
 pub fn build(table: &EntityTable, product_step_to_guid: &HashMap<u64, String>) -> QuantityTable {
-    // Pass 1: index IfcElementQuantity records and their physical quantity refs.
-    //         Also index each physical-simple-quantity record.
-    let mut qtos: HashMap<u64, (String, Vec<u64>)> = HashMap::with_capacity(1024);
-    let mut quantities: HashMap<u64, Quantity> = HashMap::with_capacity(8192);
-    // IfcPhysicalComplexQuantity groups nested IfcPhysicalQuantity refs
-    // under a named wrapper (GH #76 item 6) — the quantity-side analogue
-    // of IfcComplexProperty in extractors/psets.rs. Pre-fix these were
-    // dropped silently: a complex quantity bundling `Width`/`Height` lost
-    // both nested members, surfacing nothing. We flatten in pass 2 with
-    // dot-joined names (`Wrapper.Width`, `Wrapper.Height`), matching the
-    // pset flattening convention so the data is revealed, not just marked.
-    let mut complex_quantities: HashMap<u64, (String, Vec<u64>)> = HashMap::with_capacity(256);
-    let mut rel_pairs: Vec<(u64, u64)> = Vec::with_capacity(8192);
-    // Project-default unit fallback (GH #43). Real-world Revit/ArchiCAD
-    // exports almost always leave the per-quantity `Unit` slot as `$`
-    // and rely on the IfcUnitAssignment to disambiguate. Without this
-    // map every `unit_step_id` column on `m.quantities` is None, which
-    // forces consumers either to re-parse the IFC for units or assume
-    // a fixed interpretation (the canonical "are these volumes in m3
-    // or mm3?" trap). Resolution path is intentionally narrow: walk
-    // the file's IfcUnitAssignment refs, intersect with IfcSIUnit
-    // records, and read their UnitType enum. IfcConversionBasedUnit
-    // and IfcDerivedUnit are out of scope here — they're a separate
-    // resolver because conversion factors have to be threaded too.
-    let mut project_unit_refs: std::collections::HashSet<u64> =
-        std::collections::HashSet::with_capacity(16);
-    // `unit_type` is the raw enum body without dots, uppercased
-    // (e.g. `LENGTHUNIT`, `AREAUNIT`). Matched against the
-    // `quantity_kind → unit_type` table below.
-    //
-    // ALL SIUnits per type are kept (a Vec), not last-write-wins (GH #76
-    // item 4). Pass order is undefined relative to the IfcUnitAssignment,
-    // so a dangling same-UnitType SIUnit declared *after* the assigned one
-    // would otherwise clobber it here — and then the post-pass membership
-    // filter drops the survivor for not being in `project_unit_refs`,
-    // losing the project default entirely (`unit_step_id=None` where the
-    // assigned SIUnit's id was expected). Keeping every candidate lets the
-    // post-pass pick the assigned one regardless of declaration order.
-    let mut si_unit_by_type: HashMap<String, Vec<u64>> = HashMap::with_capacity(16);
-    // Type inheritance (GH #45) — mirror of the GH #36 path in
-    // extractors/psets.rs. Types can carry quantities the same way
-    // they carry psets because `IfcTypeObject.HasPropertySets` is
-    // typed `SET OF IfcPropertySetDefinition` and IfcElementQuantity
-    // IS-A IfcPropertySetDefinition. Captured here so type-attached
-    // quantities surface on every instance bound via
-    // IfcRelDefinesByType.
-    let mut product_to_type: HashMap<u64, u64> = HashMap::with_capacity(16_384);
-    // (type_step_id → [qto_step_id]). We re-use the same arg-5 read
-    // psets.rs does (HasPropertySets is at attribute 6 / index 5 on
-    // IfcTypeObject and every subtype); the `qtos` map captures
-    // step ids regardless of which `IfcPropertySetDefinition` subtype
-    // a ref points at, so pset refs that slip in here just don't
-    // resolve in pass 2 and get skipped silently.
-    let mut type_qtos: HashMap<u64, Vec<u64>> = HashMap::with_capacity(256);
+    let graph = PropertyGraph::build_scoped(table, GraphScope::QUANTITIES);
+    build_from_graph(&graph, product_step_to_guid)
+}
 
-    for (step_id, type_name, args) in table.iter() {
-        if type_name.eq_ignore_ascii_case(b"IFCELEMENTQUANTITY") {
-            // (GlobalId, OwnerHistory, Name, Description, MethodOfMeasurement, Quantities)
-            let fields = split_top_level_args(args);
-            let name = string_at(&fields, 2).unwrap_or_default();
-            let qty_ids = ref_list_at(&fields, 5);
-            qtos.insert(step_id, (name, qty_ids));
-        } else if let Some(kind) = quantity_kind(type_name) {
-            // IfcQuantityArea/Length/Volume/Count/Weight/Time
-            // (Name, Description, Unit, <kind>Value)
-            let fields = split_top_level_args(args);
-            let name = string_at(&fields, 0).unwrap_or_default();
-            let unit = match fields.get(2).copied().map(parse_field) {
-                Some(Field::Ref(id)) => Some(id),
-                _ => None,
-            };
-            let value = number_at(&fields, 3).map(format_number);
-            quantities.insert(
-                step_id,
-                Quantity {
-                    name,
-                    kind: std::borrow::Cow::Borrowed(kind),
-                    value,
-                    unit_step_id: unit,
-                },
-            );
-        } else if is_unhandled_quantity(type_name) {
-            // Any IfcQuantity* class we don't have a parser for (today:
-            // IFC4X3's IfcQuantityNumber, plus whatever a future schema
-            // adds). Pre-fix these were dropped with no trace, so a
-            // consumer couldn't tell "the author wrote no quantity" from
-            // "ifcfast can't read this quantity". Mirrors the
-            // `unhandled:IFCXXX` marker row in extractors/psets.rs
-            // (GH #159): value stays null, quantity_type carries the
-            // marker, and the row is queryable.
-            let fields = split_top_level_args(args);
-            let name = string_at(&fields, 0).unwrap_or_default();
-            let marker = format!(
-                "unhandled:{}",
-                std::str::from_utf8(type_name)
-                    .map(|s| s.to_ascii_uppercase())
-                    .unwrap_or_else(|_| "IFCQUANTITY?".to_string())
-            );
-            quantities.insert(
-                step_id,
-                Quantity {
-                    name,
-                    kind: std::borrow::Cow::Owned(marker),
-                    value: None,
-                    unit_step_id: None,
-                },
-            );
-        } else if type_name.eq_ignore_ascii_case(b"IFCPHYSICALCOMPLEXQUANTITY") {
-            // (Name, Description, HasQuantities, Discrimination, Quality,
-            //  Usage). HasQuantities (index 2) is a SET of nested
-            // IfcPhysicalQuantity refs. IfcPhysicalComplexQuantity does
-            // NOT inherit IfcRoot, so the leading arg is the name. Captured
-            // here, flattened in pass 2 (GH #76 item 6).
-            let fields = split_top_level_args(args);
-            let name = string_at(&fields, 0).unwrap_or_default();
-            let inner_ids = ref_list_at(&fields, 2);
-            complex_quantities.insert(step_id, (name, inner_ids));
-        } else if type_name.eq_ignore_ascii_case(b"IFCRELDEFINESBYPROPERTIES") {
-            let fields = split_top_level_args(args);
-            // RelatingPropertyDefinition is set-valued in IFC4
-            // (IfcPropertySetDefinitionSet). Accept bare ref, inline list,
-            // and the typed `IFCPROPERTYSETDEFINITIONSET((...))` wrapper
-            // (GH #76 item 5). Refs that aren't IfcElementQuantity simply
-            // don't resolve in pass 2's `qtos` map and are skipped — the
-            // pset side of the same set is handled by extractors/psets.rs.
-            let rel_objs = relating_def_refs(fields.get(5).copied());
-            if rel_objs.is_empty() {
-                continue;
-            }
-            let relateds = match fields.get(4).copied().map(parse_field) {
-                Some(Field::List(body)) => parse_ref_list(body),
-                Some(Field::Ref(id)) => vec![id],
-                _ => continue,
-            };
-            for obj_id in relateds {
-                for rel_obj in &rel_objs {
-                    rel_pairs.push((obj_id, *rel_obj));
-                }
-            }
-        } else if type_name.eq_ignore_ascii_case(b"IFCRELDEFINESBYTYPE") {
-            // (GlobalId, OwnerHistory, Name, Description,
-            //  RelatedObjects, RelatingType). Same shape as the
-            // properties variant — fan out N products per relation.
-            let fields = split_top_level_args(args);
-            let type_id = match fields.get(5).copied().map(parse_field) {
-                Some(Field::Ref(id)) => id,
-                _ => continue,
-            };
-            let relateds = match fields.get(4).copied().map(parse_field) {
-                Some(Field::List(body)) => parse_ref_list(body),
-                Some(Field::Ref(id)) => vec![id],
-                _ => continue,
-            };
-            for obj_id in relateds {
-                product_to_type.insert(obj_id, type_id);
-            }
-        } else if is_type_object(type_name) {
-            // IfcTypeObject + every IfcXxxType subclass. Attribute 6
-            // (index 5) is HasPropertySets on IfcTypeObject and every
-            // subtype — same positional read psets.rs uses. The list
-            // may contain IfcPropertySet refs (pset side, handled by
-            // extractors/psets.rs) AND IfcElementQuantity refs (qto
-            // side, handled here). We capture every ref; pass 2's
-            // `qtos.get(qto_id)` filters to the ones that resolve.
-            let fields = split_top_level_args(args);
-            let candidate_ids = ref_list_at(&fields, 5);
-            if !candidate_ids.is_empty() {
-                type_qtos.insert(step_id, candidate_ids);
-            }
-        } else if type_name.eq_ignore_ascii_case(b"IFCUNITASSIGNMENT") {
-            // (Units : SET [1:?] OF IfcUnit). One arg, a list of refs.
-            // Most files have exactly one IfcUnitAssignment; legal but
-            // unusual files may have several. We union them all — any
-            // SIUnit reachable from any assignment counts as a
-            // project default candidate.
-            let fields = split_top_level_args(args);
-            for unit_id in ref_list_at(&fields, 0) {
-                project_unit_refs.insert(unit_id);
-            }
-        } else if type_name.eq_ignore_ascii_case(b"IFCSIUNIT") {
-            // (Dimensions, UnitType, Prefix, Name). Slot 1 is the
-            // UnitType enum (`.LENGTHUNIT.`, `.AREAUNIT.`, …). Capture
-            // every SIUnit's type here; project-membership filtering
-            // happens after pass 1 so we don't have to revisit the
-            // table once we know which units are in `project_unit_refs`.
-            let fields = split_top_level_args(args);
-            if let Some(raw) = fields.get(1).copied() {
-                if let Some(unit_type) = parse_enum_uppercase(raw) {
-                    // Collect every SIUnit per UnitType. A well-formed
-                    // file has one, but dangling/duplicate SIUnits exist
-                    // (GH #76 item 4); the post-pass membership filter
-                    // disambiguates by IfcUnitAssignment reachability.
-                    si_unit_by_type.entry(unit_type).or_default().push(step_id);
-                }
-            }
-        }
-    }
-
-    // Build the (UnitType → step_id) project-default map. Only SIUnits
-    // referenced by an IfcUnitAssignment count — a stray SIUnit
-    // declared inside an IfcConversionBasedUnit shouldn't masquerade
-    // as a project default.
-    let mut project_default_unit: HashMap<&'static str, u64> = HashMap::with_capacity(8);
-    if !project_unit_refs.is_empty() {
-        for (unit_type, step_ids) in &si_unit_by_type {
-            let canonical = match canonical_unit_type(unit_type) {
-                Some(c) => c,
-                None => continue,
-            };
-            // Pick the SIUnit of this type that the IfcUnitAssignment
-            // actually references. Dangling same-type SIUnits (e.g. one
-            // nested in an unresolved IfcConversionBasedUnit) are skipped,
-            // so a stray duplicate can no longer shadow the real default
-            // regardless of where it sits in the file (GH #76 item 4).
-            if let Some(assigned) = step_ids.iter().find(|id| project_unit_refs.contains(id)) {
-                project_default_unit.insert(canonical, *assigned);
-            }
-        }
-    }
-
+/// [`build`] from an already-built graph (which must include
+/// [`GraphScope::quantities`]).
+///
+/// Rows: every `(object, IfcElementQuantity)` pair of
+/// `IfcRelDefinesByProperties` in relation order, one row per leaf
+/// quantity (`IfcPhysicalComplexQuantity` members flatten to
+/// `Wrapper.Width`, GH #76 item 6); then, by product step id, the type's
+/// `HasPropertySets` quantities not shadowed by an instance row on the
+/// same guid (GH #45, instance wins).
+///
+/// `unit_step_id` is the quantity's own `Unit`, else the project
+/// `IfcSIUnit` of its kind (GH #43). `IfcConversionBasedUnit` /
+/// `IfcDerivedUnit` project units are not a fallback target here; the
+/// general resolver is `crate::units::UnitTable`.
+pub fn build_from_graph(
+    graph: &PropertyGraph,
+    product_step_to_guid: &HashMap<u64, String>,
+) -> QuantityTable {
+    assert!(
+        graph.scope.quantities,
+        "quantities::build_from_graph needs a PropertyGraph built with quantities in scope"
+    );
     let mut out = QuantityTable::default();
 
-    // (guid → set of "qto_name\tquantity_name" keys already emitted
-    // from the instance side). Used to suppress same-named type
-    // quantities on collision so instance values win, matching the
-    // ifcopenshell `should_inherit=True` semantics replicated in
-    // extractors/psets.rs (GH #36 / #45).
-    let mut seen_per_product: HashMap<&str, std::collections::HashSet<String>> =
+    // (guid → "qto_name\tquantity_name" keys emitted on the instance
+    // side), so same-named type quantities are suppressed: instance wins,
+    // ifcopenshell `should_inherit=True` (GH #36 / #45).
+    let mut seen_per_product: HashMap<&str, HashSet<String>> =
         HashMap::with_capacity(product_step_to_guid.len());
 
-    // Instance pass.
-    for (obj_step_id, rel_obj_id) in &rel_pairs {
-        // Only act on rels that point at IfcElementQuantity (the same
-        // rel type also points at IfcPropertySet — we filter via the
-        // qtos table).
-        let (qto_name, qty_ids) = match qtos.get(rel_obj_id) {
-            Some(x) => x,
-            None => continue,
+    for (obj_step_id, set_step_id) in &graph.defines {
+        // The same relation type also points at IfcPropertySet; only
+        // IfcElementQuantity targets count here.
+        let set = match graph.sets.get(set_step_id) {
+            Some(s) if s.kind == PsetKind::ElementQuantity => s,
+            _ => continue,
         };
         let guid = match product_step_to_guid.get(obj_step_id) {
             Some(g) => g.as_str(),
             None => continue,
         };
         let mut emitted_names: Vec<String> = Vec::new();
-        for qid in qty_ids {
-            emit_quantity(
-                qid,
-                "",
-                guid,
-                qto_name,
-                "instance",
-                &quantities,
-                &complex_quantities,
-                &project_default_unit,
+        graph.walk_set_leaves(set, &mut |path, def| {
+            let name = quantity_name(path, &def.name);
+            push_row(
                 &mut out,
-                &mut emitted_names,
-                0,
+                graph,
+                guid,
+                &set.name,
+                name.clone(),
+                def,
+                "instance",
             );
-        }
+            emitted_names.push(name);
+        });
         if !emitted_names.is_empty() {
-            let set = seen_per_product.entry(guid).or_default();
+            let seen = seen_per_product.entry(guid).or_default();
             for name in emitted_names {
-                set.insert(format!("{qto_name}\t{name}"));
+                seen.insert(format!("{}\t{name}", set.name));
             }
         }
     }
 
-    // Type-inheritance pass. Quantity inheritance is silent unless
-    // BOTH there's a product↔type relation AND at least one type
-    // carries quantity refs.
-    if !type_qtos.is_empty() && !product_to_type.is_empty() {
-        // Sorted by product step id — see the identical note in
-        // extractors/psets.rs. HashMap iteration order is per-process
-        // random and was leaking into the emitted row order (GH #152).
-        let mut inherit: Vec<(u64, u64)> = product_to_type
+    // Type inheritance. Sorted by product step id (GH #152: HashMap order
+    // leaked into the row order).
+    if !graph.type_sets.is_empty() && !graph.object_type.is_empty() {
+        let mut inherit: Vec<(u64, u64)> = graph
+            .object_type
             .iter()
             .map(|(product, type_id)| (*product, *type_id))
             .collect();
         inherit.sort_unstable();
+        let empty = HashSet::new();
         for (product_step_id, type_step_id) in &inherit {
             let guid = match product_step_to_guid.get(product_step_id) {
                 Some(g) => g.as_str(),
                 None => continue,
             };
-            let candidate_qto_ids = match type_qtos.get(type_step_id) {
+            let candidate_ids = match graph.type_sets.get(type_step_id) {
                 Some(v) => v,
                 None => continue,
             };
-            let empty = std::collections::HashSet::new();
             let already_seen = seen_per_product.get(guid).unwrap_or(&empty);
-            for qto_id in candidate_qto_ids {
-                // Same filter as the instance side: a qto_id from
-                // HasPropertySets that doesn't resolve in `qtos` is
-                // an IfcPropertySet ref, handled by extractors/psets.rs.
-                let (qto_name, qty_ids) = match qtos.get(qto_id) {
-                    Some(x) => x,
-                    None => continue,
+            for set_id in candidate_ids {
+                // HasPropertySets also lists IfcPropertySets (psets.rs).
+                let set = match graph.sets.get(set_id) {
+                    Some(s) if s.kind == PsetKind::ElementQuantity => s,
+                    _ => continue,
                 };
-                for qid in qty_ids {
-                    emit_quantity_dedup(
-                        qid,
-                        "",
-                        guid,
-                        qto_name,
-                        "type",
-                        &quantities,
-                        &complex_quantities,
-                        &project_default_unit,
-                        &mut out,
-                        already_seen,
-                        0,
-                    );
-                }
+                graph.walk_set_leaves(set, &mut |path, def| {
+                    let name = quantity_name(path, &def.name);
+                    if already_seen.contains(&format!("{}\t{name}", set.name)) {
+                        return;
+                    }
+                    push_row(&mut out, graph, guid, &set.name, name, def, "type");
+                });
             }
         }
     }
@@ -375,130 +171,60 @@ pub fn build(table: &EntityTable, product_step_to_guid: &HashMap<u64, String>) -
     out
 }
 
-/// Cap on IfcPhysicalComplexQuantity nesting depth — mirrors the pset
-/// side. The schema permits arbitrary nesting; real files stay shallow.
-/// A self-referential or pathologically deep chain stops here rather
-/// than overflowing the stack.
-const MAX_COMPLEX_QUANTITY_DEPTH: usize = 8;
-
-/// Emit the row(s) for one quantity ref. A simple quantity yields one
-/// row; an IfcPhysicalComplexQuantity yields one row per nested member
-/// with the wrapper's name dot-prefixed (`Wrapper.Width`), recursing.
-/// Each emitted name (full dot-joined path) is appended to
-/// `emitted_names` so the caller can stamp `seen_per_product` for the
-/// type-inheritance dedup.
-#[allow(clippy::too_many_arguments)]
-fn emit_quantity(
-    qid: &u64,
-    prefix: &str,
+/// One row for a leaf quantity definition.
+fn push_row(
+    out: &mut QuantityTable,
+    graph: &PropertyGraph,
     guid: &str,
     qto_name: &str,
+    name: String,
+    def: &PropDef,
     source: &str,
-    quantities: &HashMap<u64, Quantity>,
-    complex_quantities: &HashMap<u64, (String, Vec<u64>)>,
-    project_default_unit: &HashMap<&'static str, u64>,
-    out: &mut QuantityTable,
-    emitted_names: &mut Vec<String>,
-    depth: usize,
 ) {
-    if let Some(q) = quantities.get(qid) {
-        let name = join_name(prefix, &q.name);
-        let unit = q.unit_step_id.or_else(|| {
-            unit_type_for_quantity_kind(&q.kind)
-                .and_then(|ut| project_default_unit.get(ut).copied())
-        });
-        out.guid.push(guid.to_string());
-        out.qto_name.push(qto_name.to_string());
-        out.quantity_name.push(name.clone());
-        out.value.push(q.value.clone());
-        out.quantity_type.push(q.kind.to_string());
-        out.unit_step_id.push(unit);
-        out.source.push(source.to_string());
-        emitted_names.push(name);
-        return;
-    }
-    // IfcPhysicalComplexQuantity (GH #76 item 6): recurse into nested
-    // members, dot-prefixing with this wrapper's name.
-    if let Some((cname, inner_ids)) = complex_quantities.get(qid) {
-        if depth >= MAX_COMPLEX_QUANTITY_DEPTH {
-            return;
+    let (kind, value) = match quantity_kind(def.class) {
+        Some(kind) => {
+            let value = match def.values.first().map(|v| parse_field(v.src)) {
+                Some(Field::Number(n)) => Some(format_number(n)),
+                _ => None,
+            };
+            (kind.to_string(), value)
         }
-        let nested_prefix = join_name(prefix, cname);
-        for inner in inner_ids {
-            emit_quantity(
-                inner,
-                &nested_prefix,
-                guid,
-                qto_name,
-                source,
-                quantities,
-                complex_quantities,
-                project_default_unit,
-                out,
-                emitted_names,
-                depth + 1,
-            );
-        }
-    }
+        // An IfcQuantity* class we can't parse (IFC4X3 IfcQuantityNumber,
+        // …): value null, quantity_type carries the marker so "no
+        // quantity authored" and "ifcfast can't read this" stay distinct
+        // (GH #159).
+        None => (
+            format!(
+                "unhandled:{}",
+                std::str::from_utf8(def.entity)
+                    .map(|s| s.to_ascii_uppercase())
+                    .unwrap_or_else(|_| "IFCQUANTITY?".to_string())
+            ),
+            None,
+        ),
+    };
+    let unit = def.unit_step.or_else(|| {
+        unit_type_for_quantity_class(def.class)
+            .and_then(|ut| graph.quantity_default_units.get(ut).copied())
+    });
+    out.guid.push(guid.to_string());
+    out.qto_name.push(qto_name.to_string());
+    out.quantity_name.push(name);
+    out.value.push(value);
+    out.quantity_type.push(kind);
+    out.unit_step_id.push(unit);
+    out.source.push(source.to_string());
 }
 
-/// Dedup-aware variant. Skips emit when the instance side already
-/// surfaced a row at `(qto_name, full_name)`. Same shape contract as the
-/// pset-side `emit_property_dedup` — instance wins on collision.
-#[allow(clippy::too_many_arguments)]
-fn emit_quantity_dedup(
-    qid: &u64,
-    prefix: &str,
-    guid: &str,
-    qto_name: &str,
-    source: &str,
-    quantities: &HashMap<u64, Quantity>,
-    complex_quantities: &HashMap<u64, (String, Vec<u64>)>,
-    project_default_unit: &HashMap<&'static str, u64>,
-    out: &mut QuantityTable,
-    already_seen: &std::collections::HashSet<String>,
-    depth: usize,
-) {
-    if let Some(q) = quantities.get(qid) {
-        let name = join_name(prefix, &q.name);
-        let key = format!("{qto_name}\t{name}");
-        if already_seen.contains(&key) {
-            return;
-        }
-        let unit = q.unit_step_id.or_else(|| {
-            unit_type_for_quantity_kind(&q.kind)
-                .and_then(|ut| project_default_unit.get(ut).copied())
-        });
-        out.guid.push(guid.to_string());
-        out.qto_name.push(qto_name.to_string());
-        out.quantity_name.push(name);
-        out.value.push(q.value.clone());
-        out.quantity_type.push(q.kind.to_string());
-        out.unit_step_id.push(unit);
-        out.source.push(source.to_string());
-        return;
+/// Dot-join the enclosing complex names and the leaf name. An unnamed
+/// wrapper contributes nothing (`join_name("", x) == x`), unlike the pset
+/// side's bare `.`; both are long-standing and kept.
+fn quantity_name(path: &[&str], leaf: &str) -> String {
+    let mut prefix = String::new();
+    for p in path {
+        prefix = join_name(&prefix, p);
     }
-    if let Some((cname, inner_ids)) = complex_quantities.get(qid) {
-        if depth >= MAX_COMPLEX_QUANTITY_DEPTH {
-            return;
-        }
-        let nested_prefix = join_name(prefix, cname);
-        for inner in inner_ids {
-            emit_quantity_dedup(
-                inner,
-                &nested_prefix,
-                guid,
-                qto_name,
-                source,
-                quantities,
-                complex_quantities,
-                project_default_unit,
-                out,
-                already_seen,
-                depth + 1,
-            );
-        }
-    }
+    join_name(&prefix, leaf)
 }
 
 /// Dot-join a name prefix with a leaf name (`""` prefix → leaf as-is).
@@ -510,126 +236,30 @@ fn join_name(prefix: &str, leaf: &str) -> String {
     }
 }
 
-/// Detect an IfcTypeObject / IfcXxxType subclass by entity-name
-/// suffix. Mirrors the identical rule in `extractors/psets.rs` and
-/// `indexer::index` so the three loops agree on what counts as a
-/// type. The IFC2x3 collapsed `IfcDoorStyle` / `IfcWindowStyle`
-/// classes don't follow the `*Type` suffix but ARE valid
-/// `IfcRelDefinesByType.RelatingType` targets on 2x3 files.
-fn is_type_object(t: &[u8]) -> bool {
-    let suffix_ok = t.len() > 7
-        && t[..3].eq_ignore_ascii_case(b"IFC")
-        && t[t.len() - 4..].eq_ignore_ascii_case(b"TYPE");
-    let ifc2x3_style =
-        t.eq_ignore_ascii_case(b"IFCDOORSTYLE") || t.eq_ignore_ascii_case(b"IFCWINDOWSTYLE");
-    // Bare base classes `IfcTypeProduct` / `IfcTypeObject` are non-abstract
-    // and emitted by Revit for types with no schema-specific `*Type`
-    // subtype; they end in `PRODUCT` / `OBJECT`, miss the suffix check, and
-    // would silently drop their inherited quantities. See #69.
-    let bare_base =
-        t.eq_ignore_ascii_case(b"IFCTYPEPRODUCT") || t.eq_ignore_ascii_case(b"IFCTYPEOBJECT");
-    suffix_ok || ifc2x3_style || bare_base
+/// The `quantity_type` column value of a recognised quantity class.
+fn quantity_kind(class: PropClass) -> Option<&'static str> {
+    Some(match class {
+        PropClass::QuantityArea => "Area",
+        PropClass::QuantityLength => "Length",
+        PropClass::QuantityVolume => "Volume",
+        PropClass::QuantityCount => "Count",
+        PropClass::QuantityWeight => "Weight",
+        PropClass::QuantityTime => "Time",
+        _ => return None,
+    })
 }
 
-struct Quantity {
-    name: String,
-    /// The `quantity_type` column value. `Borrowed` for the six
-    /// recognised IfcQuantity* classes; `Owned` for the
-    /// `unhandled:IFCXXX` marker of a class we don't parse yet, so the
-    /// blind spot is visible without allocating on the hot path.
-    kind: std::borrow::Cow<'static, str>,
-    value: Option<String>,
-    unit_step_id: Option<u64>,
-}
-
-/// An `IfcQuantity*` entity that [`quantity_kind`] doesn't recognise.
-/// The `IFCQUANTITY` prefix is unique to `IfcPhysicalSimpleQuantity`
-/// leaves in the IFC schema family, which is what makes it a safe
-/// "did we miss a quantity class" probe — the exact mirror of
-/// `psets::is_unhandled_simple_property`'s `*VALUE` suffix rule.
-/// `IfcPhysicalComplexQuantity` does not start with `IFCQUANTITY` and
-/// is handled on its own path.
-fn is_unhandled_quantity(type_name: &[u8]) -> bool {
-    const PREFIX: &[u8] = b"IFCQUANTITY";
-    type_name.len() > PREFIX.len()
-        && type_name[..PREFIX.len()].eq_ignore_ascii_case(PREFIX)
-        && quantity_kind(type_name).is_none()
-}
-
-fn quantity_kind(type_name: &[u8]) -> Option<&'static str> {
-    if type_name.eq_ignore_ascii_case(b"IFCQUANTITYAREA") {
-        Some("Area")
-    } else if type_name.eq_ignore_ascii_case(b"IFCQUANTITYLENGTH") {
-        Some("Length")
-    } else if type_name.eq_ignore_ascii_case(b"IFCQUANTITYVOLUME") {
-        Some("Volume")
-    } else if type_name.eq_ignore_ascii_case(b"IFCQUANTITYCOUNT") {
-        Some("Count")
-    } else if type_name.eq_ignore_ascii_case(b"IFCQUANTITYWEIGHT") {
-        Some("Weight")
-    } else if type_name.eq_ignore_ascii_case(b"IFCQUANTITYTIME") {
-        Some("Time")
-    } else {
-        None
-    }
-}
-
-/// Map a `quantity_type` string (the column written to parquet) back
-/// to the canonical `IfcUnitEnum` literal used by `IfcSIUnit.UnitType`.
-/// `Count` is dimensionless — it has no fallback target, so a null
-/// `unit_step_id` is the correct, terminal answer.
-fn unit_type_for_quantity_kind(kind: &str) -> Option<&'static str> {
-    match kind {
-        "Length" => Some("LENGTHUNIT"),
-        "Area" => Some("AREAUNIT"),
-        "Volume" => Some("VOLUMEUNIT"),
-        "Weight" => Some("MASSUNIT"),
-        "Time" => Some("TIMEUNIT"),
+/// The `IfcUnitEnum` literal a quantity class falls back to. `Count` is
+/// dimensionless: a null `unit_step_id` is the correct, terminal answer.
+fn unit_type_for_quantity_class(class: PropClass) -> Option<&'static str> {
+    match class {
+        PropClass::QuantityLength => Some("LENGTHUNIT"),
+        PropClass::QuantityArea => Some("AREAUNIT"),
+        PropClass::QuantityVolume => Some("VOLUMEUNIT"),
+        PropClass::QuantityWeight => Some("MASSUNIT"),
+        PropClass::QuantityTime => Some("TIMEUNIT"),
         _ => None,
     }
-}
-
-/// Pin every `IfcUnitEnum` literal we accept as a fallback target to
-/// a `&'static str` so the project-default map keys don't carry
-/// allocations. Anything outside this set is irrelevant to quantity
-/// resolution and is intentionally dropped.
-fn canonical_unit_type(uppercase: &str) -> Option<&'static str> {
-    match uppercase {
-        "LENGTHUNIT" => Some("LENGTHUNIT"),
-        "AREAUNIT" => Some("AREAUNIT"),
-        "VOLUMEUNIT" => Some("VOLUMEUNIT"),
-        "MASSUNIT" => Some("MASSUNIT"),
-        "TIMEUNIT" => Some("TIMEUNIT"),
-        _ => None,
-    }
-}
-
-/// Parse a STEP enum field (`.LENGTHUNIT.` → `"LENGTHUNIT"`). Strips
-/// surrounding dots, uppercases, returns None on shapes that don't
-/// match the enum-literal pattern.
-fn parse_enum_uppercase(raw: &[u8]) -> Option<String> {
-    let trimmed = trim_bytes(raw);
-    if trimmed.len() < 2 {
-        return None;
-    }
-    if trimmed.first() != Some(&b'.') || trimmed.last() != Some(&b'.') {
-        return None;
-    }
-    let inner = &trimmed[1..trimmed.len() - 1];
-    let s = std::str::from_utf8(inner).ok()?;
-    Some(s.to_ascii_uppercase())
-}
-
-fn trim_bytes(s: &[u8]) -> &[u8] {
-    let mut start = 0;
-    while start < s.len() && (s[start] as char).is_whitespace() {
-        start += 1;
-    }
-    let mut end = s.len();
-    while end > start && (s[end - 1] as char).is_whitespace() {
-        end -= 1;
-    }
-    &s[start..end]
 }
 
 fn format_number(n: f64) -> String {
@@ -637,77 +267,6 @@ fn format_number(n: f64) -> String {
         format!("{}", n as i64)
     } else {
         format!("{}", n)
-    }
-}
-
-fn string_at(fields: &[&[u8]], idx: usize) -> Option<String> {
-    match parse_field(fields.get(idx)?) {
-        Field::String(s) => Some(s),
-        _ => None,
-    }
-}
-
-fn number_at(fields: &[&[u8]], idx: usize) -> Option<f64> {
-    match parse_field(fields.get(idx)?) {
-        Field::Number(n) => Some(n),
-        _ => None,
-    }
-}
-
-fn ref_list_at(fields: &[&[u8]], idx: usize) -> Vec<u64> {
-    match fields.get(idx).copied().map(parse_field) {
-        Some(Field::List(body)) => parse_ref_list(body),
-        _ => Vec::new(),
-    }
-}
-
-fn parse_ref_list(body: &[u8]) -> Vec<u64> {
-    split_top_level_args(body)
-        .into_iter()
-        .filter_map(|f| match parse_field(f) {
-            Field::Ref(id) => Some(id),
-            _ => None,
-        })
-        .collect()
-}
-
-/// Resolve `IfcRelDefinesByProperties.RelatingPropertyDefinition` to the
-/// definition step ids it references. Mirrors the psets-side helper of
-/// the same name (GH #76 item 5): accepts a bare ref, an inline list, and
-/// the typed `IFCPROPERTYSETDEFINITIONSET((...))` wrapper. Refs that turn
-/// out to be psets (not IfcElementQuantity) simply don't resolve in the
-/// quantity pass and are dropped there.
-fn relating_def_refs(raw: Option<&[u8]>) -> Vec<u64> {
-    let raw = match raw {
-        Some(r) => r,
-        None => return Vec::new(),
-    };
-    match parse_field(raw) {
-        Field::Ref(id) => vec![id],
-        Field::List(body) => parse_ref_list(body),
-        Field::Other(bytes) => relating_def_typed_wrapper_refs(bytes),
-        _ => Vec::new(),
-    }
-}
-
-/// Peel `IFCPROPERTYSETDEFINITIONSET((#1,#2))` to its inner ref list.
-/// Mirror of the psets-side helper: two paren layers (entity-arg list,
-/// then the inner LIST value).
-fn relating_def_typed_wrapper_refs(bytes: &[u8]) -> Vec<u64> {
-    let t = crate::lexer::trim_ws(bytes);
-    let prefix = b"IFCPROPERTYSETDEFINITIONSET";
-    if t.len() <= prefix.len() || !t[..prefix.len()].eq_ignore_ascii_case(prefix) {
-        return Vec::new();
-    }
-    let outer = crate::lexer::trim_ws(&t[prefix.len()..]);
-    if outer.first() != Some(&b'(') || outer.last() != Some(&b')') {
-        return Vec::new();
-    }
-    let inner = crate::lexer::trim_ws(&outer[1..outer.len() - 1]);
-    match parse_field(inner) {
-        Field::List(body) => parse_ref_list(body),
-        Field::Ref(id) => vec![id],
-        _ => Vec::new(),
     }
 }
 

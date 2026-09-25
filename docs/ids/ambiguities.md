@@ -97,3 +97,59 @@ prints as IfcTester's `str(options)` dict, but with a fixed key order (enumerati
 bounds, lengths) where IfcTester keeps document order (`facet.py:1007-1022`). **open**,
 gated in slice 4 by `to_ifctester_json` equality.
 
+
+## Slice 2 (Property, Classification, Material) decisions, 2026-09-25
+
+Research pass for slice 2 (`docs/ids/facet-semantics-slice2.md`, which has the full rule → case
+→ line table). All rows below are **intended** until slice 2 lands. Paths as above, plus
+`element.py` / `cls.py` / `unit.py` = `ifcopenshell/util/{element,classification,unit}.py`
+0.8.5. None of these points is decided by a suite case. **open** = the recommendation departs
+from IfcTester, or the IfcTester reading is an artifact, so it needs a sign-off.
+
+| # | Point | IfcTester reading (source) | ifcfast | Pinning case(s) |
+|---|---|---|---|---|
+| A14 | Occurrence and type sets with the same name | Merged **per property**: the type dict is updated with the occurrence's (`element.py:145-150`, `:215-232`). The pset `id` becomes the occurrence set's, so the dataType and unit loop only walks the occurrence set's properties (`facet.py:723-726`). A value inherited from the type is never dataType-checked or unit-converted | Merge per property, as IfcTester. dataType and units are checked against the property entity that **supplied** the value (**open**: departs from IfcTester in this corner) | `pass-properties_can_be_overriden_by_an_occurrence_1_2` is consistent with both merges |
+| A15 | `optional` + a restriction `propertySet` that matches several sets | Returns pass at the first matched set that lacks the property, even if a later set has a wrong value (`facet.py:716-718`) | Evaluate every matched set. Absent properties are skipped; every present one must satisfy (**open**) | none |
+| A16 | Cardinality of unsupported kinds | A reference value is invisible, i.e. absent (`element.py:412-473` has no branch). A complex property or quantity is present but fails with NOVALUE (`facet.py:853-858`), so `optional` fails on it and `prohibited` passes | Both count as **absent**: required → `PROP_UNSUPPORTED`, optional → pass, prohibited → pass (**open**) | `fail-complex_properties_are_not_supported_1_2`, `fail-reference_properties_are_treated_as_objects_and_not_supported` (required only) |
+| A17 | dataType of multi-valued properties | List and enumerated: the first element only (`facet.py:774`, `:784`). Bounded: the last present of Upper, Lower, SetPoint (`:803-808`) | Every present element must carry the dataType (identical for homogeneous data) | none |
+| A18 | dataType and units on `IfcPreDefinedPropertySet` attributes | Neither is checked: the fake property objects skip every branch (`facet.py:729-731`, `:914-919`) | dataType = the attribute's declared type name (`IFCDOORPANELOPERATIONENUM`). Measure attributes are converted like single values | `pass-predefined_properties_are_supported_but_discouraged_1_2` passes either way |
+| A19 | Classification value and system on the same reference? | Independent: value against any reference (ancestors included), system against any reference's root (`facet.py:434-445`) | Same as IfcTester. `classification-facet.md` ("the classification ETIM must have the value …") reads as same-reference, but no case separates them | none |
+| A20 | An occurrence reference in the same system as a type reference | The type's references of that system are replaced (`cls.py:46-57`) | Same | `…per_system_{1,2,3}_3` use two different systems |
+| A21 | Non-classification external references, IFC2X3 material classification, reference cycles | `IfcLibraryReference` etc. on a non-rooted resource raises `AttributeError` in `get_classification` (`cls.py:61-69`, it reads `ReferencedSource`). IFC2X3 `IfcMaterialClassificationRelationship` is not read (`cls.py:32-36`). A `ReferencedSource` cycle loops forever (`cls.py:72-79`) | Only `IfcClassificationReference` / `IfcClassification` count. IFC2X3 material classification: none (as IfcTester). The chain walk is cycle-guarded | none |
+| A22 | Occurrence material plus type material | The occurrence's first `IfcRelAssociatesMaterial` wins outright, with no union with the type (`element.py:728-741`) | Same | `pass-occurrences_can_override_materials_from_their_types` would also pass under a union |
+| A23 | Directly associated `IfcMaterialLayer` / `IfcMaterialProfile` / `IfcMaterialConstituent` (IFC4), a layer or profile whose `Material` is null | `values` is unbound (`UnboundLocalError`), or `AttributeError` (`facet.py:957-986`) | Treat it as a one-item set: its Name and Category plus its material's Name and Category. Skip null materials | none |
+| A24 | Candidates when the **first** applicability facet is property / classification / material | Property: `IfcObjectDefinition`, plus `IfcMaterialDefinition` + `IfcProfileDef` in IFC4+ (`facet.py:668-679`). Classification and material: `IfcObjectDefinition` (`:412-417`, `:939-944`). Subtypes included | Same | none |
+| A25 | Configurations the facet docs call "not allowed": `value` without `dataType`, prohibited with `dataType` or `value`, optional without either | Evaluated normally. Prohibited = NOT(required outcome incl. value) (`facet.py:903-904`) | Evaluate as IfcTester. Not `IdsInvalidError` (no `invalid-` case covers them) | none |
+| A26 | A measure value whose unit can't be resolved (no property `Unit`, no project unit of that type) and that needs a value comparison | Compares the raw number, which assumes SI (`unit.py:499-502` returns None) | Per-element failure `PROP_UNIT_UNRESOLVED` (new code). Design §2.5's run-level `IdsError::UnresolvedUnit` would abort a whole report over one property (**open**) | none |
+| A27 | IfcTester artifacts not replicated | A baseName restriction can match the pset dict's `"id"` key (`facet.py:712-713`, `element.py:294`). LOGICAL `.U.` counts as a value on the restriction path (`facet.py:711-714`). `StopIteration` when a `.U.` comes from a type set (`:703-707`). `UnboundLocalError` on a bounded value with no bounds (`:808`) | None of these | none |
+| A28 | Material failure text | `actual` is a Python `set`, so its repr order depends on `PYTHONHASHSEED` (`facet.py:995`, `:1176`) | Sorted, deduplicated, `None` dropped. `actual` of `MATERIAL_VALUE_MISMATCH` is excluded from the slice-4 parity gate | none |
+
+Explicit in the text, IfcTester diverges, **no case**: follow the text.
+
+| # | Point | Spec text / source | IfcTester reading (source) | ifcfast |
+|---|---|---|---|---|
+| D5 | Unit conversion outside single values | `units.md`: values "need to be converted to the default unit before comparison"; mass is kg | Enumerated values are never converted (`facet.py:769-778`). Mass is converted with output prefix KILO only on single values; quantities, lists, bounded and tables come out in **grams** (`:743` vs `:762-768`, `:792-798`, `:814-822`, `:837-845`) | Convert every numeric kind to SI; mass in kg |
+| D6 | Conversion-based, temperature and derived units | `units.md` examples: 1 lbs = 0.45359237 kg, 20 °C = 293.15 K | Converts by unit *name* through an approximate table, ignoring `ConversionFactor` (`unit.py:661-662`; `pound` = 0.454 at `:208`). No temperature offset (`si_offsets` is unused, `:223`). Unnamed derived units are skipped on single values (`facet.py:741-742`) and raise `AttributeError` on the other kinds | `IfcConversionBasedUnit` via `ConversionFactor` (`IfcMeasureWithUnit`, recursive). Celsius/Fahrenheit with offset. Derived units = product of element factors^exponent |
+| D7 | Tolerance on list / enumerated elements and on restriction enumerations | `tolerance.md`: ε applies to "doubles in ids:simpleValue and xs:restriction"; only ranges are exempt | Exact float equality: `cast_value not in value` (`facet.py:873-874`), `v == self.value` (`:880`), `Restriction.__eq__` enumeration (`:1050-1052`) | Tolerant equality everywhere except bounds (`restriction.rs` already does this) |
+| D8 | A range restriction against a list / enumerated / bounded / table property | `property-facet.md` "Supported types of properties": "If the IDS value is a restriction (with minExclusive,maxExclusive,minInclusive,maxInclusive), all IFC values should respect the range" | Any element matching is enough (`facet.py:878-884`) | **All** values must satisfy when the restriction has a bound facet. Enumeration and pattern restrictions stay any-of. **open** (the same doc's bounded *simple-value* table is refuted by `property/fail-any_matching_value_in_a_bounded_property_will_pass_4_4`, which lowers the doc's authority on this section) |
+| D9 | A table property checked without `dataType` | `property-facet.md`: `baseName` "must exist … and have a non-empty value"; dataType is optional | No column matches `None`, so it fails as DATATYPE (`facet.py:833`, `:848-851`) | A non-empty table passes a name-only check. With a `value` but no `dataType`, all columns are candidates |
+| D10 | A bounded value with no Upper, Lower or SetPoint | `property-facet.md` bounded table: "at least one of the lower and upper bounds is required" | Crash (A27) | Counts as empty → `PROP_NULL` |
+
+Pre-existing implementation note found by this pass (not an ambiguity): the shipped
+`real_eq` (`crates/core/src/ids/restriction.rs:236-242`, closed interval `v ± (|v|ε+ε)`) fails
+`tolerance/pass-comparison_tolerance_for_floating_point_{negative_low_number_upper,positive_low_number_lower}_bound`
+in f64. Moving each edge outward by one ulp passes all 28 point cases (method in the slice-2 doc §4).
+
+## Coordinator decisions on the slice-2 open rows, 2026-09-25
+
+Truth order stays: suite filename truth > IDS docs > IfcTester. Recorded here so the
+implementer codes against decisions, not options. All reversible.
+
+| Row | Decision | Why |
+|---|---|---|
+| A14 | Check dataType and unit against the property entity that **supplied** the value, type-inherited or not. | A value is a value regardless of source; skipping the check for inherited values would let a wrong-typed type property pass silently. Departs from IfcTester in a corner no case pins. |
+| A16 | Complex and reference properties both count as **absent**: required → `PROP_UNSUPPORTED` (new reason code, row-level and labelled), optional → pass, prohibited → pass. | One rule for both kinds; the failure names what we cannot check instead of pretending a NOVALUE. |
+| A26 | **Keep the design**: an unresolvable unit that a comparison needs is `IdsError::UnresolvedUnit`, routed through the existing `on_unsupported` machinery — `raise` → `IdsUnitError`; `mark` → that spec gets `status="unsupported"`, `unsupported_feature="unit:<UNITTYPE>"`, no element rows. No `PROP_UNIT_UNRESOLVED` code. | A per-element *fail* for "we could not determine" fabricates a compliance result and flips `rep.ok` for a reason unrelated to the model. Marking the spec keeps the rest of the report intact without inventing an outcome. |
+| D8 | A restriction **with bound facets** (min/max inclusive/exclusive) must hold for **all** values of a multi-valued property; enumeration and pattern restrictions stay any-of. | The docs are explicit and no case contradicts them; IfcTester's any-of is a gap, not a reading. |
+| real_eq | Widen each tolerance edge outward by **1 ulp** (`next_down` / `next_up`) so `tol = |v|·1e-6 + 1e-6` is inclusive in f64; add the 14 tolerance point cases as unit rows. | Two suite pass cases fail on the exact-edge f64 comparison; the rule is inclusive by intent. |
+| PROP_UNSUPPORTED | Added to the reason-code list (report.rs, `python/ifcfast/ids.py` REASON_CODES, design §3.2, AGENTS.md). | Needed by A16. |

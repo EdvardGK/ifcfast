@@ -9,6 +9,9 @@
 //!   * [`materials`]        — `IfcRelAssociatesMaterial`  → `IfcMaterial` / layer sets / lists
 //!   * [`classifications`]  — `IfcRelAssociatesClassification` → `IfcClassificationReference`
 //!
+//! [`psets`] and [`quantities`] are flattened views of [`property_graph`],
+//! the shared typed property pass the IDS property facet also reads.
+//!
 //! All four are independent and can be called in any combination. The
 //! `extract_all` PyO3 entry point in [`crate`] shares the entity table
 //! and product-GUID map across the four for ~2-3× speedup on large
@@ -16,5 +19,6 @@
 
 pub mod classifications;
 pub mod materials;
+pub mod property_graph;
 pub mod psets;
 pub mod quantities;

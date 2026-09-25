@@ -213,283 +213,24 @@ const UNIT_ASSIGN_TYPE: &[u8] = b"IFCUNITASSIGNMENT";
 const VOIDS_ELEMENT_TYPE: &[u8] = b"IFCRELVOIDSELEMENT";
 const DEFINES_BY_TYPE_TYPE: &[u8] = b"IFCRELDEFINESBYTYPE";
 
-/// Why an `IfcSIUnit` could not be turned into a metres-per-unit
-/// factor. The two cases need opposite handling and used to be
-/// conflated (GH #149): a non-length unit is a normal `continue`, an
-/// unknown prefix is a *defect* that must never quietly become the base
-/// unit — mapping `.KILO.`-typo'd prefixes to 1.0 m is a 1000× error
-/// that looks like a valid answer downstream.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum SiScaleError {
-    /// Not a length unit at all (`RADIAN`, `SQUARE_METRE`, …).
-    NotLength,
-    /// A length unit whose `IfcSIPrefix` value we don't recognise.
-    UnknownPrefix,
-}
+#[cfg(test)]
+use crate::units::{si_length_scale_checked, SiScaleError};
 
-/// SI prefix + name → metres-per-unit scale. `name` is an
-/// `IfcSIUnitName` enum value (e.g. `METRE`); `prefix` is an
-/// `IfcSIPrefix` enum value or `""` for no prefix.
-///
-/// Note: FOOT / INCH are deliberately NOT handled here — they are not
-/// legal `IfcSIUnitName` values. Imperial length is declared via
-/// `IfcConversionBasedUnit`, resolved separately (GH #73).
-fn si_length_scale_checked(prefix: &str, name: &str) -> Result<f64, SiScaleError> {
-    let base = match name {
-        "METRE" | "METER" => 1.0,
-        _ => return Err(SiScaleError::NotLength),
-    };
-    let multiplier = match prefix {
-        "" => 1.0,
-        "EXA" => 1e18,
-        "PETA" => 1e15,
-        "TERA" => 1e12,
-        "GIGA" => 1e9,
-        "MEGA" => 1e6,
-        "KILO" => 1e3,
-        "HECTO" => 1e2,
-        "DECA" => 10.0,
-        "DECI" => 1e-1,
-        "CENTI" => 1e-2,
-        "MILLI" => 1e-3,
-        "MICRO" => 1e-6,
-        "NANO" => 1e-9,
-        "PICO" => 1e-12,
-        "FEMTO" => 1e-15,
-        "ATTO" => 1e-18,
-        // NOT `base`. An unrecognised prefix is a parse failure, not
-        // "assume metres" (GH #149).
-        _ => return Err(SiScaleError::UnknownPrefix),
-    };
-    Ok(base * multiplier)
-}
-
-/// Convenience wrapper for the call sites that only need "did it
-/// resolve" — the conversion-based-unit base lookup, which already
-/// reports its own failure.
-fn si_length_scale(prefix: &str, name: &str) -> Option<f64> {
-    si_length_scale_checked(prefix, name).ok()
-}
-
-/// Emit a unit-resolution diagnostic through the single channel the
-/// indexer uses for them: loud on stderr (so a CLI / notebook user sees
-/// it immediately, matching the pre-existing conversion-unit policy)
-/// AND appended to the caller's collector so [`IndexedFile::warnings`]
-/// carries it to programmatic consumers (GH #149).
-/// Library code never prints: the message is collected on
-/// `IndexedFile.warnings`, which lib.rs hands to Python (`m.warnings`,
-/// `summary()["warnings"]`) and the Rust bins print themselves.
-fn warn_unit(collector: &mut Vec<String>, msg: String) {
-    collector.push(msg);
-}
-
-/// Parse a numeric value that may be wrapped in a defined-type
-/// constructor, e.g. `IFCLENGTHMEASURE(0.3048)` or a bare `0.3048`.
-/// `IfcMeasureWithUnit.ValueComponent` is an `IfcValue` SELECT, so on
-/// real files it almost always arrives as the wrapped form, which
-/// [`parse_field`] returns as `Field::Other`. Returns `None` if no
-/// number can be recovered.
-fn measure_number(raw: &[u8]) -> Option<f64> {
-    match parse_field(raw) {
-        Field::Number(n) => Some(n),
-        _ => {
-            // Wrapped: TYPE(<number>). Take the bytes between the first
-            // '(' and the matching trailing ')'.
-            let open = raw.iter().position(|&b| b == b'(')?;
-            let close = raw.iter().rposition(|&b| b == b')')?;
-            if close <= open + 1 {
-                return None;
-            }
-            let inner = &raw[open + 1..close];
-            std::str::from_utf8(inner).ok()?.trim().parse().ok()
-        }
-    }
-}
-
-/// Resolve a LENGTHUNIT from the assignment list to metres-per-unit.
-///
-/// Walks the `IfcUnitAssignment.Units` refs and resolves the first
-/// LENGTHUNIT entry through either:
-/// - `IfcSIUnit` — `(prefix, name)` → [`si_length_scale`], or
-/// - `IfcConversionBasedUnit` — `ConversionFactor` →
-///   `IfcMeasureWithUnit(value, si_base)` → `value × si_scale(base)`
-///   (GH #73; how imperial files declare FOOT / INCH).
-///
-/// Returns `None` when no LENGTHUNIT is declared or none could be
-/// resolved. Every failure mode — unknown SI prefix, broken
-/// conversion-factor chain, an assignment that yields no LENGTHUNIT at
-/// all, or no assignment in the file — goes through [`warn_unit`], so
-/// there is ONE policy: unresolved never silently means metres
-/// (GH #149). Warnings land on stderr and in `warnings` for the caller.
-fn resolve_length_scale(
-    unit_assignment_refs: &[u64],
-    si_units: &HashMap<u64, (String, String, String)>,
-    conv_units: &HashMap<u64, (String, String, Option<u64>)>,
-    measures: &HashMap<u64, (Option<f64>, Option<u64>)>,
-    warnings: &mut Vec<String>,
-) -> Option<f64> {
-    for unit_ref in unit_assignment_refs {
-        // SI length unit (metric files).
-        if let Some((ut, prefix, name)) = si_units.get(unit_ref) {
-            if ut.eq_ignore_ascii_case("LENGTHUNIT") {
-                match si_length_scale_checked(prefix, name) {
-                    Ok(scale) => return Some(scale),
-                    Err(SiScaleError::UnknownPrefix) => warn_unit(
-                        warnings,
-                        format!(
-                            "IfcSIUnit #{unit_ref} declares LENGTHUNIT with an \
-                             unrecognised IfcSIPrefix {prefix:?} (name {name:?}); \
-                             it cannot be converted to metres and is IGNORED \
-                             rather than treated as the un-prefixed base unit \
-                             (which would be wrong by a power of ten)."
-                        ),
-                    ),
-                    Err(SiScaleError::NotLength) => warn_unit(
-                        warnings,
-                        format!(
-                            "IfcSIUnit #{unit_ref} declares UnitType LENGTHUNIT but \
-                             an IfcSIUnitName of {name:?}, which is not a length \
-                             unit; the declaration is inconsistent and is IGNORED."
-                        ),
-                    ),
-                }
-            }
-            continue;
-        }
-        // Conversion-based length unit (imperial files: FOOT / INCH).
-        if let Some((ut, conv_name, factor_ref)) = conv_units.get(unit_ref) {
-            if !ut.eq_ignore_ascii_case("LENGTHUNIT") {
-                continue;
-            }
-            let resolved =
-                factor_ref
-                    .and_then(|fr| measures.get(&fr))
-                    .and_then(|(value, base_ref)| {
-                        let v = (*value)?;
-                        let base_ref = (*base_ref)?;
-                        let (base_ut, base_prefix, base_name) = si_units.get(&base_ref)?;
-                        if !base_ut.eq_ignore_ascii_case("LENGTHUNIT") {
-                            return None;
-                        }
-                        let base_scale = si_length_scale(base_prefix, base_name)?;
-                        Some(v * base_scale)
-                    });
-            match resolved {
-                Some(scale) => return Some(scale),
-                None => {
-                    warn_unit(
-                        warnings,
-                        format!(
-                            "IfcConversionBasedUnit (LENGTHUNIT, name={conv_name:?}, \
-                             #{unit_ref}) could not be resolved to a metres-per-unit \
-                             scale; its ConversionFactor → IfcMeasureWithUnit → \
-                             IfcSIUnit chain is missing or malformed. unit_scale is \
-                             left unset (consumers default to metres, which is WRONG \
-                             for this file)."
-                        ),
-                    );
-                    // Keep scanning: another LENGTHUNIT entry might resolve.
-                }
-            }
-        }
-    }
-    // Nothing resolved. Distinguish "the file never declared units" from
-    // "it declared them and we failed" — both leave unit_scale unset, but
-    // they are different defects and the reader needs to know which.
-    if unit_assignment_refs.is_empty() {
-        warn_unit(
-            warnings,
-            "no IfcUnitAssignment (or an empty one) was found in this file: \
-             the project's length unit is UNDECLARED. unit_scale is left \
-             unset; consumers that default to metres will be wrong by 1000× \
-             on a millimetre-authored file."
-                .to_string(),
-        );
-    } else {
-        warn_unit(
-            warnings,
-            format!(
-                "the IfcUnitAssignment lists {} unit(s) but none of them \
-                 resolved to a LENGTHUNIT metres-per-unit scale. unit_scale is \
-                 left unset; consumers that default to metres may be wrong.",
-                unit_assignment_refs.len()
-            ),
-        );
-    }
-    None
-}
-
-/// Extract the IFC project's linear-unit-to-metres scale by walking
-/// the entity table for `IfcUnitAssignment` + `IfcSIUnit` /
-/// `IfcConversionBasedUnit`. Returns `None` when no LENGTHUNIT is
-/// declared — caller should default to `1.0` (metres) in that case.
-///
-/// Mirrors the unit-scale resolution already done inside [`index`],
-/// extracted here so callers that build only the extractor tables
-/// (e.g. `extract_all` in the Python wheel) can pay for one cheap unit
-/// walk instead of an entire indexer pass. Only the Python wrapper
-/// uses this today; gated to keep `--no-default-features --features
-/// csg`-style smoke builds free of dead-code warnings (CI runs with
-/// `-D warnings`).
+/// Extract the IFC project's linear-unit-to-metres scale for callers that
+/// build only the extractor tables (e.g. `extract_all` in the Python
+/// wheel): one cheap walk over the unit entities instead of an entire
+/// indexer pass. Resolved through [`crate::units::UnitTable`], the same
+/// resolver [`index`] uses, so the two agree bit for bit. Returns `None`
+/// when no LENGTHUNIT resolves — never an assumed metre (GH #149). Only
+/// the Python wrapper uses this today; gated to keep
+/// `--no-default-features --features csg`-style smoke builds free of
+/// dead-code warnings (CI runs with `-D warnings`).
 #[cfg(feature = "python")]
 pub(crate) fn extract_unit_scale(table: &crate::entity_table::EntityTable) -> Option<f64> {
-    use crate::lexer::{parse_field, parse_ref_list, split_top_level_args, Field};
-
-    let mut si_units: HashMap<u64, (String, String, String)> = HashMap::new();
-    let mut conv_units: HashMap<u64, (String, String, Option<u64>)> = HashMap::new();
-    let mut measures: HashMap<u64, (Option<f64>, Option<u64>)> = HashMap::new();
-    let mut unit_assignment_refs: Vec<u64> = Vec::new();
-
-    for (step_id, type_name, args) in table.iter() {
-        // Case-insensitive, matching every other extractor. STEP keywords
-        // are uppercase by spec but not by universal practice, and a
-        // byte-exact compare here silently produced `unit_scale = None`
-        // (→ "assume metres") on lowercase-keyword files (GH #149).
-        if type_name.eq_ignore_ascii_case(SI_UNIT_TYPE) {
-            let fields = split_top_level_args(args);
-            let ut = enum_at(&fields, 1).unwrap_or_default();
-            let prefix = enum_at(&fields, 2).unwrap_or_default();
-            let name = enum_at(&fields, 3).unwrap_or_default();
-            si_units.insert(step_id, (ut, prefix, name));
-        } else if type_name.eq_ignore_ascii_case(CONVERSION_UNIT_TYPE) {
-            // IfcConversionBasedUnit(Dimensions, UnitType, Name,
-            // ConversionFactor) — UnitType at [1], Name (string) at [2],
-            // ConversionFactor ref (→ IfcMeasureWithUnit) at [3].
-            let fields = split_top_level_args(args);
-            let ut = enum_at(&fields, 1).unwrap_or_default();
-            let name = string_at(&fields, 2).unwrap_or_default();
-            let factor_ref = ref_at(&fields, 3);
-            conv_units.insert(step_id, (ut, name, factor_ref));
-        } else if type_name.eq_ignore_ascii_case(MEASURE_WITH_UNIT_TYPE) {
-            // IfcMeasureWithUnit(ValueComponent, UnitComponent) — value
-            // (often wrapped, e.g. IFCLENGTHMEASURE(0.3048)) at [0],
-            // unit ref at [1].
-            let fields = split_top_level_args(args);
-            let value = fields.first().and_then(|f| measure_number(f));
-            let unit_ref = ref_at(&fields, 1);
-            measures.insert(step_id, (value, unit_ref));
-        } else if type_name.eq_ignore_ascii_case(UNIT_ASSIGN_TYPE)
-            && unit_assignment_refs.is_empty()
-        {
-            let fields = split_top_level_args(args);
-            if let Some(f) = fields.first() {
-                if let Field::List(body) = parse_field(f) {
-                    unit_assignment_refs = parse_ref_list(body);
-                }
-            }
-        }
-    }
-
-    // This entry point has no IndexedFile to hang warnings on; the
-    // `warn_unit` stderr half still fires, which is the loud channel.
+    // This entry point has no IndexedFile to hang warnings on; the indexer
+    // pass over the same file reports them.
     let mut warnings: Vec<String> = Vec::new();
-    resolve_length_scale(
-        &unit_assignment_refs,
-        &si_units,
-        &conv_units,
-        &measures,
-        &mut warnings,
-    )
+    crate::units::UnitTable::from_table(table).length_scale(&mut warnings)
 }
 
 /// Canonical "should the mesher walk this entity as a product?" check.
@@ -961,17 +702,11 @@ pub fn index(buf: &[u8]) -> IndexedFile {
     // slot is a different attribute in IFC2X3 (see issue #8 finding 1).
     let is_ifc2x3 = out.schema.eq_ignore_ascii_case("IFC2X3");
 
-    // step_id -> (unit_type, prefix_name, unit_name) for SI units we see
-    let mut si_units: HashMap<u64, (String, String, String)> = HashMap::new();
-    // step_id -> (unit_type, name, conversion_factor_ref) for
-    // IfcConversionBasedUnit (how imperial files declare FOOT / INCH).
-    let mut conv_units: HashMap<u64, (String, String, Option<u64>)> = HashMap::new();
-    // step_id -> (value, unit_component_ref) for IfcMeasureWithUnit,
-    // the conversion-factor target of a conversion-based unit.
-    let mut measures: HashMap<u64, (Option<f64>, Option<u64>)> = HashMap::new();
-    // The first IfcUnitAssignment.Units we encounter; one project = one
-    // assignment in practice.
-    let mut unit_assignment_refs: Vec<u64> = Vec::new();
+    // IfcSIUnit / IfcConversionBasedUnit (how imperial files declare
+    // FOOT / INCH, GH #73) / IfcMeasureWithUnit / the first non-empty
+    // IfcUnitAssignment, collected for `crate::units::UnitTable`, which
+    // resolves unit_scale after the pass.
+    let mut units = crate::units::UnitCollector::default();
 
     // A missing `DATA;` marker is recorded, not swallowed (GH #148).
     // We still scan from byte 0 so bare record-list fixtures keep
@@ -1133,10 +868,7 @@ pub fn index(buf: &[u8]) -> IndexedFile {
             EntityKind::SiUnit => {
                 // IfcSIUnit(Dimensions, UnitType, Prefix, Name).
                 split_top_level_args_into(rec.args, &mut fields_buf);
-                let ut = enum_at(&fields_buf, 1).unwrap_or_default();
-                let prefix = enum_at(&fields_buf, 2).unwrap_or_default();
-                let name = enum_at(&fields_buf, 3).unwrap_or_default();
-                si_units.insert(rec.id, (ut, prefix, name));
+                units.feed(rec.id, SI_UNIT_TYPE, &fields_buf);
             }
             EntityKind::ConversionBasedUnit => {
                 // IfcConversionBasedUnit(Dimensions, UnitType, Name,
@@ -1144,30 +876,19 @@ pub fn index(buf: &[u8]) -> IndexedFile {
                 // [2], ConversionFactor ref (→ IfcMeasureWithUnit) at [3].
                 // How imperial files declare FOOT / INCH (GH #73).
                 split_top_level_args_into(rec.args, &mut fields_buf);
-                let ut = enum_at(&fields_buf, 1).unwrap_or_default();
-                let name = string_at(&fields_buf, 2).unwrap_or_default();
-                let factor_ref = ref_at(&fields_buf, 3);
-                conv_units.insert(rec.id, (ut, name, factor_ref));
+                units.feed(rec.id, CONVERSION_UNIT_TYPE, &fields_buf);
             }
             EntityKind::MeasureWithUnit => {
                 // IfcMeasureWithUnit(ValueComponent, UnitComponent) —
                 // value (often wrapped, e.g. IFCLENGTHMEASURE(0.3048))
                 // at [0], unit ref at [1].
                 split_top_level_args_into(rec.args, &mut fields_buf);
-                let value = fields_buf.first().and_then(|f| measure_number(f));
-                let unit_ref = ref_at(&fields_buf, 1);
-                measures.insert(rec.id, (value, unit_ref));
+                units.feed(rec.id, MEASURE_WITH_UNIT_TYPE, &fields_buf);
             }
             EntityKind::UnitAssignment => {
                 // IfcUnitAssignment(Units) — Units is a list of refs at arg[0].
                 split_top_level_args_into(rec.args, &mut fields_buf);
-                if let Some(f) = fields_buf.first() {
-                    if let Field::List(body) = parse_field(f) {
-                        if unit_assignment_refs.is_empty() {
-                            unit_assignment_refs = parse_ref_list(body);
-                        }
-                    }
-                }
+                units.feed(rec.id, UNIT_ASSIGN_TYPE, &fields_buf);
             }
             EntityKind::Aggregates => {
                 // IfcRelAggregates(_,_,_,_, RelatingObject, RelatedObjects).
@@ -1269,32 +990,10 @@ pub fn index(buf: &[u8]) -> IndexedFile {
     // IfcSIUnit (metric) or an IfcConversionBasedUnit (imperial:
     // FOOT / INCH, GH #73) — and derive metres-per-unit.
     let mut unit_warnings: Vec<String> = Vec::new();
-    out.unit_scale = resolve_length_scale(
-        &unit_assignment_refs,
-        &si_units,
-        &conv_units,
-        &measures,
-        &mut unit_warnings,
-    );
+    out.unit_scale = units.finish().length_scale(&mut unit_warnings);
     out.warnings.append(&mut unit_warnings);
 
     out
-}
-
-fn enum_at(fields: &[&[u8]], idx: usize) -> Option<String> {
-    let f = fields.get(idx)?;
-    match parse_field(f) {
-        Field::Enum(e) => std::str::from_utf8(e).ok().map(|s| s.to_string()),
-        _ => None,
-    }
-}
-
-fn ref_at(fields: &[&[u8]], idx: usize) -> Option<u64> {
-    let f = fields.get(idx)?;
-    match parse_field(f) {
-        Field::Ref(id) => Some(id),
-        _ => None,
-    }
 }
 
 fn extract_product(
@@ -2265,5 +1964,288 @@ ENDSEC;\nEND-ISO-10303-21;\n"
         let idx = index(src.as_bytes());
         assert_eq!(idx.product_entity, vec!["IfcGeographicElement".to_string()]);
         assert!(idx.skipped_product_type_counts.is_empty());
+    }
+}
+
+/// Pre-UnitTable `unit_scale` resolution, kept verbatim as the test oracle
+/// for routing `resolve_length_scale` through [`crate::units::UnitTable`]
+/// (GH #192 slice 2A). Deleting it deletes the proof.
+#[cfg(test)]
+mod unit_scale_legacy {
+    use super::{
+        string_at, CONVERSION_UNIT_TYPE, MEASURE_WITH_UNIT_TYPE, SI_UNIT_TYPE, UNIT_ASSIGN_TYPE,
+    };
+    use crate::lexer::{parse_field, parse_ref_list, split_top_level_args, Field};
+    use crate::units::{measure_number, si_length_scale_checked, SiScaleError};
+    use std::collections::HashMap;
+
+    fn enum_at(fields: &[&[u8]], idx: usize) -> Option<String> {
+        let f = fields.get(idx)?;
+        match parse_field(f) {
+            Field::Enum(e) => std::str::from_utf8(e).ok().map(|s| s.to_string()),
+            _ => None,
+        }
+    }
+
+    fn ref_at(fields: &[&[u8]], idx: usize) -> Option<u64> {
+        let f = fields.get(idx)?;
+        match parse_field(f) {
+            Field::Ref(id) => Some(id),
+            _ => None,
+        }
+    }
+    fn push_warning(collector: &mut Vec<String>, msg: String) {
+        collector.push(msg);
+    }
+
+    pub(super) fn resolve_length_scale_legacy(
+        unit_assignment_refs: &[u64],
+        si_units: &HashMap<u64, (String, String, String)>,
+        conv_units: &HashMap<u64, (String, String, Option<u64>)>,
+        measures: &HashMap<u64, (Option<f64>, Option<u64>)>,
+        warnings: &mut Vec<String>,
+    ) -> Option<f64> {
+        for unit_ref in unit_assignment_refs {
+            // SI length unit (metric files).
+            if let Some((ut, prefix, name)) = si_units.get(unit_ref) {
+                if ut.eq_ignore_ascii_case("LENGTHUNIT") {
+                    match si_length_scale_checked(prefix, name) {
+                        Ok(scale) => return Some(scale),
+                        Err(SiScaleError::UnknownPrefix) => push_warning(
+                            warnings,
+                            format!(
+                                "IfcSIUnit #{unit_ref} declares LENGTHUNIT with an \
+                                 unrecognised IfcSIPrefix {prefix:?} (name {name:?}); \
+                                 it cannot be converted to metres and is IGNORED \
+                                 rather than treated as the un-prefixed base unit \
+                                 (which would be wrong by a power of ten)."
+                            ),
+                        ),
+                        Err(SiScaleError::NotLength) => push_warning(
+                            warnings,
+                            format!(
+                                "IfcSIUnit #{unit_ref} declares UnitType LENGTHUNIT but \
+                                 an IfcSIUnitName of {name:?}, which is not a length \
+                                 unit; the declaration is inconsistent and is IGNORED."
+                            ),
+                        ),
+                    }
+                }
+                continue;
+            }
+            // Conversion-based length unit (imperial files: FOOT / INCH).
+            if let Some((ut, conv_name, factor_ref)) = conv_units.get(unit_ref) {
+                if !ut.eq_ignore_ascii_case("LENGTHUNIT") {
+                    continue;
+                }
+                let resolved =
+                    factor_ref
+                        .and_then(|fr| measures.get(&fr))
+                        .and_then(|(value, base_ref)| {
+                            let v = (*value)?;
+                            let base_ref = (*base_ref)?;
+                            let (base_ut, base_prefix, base_name) = si_units.get(&base_ref)?;
+                            if !base_ut.eq_ignore_ascii_case("LENGTHUNIT") {
+                                return None;
+                            }
+                            let base_scale =
+                                si_length_scale_checked(base_prefix, base_name).ok()?;
+                            Some(v * base_scale)
+                        });
+                match resolved {
+                    Some(scale) => return Some(scale),
+                    None => {
+                        push_warning(
+                            warnings,
+                            format!(
+                                "IfcConversionBasedUnit (LENGTHUNIT, name={conv_name:?}, \
+                                 #{unit_ref}) could not be resolved to a metres-per-unit \
+                                 scale; its ConversionFactor → IfcMeasureWithUnit → \
+                                 IfcSIUnit chain is missing or malformed. unit_scale is \
+                                 left unset (consumers default to metres, which is WRONG \
+                                 for this file)."
+                            ),
+                        );
+                        // Keep scanning: another LENGTHUNIT entry might resolve.
+                    }
+                }
+            }
+        }
+        // Nothing resolved. Distinguish "the file never declared units" from
+        // "it declared them and we failed" — both leave unit_scale unset, but
+        // they are different defects and the reader needs to know which.
+        if unit_assignment_refs.is_empty() {
+            push_warning(
+                warnings,
+                "no IfcUnitAssignment (or an empty one) was found in this file: \
+                 the project's length unit is UNDECLARED. unit_scale is left \
+                 unset; consumers that default to metres will be wrong by 1000× \
+                 on a millimetre-authored file."
+                    .to_string(),
+            );
+        } else {
+            push_warning(
+                warnings,
+                format!(
+                    "the IfcUnitAssignment lists {} unit(s) but none of them \
+                     resolved to a LENGTHUNIT metres-per-unit scale. unit_scale is \
+                     left unset; consumers that default to metres may be wrong.",
+                    unit_assignment_refs.len()
+                ),
+            );
+        }
+        None
+    }
+
+    /// The pre-UnitTable `extract_unit_scale` walk, verbatim.
+    pub(super) fn legacy_unit_scale(
+        table: &crate::entity_table::EntityTable,
+        warnings: &mut Vec<String>,
+    ) -> Option<f64> {
+        let mut si_units: HashMap<u64, (String, String, String)> = HashMap::new();
+        let mut conv_units: HashMap<u64, (String, String, Option<u64>)> = HashMap::new();
+        let mut measures: HashMap<u64, (Option<f64>, Option<u64>)> = HashMap::new();
+        let mut unit_assignment_refs: Vec<u64> = Vec::new();
+
+        for (step_id, type_name, args) in table.iter() {
+            if type_name.eq_ignore_ascii_case(SI_UNIT_TYPE) {
+                let fields = split_top_level_args(args);
+                let ut = enum_at(&fields, 1).unwrap_or_default();
+                let prefix = enum_at(&fields, 2).unwrap_or_default();
+                let name = enum_at(&fields, 3).unwrap_or_default();
+                si_units.insert(step_id, (ut, prefix, name));
+            } else if type_name.eq_ignore_ascii_case(CONVERSION_UNIT_TYPE) {
+                let fields = split_top_level_args(args);
+                let ut = enum_at(&fields, 1).unwrap_or_default();
+                let name = string_at(&fields, 2).unwrap_or_default();
+                let factor_ref = ref_at(&fields, 3);
+                conv_units.insert(step_id, (ut, name, factor_ref));
+            } else if type_name.eq_ignore_ascii_case(MEASURE_WITH_UNIT_TYPE) {
+                let fields = split_top_level_args(args);
+                let value = fields.first().and_then(|f| measure_number(f));
+                let unit_ref = ref_at(&fields, 1);
+                measures.insert(step_id, (value, unit_ref));
+            } else if type_name.eq_ignore_ascii_case(UNIT_ASSIGN_TYPE)
+                && unit_assignment_refs.is_empty()
+            {
+                let fields = split_top_level_args(args);
+                if let Some(f) = fields.first() {
+                    if let Field::List(body) = parse_field(f) {
+                        unit_assignment_refs = parse_ref_list(body);
+                    }
+                }
+            }
+        }
+        resolve_length_scale_legacy(
+            &unit_assignment_refs,
+            &si_units,
+            &conv_units,
+            &measures,
+            warnings,
+        )
+    }
+
+    /// Every `.ifc` under the repo's fixture trees (recursive: the IDS
+    /// conformance suite adds a few hundred small files), plus
+    /// `$IFCFAST_CORPUS` (colon-separated absolute paths; skipped when
+    /// unset).
+    fn unit_scale_files() -> Vec<std::path::PathBuf> {
+        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            let Ok(rd) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    walk(&p, out);
+                } else if p.extension().is_some_and(|x| x.eq_ignore_ascii_case("ifc")) {
+                    out.push(p);
+                }
+            }
+        }
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut out = Vec::new();
+        walk(&root.join("tests/fixtures"), &mut out);
+        walk(&root.join("../../tests/fixtures"), &mut out);
+        if let Ok(corpus) = std::env::var("IFCFAST_CORPUS") {
+            out.extend(
+                corpus
+                    .split(':')
+                    .filter(|s| !s.is_empty())
+                    .map(std::path::PathBuf::from),
+            );
+        }
+        out.sort();
+        out
+    }
+
+    /// `unit_scale` (bits) and its warnings are unchanged by routing the
+    /// resolution through `UnitTable`, on both entry points: the
+    /// EntityTable walk (`extract_unit_scale`) and the indexer's
+    /// streaming pass.
+    #[test]
+    fn length_scale_matches_legacy_on_fixtures_and_corpus() {
+        let files = unit_scale_files();
+        assert!(files.len() >= 20, "fixture walk found only {files:?}");
+        let mut resolved = 0usize;
+        for path in &files {
+            let buf = std::fs::read(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+            let table = crate::entity_table::EntityTable::build(&buf);
+            let mut w_old = Vec::new();
+            let old = legacy_unit_scale(&table, &mut w_old);
+            let mut w_new = Vec::new();
+            let new = crate::units::UnitTable::from_table(&table).length_scale(&mut w_new);
+            assert_eq!(
+                old.map(f64::to_bits),
+                new.map(f64::to_bits),
+                "{}: unit_scale {old:?} -> {new:?}",
+                path.display()
+            );
+            assert_eq!(w_old, w_new, "{}: warnings changed", path.display());
+            let idx = super::index(&buf);
+            assert_eq!(
+                old.map(f64::to_bits),
+                idx.unit_scale.map(f64::to_bits),
+                "{}: indexer unit_scale {:?} vs legacy {old:?}",
+                path.display(),
+                idx.unit_scale
+            );
+            for w in &w_old {
+                assert!(
+                    idx.warnings.contains(w),
+                    "{}: indexer lost warning {w:?}",
+                    path.display()
+                );
+            }
+            if old.is_some() {
+                resolved += 1;
+            }
+        }
+        eprintln!(
+            "unit_scale legacy equality: {} files ({} with a resolved length unit)",
+            files.len(),
+            resolved
+        );
+    }
+
+    /// The general resolver agrees with the length path wherever the
+    /// length path resolves (they differ only on nested conversion bases
+    /// and offset units, see `UnitTable::length_scale`).
+    #[test]
+    fn general_length_resolution_agrees_with_length_scale() {
+        for path in unit_scale_files() {
+            let buf = std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+            let table = crate::entity_table::EntityTable::build(&buf);
+            let units = crate::units::UnitTable::from_table(&table);
+            let mut w = Vec::new();
+            if let Some(s) = units.length_scale(&mut w) {
+                assert_eq!(
+                    units.scale_for_unit_type("LENGTHUNIT").map(f64::to_bits),
+                    Some(s.to_bits()),
+                    "{}",
+                    path.display()
+                );
+            }
+        }
     }
 }

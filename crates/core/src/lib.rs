@@ -44,6 +44,7 @@ pub mod guid;
 pub mod indexer;
 pub mod lexer;
 pub mod source;
+pub mod units;
 
 #[cfg(feature = "mesh")]
 pub mod mesh;

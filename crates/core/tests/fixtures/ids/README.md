@@ -17,3 +17,14 @@ Only a handful are vendored, as parse fixtures for
 full suite is fetched at the pinned sha by `scripts/fetch_ids_testcases.py`
 into `~/.cache/ifcfast/ids-testcases/<sha>/`; `ids_xml.rs` also walks
 that directory (or `$IFCFAST_IDS_TESTCASES`) when it exists.
+
+## ifcfast's own fixtures
+
+`props_units.ifc` is NOT from the buildingSMART suite: it is written for
+ifcfast (MIT, like the rest of the repository) as the fixture for
+`extractors::property_graph` and `units` (GH #192 slice 2): list,
+bounded, enumerated, table and complex properties, a property with its
+own `Unit`, a type-inherited pset shadowed by the instance, a quantity
+with its own `Unit`, an IFC2X3 `IfcExtendedMaterialProperties`, and a
+unit assignment with SI, conversion-based, derived, monetary and
+offset (°C) units.

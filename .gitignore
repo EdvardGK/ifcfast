@@ -36,6 +36,7 @@ Thumbs.db
 *.parquet
 !examples/**/*.ifc
 !tests/fixtures/*.ifc
+!crates/core/tests/fixtures/ids/*.ifc
 !python/ifcfast/data/*.ifc
 .vercel
 
