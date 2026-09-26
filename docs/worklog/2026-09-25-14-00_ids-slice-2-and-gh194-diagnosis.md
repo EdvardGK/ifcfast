@@ -1,7 +1,7 @@
 ## Agent signature
 - **Agent**: `claude-fable-5-1` (coordinator) with opus sub-agents (2A refactor, semantics spec, 2B facets, #194 diagnosis)
 - **Working tree**: `/home/edkjo/workspace/inbox/ifcfast`
-- **Branch**: `main` @ `7792bdc` → `cda4f78` (commits: `d8bf1d1` slice 2A, `cda4f78` slice 2B, `93669e6` worklog, `c843201` csg-smoke fix)
+- **Branch**: `main` @ `7792bdc` → `cc5d9b2` (commits: `d8bf1d1` slice 2A, `cda4f78` slice 2B, `93669e6` worklog, `c843201` csg-smoke fix, `cc5d9b2` worklog CI note)
 - **Session scope**: IDS slice 2 (Property / Classification / Material facets, PropertyGraph + UnitTable) shipped to main; GH #194 diagnosed (contract, not math)
 - **Touched paths**: `crates/core/src/extractors/{property_graph.rs (new),psets.rs,quantities.rs,materials.rs,classifications.rs,mod.rs}`, `crates/core/src/units.rs` (new), `crates/core/src/indexer.rs`, `crates/core/src/lib.rs`, `crates/core/src/ids/{graph.rs (new),eval,compile,report,restriction,candidates,mod,schema_tables}.rs`, `crates/core/tests/ids_eval.rs`, `crates/core/tests/fixtures/ids/props_units.ifc`, `.gitignore`, `scripts/{gen_schema_tables.py,dump_tables_ab.py (new)}`, `python/ifcfast/{ids.py,model.py}`, `AGENTS.md` + `python/ifcfast/data/AGENTS.md`, `docs/ids/{facet-semantics-slice2.md (new),ambiguities.md}`, `docs/plans/2026-09-24_ids-validation-design.md`
 - **Parallel sessions observed**: GH #194 filed 2026-09-24 15:54 by Ed from the edkjo box (signed "edkjo, revit-plugin/personal"); no commits on origin/main from others
@@ -80,3 +80,5 @@ No spruceledger node changed an action this session.
 - `git add -A . ':!scratch'` aborts on the ignored path and silently skips the commit; use `git add -A`.
 - `~/.cache/ifcfast/` bundle dirs are hash-named; the IDS suite is under `ids-testcases/<sha>/`.
 - Debug `psets::build` is 15–25 % slower after 2A (one Vec per PropDef + wrapper decode); check release timing before quoting.
+- **csg-smoke builds `--no-default-features --features csg`** (no `ids`): any extractor field whose only reader is `ids::*` needs `#[cfg_attr(not(feature = "ids"), allow(dead_code))]` or CI fails on every platform. Reproduce locally with `cargo check -p ifcfast-core --no-default-features --features csg` before pushing.
+- Full corpus pytest is 73–82 min on a debug `.so` and pushes the box into swap; run detached with `setsid nohup` and watch the log with a 30-min Monitor.
