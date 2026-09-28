@@ -1588,7 +1588,14 @@ ENDSEC;\nEND-ISO-10303-21;\n"
     /// twice (`10f32.powi(±18)`, `value_f32 × prefix_f32`); there the new
     /// value is the correctly rounded tier-1 `unit_scale`, one ulp away.
     #[test]
-    fn length_scale_bit_identical_to_legacy_where_legacy_resolved() {
+    // The legacy resolver rounded twice in f32 (`10f32.powi(n)` then
+    // `value_f32 * prefix_f32`), and `powi` is not correctly rounded — its
+    // result differs between hosts (the CI runner disagreed with the dev
+    // box by one ulp on a prefixed conversion unit). The new path rounds
+    // once from the f64 tier-1 scale, so the invariant that matters is
+    // "bit-identical to `unit_scale` as f32"; legacy is allowed one ulp of
+    // slack on plain units and two on prefixed-base conversion units.
+    fn length_scale_matches_tier1_and_stays_within_an_ulp_of_legacy() {
         let si = |prefix: &str| {
             units_ifc(&format!(
                 "#1=IFCUNITASSIGNMENT((#3,#2));\n\
@@ -1616,14 +1623,20 @@ ENDSEC;\nEND-ISO-10303-21;\n"
         exact.push(conv("0.3048", "$"));
         exact.push(conv("2.54", ".CENTI."));
         exact.push(conv("304.8", ".MILLI."));
+        let tier1_bits = |table: &EntityTable| {
+            (crate::units::UnitTable::from_table(table)
+                .length_scale(&mut Vec::new())
+                .unwrap() as f32)
+                .to_bits()
+        };
         for ifc in &exact {
             let table = EntityTable::build(ifc.as_bytes());
-            let old = legacy_length_scale::resolve_length_scale_legacy(&table);
-            assert!(old.is_some(), "{ifc}");
-            assert_eq!(
-                old.map(f32::to_bits),
-                resolve_length_scale_opt(&table).map(f32::to_bits),
-                "{ifc}: {old:?}"
+            let old = legacy_length_scale::resolve_length_scale_legacy(&table).unwrap();
+            let new = resolve_length_scale_opt(&table).unwrap();
+            assert_eq!(new.to_bits(), tier1_bits(&table), "{ifc}");
+            assert!(
+                old.to_bits().abs_diff(new.to_bits()) <= 1,
+                "{ifc}: {old} vs {new}"
             );
         }
         for ifc in [
@@ -1635,14 +1648,11 @@ ENDSEC;\nEND-ISO-10303-21;\n"
             let table = EntityTable::build(ifc.as_bytes());
             let old = legacy_length_scale::resolve_length_scale_legacy(&table).unwrap();
             let new = resolve_length_scale_opt(&table).unwrap();
-            let tier1 = crate::units::UnitTable::from_table(&table)
-                .length_scale(&mut Vec::new())
-                .unwrap();
-            assert_eq!(new.to_bits(), (tier1 as f32).to_bits(), "{ifc}");
-            assert_eq!(
-                old.to_bits().abs_diff(new.to_bits()),
-                1,
-                "{ifc}: {old} vs {new}"
+            assert_eq!(new.to_bits(), tier1_bits(&table), "{ifc}");
+            let ulps = old.to_bits().abs_diff(new.to_bits());
+            assert!(
+                (1..=2).contains(&ulps),
+                "{ifc}: {old} vs {new} ({ulps} ulps)"
             );
         }
 
@@ -1681,10 +1691,13 @@ ENDSEC;\nEND-ISO-10303-21;\n"
             match old {
                 Some(o) => {
                     resolved += 1;
-                    assert_eq!(
-                        Some(o.to_bits()),
-                        new.map(f32::to_bits),
-                        "{}: {old:?} -> {new:?}",
+                    let n = new.unwrap_or_else(|| {
+                        panic!("{}: legacy resolved, new did not", path.display())
+                    });
+                    assert_eq!(n.to_bits(), tier1_bits(&table), "{}", path.display());
+                    assert!(
+                        o.to_bits().abs_diff(n.to_bits()) <= 1,
+                        "{}: {o} -> {n}",
                         path.display()
                     );
                 }
@@ -1693,7 +1706,7 @@ ENDSEC;\nEND-ISO-10303-21;\n"
         }
         eprintln!(
             "mesh length_scale legacy equality: {} files, {resolved} resolved by legacy \
-             (all bit-identical), {newly} newly resolved",
+             (all within an ulp, new == tier-1), {newly} newly resolved",
             files.len()
         );
     }
