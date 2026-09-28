@@ -72,3 +72,17 @@ issues shipped in `5d87b44` (cache schema 34→35, unreleased). #195–#200 clos
 3. #194 still waits on Ed's contract decision.
 4. #204, #205 small follow-ons; #187, #186, #185, #182, #117, #191 queue.
 5. Ed by hand: post `pr24-reply.md` on PR #24 and close; close PR #90.
+
+## Release addendum (2026-09-28)
+
+Ed: "get it out there". **v0.6.0 released** — `782d3e1` (release commit) tagged
+`v0.6.0`; CI publish green (linux x86_64, windows, macOS arm64 + intel, sdist on
+PyPI with attestations); GitHub release created from the CHANGELOG 0.6.0 section.
+CHANGELOG got the missing IDS slices 1–2 "Added" entry. Site synced to the
+v0.6.0 wasm + regenerated sidecars (ifcfast-site `52dd0cb`, parity 18/18, no
+skips) — the parity gate caught **#206** (summary()/schemas listed 5 spaces
+columns, frame has 7): fixed on main `cf09c70` + pinned to the live frame,
+closed; v0.6.0 wheel carries the 5-column summary, next release carries the fix.
+Local gotcha repeated twice this session: `target/{debug,maturin}/lib_core.so`
+ends up 0 bytes after interleaved builds → `touch crates/core/src/lib.rs` +
+`maturin develop` under the lock repairs it.
