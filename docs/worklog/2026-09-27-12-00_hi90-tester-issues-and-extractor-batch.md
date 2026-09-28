@@ -1,7 +1,7 @@
 ## Agent signature
 - **Agent**: `claude-fable-5-1` (coordinator; opus agents for streams A/C/review-fix, sonnet for docs)
 - **Working tree**: `/home/edkjo/workspace/inbox/ifcfast`
-- **Branch**: `main` @ `cff9a36` → `5d87b44` (1 commit this session)
+- **Branch**: `main` @ `cff9a36` → `57d86f2` (3 commits this session: `5d87b44` v35, `a7896c8` worklog, `57d86f2` wasm test fix; CI green on `57d86f2`)
 - **Session scope**: HI90 tester issues #201–#203 + extractor batch #195–#200, shipped as cache schema v35
 - **Touched paths**: crates/core/src/{indexer.rs,lib.rs,units.rs,body_rep.rs,schema_products.rs,mesh/mod.rs,clash/engine.rs,extractors/*,ids/eval.rs}, crates/wasm/src/analysis.rs, crates/wasm/test/parity.mjs, python/ifcfast/{model.py,header.py,whitelist.py,clash.py,data/schema_supertypes.py,data/AGENTS.md}, scripts/{gen_schema_supertypes.py,gen_defined_type_names.py,dump_tables_ab.py,generate_sample_sidecars.py}, AGENTS.md, CHANGELOG.md, tests/ (5 new files + fixtures)
 - **Parallel sessions observed**: none on origin/main; issues #201–#203 were filed 2026-09-26 by a separate session signed "edkjo, hi90-mottakskontroll/personal-tool"
