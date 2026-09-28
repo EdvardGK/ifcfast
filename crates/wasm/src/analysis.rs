@@ -1352,8 +1352,9 @@ impl Analysis {
         // a class indexes to ZERO products, and without this the drop
         // zone renders an empty model with no explanation.
         //
-        // Keys are the STEP tokens the indexer counted — `IFCTUBEBUNDLE`,
-        // not `IfcTubeBundle`. The wheel title-cases them through
+        // Keys are the STEP tokens the indexer counted — `IFCACMEWIDGET`
+        // (a vendor class outside the schema), never title case. The
+        // wheel title-cases them through
         // `ifcfast.data.schema_supertypes.ALL_ENTITIES`, the full
         // IFC2X3/IFC4/IFC4X3 entity list generated into the Python
         // package; the wasm crate has no such list and the core's
@@ -2400,7 +2401,7 @@ mod tests {
         assert_eq!(summary["products"], json!(0));
         assert_eq!(
             summary["skipped_product_types"],
-            json!({ "IFCTUBEBUNDLE": 1 }),
+            json!({ "IFCACMEWIDGET": 1 }),
             "STEP spelling, not the wheel's title case — see the comment \
              in summary_json()"
         );
