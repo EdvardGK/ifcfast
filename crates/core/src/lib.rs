@@ -447,6 +447,31 @@ mod python {
             voids.set_item("host", PyList::new(py, &idx.voids_host)?)?;
             dict.set_item("voids", voids)?;
 
+            // GH #192 slice 3: IfcRelFillsElement (step ids; Python resolves
+            // guids through the product table like `voids`), IfcRelNests
+            // and IfcRelAssignsToGroup[ByFactor] (guids resolved in Rust:
+            // either side can be any IfcObjectDefinition).
+            let fills = PyDict::new(py);
+            fills.set_item("opening", PyList::new(py, &idx.fills_opening)?)?;
+            fills.set_item("element", PyList::new(py, &idx.fills_element)?)?;
+            dict.set_item("fills", fills)?;
+
+            let nests = PyDict::new(py);
+            nests.set_item("parent", PyList::new(py, &idx.nests_parent)?)?;
+            nests.set_item("child", PyList::new(py, &idx.nests_child)?)?;
+            nests.set_item("position", PyList::new(py, &idx.nests_position)?)?;
+            nests.set_item("parent_guid", PyList::new(py, &idx.nests_parent_guid)?)?;
+            nests.set_item("child_guid", PyList::new(py, &idx.nests_child_guid)?)?;
+            dict.set_item("nests", nests)?;
+
+            let groups = PyDict::new(py);
+            groups.set_item("group", PyList::new(py, &idx.groups_group)?)?;
+            groups.set_item("member", PyList::new(py, &idx.groups_member)?)?;
+            groups.set_item("group_guid", PyList::new(py, &idx.groups_group_guid)?)?;
+            groups.set_item("group_entity", PyList::new(py, &idx.groups_group_entity)?)?;
+            groups.set_item("member_guid", PyList::new(py, &idx.groups_member_guid)?)?;
+            dict.set_item("groups", groups)?;
+
             // IfcRelDefinesByType: (product_step_id, type_step_id) pairs, plus
             // the IfcTypeObject table that lets Python resolve type_step_id to
             // (type_guid, type_name, type_entity).

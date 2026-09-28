@@ -4,11 +4,12 @@ Design: ``docs/plans/2026-09-24_ids-validation-design.md`` (GH #192).
 
 IfcTester is the reference implementation; ifcfast is the speed-first
 companion (the same relationship ``m.mesh_qto()`` has to ifcopenshell
-geometry). Slices 1-2 implement the **Entity**, **Attribute**,
-**Property**, **Classification** and **Material** facets. An IDS that uses
-PartOf raises :class:`IdsUnsupportedError` (``on_unsupported="raise"``, the
-default) or marks that specification ``status="unsupported"``
-(``on_unsupported="mark"``) until GH #192 slice 3 lands. A value comparison
+geometry). Slices 1-3 implement all six facets: **Entity**,
+**Attribute**, **Property**, **Classification**, **Material** and
+**PartOf**. A construct the engine does not implement (some XSD regex
+blocks) raises :class:`IdsUnsupportedError` (``on_unsupported="raise"``,
+the default) or marks that specification ``status="unsupported"``
+(``on_unsupported="mark"``). A value comparison
 that needs a unit the model does not declare raises :class:`IdsUnitError`
 (or, under ``"mark"``, marks the spec ``unsupported_feature="unit:<TYPE>"``).
 Nothing is ever guessed.

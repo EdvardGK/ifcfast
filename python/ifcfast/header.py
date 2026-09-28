@@ -805,7 +805,16 @@ def _resolve_step_escapes(s: str) -> str:
 #       `quantities.unit_step_id` falls back to the first non-empty
 #       `IfcUnitAssignment`'s unit of any kind (conversion-based feet
 #       included), not just `IfcSIUnit`.
-_CACHE_SCHEMA_VERSION = 35
+#   36: GH #192 slice 3 — the tier-1 index gains three edge tables,
+#       `nests` (IfcRelNests: parent_guid, child_guid, position,
+#       parent_step_id, child_step_id), `groups` (IfcRelAssignsToGroup and
+#       …ByFactor: group_guid, group_entity, member_guid, group_step_id,
+#       member_step_id) and `fills` (IfcRelFillsElement: opening_guid,
+#       element_guid), written as nests/groups/fills.parquet. The cache
+#       reader requires all three, so a v35 bundle would read as corrupt
+#       rather than as "no edges"; the bump keys it away instead. No
+#       existing table changes.
+_CACHE_SCHEMA_VERSION = 36
 
 _FIELD_RE = re.compile(r"\(\s*(.*?)\s*\)\s*;", re.DOTALL)
 

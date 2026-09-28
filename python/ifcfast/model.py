@@ -407,6 +407,11 @@ class Model:
     _aggregates_df: Optional["object"] = field(repr=False, default=None)
     _storey_building_df: Optional["object"] = field(repr=False, default=None)
     _voids_df: Optional["object"] = field(repr=False, default=None)
+    # GH #192 slice 3: IfcRelNests / IfcRelAssignsToGroup[ByFactor] /
+    # IfcRelFillsElement edges (tier 1, cached like the other edge tables).
+    _nests_df: Optional["object"] = field(repr=False, default=None)
+    _groups_df: Optional["object"] = field(repr=False, default=None)
+    _fills_df: Optional["object"] = field(repr=False, default=None)
     _spaces_df: Optional["object"] = field(repr=False, default=None)
     _type_objects_df: Optional["object"] = field(repr=False, default=None)
     _graph: Optional["object"] = field(repr=False, default=None)
@@ -1158,9 +1163,10 @@ class Model:
         DataFrames plus ``.ok`` and ``.to_parquet(dir)``. Each call stands
         alone; nothing is cached on the Model.
 
-        Checks the Entity, Attribute, Property, Classification and
-        Material facets; PartOf raises :class:`ifcfast.IdsUnsupportedError`
-        unless ``on_unsupported="mark"``. See :func:`ifcfast.validate_ids`.
+        Checks all six IDS 1.0 facets (Entity, Attribute, Property,
+        Classification, Material, PartOf); a construct the engine does not
+        implement raises :class:`ifcfast.IdsUnsupportedError` unless
+        ``on_unsupported="mark"``. See :func:`ifcfast.validate_ids`.
         """
         from .ids import validate_ids as _validate_ids
 
@@ -1794,6 +1800,60 @@ class Model:
         return self._voids_df
 
     @property
+    def fills(self):
+        """Long-format ``IfcRelFillsElement`` edges — the companion of
+        :attr:`voids`.
+
+        DataFrame with columns ``opening_guid`` and ``element_guid`` —
+        one row per relation: the door / window / other element that
+        fills the opening. Join with :attr:`voids` on ``opening_guid`` to
+        get door → opening → wall. Same shape and resolution rule as
+        ``voids`` (both sides are products). Empty if the IFC declared
+        no fills.
+        """
+        import pandas as pd
+
+        if self._fills_df is None:
+            self._fills_df = pd.DataFrame(columns=_FILLS_COLUMNS)
+        return self._fills_df
+
+    @property
+    def nests(self):
+        """Long-format ``IfcRelNests`` edges (ports, MEP parts, tasks …).
+
+        DataFrame with columns ``parent_guid``, ``child_guid``,
+        ``position``, ``parent_step_id``, ``child_step_id`` — one row per
+        (relation, nested object), in file order. ``position`` is the
+        0-based index in ``RelatedObjects`` (ordered in IFC4+; the
+        written order in IFC2X3). Either side can be any
+        ``IfcObjectDefinition``, not only a product, so guids come
+        straight from the file. Empty if the IFC declared no nesting.
+        """
+        import pandas as pd
+
+        if self._nests_df is None:
+            self._nests_df = pd.DataFrame(columns=_NESTS_COLUMNS)
+        return self._nests_df
+
+    @property
+    def groups(self):
+        """Long-format group membership: ``IfcRelAssignsToGroup`` and
+        ``IfcRelAssignsToGroupByFactor``.
+
+        DataFrame with columns ``group_guid``, ``group_entity``,
+        ``member_guid``, ``group_step_id``, ``member_step_id`` — one row
+        per (relation, member), in file order. ``group_entity`` is the
+        group's class (``IfcDistributionSystem``, ``IfcZone``,
+        ``IfcBuildingSystem``, ``IfcInventory`` …). An element in several
+        systems has several rows. Empty if the IFC declared no groups.
+        """
+        import pandas as pd
+
+        if self._groups_df is None:
+            self._groups_df = pd.DataFrame(columns=_GROUPS_COLUMNS)
+        return self._groups_df
+
+    @property
     def spaces_df(self):
         """Tier-1 space index as a pandas DataFrame.
 
@@ -2080,6 +2140,9 @@ class Model:
             "aggregates": _df_meta(self._aggregates_df),
             "storey_building": _df_meta(self._storey_building_df),
             "voids": _df_meta(self._voids_df),
+            "nests": _df_meta(self._nests_df),
+            "groups": _df_meta(self._groups_df),
+            "fills": _df_meta(self._fills_df),
         }
         for name in ("psets", "quantities", "materials", "classifications", "drift", "segments"):
             tables[name] = _data_layer_meta(self._data_layers, name)
@@ -2153,6 +2216,9 @@ class Model:
             "aggregates": _df_schema(self._aggregates_df),
             "storey_building": _df_schema(self._storey_building_df),
             "voids": _df_schema(self._voids_df),
+            "nests": _df_schema(self._nests_df),
+            "groups": _df_schema(self._groups_df),
+            "fills": _df_schema(self._fills_df),
         }
         for name in ("psets", "quantities", "materials", "classifications", "drift", "segments"):
             df = (
@@ -2429,7 +2495,8 @@ class Model:
 
         Supported tables: ``products`` / ``storeys`` / ``spaces`` /
         ``type_objects`` / ``contained_in`` / ``aggregates`` /
-        ``storey_building`` / ``voids`` / ``psets`` / ``quantities`` /
+        ``storey_building`` / ``voids`` / ``nests`` / ``groups`` /
+        ``fills`` / ``psets`` / ``quantities`` /
         ``materials`` / ``classifications`` / ``drift`` / ``segments``.
         Triggers lazy extraction for the four data layers, drift, and
         the per-product mesh segments table; pure DataFrame slice for
@@ -2459,6 +2526,9 @@ class Model:
             "aggregates": "_aggregates_df",
             "storey_building": "_storey_building_df",
             "voids": "_voids_df",
+            "nests": "_nests_df",
+            "groups": "_groups_df",
+            "fills": "_fills_df",
         }.get(table)
         if df_attr is not None:
             df = getattr(self, df_attr)
@@ -3118,6 +3188,43 @@ def _index_native(
         voids_rows, columns=["opening_guid", "host_guid"]
     )
 
+    # GH #192 slice 3. Fills resolve like voids (both sides are products);
+    # nests / groups arrive guid-resolved from Rust because either side
+    # can be any IfcObjectDefinition (ports, systems, zones, tasks …).
+    fills_rows: list[tuple[str, str]] = []
+    fills_raw = raw.get("fills") or {}
+    for opening, element in zip(
+        fills_raw.get("opening", []), fills_raw.get("element", [])
+    ):
+        og = product_step_to_guid.get(int(opening))
+        eg = product_step_to_guid.get(int(element))
+        if og is not None and eg is not None:
+            fills_rows.append((og, eg))
+    fills_df = pd.DataFrame(fills_rows, columns=_FILLS_COLUMNS)
+
+    nests_raw = raw.get("nests") or {}
+    nests_df = pd.DataFrame(
+        {
+            "parent_guid": pd.Series(nests_raw.get("parent_guid", []), dtype=object),
+            "child_guid": pd.Series(nests_raw.get("child_guid", []), dtype=object),
+            "position": pd.Series(nests_raw.get("position", []), dtype="int64"),
+            "parent_step_id": pd.Series(nests_raw.get("parent", []), dtype="int64"),
+            "child_step_id": pd.Series(nests_raw.get("child", []), dtype="int64"),
+        },
+        columns=_NESTS_COLUMNS,
+    )
+    groups_raw = raw.get("groups") or {}
+    groups_df = pd.DataFrame(
+        {
+            "group_guid": pd.Series(groups_raw.get("group_guid", []), dtype=object),
+            "group_entity": pd.Series(groups_raw.get("group_entity", []), dtype=object),
+            "member_guid": pd.Series(groups_raw.get("member_guid", []), dtype=object),
+            "group_step_id": pd.Series(groups_raw.get("group", []), dtype="int64"),
+            "member_step_id": pd.Series(groups_raw.get("member", []), dtype="int64"),
+        },
+        columns=_GROUPS_COLUMNS,
+    )
+
     model = Model(
         header=hdr,
         schema=schema or "",
@@ -3136,6 +3243,9 @@ def _index_native(
         _aggregates_df=aggregates_df,
         _storey_building_df=storey_building_df,
         _voids_df=voids_df,
+        _nests_df=nests_df,
+        _groups_df=groups_df,
+        _fills_df=fills_df,
         _strict=strict,
     )
     # GH #73: classify the unit signal and fire the loud channel. Done
@@ -3296,9 +3406,21 @@ def _data_layer_meta(data_layers, name: str) -> dict:
 
 _PREVIEW_TABLES = {
     "products", "storeys", "spaces", "type_objects", "contained_in",
-    "aggregates", "storey_building", "voids", "psets", "quantities",
-    "materials", "classifications", "drift", "segments",
+    "aggregates", "storey_building", "voids", "nests", "groups", "fills",
+    "psets", "quantities", "materials", "classifications", "drift",
+    "segments",
 }
+
+# GH #192 slice 3 edge tables. Module-level so the empty frames, the
+# builder and the cache agree on one column order.
+_NESTS_COLUMNS = [
+    "parent_guid", "child_guid", "position", "parent_step_id", "child_step_id",
+]
+_GROUPS_COLUMNS = [
+    "group_guid", "group_entity", "member_guid", "group_step_id",
+    "member_step_id",
+]
+_FILLS_COLUMNS = ["opening_guid", "element_guid"]
 
 _VALID_MODES = {"count", "measure", "linear", "skip"}
 

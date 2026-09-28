@@ -27,6 +27,12 @@
 //!   (`Property.filter`, `facet.py:668-679`; ambiguity register A24).
 //! * Classification / Material: every `IfcObjectDefinition`
 //!   (`facet.py:412-417`, `:939-944`).
+//! * PartOf: IfcTester seeds every instance of the file (`list(ifc_file)`,
+//!   `facet.py:477-482`), but only an `IfcObjectDefinition` carries the
+//!   inverses a partOf reads (`Decomposes`, `Nests`, `HasAssignments`,
+//!   `ContainedInStructure`, `FillsVoids`, `VoidsElements`), and an
+//!   applicability facet is always `required`, so the seed is every
+//!   `IfcObjectDefinition` (subtypes included).
 //!
 //! The entity facet's `predefinedType`, and every other applicability
 //! facet, are then applied per candidate by `eval`.
@@ -75,7 +81,10 @@ pub fn seed(ctx: &Ctx, first: &CFacet) -> Vec<u64> {
                 occ
             }
         },
-        CFacet::Property(_) | CFacet::Classification(_) | CFacet::Material(_) => {
+        CFacet::Property(_)
+        | CFacet::Classification(_)
+        | CFacet::Material(_)
+        | CFacet::PartOf(_) => {
             let mut roots: Vec<&str> = vec!["IFCOBJECTDEFINITION"];
             if matches!(first, CFacet::Property(_)) && ctx.schema != Schema::Ifc2x3 {
                 roots.extend(["IFCMATERIALDEFINITION", "IFCPROFILEDEF"]);

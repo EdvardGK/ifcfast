@@ -15,10 +15,9 @@
 use super::attrs::py_repr_str;
 use super::ir::{Facet, FacetCardinality, Restriction, SpecCardinality, Val};
 
-/// Reason codes (design §3.2). Emitted today: entity, attribute,
-/// property, classification, material, prohibited and spec-level ones
-/// (PartOf arrives in slice 3). Mapping from IfcTester's reasons:
-/// `docs/ids/facet-semantics-slice2.md` §5.
+/// Reason codes (design §3.2). Every code is emitted. Mapping from
+/// IfcTester's reasons: `docs/ids/facet-semantics-slice2.md` §5 and
+/// `docs/ids/facet-semantics-slice3.md` §4 (PartOf).
 pub mod reason {
     pub const ENTITY_MISMATCH: &str = "ENTITY_MISMATCH";
     pub const PREDEFINED_MISMATCH: &str = "PREDEFINED_MISMATCH";
@@ -41,6 +40,11 @@ pub mod reason {
     pub const CLASS_VALUE_MISMATCH: &str = "CLASS_VALUE_MISMATCH";
     pub const MATERIAL_MISSING: &str = "MATERIAL_MISSING";
     pub const MATERIAL_VALUE_MISMATCH: &str = "MATERIAL_VALUE_MISMATCH";
+    /// No relation of the requested kind (IfcTester PartOf NOVALUE).
+    pub const PARTOF_MISSING: &str = "PARTOF_MISSING";
+    /// The related object's class or predefinedType does not match the
+    /// nested entity facet (IfcTester PartOf ENTITY / PREDEFINEDTYPE).
+    pub const PARTOF_ENTITY_MISMATCH: &str = "PARTOF_ENTITY_MISMATCH";
     pub const PROHIBITED_PRESENT: &str = "PROHIBITED_PRESENT";
     pub const SPEC_NO_APPLICABLE: &str = "SPEC_NO_APPLICABLE";
     pub const SPEC_PROHIBITED_APPLICABLE: &str = "SPEC_PROHIBITED_APPLICABLE";
@@ -151,7 +155,7 @@ pub struct FailuresTable {
     pub guid: Vec<Option<String>>,
     pub requirement_index: Vec<i16>,
     /// `entity` / `attribute` / `property` / `classification` /
-    /// `material` (`part_of` in slice 3).
+    /// `material` / `part_of`.
     pub facet_type: Vec<&'static str>,
     pub facet_cardinality: Vec<&'static str>,
     pub reason_code: Vec<&'static str>,
@@ -315,8 +319,33 @@ pub fn facet_label(
                 ],
                 vec![("value", py_str_val(nonempty(value.as_ref())))],
             ),
-            // Slice 3 ports the PartOf templates.
-            other => return format!("{} facet", other.kind()),
+            // facet.py:452-475; parameter order name, predefinedType,
+            // relation. With no relation every template needs {relation},
+            // so the label is IfcTester's "This facet cannot be
+            // interpreted" (ambiguity register A42).
+            Facet::PartOf { entity, relation } => (
+                &[
+                    "An element with an {relation} relationship with an {name}",
+                    "An element with an {relation} relationship",
+                ],
+                &[
+                    "An element must have an {relation} relationship with an {name} of predefined type {predefinedType}",
+                    "An element must have an {relation} relationship with an {name}",
+                    "An element must have an {relation} relationship",
+                ],
+                &[
+                    "An element must not have an {relation} relationship with an {name}",
+                    "An element must not have an {relation} relationship",
+                ],
+                vec![
+                    ("name", py_str_val(Some(&entity.name))),
+                    (
+                        "predefinedType",
+                        py_str_val(entity.predefined_type.as_ref()),
+                    ),
+                    ("relation", relation.map(|r| r.ids_token().to_string())),
+                ],
+            ),
         };
     // facet.py:128-145
     let templates: Vec<String> = match clause {

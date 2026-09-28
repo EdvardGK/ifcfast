@@ -7,6 +7,7 @@
 //! | property | [`PropertyGraph`] (`GraphScope::ALL`) + [`UnitTable`] + `IfcPreDefinedPropertySet` records via the schema tables | a property facet is present |
 //! | classification | `extractors::classifications::collect` | a classification facet is present |
 //! | material | `extractors::materials::collect` | a material facet is present |
+//! | partOf | [`RelData`]: first-in-file-order relation edges, positions from `doc::rel_rules` | a partOf facet is present |
 //!
 //! What each view returns is the IfcTester-shaped reading of the data
 //! (`docs/ids/facet-semantics-slice2.md`); the facet checks themselves
@@ -16,6 +17,7 @@ use std::collections::{HashMap, HashSet};
 
 use super::attrs::{read_attr, AttrValue, Record};
 use super::eval::Ctx;
+use super::ir::Schema;
 use super::schema_tables::{AttrDef, AttrKind};
 use super::IdsError;
 use crate::entity_table::EntityTable;
@@ -30,22 +32,175 @@ pub struct GraphNeeds {
     pub properties: bool,
     pub classifications: bool,
     pub materials: bool,
+    pub relations: bool,
 }
 
-/// Everything the property / classification / material facets read.
+/// Everything the property / classification / material / partOf facets
+/// read.
 pub struct Graph<'t> {
     pub props: Option<PropData<'t>>,
     pub classes: Option<ClassData>,
     pub materials: Option<MaterialData>,
+    pub rels: Option<RelData>,
 }
 
 impl<'t> Graph<'t> {
-    pub fn build(table: &'t EntityTable<'_>, needs: GraphNeeds) -> Graph<'t> {
+    pub fn build(table: &'t EntityTable<'_>, schema: Schema, needs: GraphNeeds) -> Graph<'t> {
         Graph {
             props: needs.properties.then(|| PropData::build(table)),
             classes: needs.classifications.then(|| ClassData::build(table)),
             materials: needs.materials.then(|| MaterialData::build(table)),
+            rels: needs.relations.then(|| RelData::build(table, schema)),
         }
+    }
+}
+
+// --------------------------------------------------------------------------
+// Relations (partOf, docs/ids/facet-semantics-slice3.md)
+// --------------------------------------------------------------------------
+
+/// The relation edges the partOf facet walks, each as "object → the one
+/// related object ifcopenshell returns". ifcopenshell reads an inverse
+/// attribute and takes its first member (`util/element.py`
+/// `get_aggregate` / `get_nest` / `get_container` / `get_filled_void` /
+/// `get_voided_element`; `PartOf.get_parent` and the group branch,
+/// `ifctester/facet.py:545-551`, `:624-631`); inverse members come back in
+/// FILE order, so the first relation in file order wins here (register
+/// A39). Field positions are `doc::rel_rules`'s, not re-derived.
+#[derive(Debug, Default)]
+pub struct RelData {
+    /// `Decomposes[0]` when it is an `IfcRelAggregates`: child → whole.
+    aggregate: HashMap<u64, u64>,
+    /// IFC4+ `Nests[0]`; IFC2X3 `Decomposes[0]` when it is an
+    /// `IfcRelNests`: part → host.
+    nest: HashMap<u64, u64>,
+    /// `ContainedInStructure[0]`: element → spatial structure. Only
+    /// visible from classes that carry the inverse (checked in
+    /// [`RelData::container`]).
+    container: HashMap<u64, u64>,
+    /// First `IfcRelAssignsToGroup` (or `…ByFactor`) of `HasAssignments`:
+    /// member → group.
+    group: HashMap<u64, u64>,
+    /// `FillsVoids[0]`: filling element → opening.
+    filled_void: HashMap<u64, u64>,
+    /// `VoidsElements[0]`: opening → voided element.
+    voided_element: HashMap<u64, u64>,
+}
+
+impl RelData {
+    fn build(table: &EntityTable<'_>, schema: Schema) -> RelData {
+        let mut d = RelData::default();
+        // IFC2X3: IfcRelAggregates and IfcRelNests both populate the one
+        // `Decomposes` inverse (both are IfcRelDecomposes); `get_aggregate`
+        // / `get_nest` look at its FIRST member only.
+        let mut decomposes: HashMap<u64, (u64, bool)> = HashMap::new();
+        let is_2x3 = schema == Schema::Ifc2x3;
+        for (_, ty, args) in table.iter() {
+            if ty.len() < 11 || !ty[..6].eq_ignore_ascii_case(b"IFCREL") {
+                continue;
+            }
+            let up = ty.to_ascii_uppercase();
+            // (map, child field is the rule's anchor?)
+            let target = match up.as_slice() {
+                b"IFCRELAGGREGATES" => 0,
+                b"IFCRELNESTS" => 1,
+                b"IFCRELCONTAINEDINSPATIALSTRUCTURE" => 2,
+                b"IFCRELASSIGNSTOGROUP" | b"IFCRELASSIGNSTOGROUPBYFACTOR" => 3,
+                b"IFCRELFILLSELEMENT" => 4,
+                b"IFCRELVOIDSELEMENT" => 5,
+                _ => continue,
+            };
+            let Some(rule) = crate::doc::rule_for(&up) else {
+                continue;
+            };
+            let fields = crate::lexer::split_top_level_args(args);
+            let anchor = crate::doc::field_refs(&fields, rule.anchor);
+            let pull = crate::doc::field_refs(&fields, rule.pull);
+            // Voids: anchor = the voided element, pull = the opening; the
+            // opening is the object that reads `VoidsElements`. Every
+            // other rule has the object side as its anchor.
+            let (objects, related) = if target == 5 {
+                (pull, anchor.first().copied())
+            } else {
+                (anchor, pull.first().copied())
+            };
+            let Some(related) = related else { continue };
+            for o in objects {
+                match target {
+                    0 | 1 if is_2x3 => {
+                        decomposes.entry(o).or_insert((related, target == 1));
+                    }
+                    0 => {
+                        d.aggregate.entry(o).or_insert(related);
+                    }
+                    1 => {
+                        d.nest.entry(o).or_insert(related);
+                    }
+                    2 => {
+                        d.container.entry(o).or_insert(related);
+                    }
+                    3 => {
+                        d.group.entry(o).or_insert(related);
+                    }
+                    4 => {
+                        d.filled_void.entry(o).or_insert(related);
+                    }
+                    _ => {
+                        d.voided_element.entry(o).or_insert(related);
+                    }
+                }
+            }
+        }
+        for (o, (related, is_nest)) in decomposes {
+            if is_nest {
+                d.nest.insert(o, related);
+            } else {
+                d.aggregate.insert(o, related);
+            }
+        }
+        d
+    }
+
+    /// ifcopenshell `get_aggregate`.
+    pub fn aggregate(&self, id: u64) -> Option<u64> {
+        self.aggregate.get(&id).copied()
+    }
+
+    /// ifcopenshell `get_nest`.
+    pub fn nest(&self, id: u64) -> Option<u64> {
+        self.nest.get(&id).copied()
+    }
+
+    /// ifcopenshell `get_container(element, should_get_direct=True)`: the
+    /// `ContainedInStructure` inverse exists on IfcElement, IfcAnnotation
+    /// and IfcGrid (IFC2X3, IFC4) / IfcPositioningElement (IFC4X3); any
+    /// other class listed in `RelatedElements` (an IfcSpace, say) has no
+    /// container as ifcopenshell reads it (register A40).
+    pub fn container(&self, ctx: &Ctx, id: u64, class: &str) -> Option<u64> {
+        let owners: &[&str] = if ctx.schema == Schema::Ifc4x3 {
+            &["IFCELEMENT", "IFCANNOTATION", "IFCPOSITIONINGELEMENT"]
+        } else {
+            &["IFCELEMENT", "IFCANNOTATION", "IFCGRID"]
+        };
+        if !owners.iter().any(|o| ctx.t.is_subtype_of(class, o)) {
+            return None;
+        }
+        self.container.get(&id).copied()
+    }
+
+    /// The first group of `HasAssignments` (IfcTester's group branch).
+    pub fn group(&self, id: u64) -> Option<u64> {
+        self.group.get(&id).copied()
+    }
+
+    /// ifcopenshell `get_filled_void`: element → the opening it fills.
+    pub fn filled_void(&self, id: u64) -> Option<u64> {
+        self.filled_void.get(&id).copied()
+    }
+
+    /// ifcopenshell `get_voided_element`: opening → the voided element.
+    pub fn voided_element(&self, id: u64) -> Option<u64> {
+        self.voided_element.get(&id).copied()
     }
 }
 

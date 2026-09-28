@@ -24,7 +24,8 @@
 use super::audit::lexical_ok;
 use super::datatypes::datatype_base;
 use super::ir::{
-    EntityFacet, Facet, FacetCardinality, IdsDocument, Schema, Spec, SpecCardinality, Val, XsdBase,
+    EntityFacet, Facet, FacetCardinality, IdsDocument, Relation, Schema, Spec, SpecCardinality,
+    Val, XsdBase,
 };
 use super::report::{facet_label, Clause};
 use super::restriction::{Actual, CompiledVal};
@@ -46,6 +47,8 @@ pub struct Needs {
     pub classifications: bool,
     /// Material strings ([`super::graph::MaterialData`]).
     pub materials: bool,
+    /// PartOf relation edges ([`super::graph::RelData`]).
+    pub relations: bool,
 }
 
 /// A compiled IDS document.
@@ -96,6 +99,7 @@ pub enum CFacet {
     Property(CProperty),
     Classification(CClassification),
     Material(CMaterial),
+    PartOf(CPartOf),
 }
 
 impl CFacet {
@@ -106,6 +110,7 @@ impl CFacet {
             CFacet::Property(_) => "property",
             CFacet::Classification(_) => "classification",
             CFacet::Material(_) => "material",
+            CFacet::PartOf(_) => "part_of",
         }
     }
 }
@@ -129,6 +134,18 @@ pub struct CProperty {
 pub struct CClassification {
     pub system: Option<CompiledVal>,
     pub value: Option<CompiledVal>,
+}
+
+/// A partOf facet (`docs/ids/facet-semantics-slice3.md`). The nested
+/// entity facet is matched against the RELATED object (the whole, the
+/// container, the group, the voided element): exact class, no subtypes,
+/// and its predefinedType compared as a plain value (IfcTester
+/// `PartOf.__call__`, `facet.py:503-622`, has no USERDEFINED query here).
+#[derive(Debug)]
+pub struct CPartOf {
+    pub entity: CEntity,
+    /// `None`: every relation, transitively (IfcTester `get_parent`).
+    pub relation: Option<Relation>,
 }
 
 /// A material facet (§3).
@@ -258,16 +275,6 @@ pub fn compile_with(
             .collect();
         let state = if opts.filter_ifc_version && !sp.ifc_versions.contains(&schema) {
             SpecState::SkippedIfcVersion
-        } else if let Some(feature) = unsupported_feature(sp) {
-            match opts.on_unsupported {
-                OnUnsupported::Raise => {
-                    return Err(IdsError::Unsupported {
-                        feature,
-                        spec_index: Some(sp.idx),
-                    })
-                }
-                OnUnsupported::Mark => SpecState::Unsupported { feature },
-            }
         } else {
             match compile_spec(sp, schema, t) {
                 Ok((applicability, requirements)) => {
@@ -280,6 +287,7 @@ pub fn compile_with(
                             CFacet::Property(_) => needs.properties = true,
                             CFacet::Classification(_) => needs.classifications = true,
                             CFacet::Material(_) => needs.materials = true,
+                            CFacet::PartOf(_) => needs.relations = true,
                             CFacet::Entity(_) | CFacet::Attribute(_) => {}
                         }
                     }
@@ -315,16 +323,6 @@ pub fn compile_with(
         needs,
         on_unsupported: opts.on_unsupported,
     })
-}
-
-/// The first facet this engine does not implement (PartOf until slice 3),
-/// as `facet:<kind>`.
-fn unsupported_feature(sp: &Spec) -> Option<String> {
-    sp.applicability
-        .iter()
-        .chain(sp.requirements.iter().map(|r| &r.facet))
-        .find(|f| matches!(f, Facet::PartOf { .. }))
-        .map(|f| format!("facet:{}", f.kind()))
 }
 
 fn spec_path(sp: &Spec) -> String {
@@ -371,7 +369,12 @@ fn compile_spec(sp: &Spec, schema: Schema, t: &'static SchemaTables) -> Result<C
                     compile_attribute(name, value.as_ref(), context.as_deref(), t).map_err(at)?;
                 applicability.push((i, CFacet::Attribute(ca)));
             }
-            Facet::Entity(_) | Facet::PartOf { .. } => {}
+            Facet::PartOf { entity, relation } => {
+                let cp = compile_part_of(entity, *relation, schema, t)
+                    .map_err(|m| invalid(sp, "applicability", i, m))?;
+                applicability.push((i, CFacet::PartOf(cp)));
+            }
+            Facet::Entity(_) => {}
             other => applicability.push((i, compile_data_facet(other, t).map_err(at)?)),
         }
     }
@@ -411,13 +414,13 @@ fn compile_spec(sp: &Spec, schema: Schema, t: &'static SchemaTables) -> Result<C
                 })?,
                 r.cardinality,
             ),
-            // unsupported_feature() ran first.
-            other => {
-                return Err(IdsError::Unsupported {
-                    feature: format!("facet:{}", other.kind()),
-                    spec_index: Some(sp.idx),
-                })
-            }
+            Facet::PartOf { entity, relation } => (
+                CFacet::PartOf(
+                    compile_part_of(entity, *relation, schema, t)
+                        .map_err(|m| invalid(sp, "requirements", i, m))?,
+                ),
+                r.cardinality,
+            ),
         };
         requirements.push(CRequirement {
             facet,
@@ -554,6 +557,20 @@ fn compile_entity(
         }
     };
     Ok(CEntity { name, predefined })
+}
+
+/// The nested entity facet of a partOf, resolved like an entity facet
+/// (an unknown class is an invalid IDS).
+fn compile_part_of(
+    e: &EntityFacet,
+    relation: Option<Relation>,
+    schema: Schema,
+    t: &'static SchemaTables,
+) -> Result<CPartOf, String> {
+    Ok(CPartOf {
+        entity: compile_entity(e, schema, t)?,
+        relation,
+    })
 }
 
 fn compile_attribute(
@@ -743,31 +760,25 @@ mod tests {
     }
 
     #[test]
-    fn ids_compile_unsupported_facets_raise_or_mark() {
-        let part_of = r#"<partOf><entity><name><simpleValue>IFCBUILDINGSTOREY</simpleValue></name></entity></partOf>"#;
+    fn ids_compile_part_of_resolves_entity_and_needs_relations() {
+        let part_of = r#"<partOf relation="IFCRELAGGREGATES"><entity><name><simpleValue>IFCBUILDINGSTOREY</simpleValue></name></entity></partOf>"#;
         let d = doc("IFC4", &ent("IFCWALL"), part_of);
-        match compile(&d, Schema::Ifc4) {
-            Err(IdsError::Unsupported {
-                feature,
-                spec_index,
-            }) => {
-                assert_eq!(feature, "facet:part_of");
-                assert_eq!(spec_index, Some(0));
-            }
+        let p = compile(&d, Schema::Ifc4).unwrap_or_else(|e| panic!("{e}"));
+        assert!(p.needs.relations && !p.needs.properties);
+        match &p.specs[0].state {
+            SpecState::Active { requirements, .. } => match &requirements[0].facet {
+                CFacet::PartOf(cp) => {
+                    assert_eq!(cp.relation, Some(Relation::Aggregates));
+                    assert!(cp.entity.name.matches_class("IFCBUILDINGSTOREY"));
+                }
+                other => panic!("{other:?}"),
+            },
             other => panic!("{other:?}"),
         }
-        let p = compile_with(
-            &d,
-            Schema::Ifc4,
-            ValidateOptions {
-                on_unsupported: OnUnsupported::Mark,
-                filter_ifc_version: false,
-            },
-        )
-        .unwrap_or_else(|e| panic!("{e}"));
-        assert!(
-            matches!(&p.specs[0].state, SpecState::Unsupported { feature } if feature == "facet:part_of")
-        );
+        // An unknown nested entity is an invalid IDS, as for an entity facet.
+        let bad = r#"<partOf><entity><name><simpleValue>IFCRABBIT</simpleValue></name></entity></partOf>"#;
+        let d = doc("IFC4", &ent("IFCWALL"), bad);
+        assert!(err(&d, Schema::Ifc4).contains("IFCRABBIT"));
     }
 
     fn prop(dt: &str) -> String {

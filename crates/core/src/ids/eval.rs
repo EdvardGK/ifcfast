@@ -6,7 +6,8 @@
 //!
 //! Property, classification and material facets follow
 //! `docs/ids/facet-semantics-slice2.md` and the slice-2 decisions in the
-//! ambiguity register (A14, A16, A26, D8).
+//! ambiguity register (A14, A16, A26, D8). PartOf follows
+//! `docs/ids/facet-semantics-slice3.md` (A39–A45).
 //!
 //! Serial for slices 1–2. // rayon: slice 5 — shard (spec × candidate chunk)
 //! over `table.order()`; the row order contract (spec_index, step_id,
@@ -18,13 +19,13 @@ use super::attrs::{py_repr_str, read_attr};
 use super::attrs::{AttrValue, Record};
 use super::candidates::seed;
 use super::compile::{
-    CAttribute, CClassification, CEntity, CFacet, CMaterial, CProperty, CompiledSpec, Needs, Plan,
-    SpecState,
+    CAttribute, CClassification, CEntity, CFacet, CMaterial, CPartOf, CProperty, CompiledSpec,
+    Needs, Plan, SpecState,
 };
 use super::datatypes::datatype_base;
-use super::graph::{Graph, GraphNeeds, PropData, PropSrc, PropView};
-use super::ir::XsdBase;
+use super::graph::{Graph, GraphNeeds, PropData, PropSrc, PropView, RelData};
 use super::ir::{FacetCardinality, Schema, SpecCardinality};
+use super::ir::{Relation, XsdBase};
 use super::report::{card_str, reason, spec_card_str, IdsReport};
 use super::restriction::py_float_repr;
 use super::restriction::Actual;
@@ -61,10 +62,12 @@ impl<'t, 'a> Ctx<'t, 'a> {
             occurrences: HashMap::new(),
             graph: Graph::build(
                 table,
+                schema,
                 GraphNeeds {
                     properties: needs.properties,
                     classifications: needs.classifications,
                     materials: needs.materials,
+                    relations: needs.relations,
                 },
             ),
         };
@@ -374,6 +377,7 @@ fn eval_facet(
         CFacet::Property(p) => eval_property(ctx, p, card, rec),
         CFacet::Classification(c) => eval_classification(ctx, c, card, rec),
         CFacet::Material(m) => eval_material(ctx, m, card, rec),
+        CFacet::PartOf(p) => eval_part_of(ctx, p, card, rec),
     }
 }
 
@@ -413,6 +417,7 @@ pub fn run(plans: &[Plan], table: &EntityTable, schema: Schema) -> Result<IdsRep
         needs.properties |= p.needs.properties;
         needs.classifications |= p.needs.classifications;
         needs.materials |= p.needs.materials;
+        needs.relations |= p.needs.relations;
     }
     let ctx = Ctx::new(table, schema, needs);
     let mut rep = IdsReport::default();
@@ -1125,6 +1130,207 @@ pub(crate) fn eval_material(
                 }
             }
         }
+    };
+    if card == FacetCardinality::Prohibited {
+        return Ok(if base.pass {
+            Outcome::fail(reason::PROHIBITED_PRESENT, base.actual, base.source)
+        } else {
+            Outcome::pass()
+        });
+    }
+    Ok(base)
+}
+
+// --------------------------------------------------------------------------
+// PartOf facet (docs/ids/facet-semantics-slice3.md)
+// --------------------------------------------------------------------------
+
+/// What one relation walk found.
+enum Walk {
+    /// No related object at all (IfcTester NOVALUE; for the default
+    /// relation an empty ancestor list, A43).
+    Missing,
+    /// A related object matched the nested entity facet; its class.
+    Match(String),
+    /// Related objects exist, none matched (IfcTester ENTITY /
+    /// PREDEFINEDTYPE); `actual` in IfcTester's form.
+    Mismatch(String),
+}
+
+/// Upper-case class of `id` for the `actual` column (the raw token when
+/// the schema does not know it).
+fn class_label(ctx: &Ctx, id: u64) -> String {
+    match ctx.class_of(id) {
+        Some(c) => c.to_string(),
+        None => ctx
+            .table
+            .type_of(id)
+            .map(|t| String::from_utf8_lossy(t).to_ascii_uppercase())
+            .unwrap_or_default(),
+    }
+}
+
+/// `predefined_type == self.predefinedType` (no USERDEFINED query in the
+/// partOf branches, `facet.py:510-521`, `:559-562`) plus the value for
+/// the `actual` column.
+fn part_of_predefined(ctx: &Ctx, e: &CEntity, id: u64) -> Result<(bool, Option<String>), IdsError> {
+    let Some(p) = &e.predefined else {
+        return Ok((true, None));
+    };
+    let pt = match ctx.load(id)? {
+        Some(rec) => ctx.predefined_type(&rec)?.0,
+        None => None,
+    };
+    let ok = pt
+        .as_ref()
+        .is_some_and(|v| p.val.matches(&Actual::Str(v.clone())));
+    Ok((ok, pt))
+}
+
+fn name_matches(ctx: &Ctx, e: &CEntity, id: u64) -> bool {
+    ctx.class_of(id).is_some_and(|c| e.name.matches_class(c))
+}
+
+/// The transitive branches (default relation, aggregates, nests,
+/// `facet.py:505-544`, `:577-598`): climb `step` until an ancestor's
+/// class matches the nested entity name; that first name match decides
+/// (its predefinedType must then match too, no further climbing).
+/// `actual` is the Python list of the classes climbed, the matched one
+/// suffixed `.<predefinedType>` when one is required. A cycle stops the
+/// climb (IfcTester would loop forever, A44).
+fn climb(
+    ctx: &Ctx,
+    e: &CEntity,
+    start: u64,
+    step: impl Fn(u64) -> Option<u64>,
+) -> Result<Walk, IdsError> {
+    let mut ancestors: Vec<String> = Vec::new();
+    let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    seen.insert(start);
+    let mut cur = step(start);
+    if cur.is_none() {
+        return Ok(Walk::Missing);
+    }
+    while let Some(id) = cur {
+        if !seen.insert(id) {
+            break;
+        }
+        ancestors.push(class_label(ctx, id));
+        if name_matches(ctx, e, id) {
+            if e.predefined.is_some() {
+                let (ok, pt) = part_of_predefined(ctx, e, id)?;
+                if let Some(last) = ancestors.last_mut() {
+                    last.push('.');
+                    last.push_str(pt.as_deref().unwrap_or("None"));
+                }
+                if ok {
+                    return Ok(Walk::Match(class_label(ctx, id)));
+                }
+            } else {
+                return Ok(Walk::Match(class_label(ctx, id)));
+            }
+            break;
+        }
+        cur = step(id);
+    }
+    Ok(Walk::Mismatch(format!(
+        "[{}]",
+        ancestors
+            .iter()
+            .map(|a| py_repr_str(a))
+            .collect::<Vec<_>>()
+            .join(", ")
+    )))
+}
+
+/// The direct branches (containment, group, voids/fills,
+/// `facet.py:545-576`, `:599-618`): one related object, class then
+/// predefinedType. `group_rule`: the group branch checks the
+/// predefinedType even after a class mismatch, and that reason wins
+/// (`facet.py:554-562`); the others check it only after a class match.
+fn direct(
+    ctx: &Ctx,
+    e: &CEntity,
+    related: Option<u64>,
+    group_rule: bool,
+) -> Result<Walk, IdsError> {
+    let Some(id) = related else {
+        return Ok(Walk::Missing);
+    };
+    let mut out = if name_matches(ctx, e, id) {
+        Walk::Match(class_label(ctx, id))
+    } else {
+        Walk::Mismatch(class_label(ctx, id))
+    };
+    if group_rule || matches!(out, Walk::Match(_)) {
+        let (ok, pt) = part_of_predefined(ctx, e, id)?;
+        if !ok {
+            out = Walk::Mismatch(pt.unwrap_or_else(|| "None".into()));
+        }
+    }
+    Ok(out)
+}
+
+/// ifcopenshell `get_parent` (`util/element.py`): direct container, then
+/// aggregate, nest, filled opening, voided element; IfcTester's
+/// `PartOf.get_parent` falls back to the first group (`facet.py:624-631`).
+fn default_parent(ctx: &Ctx, rd: &RelData, id: u64) -> Option<u64> {
+    let class = ctx.class_of(id)?;
+    rd.container(ctx, id, class)
+        .or_else(|| rd.aggregate(id))
+        .or_else(|| rd.nest(id))
+        .or_else(|| rd.filled_void(id))
+        .or_else(|| rd.voided_element(id))
+        .or_else(|| rd.group(id))
+}
+
+/// IfcTester `PartOf.__call__` (`facet.py:503-622`) with the slice-3
+/// decision that no related object at all is `PARTOF_MISSING` in every
+/// branch (A43).
+pub(crate) fn eval_part_of(
+    ctx: &Ctx,
+    p: &CPartOf,
+    card: FacetCardinality,
+    rec: &Record,
+) -> Result<Outcome, IdsError> {
+    let rd = ctx
+        .graph
+        .rels
+        .as_ref()
+        .ok_or_else(|| missing_graph("relation"))?;
+    let e = &p.entity;
+    let walk = match p.relation {
+        None => climb(ctx, e, rec.id, |id| default_parent(ctx, rd, id))?,
+        Some(Relation::Aggregates) => climb(ctx, e, rec.id, |id| rd.aggregate(id))?,
+        Some(Relation::Nests) => climb(ctx, e, rec.id, |id| rd.nest(id))?,
+        Some(Relation::ContainedInSpatialStructure) => {
+            direct(ctx, e, rd.container(ctx, rec.id, rec.class), false)?
+        }
+        Some(Relation::AssignsToGroup) => direct(ctx, e, rd.group(rec.id), true)?,
+        Some(Relation::VoidsElementFillsElement) => {
+            let host = if ctx.t.is_subtype_of(rec.class, "IFCOPENINGELEMENT") {
+                rd.voided_element(rec.id)
+            } else {
+                rd.filled_void(rec.id).and_then(|o| rd.voided_element(o))
+            };
+            direct(ctx, e, host, false)?
+        }
+    };
+    let base = match walk {
+        // `optional` never reaches here: the IDS 1.0 XSD allows only
+        // required / prohibited on <partOf> (the parser refuses it).
+        Walk::Missing => Outcome::fail(reason::PARTOF_MISSING, None, None),
+        Walk::Match(class) => Outcome {
+            pass: true,
+            reason: None,
+            actual: Some(class),
+            source: Some("instance"),
+        },
+        Walk::Mismatch(actual) => Outcome::fail(
+            reason::PARTOF_ENTITY_MISMATCH,
+            Some(actual),
+            Some("instance"),
+        ),
     };
     if card == FacetCardinality::Prohibited {
         return Ok(if base.pass {

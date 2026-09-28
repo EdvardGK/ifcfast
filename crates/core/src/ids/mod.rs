@@ -9,10 +9,11 @@
 //! (column-major specs / elements / failures). [`validate`] is the single
 //! entry point.
 //!
-//! Slices 1–2 implement the Entity, Attribute, Property, Classification
-//! and Material facets (the last three read the lazy data layer in
-//! [`graph`]). PartOf raises [`IdsError::Unsupported`] (`facet:part_of`)
-//! until GH #192 slice 3. A value comparison that needs an undeclared
+//! Slices 1–3 implement all six IDS 1.0 facets: Entity, Attribute,
+//! Property, Classification, Material and PartOf (the last four read the
+//! lazy data layer in [`graph`]). A construct the engine does not
+//! implement (some XSD regex blocks) raises [`IdsError::Unsupported`].
+//! A value comparison that needs an undeclared
 //! unit raises [`IdsError::UnresolvedUnit`], or under
 //! [`OnUnsupported::Mark`] marks that spec `unsupported` (`unit:<TYPE>`).
 //!

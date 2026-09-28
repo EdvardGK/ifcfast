@@ -17,10 +17,10 @@ Citations are against the pinned references:
 
 Status: the native engine implements the Entity and Attribute facets (GH #192 slice 1,
 `crates/core/src/ids/{compile,candidates,attrs,eval,report}.rs`) and the Property,
-Classification and Material facets (slice 2, plus `ids/graph.rs`); rows for those facets
-describe shipped behaviour, pinned by `crates/core/tests/ids_eval.rs` (all 334 suite cases
-agree with the filename truth: every folder but `partof` by result, `partof` as
-`Unsupported`). PartOf rows stay *intended* until slice 3 lands.
+Classification and Material facets (slice 2, plus `ids/graph.rs`) and the PartOf facet
+(slice 3, `ids/graph.rs` `RelData`); every row describes shipped behaviour, pinned by
+`crates/core/tests/ids_eval.rs` (all 334 suite cases agree with the filename truth by
+result, none `Unsupported`).
 
 ## Ambiguous in the text: follow IfcTester
 
@@ -174,3 +174,26 @@ of them (all 174 slice-2 cases agree either way). Code paths are `crates/core/sr
 | A37 | A list, enumerated, bounded or table member that is not comparable (a nested list or reference inside an `IfcValue` list) | Compared as a tuple and never equal (`facet.py:871-884`) | Never matches; under a bounded restriction (D8, all-of) it fails the check | `eval.rs` `check_prop`; none |
 | A38 | A property `dataType` that names an IFC4-only IfcValue / measure type in an IFC2X3 file (e.g. `IFCDATE`) | Not checked (no audit beyond the XSD, `ids.py:56-65`); the value simply never matches | `IdsInvalidError` at compile when the name is an IfcValue / measure type of some schema but not the file's (design §2.5). Enumeration dataTypes are only checked against `DataTypes.md` (the tables carry no full type list) | `compile.rs` `resolve_data_type`; `ids_compile_data_facets_and_datatypes` |
 
+## Slice 3 (PartOf) rows, 2026-09-28
+
+Spec: `docs/ids/facet-semantics-slice3.md`. No suite case pins any row below: every partof case
+names its relation explicitly and IfcTester agrees with all 34. Code paths are
+`crates/core/src/ids/{graph,eval,candidates,report}.rs`; the pinning test is
+`ids_eval.rs` `ids_part_of_relations_reason_codes_and_labels` (12 specs on
+`fixtures/ids/partof_relations.ifc`, cross-checked against IfcTester: same statuses, reasons
+and labels).
+
+| # | Point | IfcTester reading (source) | ifcfast | Pinning |
+|---|---|---|---|---|
+| A39 | Which relation counts when an object has several of one kind (several groups is valid IFC; several aggregates / containers / nests is not) | The inverse's first member (`Decomposes[0]`, `Nests[0]`, `ContainedInStructure[0]`, `FillsVoids[0]`, `VoidsElements[0]`, the first `IfcRelAssignsToGroup` of `HasAssignments`; `element.py:1041`, `:1286`, `:1305`, `:1324`, `:1349`, `facet.py:547-551`). ifcopenshell lists inverse members in **file order** (probe: `HasAssignments` = `[#20, #10, #30]` for that text order) | The first relation in file order, as A8 does for types. An element in two systems is checked against the first one only, as in IfcTester | `graph.rs` `RelData::build`; none |
+| A40 | An object listed in `IfcRelContainedInSpatialStructure.RelatedElements` whose class has no `ContainedInStructure` inverse (an `IfcSpace`: the inverse exists on IfcElement, IfcAnnotation, IfcGrid in IFC2X3 / IFC4, IfcElement, IfcAnnotation, IfcPositioningElement in IFC4X3) | `getattr(element, "ContainedInStructure", None)` is `None`, so no container (`element.py:1041`) | Same: the class gate in `RelData::container`. `m.contained_in` still lists the edge (it reports the file, not the facet) | `ids_eval.rs` spec `space`; none in the suite |
+| A41 | Candidates when partOf is the FIRST applicability facet | Every instance of the file (`list(ifc_file)`, `facet.py:477-482`) | Every `IfcObjectDefinition` (subtypes included): only those carry the inverses a partOf reads, and an applicability facet is always `required`, so nothing else can pass | `candidates.rs`; `ids_eval.rs` spec `applicability` |
+| A42 | Label of a partOf without `relation` | Every template needs `{relation}`, so `to_string` returns `This facet cannot be interpreted` (`facet.py:146-158`, `:458-474`) | Same text (label parity for slice 4) | `ids_eval.rs` `requirement_labels[0]` |
+| A43 | Reason codes | `NOVALUE`, `ENTITY` (a list for the transitive branches, a class for the direct ones), `PREDEFINEDTYPE`, `PROHIBITED` (`facet.py:522-618`, `PartOfResult`, `:1138-1147`). The no-relation walk reports `ENTITY` with `[]` when there is no parent at all | `PARTOF_MISSING` whenever there is no related object, the no-relation walk included; `ENTITY` and `PREDEFINEDTYPE` both → `PARTOF_ENTITY_MISMATCH` (the nested entity facet failed), `actual` in IfcTester's form (`"['IFCELEMENTASSEMBLY.TRUSS']"`, `IFCSPACE`, the predefined value); `PROHIBITED` → `PROHIBITED_PRESENT` with the matched class. Slice 4's `to_ifctester_json` maps back: `PARTOF_MISSING` → NOVALUE except the empty-list ENTITY case, `PARTOF_ENTITY_MISMATCH` → ENTITY or PREDEFINEDTYPE by relation and `actual` | `ids_eval.rs` failure rows; none |
+| A44 | A relation cycle (`A` aggregates `B`, `B` aggregates `A`; invalid IFC) | The `while` climb never ends (`facet.py:506-521`, `:530-543`, `:583-597`) | The climb stops at the first revisit and reports what it climbed | `eval.rs` `climb`; none |
+| A45 | IFC2X3 decomposition | `IfcRelAggregates` and `IfcRelNests` share the `Decomposes` inverse; `get_aggregate` / `get_nest` read `Decomposes[0]` and return `None` when it is the other kind (`element.py:1324`, `:1349`) | Same: one first-in-file-order decomposition per object, split by kind | `graph.rs` `RelData::build`; none |
+| A46 | Recursion for containment, groups and voids/fills | Direct only (`facet.py:545-576`, `:599-618`); only aggregation, nesting and the no-relation walk climb | Same (**open**). `partof-facet.md` says a named relation is "evaluated (recursively)" for every kind; for containment that can never chain (a spatial element is aggregated, not contained), for groups of groups and chained openings it could. The suite pins only aggregation (`the_containment_can_be_indirect_{1,2}_2`) and nesting (`nesting_may_be_indirect`) | none |
+
+Not ambiguities, recorded so nobody re-derives them: `optional` on `<partOf>` and a single
+`IFCRELVOIDSELEMENT` / `IFCRELFILLSELEMENT` relation are both outside the IDS 1.0 XSD; both
+engines refuse them (`IdsInvalidError` / `IdsXmlValidationError`).

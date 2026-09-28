@@ -50,8 +50,9 @@ Automate (Condition), a cron/Python job, or an MCP agent loop.
   (`m.point_cloud()`), and geometric quantities (`m.mesh_qto()`) —
   handed back as numpy / pandas, ready for trimesh / Open3D.
 - **Spatial-relationship graph built in.** `m.contained_in /
-  .aggregates / .storey_building` + seven traversal helpers. One call
-  walks wall → storey → building → site → project.
+  .aggregates / .storey_building / .voids / .fills / .nests / .groups`
+  + seven traversal helpers. One call walks wall → storey → building →
+  site → project.
 - **Self-describing.** `m.summary()` and `m.schemas` answer "what am I
   looking at" without triggering extracts. Every CLI subcommand has
   `--json`.
@@ -250,6 +251,9 @@ here too.
 | `IfcSpace` rows / as a DataFrame | `m.spaces` (list) / `m.spaces_df` (joined with product name + storey) |
 | `IfcTypeObject` rows / as a DataFrame | `m.type_objects` (list) / `m.type_objects_df` |
 | Opening → host edges (`IfcRelVoidsElement`) | `m.voids` |
+| Door / window → the opening it fills (`IfcRelFillsElement`) | `m.fills` (`opening_guid`, `element_guid`); join `m.voids` on `opening_guid` for door → opening → wall |
+| Nested parts: ports on a pump, parts of an element, tasks (`IfcRelNests`) | `m.nests` (`parent_guid`, `child_guid`, `position`, `parent_step_id`, `child_step_id`) |
+| System / zone / group membership (`IfcRelAssignsToGroup`, incl. `…ByFactor`) | `m.groups` (`group_guid`, `group_entity`, `member_guid`, `group_step_id`, `member_step_id`); `m.groups[m.groups.group_entity == "IfcDistributionSystem"]` |
 | Which representation items made a mesh | `m.segments` (joins `m.drift` on `guid` / `product_index`) |
 | Full agent guide as text (this document) | `ifcfast.agents_guide()` |
 | One label per elevation across discipline models | `ifcfast.federated_floors.synthesise_federated_floors(storeys)` |
@@ -258,7 +262,7 @@ here too.
 | Clash detection within one model | `ifcfast.clash("model.bundle/")` |
 | Cross-discipline clash (N models) | `ifcfast.clash(["ark.bundle/", "rib.bundle/"])` — federates, then clashes |
 | Merge N bundles into one substrate | `ifcfast.federate([a, b, …], out_dir)` |
-| Check a model against an IDS (buildingSMART IDS 1.0) | `m.validate_ids("spec.ids")` / `ifcfast.validate_ids(ids, ifc)` → `IdsReport(specs, elements, failures)`; `rep.ok`. Entity, Attribute, Property, Classification and Material facets today; PartOf raises `IdsUnsupportedError` — see [IDS validation](#ids-validation-mvalidate_ids) |
+| Check a model against an IDS (buildingSMART IDS 1.0) | `m.validate_ids("spec.ids")` / `ifcfast.validate_ids(ids, ifc)` → `IdsReport(specs, elements, failures)`; `rep.ok`. All six facets (Entity, Attribute, Property, Classification, Material, PartOf) — see [IDS validation](#ids-validation-mvalidate_ids) |
 
 ## Substrate output (DuckDB-queryable parquet)
 
@@ -504,6 +508,9 @@ ON a.source_model < b.source_model AND …`.
 *value* changed. Old caches become orphaned automatically. The browser
 build mirrors it at `CACHE_SCHEMA_VERSION` in `crates/wasm/src/analysis.rs`;
 the two are hashed into the same `cache_key` and bump in lockstep.
+Cache schema **v36** (GH #192 slice 3) added the `nests`, `groups` and
+`fills` edge tables (`nests.parquet` / `groups.parquet` / `fills.parquet`
+in the index cache); no existing table changed.
 
 **Cache freshness is verified, not assumed.** The cache key cannot see
 a same-size edit confined to the middle of a >8 MB file (its hash only
@@ -779,15 +786,16 @@ ifcopenshell at runtime, typed errors instead of guesses. Conformance is
 gated against the buildingSMART IDS test suite with IfcTester as the
 second voice (`tests/oracle/ids_conformance.py`).
 
-**Coverage today (slices 1–2): Entity, Attribute, Property,
-Classification and Material facets.** PartOf raises
-`IdsUnsupportedError` until GH #192 slice 3. Decide:
+**Coverage (slices 1–3): all six IDS 1.0 facets — Entity, Attribute,
+Property, Classification, Material and PartOf.** What can still raise
+`IdsUnsupportedError` is a construct inside a facet (some XSD regex
+blocks such as `\p{IsThai}`). Decide:
 
-| Your IDS uses… | Do this |
+| Your IDS … | Do this |
 |---|---|
-| no `partOf` facet | `m.validate_ids(ids)` — full result |
-| `partOf`, and you need every spec checked | run IfcTester for those specs (the error names the facet) |
-| a mix, and a partial answer is useful | `m.validate_ids(ids, on_unsupported="mark")` — those specs come back `status="unsupported"` with **no element rows**; `rep.ok` is `False` while any spec is unsupported |
+| parses and uses supported constructs (the usual case) | `m.validate_ids(ids)` — full result |
+| raises `IdsUnsupportedError`, and you need every spec checked | run IfcTester for those specs (the error names the construct and the spec) |
+| raises it, and a partial answer is useful | `m.validate_ids(ids, on_unsupported="mark")` — those specs come back `status="unsupported"` with **no element rows**; `rep.ok` is `False` while any spec is unsupported |
 
 ```python
 import ifcfast
@@ -817,7 +825,7 @@ until slice 4.
 | `cardinality` | category | `required` / `optional` / `prohibited` |
 | `status` | category | `pass` / `fail` / `skipped_ifc_version` / `unsupported` |
 | `reason_code` | category | `SPEC_NO_APPLICABLE` (required, nothing applicable) / `SPEC_PROHIBITED_APPLICABLE` / null |
-| `unsupported_feature` | string | e.g. `facet:part_of`, `xsd-regex:block:IsThai`, `unit:THERMODYNAMICTEMPERATUREUNIT`; null otherwise |
+| `unsupported_feature` | string | e.g. `xsd-regex:block:IsThai`, `unit:THERMODYNAMICTEMPERATUREUNIT`; null otherwise |
 | `applicable`, `passed`, `failed` | int64 | element counts |
 | `applicability_label` | string | IfcTester-style label, e.g. `All IFCWALL data` |
 | `requirement_labels` | list[str] | one label per requirement |
@@ -833,7 +841,7 @@ prohibited spec is `fail`.
 
 **`failures`** — one row per spec × element × failing requirement:
 `spec_index`, `step_id`, `guid`, `requirement_index` (int16),
-`facet_type` (`entity`/`attribute`/`property`/`classification`/`material`), `facet_cardinality`,
+`facet_type` (`entity`/`attribute`/`property`/`classification`/`material`/`part_of`), `facet_cardinality`,
 `reason_code`, `expected` (the requirement's IfcTester label), `actual`
 (Python-`str` of the value found; null when nothing was found),
 `value_source` (`instance` / `type`; null when no value).
@@ -851,8 +859,13 @@ so they count as absent — `optional` and `prohibited` pass),
 `IfcText`, CamelCase since v35), `PROP_VALUE_MISMATCH`, `CLASS_MISSING`,
 `CLASS_VALUE_MISMATCH`, `CLASS_SYSTEM_MISMATCH`, `MATERIAL_MISSING`,
 `MATERIAL_VALUE_MISMATCH` (`actual` = the sorted candidate set),
-`PROHIBITED_PRESENT`, `SPEC_NO_APPLICABLE`, `SPEC_PROHIBITED_APPLICABLE`.
-Reserved for slice 3: `PARTOF_MISSING`, `PARTOF_ENTITY_MISMATCH`.
+`PARTOF_MISSING` (no related object through that relation; with no
+`relation`, no parent at all), `PARTOF_ENTITY_MISMATCH` (related objects
+exist but the nested entity's class or predefinedType does not match;
+`actual` = the classes climbed as a Python list, e.g.
+`['IFCELEMENTASSEMBLY.TRUSS']`, for aggregates / nests / no relation, else
+the related class or its predefinedType), `PROHIBITED_PRESENT`,
+`SPEC_NO_APPLICABLE`, `SPEC_PROHIBITED_APPLICABLE`.
 
 `actual` on `PROP_DATATYPE_MISMATCH` is the value's type in CamelCase
 (`IfcText`, `IfcLengthMeasure`), as IfcTester prints it (GH #200).
@@ -905,6 +918,20 @@ are places IfcTester 0.8.5 differs — see `docs/ids/ambiguities.md`. An
   else the type's. `value` matches any of: material Name / Category, set
   name, layer / profile / constituent Name / Category and their
   material's Name / Category, list members.
+- **PartOf.** The nested entity is matched against the RELATED object
+  (exact class; its predefinedType resolves type-first like the entity
+  facet). `IFCRELAGGREGATES` and `IFCRELNESTS` climb transitively and the
+  first ancestor with a matching class decides; aggregation never crosses
+  containment. `IFCRELCONTAINEDINSPATIALSTRUCTURE` (direct container
+  only, and only for IfcElement / IfcAnnotation / IfcGrid — an IfcSpace
+  listed in a containment relation has no container),
+  `IFCRELASSIGNSTOGROUP` (the FIRST group assignment in file order,
+  ByFactor included) and `IFCRELVOIDSELEMENT IFCRELFILLSELEMENT`
+  (opening → voided element; door → filled opening → voided element) are
+  one step. No `relation`: climb container, aggregate, nest, filled
+  opening, voided element, then group, until a class matches. `optional`
+  is not allowed on `<partOf>` (XSD). Rules and the IfcTester reading:
+  `docs/ids/facet-semantics-slice3.md`.
 
 **Errors** (all subclass `ifcfast.IfcfastError`):
 
@@ -912,7 +939,7 @@ are places IfcTester 0.8.5 differs — see `docs/ids/ambiguities.md`. An
 |---|---|---|
 | `IdsInvalidError` | malformed IDS, or one that can never be satisfied for the file's schema: unknown entity / attribute, inverse or derived attribute, a value of the wrong literal type (`42.0` for an integer, `FALSE`), a pattern on a numeric attribute, a value check on an object / list / select attribute | `.path`, `.line` |
 | `IdsInvalidError` also | a property `dataType` that is not an IDS dataType, or an IfcValue / measure type the file's schema lacks | |
-| `IdsUnsupportedError` | valid IDS construct ifcfast does not implement (`partOf`, some XSD regex constructs); the message points to IfcTester | `.feature`, `.spec_index` |
+| `IdsUnsupportedError` | valid IDS construct ifcfast does not implement (some XSD regex constructs); the message points to IfcTester | `.feature`, `.spec_index` |
 | `IdsUnitError` | a value comparison needs a unit the model does not declare (`on_unsupported="raise"`) | `.unit_type` |
 | `IfcfastError` | the IFC is truncated or its `FILE_SCHEMA` is not IFC2X3 / IFC4 / IFC4X3* | — |
 
@@ -1752,6 +1779,8 @@ storeys — voids follow their host, and the spine is derived.
 
 ## Writing: `m.hotswap(guid, vertices, triangles)` — mesh swap
 
+`hotswap()` repoints whichever representation the mesher would have tessellated for that product — resolved via the same tiered body rule as `has_body` / `body_rep_type` (GH #202: `Body` / `Facetation`, then `Body-FallBack`, then an identifier-less solid / surface or mapped body) — not only a representation literally named `Body` (GH #204).
+
 The second write primitive: replace **one element's body geometry** with
 a new triangle mesh — the "swap a heavy mesh for a decimated one" move.
 It repoints that element's `Body` `IfcShapeRepresentation` at freshly
@@ -1838,9 +1867,7 @@ Decision rules:
 
 ## What `ifcfast` does NOT do (yet)
 
-- IDS PartOf facet (`IdsUnsupportedError`, GH #192 slice 3),
-  `to_ifctester_json()`
-  (slice 4), and XSD regex constructs with no Rust `regex` equivalent
+- IDS `to_ifctester_json()` (GH #192 slice 4), and XSD regex constructs with no Rust `regex` equivalent
   (e.g. some `\p{Is…}` blocks, complex class subtraction) —
   `IdsUnsupportedError` names the construct. Use IfcTester for those.
 - Mutate quantity values (`IfcElementQuantity`), enumerated / bounded /

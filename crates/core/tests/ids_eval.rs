@@ -1,6 +1,5 @@
-//! IDS evaluation against the buildingSMART conformance suite (slices 1–2:
-//! Entity, Attribute, Property, Classification and Material facets) plus
-//! report-shape checks.
+//! IDS evaluation against the buildingSMART conformance suite (slices 1–3:
+//! all six facets) plus report-shape checks.
 //!
 //! Suite: `$IFCFAST_IDS_TESTCASES` or
 //! `~/.cache/ifcfast/ids-testcases/a67047736aa93586d723329fce3aab1b9ac056af/`
@@ -9,24 +8,18 @@
 //!
 //! Truth from the filename (TestCases/scripts.md, design §4):
 //! `pass-` → report ok; `fail-` → not ok; `invalid-` → `InvalidIds` or
-//! not ok. A case whose IDS uses PartOf (slice 3) must raise
-//! `Unsupported` (an `invalid-` one may also be refused as `InvalidIds` by
-//! the parse-time audit).
+//! not ok. No case may raise `Unsupported`.
 #![cfg(feature = "ids")]
 
 use std::path::PathBuf;
 
 use _core::entity_table::EntityTable;
-use _core::ids::ir::Facet;
 use _core::ids::{
-    parse_ids, schema_from_header, validate, validate_with, IdsError, OnUnsupported,
-    ValidateOptions,
+    schema_from_header, validate, validate_with, IdsError, OnUnsupported, ValidateOptions,
 };
 
 const SUITE_SHA: &str = "a67047736aa93586d723329fce3aab1b9ac056af";
-/// Slice-1 and slice-2 folders (real outcomes), then `partof`, whose
-/// facet arrives in slice 3 (every case there must be `Unsupported`, or
-/// `InvalidIds` for an `invalid-` case refused by the parse-time audit).
+/// Every folder of the suite.
 const FOLDERS: &[&str] = &[
     "entity",
     "attribute",
@@ -93,27 +86,7 @@ fn run_case(ids: &[u8], ifc: &[u8]) -> (Got, String) {
     }
 }
 
-/// Does the IDS use a facet this engine does not implement yet (PartOf)?
-/// From the IR when it parses, else from the raw text.
-fn uses_unsupported_facet(ids: &[u8]) -> bool {
-    match parse_ids(ids) {
-        Ok(doc) => doc.specs.iter().any(|s| {
-            s.applicability
-                .iter()
-                .chain(s.requirements.iter().map(|r| &r.facet))
-                .any(|f| matches!(f, Facet::PartOf { .. }))
-        }),
-        Err(_) => {
-            let t = String::from_utf8_lossy(ids);
-            t.contains("<partOf") || t.contains(":partOf")
-        }
-    }
-}
-
-fn agrees(expected: &str, unsupported: bool, got: Got) -> bool {
-    if unsupported {
-        return got == Got::Unsupported || (expected == "invalid" && got == Got::Invalid);
-    }
+fn agrees(expected: &str, got: Got) -> bool {
     match expected {
         "pass" => got == Got::Pass,
         "fail" => got == Got::Fail,
@@ -153,7 +126,6 @@ fn ids_conformance_suite() {
             let ifc_path = ids_path.with_extension("ifc");
             let ifc =
                 std::fs::read(&ifc_path).unwrap_or_else(|e| panic!("{}: {e}", ifc_path.display()));
-            let unsupported = uses_unsupported_facet(&ids);
             let (got, detail) = run_case(&ids, &ifc);
             row[0] += 1;
             match expected {
@@ -173,17 +145,12 @@ fn ids_conformance_suite() {
             if got == Got::Fail && std::env::var_os("IFCFAST_IDS_VERBOSE").is_some() {
                 println!("  failed {folder}/{stem}: {detail}");
             }
-            if agrees(expected, unsupported, got) {
+            if agrees(expected, got) {
                 row[6] += 1;
             } else {
                 row[7] += 1;
                 mismatches.push(format!(
-                    "{folder}/{stem}: expected {expected}{}, got {got:?} — {detail}",
-                    if unsupported {
-                        " (unsupported facet)"
-                    } else {
-                        ""
-                    }
+                    "{folder}/{stem}: expected {expected}, got {got:?} — {detail}"
                 ));
             }
         }
@@ -240,7 +207,8 @@ fn ids(specs: &str) -> String {
 const WALL_NAME: &str = r#"<specification name="walls named" ifcVersion="IFC4"><applicability minOccurs="1" maxOccurs="unbounded"><entity><name><simpleValue>IFCWALL</simpleValue></name></entity></applicability><requirements><attribute><name><simpleValue>Name</simpleValue></name></attribute><entity><name><simpleValue>IFCWALL</simpleValue></name><predefinedType><simpleValue>SOLIDWALL</simpleValue></predefinedType></entity></requirements></specification>"#;
 const DOORS: &str = r#"<specification name="doors" ifcVersion="IFC4"><applicability minOccurs="1" maxOccurs="unbounded"><entity><name><simpleValue>IFCDOOR</simpleValue></name></entity></applicability></specification>"#;
 const NO_SLABS: &str = r#"<specification name="no slabs" ifcVersion="IFC4"><applicability minOccurs="0" maxOccurs="0"><entity><name><simpleValue>IFCSLAB</simpleValue></name></entity></applicability></specification>"#;
-const PART_OF: &str = r#"<specification name="partof" ifcVersion="IFC4"><applicability minOccurs="1" maxOccurs="unbounded"><entity><name><simpleValue>IFCWALL</simpleValue></name></entity></applicability><requirements><partOf><entity><name><simpleValue>IFCBUILDINGSTOREY</simpleValue></name></entity></partOf></requirements></specification>"#;
+/// An XSD regex block the engine does not implement (`\p{IsThai}`).
+const THAI: &str = r#"<specification name="thai" ifcVersion="IFC4"><applicability minOccurs="1" maxOccurs="unbounded"><entity><name><simpleValue>IFCWALL</simpleValue></name></entity></applicability><requirements><attribute><name><simpleValue>Name</simpleValue></name><value><xs:restriction base="xs:string"><xs:pattern value="\p{IsThai}+"/></xs:restriction></value></attribute></requirements></specification>"#;
 
 #[test]
 fn ids_report_columns_and_reason_codes() {
@@ -304,7 +272,7 @@ fn ids_report_columns_and_reason_codes() {
 fn ids_unsupported_raise_vs_mark() {
     let buf = IFC.as_bytes();
     let table = EntityTable::build(buf);
-    let x = ids(&format!("{WALL_NAME}{PART_OF}"));
+    let x = ids(&format!("{WALL_NAME}{THAI}"));
     match validate(
         x.as_bytes(),
         &table,
@@ -315,7 +283,7 @@ fn ids_unsupported_raise_vs_mark() {
             feature,
             spec_index,
         }) => {
-            assert_eq!(feature, "facet:part_of");
+            assert_eq!(feature, "xsd-regex:block:IsThai");
             assert_eq!(spec_index, Some(1));
         }
         other => panic!("{other:?}"),
@@ -330,7 +298,7 @@ fn ids_unsupported_raise_vs_mark() {
     assert_eq!(r.specs.status, vec!["fail", "unsupported"]);
     assert_eq!(
         r.specs.unsupported_feature[1].as_deref(),
-        Some("facet:part_of")
+        Some("xsd-regex:block:IsThai")
     );
     assert!(
         r.elements.spec_index.iter().all(|&i| i == 0),
@@ -669,4 +637,208 @@ fn ids_unresolved_unit_raise_vs_mark() {
     )
     .unwrap_or_else(|e| panic!("{e}"));
     assert!(r.ok());
+}
+
+// --------------------------------------------------------------------------
+// PartOf (slice 3) on a hand-written relations fixture
+// --------------------------------------------------------------------------
+
+const RELS_IFC: &str = include_str!("fixtures/ids/partof_relations.ifc");
+
+fn ent_xml(name: &str) -> String {
+    format!("<entity><name><simpleValue>{name}</simpleValue></name></entity>")
+}
+
+/// `<partOf>` with an optional relation, cardinality and predefinedType.
+fn part_of_xml(rel: Option<&str>, card: &str, name: &str, pt: Option<&str>) -> String {
+    let rel = rel.map_or(String::new(), |r| format!(r#" relation="{r}""#));
+    let card = if card.is_empty() {
+        String::new()
+    } else {
+        format!(r#" cardinality="{card}""#)
+    };
+    let pt = pt.map_or(String::new(), |p| {
+        format!("<predefinedType><simpleValue>{p}</simpleValue></predefinedType>")
+    });
+    format!(
+        "<partOf{rel}{card}><entity><name><simpleValue>{name}</simpleValue></name>{pt}</entity></partOf>"
+    )
+}
+
+fn spec_xml(name: &str, app: &str, req: &str) -> String {
+    format!(
+        r#"<specification name="{name}" ifcVersion="IFC4"><applicability minOccurs="1" maxOccurs="unbounded">{app}</applicability><requirements>{req}</requirements></specification>"#
+    )
+}
+
+#[test]
+fn ids_part_of_relations_reason_codes_and_labels() {
+    let buf = RELS_IFC.as_bytes();
+    let table = EntityTable::build(buf);
+    let schema = schema_from_header(buf).unwrap_or_else(|e| panic!("{e}"));
+    const VF: &str = "IFCRELVOIDSELEMENT IFCRELFILLSELEMENT";
+    let specs = [
+        // 0: default relation climbs nest → aggregate → containment.
+        spec_xml(
+            "default",
+            &ent_xml("IFCDISCRETEACCESSORY"),
+            &part_of_xml(None, "", "IFCBUILDINGSTOREY", None),
+        ),
+        // 1: the compound relation, door → opening → wall.
+        spec_xml(
+            "fills",
+            &ent_xml("IFCDOOR"),
+            &part_of_xml(Some(VF), "", "IFCWALL", None),
+        ),
+        // 2: group with predefinedType.
+        spec_xml(
+            "group",
+            &ent_xml("IFCDOOR"),
+            &part_of_xml(
+                Some("IFCRELASSIGNSTOGROUP"),
+                "",
+                "IFCDISTRIBUTIONSYSTEM",
+                Some("ELECTRICAL"),
+            ),
+        ),
+        // 3: aggregates stay within aggregates (the assembly is contained,
+        //    not aggregated, so the building is never reached).
+        spec_xml(
+            "agg",
+            &ent_xml("IFCBEAM"),
+            &part_of_xml(Some("IFCRELAGGREGATES"), "", "IFCBUILDING", None),
+        ),
+        // 4: an IfcSpace listed in RelatedElements has no
+        //    ContainedInStructure inverse (A40).
+        spec_xml(
+            "space",
+            &ent_xml("IFCSPACE"),
+            &part_of_xml(
+                Some("IFCRELCONTAINEDINSPATIALSTRUCTURE"),
+                "",
+                "IFCBUILDINGSTOREY",
+                None,
+            ),
+        ),
+        // 5: default relation through fills and voids: door → opening →
+        //    wall → storey.
+        spec_xml(
+            "default-fills",
+            &ent_xml("IFCDOOR"),
+            &part_of_xml(None, "", "IFCBUILDINGSTOREY", None),
+        ),
+        // 6: no relation of the kind: PARTOF_MISSING.
+        spec_xml(
+            "required",
+            &ent_xml("IFCWALL"),
+            &part_of_xml(Some("IFCRELNESTS"), "", "IFCBEAM", None),
+        ),
+        // 7: prohibited.
+        spec_xml(
+            "prohibited",
+            &ent_xml("IFCBEAM"),
+            &part_of_xml(
+                Some("IFCRELAGGREGATES"),
+                "prohibited",
+                "IFCELEMENTASSEMBLY",
+                None,
+            ),
+        ),
+        // 8: partOf as the first applicability facet.
+        spec_xml(
+            "applicability",
+            &part_of_xml(Some("IFCRELAGGREGATES"), "", "IFCELEMENTASSEMBLY", None),
+            "",
+        ),
+        // 9: group rule: the predefinedType is checked after a class
+        //    mismatch and names the failure.
+        spec_xml(
+            "group-pt",
+            &ent_xml("IFCDOOR"),
+            &part_of_xml(Some("IFCRELASSIGNSTOGROUP"), "", "IFCZONE", Some("SEWAGE")),
+        ),
+        // 10: ByFactor counts as a group assignment.
+        spec_xml(
+            "byfactor",
+            &ent_xml("IFCSPACE"),
+            &part_of_xml(Some("IFCRELASSIGNSTOGROUP"), "", "IFCZONE", None),
+        ),
+        // 11: transitive aggregate predefinedType, first name match decides.
+        spec_xml(
+            "agg-pt",
+            &ent_xml("IFCBEAM"),
+            &part_of_xml(
+                Some("IFCRELAGGREGATES"),
+                "",
+                "IFCELEMENTASSEMBLY",
+                Some("GIRDER"),
+            ),
+        ),
+    ]
+    .concat();
+    let r = validate(ids(&specs).as_bytes(), &table, schema, OnUnsupported::Raise)
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(
+        r.specs.status,
+        vec![
+            "pass", "pass", "pass", "fail", "fail", "pass", "fail", "fail", "pass", "fail", "pass",
+            "fail"
+        ]
+    );
+    assert_eq!(r.specs.applicable[8], 1);
+    let rows: Vec<(i32, i64, &str, Option<&str>)> = (0..r.failures.spec_index.len())
+        .map(|i| {
+            (
+                r.failures.spec_index[i],
+                r.failures.step_id[i],
+                r.failures.reason_code[i],
+                r.failures.actual[i].as_deref(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        rows,
+        vec![
+            (
+                3,
+                8,
+                "PARTOF_ENTITY_MISMATCH",
+                Some("['IFCELEMENTASSEMBLY']")
+            ),
+            (4, 11, "PARTOF_MISSING", None),
+            (6, 4, "PARTOF_MISSING", None),
+            (7, 8, "PROHIBITED_PRESENT", Some("IFCELEMENTASSEMBLY")),
+            (9, 6, "PARTOF_ENTITY_MISMATCH", Some("ELECTRICAL")),
+            (
+                11,
+                8,
+                "PARTOF_ENTITY_MISMATCH",
+                Some("['IFCELEMENTASSEMBLY.TRUSS']")
+            ),
+        ]
+    );
+    assert!(r.failures.facet_type.iter().all(|f| *f == "part_of"));
+    // Labels: IfcTester templates (facet.py:452-475).
+    assert_eq!(
+        r.specs.requirement_labels[0],
+        vec!["This facet cannot be interpreted"]
+    );
+    assert_eq!(
+        r.specs.requirement_labels[2],
+        vec!["An element must have an IFCRELASSIGNSTOGROUP relationship with an IFCDISTRIBUTIONSYSTEM of predefined type ELECTRICAL"]
+    );
+    assert_eq!(
+        r.specs.requirement_labels[6],
+        vec!["An element must have an IFCRELNESTS relationship with an IFCBEAM"]
+    );
+    assert_eq!(
+        r.specs.requirement_labels[7],
+        vec![
+            "An element must not have an IFCRELAGGREGATES relationship with an IFCELEMENTASSEMBLY"
+        ]
+    );
+    assert_eq!(
+        r.specs.applicability_label[8],
+        "An element with an IFCRELAGGREGATES relationship with an IFCELEMENTASSEMBLY"
+    );
 }

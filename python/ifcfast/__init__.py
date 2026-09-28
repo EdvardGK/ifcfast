@@ -61,8 +61,8 @@ Public API:
 * :func:`bundle` — write the parquet substrate for one IFC.
 * :func:`federate` — merge N substrate bundles into one clash-able bundle.
 * :func:`clash` — clash detection against a bundle (or a list of them).
-* :func:`validate_ids` — check a model against IDS 1.0 files (Entity +
-  Attribute facets today; others raise :class:`IdsUnsupportedError`).
+* :func:`validate_ids` — check a model against IDS 1.0 files (all six
+  facets; an unimplemented construct raises :class:`IdsUnsupportedError`).
 * :class:`Model` — parsed index, lazy data layers, spatial-graph helpers.
 * :class:`ProductRow`, :class:`StoreyRow` — row dataclasses.
 * :mod:`ifcfast.classify` — element-mode policy.
@@ -299,6 +299,7 @@ Substrate + clash (GeoParquet, model-scale analysis):
 
 Spatial-relationship graph:
     m.contained_in / m.aggregates / m.storey_building / m.voids   # DataFrames
+    m.fills / m.nests / m.groups     # fills, IfcRelNests, group/system membership
     m.parent(g) / m.children(g) / m.ancestors(g) / m.descendants(g)
     m.storey_of(g) / m.building_of(g) / m.products_in(parent_g)
     m.spaces / m.type_objects                                     # tier-1 row lists
@@ -308,7 +309,7 @@ raise. Filter ProductRow iteration via m.filter(entity=..., mode=...,
 storey_guid=...). Compare two models with m.diff(other_path).
 Recoverable native failures raise ifcfast.IfcfastError.
 
-IDS 1.0 checks (Entity + Attribute facets; others raise IdsUnsupportedError):
+IDS 1.0 checks (all six facets incl. PartOf; unimplemented constructs raise IdsUnsupportedError):
     rep = m.validate_ids("spec.ids")   # or ifcfast.validate_ids(ids, ifc)
     rep.ok; rep.specs; rep.elements; rep.failures   # failures.reason_code
 

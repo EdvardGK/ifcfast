@@ -60,6 +60,12 @@ const MEASURE_WITH_UNIT_TYPE: &[u8] = b"IFCMEASUREWITHUNIT";
 const UNIT_ASSIGN_TYPE: &[u8] = b"IFCUNITASSIGNMENT";
 const VOIDS_ELEMENT_TYPE: &[u8] = b"IFCRELVOIDSELEMENT";
 const DEFINES_BY_TYPE_TYPE: &[u8] = b"IFCRELDEFINESBYTYPE";
+// GH #192 slice 3. Field positions come from `doc::rel_rules`
+// (`REL_RULES`), never re-derived here.
+const NESTS_TYPE: &[u8] = b"IFCRELNESTS";
+const ASSIGNS_TO_GROUP_TYPE: &[u8] = b"IFCRELASSIGNSTOGROUP";
+const ASSIGNS_TO_GROUP_BY_FACTOR_TYPE: &[u8] = b"IFCRELASSIGNSTOGROUPBYFACTOR";
+const FILLS_ELEMENT_TYPE: &[u8] = b"IFCRELFILLSELEMENT";
 /// Records [`crate::body_rep`] reads to answer `has_body` (GH #202):
 /// the product's shape, its representations, and — for an
 /// identifier-less `MappedRepresentation` only — the mapped source.
@@ -225,6 +231,12 @@ enum EntityKind {
     Aggregates,
     VoidsElement,
     DefinesByType,
+    /// `IfcRelNests` (GH #192 slice 3).
+    Nests,
+    /// `IfcRelAssignsToGroup` and its `…ByFactor` subtype.
+    AssignsToGroup,
+    /// `IfcRelFillsElement`.
+    FillsElement,
     /// A record in [`SHAPE_RECORD_TYPES`]: kept by id (a borrowed slice,
     /// no parse) so `has_body` can be resolved after the pass.
     ShapeRecord,
@@ -260,6 +272,10 @@ fn dispatch_map() -> &'static HashMap<&'static [u8], EntityKind> {
         m.insert(AGGREGATES_TYPE, EntityKind::Aggregates);
         m.insert(VOIDS_ELEMENT_TYPE, EntityKind::VoidsElement);
         m.insert(DEFINES_BY_TYPE_TYPE, EntityKind::DefinesByType);
+        m.insert(NESTS_TYPE, EntityKind::Nests);
+        m.insert(ASSIGNS_TO_GROUP_TYPE, EntityKind::AssignsToGroup);
+        m.insert(ASSIGNS_TO_GROUP_BY_FACTOR_TYPE, EntityKind::AssignsToGroup);
+        m.insert(FILLS_ELEMENT_TYPE, EntityKind::FillsElement);
         for t in SHAPE_RECORD_TYPES {
             m.insert(t, EntityKind::ShapeRecord);
         }
@@ -355,6 +371,37 @@ pub struct IndexedFile {
     /// out N relateds per row).
     pub voids_opening: Vec<u64>,
     pub voids_host: Vec<u64>,
+
+    /// IfcRelFillsElement: parallel arrays of `(opening_step_id[i],
+    /// element_step_id[i])` — the door / window (RelatedBuildingElement)
+    /// that fills the opening (RelatingOpeningElement). One row per
+    /// relation, file order; the Python side resolves guids through the
+    /// product table exactly as it does for `voids` (GH #192 slice 3).
+    pub fills_opening: Vec<u64>,
+    pub fills_element: Vec<u64>,
+
+    /// IfcRelNests: one row per (relation, related object), file order.
+    /// `nests_position` is the 0-based index in `RelatedObjects` (an
+    /// ordered LIST in IFC4+, a SET in IFC2X3, where it is the written
+    /// order). Guids are resolved here because either side can be any
+    /// `IfcObjectDefinition` (ports, tasks, …), not only a product; a
+    /// row whose side is not a rooted record in the file is dropped and
+    /// counted in `warnings` (GH #192 slice 3).
+    pub nests_parent: Vec<u64>,
+    pub nests_child: Vec<u64>,
+    pub nests_position: Vec<u32>,
+    pub nests_parent_guid: Vec<String>,
+    pub nests_child_guid: Vec<String>,
+
+    /// IfcRelAssignsToGroup and IfcRelAssignsToGroupByFactor: one row
+    /// per (relation, member), file order. `groups_group_entity` is the
+    /// group's class in ifcopenshell spelling (`IfcDistributionSystem`,
+    /// `IfcZone`, …). Same drop rule as nests.
+    pub groups_group: Vec<u64>,
+    pub groups_member: Vec<u64>,
+    pub groups_group_guid: Vec<String>,
+    pub groups_group_entity: Vec<String>,
+    pub groups_member_guid: Vec<String>,
 
     /// IfcRelDefinesByType: parallel arrays of
     /// `(product_step_id[i], type_step_id[i])`. RelatedObjects is a list,
@@ -610,11 +657,26 @@ pub fn index(buf: &[u8]) -> IndexedFile {
     // known (GH #202). Borrowed slices, no parse on the hot path.
     let mut shape_records: HashMap<u64, (&[u8], &[u8])> = HashMap::new();
 
+    // GH #192 slice 3: nests / group rows as step ids, resolved to guids
+    // after the pass against `rooted` (every record whose first argument
+    // is a GlobalId-shaped string; relationships excluded). Either side
+    // of these relations can sit anywhere in the file, before or after
+    // the relation, and need not be a product.
+    let mut raw_nests: Vec<(u64, u64, u32)> = Vec::new();
+    let mut raw_groups: Vec<(u64, u64)> = Vec::new();
+    let mut rooted: Vec<(u64, &[u8], &[u8])> = Vec::new();
+    let nests_rule = crate::doc::rule_for(NESTS_TYPE).expect("REL_RULES pins IFCRELNESTS");
+    let fills_rule =
+        crate::doc::rule_for(FILLS_ELEMENT_TYPE).expect("REL_RULES pins IFCRELFILLSELEMENT");
+
     // Two-pass would let us resolve some refs, but a single pass is enough:
     // we only need step_id→guid maps that are built as we go, and downstream
     // (Python) does the final guid resolution for relationships.
     let scan_end = for_each_record(buf, data_start, data_end, |rec| {
         let t = rec.type_name;
+        if looks_rooted(rec.args) && !t.starts_with(b"IFCREL") {
+            rooted.push((rec.id, t, rec.args));
+        }
         // Single-lookup dispatch. Hot-path miss (>99% of records on big
         // MEP files) is one HashMap probe; previously each miss walked
         // two HashSets and ~8 byte-slice equality checks.
@@ -801,6 +863,43 @@ pub fn index(buf: &[u8]) -> IndexedFile {
                     }
                 }
             }
+            EntityKind::Nests => {
+                // IfcRelNests: RelatingObject(4) nests RelatedObjects(5),
+                // positions from REL_RULES (pull = host, anchor = parts).
+                split_top_level_args_into(rec.args, &mut fields_buf);
+                if let Some(&parent) = crate::doc::field_refs(&fields_buf, nests_rule.pull).first()
+                {
+                    for (pos, child) in crate::doc::field_refs(&fields_buf, nests_rule.anchor)
+                        .into_iter()
+                        .enumerate()
+                    {
+                        raw_nests.push((parent, child, pos as u32));
+                    }
+                }
+            }
+            EntityKind::AssignsToGroup => {
+                // IfcRelAssignsToGroup[ByFactor]: RelatedObjects(4) ←
+                // RelatingGroup(6) (REL_RULES; RelatedObjectsType sits at 5).
+                split_top_level_args_into(rec.args, &mut fields_buf);
+                if let Some(rule) = crate::doc::rule_for(t) {
+                    if let Some(&group) = crate::doc::field_refs(&fields_buf, rule.pull).first() {
+                        for member in crate::doc::field_refs(&fields_buf, rule.anchor) {
+                            raw_groups.push((group, member));
+                        }
+                    }
+                }
+            }
+            EntityKind::FillsElement => {
+                // IfcRelFillsElement: RelatingOpeningElement(4) is filled
+                // by RelatedBuildingElement(5), both single (REL_RULES).
+                split_top_level_args_into(rec.args, &mut fields_buf);
+                let opening = crate::doc::field_refs(&fields_buf, fills_rule.pull);
+                let element = crate::doc::field_refs(&fields_buf, fills_rule.anchor);
+                if let (Some(&o), Some(&e)) = (opening.first(), element.first()) {
+                    out.fills_opening.push(o);
+                    out.fills_element.push(e);
+                }
+            }
             EntityKind::TypeObject => {
                 // IfcTypeObject / IfcTypeProduct / IfcXxxType all inherit
                 // from IfcRoot: arg[0] GlobalId, arg[1] OwnerHistory,
@@ -842,6 +941,8 @@ pub fn index(buf: &[u8]) -> IndexedFile {
         }
     }
 
+    resolve_nests_and_groups(&mut out, &raw_nests, &raw_groups, &rooted);
+
     // All IfcRelContainedInSpatialStructure edges pass through —
     // structures can be Site, Building, Storey, or Space. The Python
     // side resolves each `contained_in_structure` step id against
@@ -874,6 +975,85 @@ pub fn index(buf: &[u8]) -> IndexedFile {
     out.warnings.append(&mut unit_warnings);
 
     out
+}
+
+/// Does a record's argument list open with a GlobalId-shaped string
+/// (`'` + 22 characters + `'` + `,`)? Cheap byte checks only; a property
+/// whose name happens to be 22 characters long also passes, which is
+/// harmless: only step ids a nests / group relation names are looked up.
+#[inline]
+fn looks_rooted(args: &[u8]) -> bool {
+    let a = args.trim_ascii_start();
+    a.len() > 24 && a[0] == b'\'' && a[23] == b'\'' && a[24] == b','
+}
+
+/// Resolve the nests / group rows of the pass to guids (and the group's
+/// class). A row whose side is not a rooted record of the file (a
+/// dangling reference) is dropped and counted in one warning.
+fn resolve_nests_and_groups(
+    out: &mut IndexedFile,
+    raw_nests: &[(u64, u64, u32)],
+    raw_groups: &[(u64, u64)],
+    rooted: &[(u64, &[u8], &[u8])],
+) {
+    if raw_nests.is_empty() && raw_groups.is_empty() {
+        return;
+    }
+    let mut need: HashSet<u64> = HashSet::new();
+    for (p, c, _) in raw_nests {
+        need.insert(*p);
+        need.insert(*c);
+    }
+    for (g, m) in raw_groups {
+        need.insert(*g);
+        need.insert(*m);
+    }
+    // step id -> (guid, type token). First record wins on a duplicated id.
+    let mut by_id: HashMap<u64, (String, &[u8])> = HashMap::with_capacity(need.len());
+    for (id, t, args) in rooted {
+        if !need.contains(id) || by_id.contains_key(id) {
+            continue;
+        }
+        let fields = split_top_level_args(args);
+        if let Some(guid) = string_at(&fields, 0) {
+            by_id.insert(*id, (guid, t));
+        }
+    }
+    let mut dropped = 0usize;
+    for &(p, c, pos) in raw_nests {
+        match (by_id.get(&p), by_id.get(&c)) {
+            (Some((pg, _)), Some((cg, _))) => {
+                out.nests_parent.push(p);
+                out.nests_child.push(c);
+                out.nests_position.push(pos);
+                out.nests_parent_guid.push(pg.clone());
+                out.nests_child_guid.push(cg.clone());
+            }
+            _ => dropped += 1,
+        }
+    }
+    for &(g, m) in raw_groups {
+        match (by_id.get(&g), by_id.get(&m)) {
+            (Some((gg, gt)), Some((mg, _))) => {
+                out.groups_group.push(g);
+                out.groups_member.push(m);
+                out.groups_group_guid.push(gg.clone());
+                out.groups_group_entity
+                    .push(type_name_uppercase_with_proper_case(gt));
+                out.groups_member_guid.push(mg.clone());
+            }
+            _ => dropped += 1,
+        }
+    }
+    if dropped > 0 {
+        let msg = format!(
+            "{dropped} IfcRelNests / IfcRelAssignsToGroup member row(s) name a record \
+             that is missing or has no GlobalId (dangling reference); those rows \
+             are left out of `nests` / `groups`."
+        );
+        eprintln!("ifcfast: {msg}");
+        out.warnings.push(msg);
+    }
 }
 
 fn extract_product(
@@ -1641,6 +1821,54 @@ ENDSEC;\nEND-ISO-10303-21;\n"
             idx.skipped_product_type_counts.is_empty(),
             "relationships counted as skipped products: {:?}",
             idx.skipped_product_type_counts
+        );
+    }
+
+    /// GH #192 slice 3: IfcRelNests / IfcRelAssignsToGroup[ByFactor] /
+    /// IfcRelFillsElement rows, positions from REL_RULES. Relations sit
+    /// BEFORE their endpoints (forward refs), a group member is a
+    /// non-product (a port), ByFactor counts, and a dangling member is
+    /// dropped with a warning.
+    #[test]
+    fn nests_groups_and_fills_are_indexed() {
+        let src = format!(
+            "{HDR}DATA;\n\
+#1=IFCRELNESTS('0Test00000000000000001',$,$,$,#10,(#12,#11));\n\
+#2=IFCRELASSIGNSTOGROUP('0Test00000000000000002',$,$,$,(#10,#12),$,#20);\n\
+#3=IFCRELASSIGNSTOGROUPBYFACTOR('0Test00000000000000003',$,$,$,(#10,#99),$,#21,0.5);\n\
+#4=IFCRELFILLSELEMENT('0Test00000000000000004',$,$,$,#30,#31);\n\
+#5=IFCRELVOIDSELEMENT('0Test00000000000000005',$,$,$,#32,#30);\n\
+#10=IFCPUMP('0Test00000000000000010',$,'p',$,$,$,$,$,$);\n\
+#11=IFCDISTRIBUTIONPORT('0Test00000000000000011',$,'in',$,$,$,$,$,$,$);\n\
+#12=IFCDISTRIBUTIONPORT('0Test00000000000000012',$,'out',$,$,$,$,$,$,$);\n\
+#20=IFCDISTRIBUTIONSYSTEM('0Test00000000000000020',$,'s',$,$,$,.WATERSUPPLY.);\n\
+#21=IFCZONE('0Test00000000000000021',$,'z',$,$,$);\n\
+#30=IFCOPENINGELEMENT('0Test00000000000000030',$,$,$,$,$,$,$,$);\n\
+#31=IFCDOOR('0Test00000000000000031',$,$,$,$,$,$,$,$,$,$,$,$);\n\
+#32=IFCWALL('0Test00000000000000032',$,$,$,$,$,$,$,$);\n\
+ENDSEC;\nEND-ISO-10303-21;\n"
+        );
+        let idx = index(src.as_bytes());
+        assert_eq!(idx.nests_parent, vec![10, 10]);
+        assert_eq!(idx.nests_child, vec![12, 11]);
+        assert_eq!(idx.nests_position, vec![0, 1]);
+        assert_eq!(idx.nests_parent_guid[0], "0Test00000000000000010");
+        assert_eq!(idx.nests_child_guid[1], "0Test00000000000000011");
+        assert_eq!(idx.groups_group, vec![20, 20, 21]);
+        assert_eq!(idx.groups_member, vec![10, 12, 10]);
+        assert_eq!(
+            idx.groups_group_entity,
+            vec!["IfcDistributionSystem", "IfcDistributionSystem", "IfcZone"]
+        );
+        assert_eq!(idx.groups_member_guid[1], "0Test00000000000000012");
+        assert_eq!(idx.fills_opening, vec![30]);
+        assert_eq!(idx.fills_element, vec![31]);
+        assert_eq!(idx.voids_opening, vec![30]);
+        assert_eq!(idx.voids_host, vec![32]);
+        assert!(
+            idx.warnings.iter().any(|w| w.contains("1 IfcRelNests")),
+            "{:?}",
+            idx.warnings
         );
     }
 

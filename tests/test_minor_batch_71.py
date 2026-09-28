@@ -203,12 +203,14 @@ def test_spaces_df_has_name_and_storey(tmp_path, monkeypatch):
             assert row.iloc[0]["name"] == "Room 101"
 
     # schemas() advertises the enriched column set.
-    assert m.schemas["spaces"]["columns"] == [
-        "guid", "step_id", "name", "storey_guid", "storey_name"
+    # GH #202 added has_body / body_rep_type; GH #206 pins these lists to
+    # the live frame in tests/test_graph.py.
+    expected = [
+        "guid", "step_id", "name", "storey_guid", "storey_name",
+        "has_body", "body_rep_type",
     ]
-    assert m.summary()["tables"]["spaces"]["columns"] == [
-        "guid", "step_id", "name", "storey_guid", "storey_name"
-    ]
+    assert m.schemas["spaces"]["columns"] == expected
+    assert m.summary()["tables"]["spaces"]["columns"] == expected
 
 
 def test_spaces_df_empty_has_join_columns(tmp_path, monkeypatch):

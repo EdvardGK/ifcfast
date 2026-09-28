@@ -7,6 +7,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`Model.hotswap()` on products whose only body is `Body-FallBack` or an
+  identifier-less solid (GH #204).** It raised `NoBodyRepresentation` even
+  though `has_body` was `True` and the mesher already tessellated them;
+  the representation lookup now goes through the same `body_rep::select_body`
+  tiered rule as `has_body` and the mesher. With `Body` + `Body-FallBack`
+  present, `Body` is repointed and the fallback rep is left byte-identical.
+- **`summary()` / `schemas` advertised 5 spaces columns for a 7-column
+  `spaces_df` (GH #206).** Pinned to the live frame.
+
+### Added — IDS slice 3: PartOf facet + relation tables (GH #192)
+
+- **IDS PartOf facet.** All six IDS 1.0 facets are now native. Relations
+  `IFCRELAGGREGATES` and `IFCRELNESTS` climb transitively (the first
+  ancestor whose class matches decides), `IFCRELCONTAINEDINSPATIALSTRUCTURE`,
+  `IFCRELASSIGNSTOGROUP` (ByFactor included) and the compound
+  `IFCRELVOIDSELEMENT IFCRELFILLSELEMENT` are one step, and no `relation`
+  walks container → aggregate → nest → filled opening → voided element →
+  group, all as IfcTester 0.8.5 reads them. Reason codes `PARTOF_MISSING`
+  and `PARTOF_ENTITY_MISMATCH`; IfcTester labels. The
+  `unsupported_feature="facet:part_of"` path is gone. Conformance:
+  312/334 green (partof 34/34), 0 unsupported, 0 ifcfast bugs, the 22
+  IfcTester disagreements of GH #193 unchanged. Rules:
+  `docs/ids/facet-semantics-slice3.md`; decisions A39–A46 in
+  `docs/ids/ambiguities.md`.
+- **`m.nests`, `m.groups`, `m.fills`** — new tier-1 edge tables from the
+  indexer, cached as `nests.parquet` / `groups.parquet` / `fills.parquet`
+  and listed by `summary()`, `schemas` and `preview()`. `nests`:
+  `parent_guid, child_guid, position, parent_step_id, child_step_id`
+  (`IfcRelNests`, file order, `position` = index in `RelatedObjects`).
+  `groups`: `group_guid, group_entity, member_guid, group_step_id,
+  member_step_id` (`IfcRelAssignsToGroup` and `…ByFactor`). `fills`:
+  `opening_guid, element_guid` (`IfcRelFillsElement`, the same shape as
+  `m.voids`). A nests / groups row naming a missing or GlobalId-less
+  record is dropped and counted in `m.warnings`. Field positions come from
+  `doc::rel_rules`. On the G55 models and ST28_RIE every row agrees with
+  ifcopenshell walking the relations (e.g. G55_RIV 30 728 group rows,
+  ST28_RIE 23 097 nest rows).
+
+### Changed
+
+- Cache schema **35 → 36** (the three new index tables; no existing table
+  changes — psets / quantities / materials / classifications / unit_scale
+  bitwise identical on the G55 models and every `tests/fixtures` IFC).
+
 ## [0.6.0] - 2026-09-28
 
 ### Added — native IDS 1.0 validation (GH #192, slices 1–2)

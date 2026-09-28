@@ -50,9 +50,9 @@ IfcTester wrong · ``test_case_drift`` both wrong and both give the same
 answer · ``both_error`` both raised. Both wrong with *different* answers is
 ``ifcfast_bug`` until triaged into ``tests/oracle/ids_xfail.toml`` as
 ``test_case_drift``. ``unsupported_facet`` ifcfast raised
-``IdsUnsupportedError`` — the case needs a facet the native engine does not
-implement yet (slice 1 = Entity + Attribute; GH #192 slices 2–3 add the
-rest). It does NOT fail pytest and is counted per folder; it is coverage,
+``IdsUnsupportedError`` — the case needs a construct the native engine does
+not implement (all six facets are implemented since GH #192 slice 3; the
+suite has no such case today). It does NOT fail pytest and is counted per folder; it is coverage,
 not a verdict, and the IfcTester half is still checked.
 
 Known failures

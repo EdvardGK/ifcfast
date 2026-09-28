@@ -167,7 +167,8 @@ def preview(path: str, table: str, n: int = 5, strict: bool = True) -> list[dict
     """Sample rows from any table as plain list-of-dicts.
 
     Tables: ``products`` / ``storeys`` / ``contained_in`` /
-    ``aggregates`` / ``storey_building`` / ``psets`` / ``quantities``
+    ``aggregates`` / ``storey_building`` / ``voids`` / ``fills`` /
+    ``nests`` / ``groups`` / ``psets`` / ``quantities``
     / ``materials`` / ``classifications`` / ``drift``. ``strict``
     mirrors :func:`open_ifc` (GH #73).
     """

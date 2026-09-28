@@ -14,6 +14,9 @@ subsequent open). Layout per file:
         aggregates.parquet     — child → parent edges (decomposition)
         storey_building.parquet — storey → building edges
         voids.parquet          — IfcRelVoidsElement (opening → host) edges
+        fills.parquet          — IfcRelFillsElement (opening → element) edges
+        nests.parquet          — IfcRelNests (parent → child, position) edges
+        groups.parquet         — IfcRelAssignsToGroup[ByFactor] membership
         psets.parquet          — long-format property sets
         quantities.parquet     — long-format base quantities
         materials.parquet      — material assignments
@@ -67,6 +70,11 @@ CONTAINED_IN_FILE = "contained_in.parquet"
 AGGREGATES_FILE = "aggregates.parquet"
 STOREY_BUILDING_FILE = "storey_building.parquet"
 VOIDS_FILE = "voids.parquet"
+# GH #192 slice 3. Always written (possibly empty), so a manifest without
+# them can only come from before cache schema 36 — whose key differs.
+FILLS_FILE = "fills.parquet"
+NESTS_FILE = "nests.parquet"
+GROUPS_FILE = "groups.parquet"
 SPACES_FILE = "spaces.parquet"
 TYPE_OBJECTS_FILE = "type_objects.parquet"
 
@@ -823,6 +831,14 @@ def write_index(model) -> Path:
         if df is None:
             continue
         _atomic_write_parquet(df, d / name)
+    # Accessors (not the private fields) so an empty table is written with
+    # its column set rather than skipped.
+    for df, name in (
+        (model.fills, FILLS_FILE),
+        (model.nests, NESTS_FILE),
+        (model.groups, GROUPS_FILE),
+    ):
+        _atomic_write_parquet(df, d / name)
 
     # Spaces — tier-1 entities, written even when empty so the manifest
     # accurately reflects "the parser saw zero IfcSpace" vs "the cache is
@@ -876,6 +892,12 @@ def write_index(model) -> Path:
         "has_aggregates": model._aggregates_df is not None,
         "has_storey_building": model._storey_building_df is not None,
         "has_voids": model._voids_df is not None,
+        "has_fills": True,
+        "has_nests": True,
+        "has_groups": True,
+        "fills_count": int(len(model.fills)),
+        "nests_count": int(len(model.nests)),
+        "groups_count": int(len(model.groups)),
         "has_spaces": True,
         "space_count": len(model.spaces),
         "contained_in_count": (
@@ -934,6 +956,15 @@ def read_index(hdr: IFCHeader):
     ):
         if m.get(flag) and not (d / fname).exists():
             return None
+    # GH #192 slice 3: the edge tables are part of every tier-1 cache; a
+    # missing one is corruption (or a foreign writer), never "no edges".
+    for flag, fname in (
+        ("has_fills", FILLS_FILE),
+        ("has_nests", NESTS_FILE),
+        ("has_groups", GROUPS_FILE),
+    ):
+        if not m.get(flag) or not (d / fname).exists():
+            return None
 
     started = time.time()
     df = pd.read_parquet(idx_path)
@@ -958,6 +989,9 @@ def read_index(hdr: IFCHeader):
         storey_building_df = pd.read_parquet(d / STOREY_BUILDING_FILE)
     if (d / VOIDS_FILE).exists():
         voids_df = pd.read_parquet(d / VOIDS_FILE)
+    fills_df = pd.read_parquet(d / FILLS_FILE)
+    nests_df = pd.read_parquet(d / NESTS_FILE)
+    groups_df = pd.read_parquet(d / GROUPS_FILE)
 
     spaces: list[SpaceRow] = []
     sp_path = d / SPACES_FILE
@@ -996,6 +1030,9 @@ def read_index(hdr: IFCHeader):
         _aggregates_df=aggregates_df,
         _storey_building_df=storey_building_df,
         _voids_df=voids_df,
+        _fills_df=fills_df,
+        _nests_df=nests_df,
+        _groups_df=groups_df,
     )
     # GH #178: restore the skipped-product coverage gap and re-fire the
     # silent-zero warning, so a cache hit is as loud as a cold parse.
