@@ -45,3 +45,14 @@ file ownership + `flock` on builds, then two more.
    and the site is synced to cache v36.
 2. #194 still waits on Ed's contract choice.
 3. #207 (lazy IDS wasm), slice 5, then #187, #185, #182, #117, #191.
+
+## Release addendum
+
+- **#208** (wasm summary lacked nests/groups/fills) found by the site-sync parity gate,
+  fixed `3a60d3a`, closed. Site synced to cache v36 (ifcfast-site `08ebc63`, parity 17/17).
+- CI red on `2be3ad7`…`4c52b02`: the #205 test pinned "legacy == new bitwise / exactly
+  1 ulp" — legacy `f32::powi` is host-dependent (ubuntu runner ≠ dev box). Rewritten as
+  "new == tier-1 `unit_scale` bitwise, legacy ≤ 1–2 ulp" (`4c52b02`, `fd405ea`); CI green.
+- **v0.6.1** released: `12fbfde` tagged `v0.6.1`, GH release created from CHANGELOG
+  0.6.1; PyPI publish via CI (check with `pip download ifcfast==0.6.1`; PyPI CDN lag of
+  ~1 h was seen for 0.6.0).
