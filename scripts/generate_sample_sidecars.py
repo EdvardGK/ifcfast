@@ -299,6 +299,9 @@ def _build_graph(model, spaces, containers, mesh_stats_by_guid, pset_attrs_by_gu
             "typed": typed_by_guid.get(guid, False),
             "type_name": type_name_by_guid.get(guid),
             "type_source": type_source_by_guid.get(guid, "none"),
+            # GH #202 — tier-1 body flag (products_df columns).
+            "has_body": bool(p.get("has_body")),
+            "body_rep_type": p.get("body_rep_type"),
             "materials": mats_by_guid.get(guid, []),
             "layer_set": layer_set_by_guid.get(guid),
             "m3": m3,

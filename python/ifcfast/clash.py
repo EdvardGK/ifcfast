@@ -147,7 +147,8 @@ def clash(
           ``XFitting``/``XSegment`` MEP joint — fittings meeting their
           own run), or ``"non_physical"`` (either side is
           ``Grid``/``Annotation``/``Space``/``OpeningElement``/
-          ``VirtualElement``). Engine *categorises*, never drops —
+          ``VirtualElement``, plus the zone / port / structural-analysis
+          / alignment / facility classes listed in AGENTS.md). Engine *categorises*, never drops —
           filter with e.g. ``df[df.category == "clash"]`` to triage
           a noisy MEP run. See GH #49.
         * ``min_distance_m`` (``float32``) — minimum mesh-to-mesh

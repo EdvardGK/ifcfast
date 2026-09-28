@@ -249,6 +249,20 @@ class ProductRow:
                          downstream consumers expecting an
                          ``IfcTypeObject`` GUID will see ``None``.
     * ``"none"``       — neither.
+
+    ``has_body`` / ``body_rep_type`` (GH #202) say whether the product
+    has a 3D body representation, read from
+    ``IfcProductDefinitionShape.Representations`` without meshing: an
+    ``IfcShapeRepresentation`` whose ``RepresentationIdentifier`` is
+    ``Body`` / ``Body-FallBack`` / ``Facetation``, or — identifier
+    absent — whose ``RepresentationType`` is a 3D solid / surface type
+    (``SweptSolid``, ``Brep``, ``Tessellation``, …, or a
+    ``MappedRepresentation`` whose source is one). ``body_rep_type`` is
+    that representation's ``RepresentationType`` (``None`` without a
+    body). Precedence when several qualify: a ``Body`` / ``Facetation``
+    representation first, then ``Body-FallBack``, then an unnamed
+    solid — so where a ``Body`` exists the pick is the pre-v35 mesher
+    pick. The mesher tessellates the same representation.
     """
 
     guid: str
@@ -265,6 +279,8 @@ class ProductRow:
     type_guid: Optional[str] = None
     type_name: Optional[str] = None
     type_source: str = "none"  # 'ifctype' / 'objecttype' / 'none'
+    has_body: bool = False
+    body_rep_type: Optional[str] = None
 
 
 @dataclass
@@ -1782,7 +1798,7 @@ class Model:
         """Tier-1 space index as a pandas DataFrame.
 
         Columns: ``guid``, ``step_id``, ``name``, ``storey_guid``,
-        ``storey_name``. The Rust indexer only emits ``guid`` + ``step_id``
+        ``storey_name``, ``has_body``, ``body_rep_type`` (GH #202). The Rust indexer only emits ``guid`` + ``step_id``
         for IfcSpace, but spaces are products too (mode-filtered into their
         own collection), so their ``name`` and spatial container live in
         the ``products`` table. GH #71 (7): rather than hand back a
@@ -1797,7 +1813,9 @@ class Model:
         if self._spaces_df is not None:
             return self._spaces_df
 
-        join_cols = ["name", "storey_guid", "storey_name"]
+        join_cols = [
+            "name", "storey_guid", "storey_name", "has_body", "body_rep_type",
+        ]
         if self.spaces:
             base = pd.DataFrame([asdict(s) for s in self.spaces])
         else:
@@ -2998,6 +3016,8 @@ def _index_native(
     duplicate_step_ids = 0
     pdata = raw["products"]
     n = len(pdata["step_id"])
+    has_body_col = pdata["has_body"]
+    body_rep_type_col = pdata["body_rep_type"]
     for i in range(n):
         sid = int(pdata["step_id"][i])
         entity = pdata["entity"][i]
@@ -3034,6 +3054,8 @@ def _index_native(
             type_guid=type_guid,
             type_name=type_name,
             type_source=type_source,
+            has_body=bool(has_body_col[i]),
+            body_rep_type=body_rep_type_col[i],
         )
         prev = _product_index_by_step.get(sid)
         if prev is None:
@@ -3163,6 +3185,8 @@ def _row_to_product(row) -> ProductRow:
         type_guid=_v("type_guid"),
         type_name=_v("type_name"),
         type_source=_v("type_source") or "none",
+        has_body=bool(_v("has_body")),
+        body_rep_type=_v("body_rep_type"),
     )
 
 

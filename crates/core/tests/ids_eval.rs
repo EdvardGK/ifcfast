@@ -559,7 +559,7 @@ fn ids_slice2_semantics_on_fixture() {
     fail(
         "a14",
         "PROP_DATATYPE_MISMATCH",
-        Some("IFCTEXT"),
+        Some("IfcText"),
         Some("type"),
     );
     fail(
@@ -574,7 +574,7 @@ fn ids_slice2_semantics_on_fixture() {
     fail(
         "a18_bad",
         "PROP_DATATYPE_MISMATCH",
-        Some("IFCDOORPANELOPERATIONENUM"),
+        Some("IfcDoorPanelOperationEnum"),
         Some("instance"),
     );
     fail("pset_missing", "PSET_MISSING", None, None);

@@ -181,6 +181,14 @@ if (!ref181) {
   for (const st of graph.storeys) delete st.elevation_m;
 }
 
+// GH #202: `has_body` / `body_rep_type` on graph.products[] — same
+// staleness pattern as above; strict the moment the sidecars regenerate.
+const ref202 = (refGraph.products ?? []).some((p) => 'has_body' in p);
+if (!ref202) {
+  console.log('SKIP  graph.products[].has_body/body_rep_type — sidecars predate GH #202; regenerate');
+  for (const p of graph.products) { delete p.has_body; delete p.body_rep_type; }
+}
+
 check(
   'summary.json',
   diff(refSummary, summary, {

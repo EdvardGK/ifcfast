@@ -28,12 +28,11 @@
 //! (IfcUnitAssignment WR01) and is not consulted.
 //!
 //! The indexer's `unit_scale` is computed through [`UnitTable::length_scale`],
-//! which keeps the pre-UnitTable resolution rules for LENGTHUNIT (SI units
-//! and single-level conversion-based units with an SI length base) and the
-//! exact same warnings, so `unit_scale` did not move by a bit when it was
-//! routed through here. The general resolver is strictly more capable
-//! (nested conversion bases, offsets); where the two could differ is listed
-//! on [`UnitTable::length_scale`].
+//! which is the general resolver for LENGTHUNIT (GH #197: nested
+//! conversion bases such as yard → foot → metre, and
+//! `IfcConversionBasedUnitWithOffset` with a zero offset, now resolve) with
+//! the pre-UnitTable warnings kept word for word. `unit_scale` is
+//! bit-identical to the old one-level rule wherever that rule resolved.
 
 use std::collections::HashMap;
 
@@ -352,6 +351,29 @@ impl UnitTable {
         }))
     }
 
+    /// The step id of the project unit of `unit_type` (any case): the entry
+    /// [`UnitTable::resolve_unit_type`] resolves through, or — when no
+    /// entry of that type resolves — the first entry of that type as
+    /// declared. `None` when the assignment has no entry of that type.
+    /// Any unit kind counts (SI, conversion-based, derived): the
+    /// `quantities.unit_step_id` fallback (GH #198).
+    pub fn project_unit_step(&self, unit_type: &str) -> Option<u64> {
+        let mut first: Option<u64> = None;
+        for &step in &self.assigned {
+            let matches = self
+                .unit_type_of(step)
+                .is_some_and(|t| t.eq_ignore_ascii_case(unit_type));
+            if !matches {
+                continue;
+            }
+            if self.resolve(step, 0).is_ok() {
+                return Some(step);
+            }
+            first.get_or_insert(step);
+        }
+        first
+    }
+
     /// SI factor of the project unit of `unit_type`. `None` when it is not
     /// declared, does not resolve, or carries an offset (use
     /// [`UnitTable::resolve_unit_type`] for those).
@@ -494,18 +516,19 @@ impl UnitTable {
     /// Metres per file length unit: the indexer's `unit_scale`, with its
     /// warnings appended to `warnings`.
     ///
-    /// Deliberately the pre-UnitTable rules, so `unit_scale` is bitwise
-    /// unchanged (`tests::length_scale_matches_legacy_*`):
-    /// - `IfcSIUnit` LENGTHUNIT: name `METRE` (or `METER`) × prefix;
-    /// - `IfcConversionBasedUnit` LENGTHUNIT: `IfcMeasureWithUnit` value ×
-    ///   an `IfcSIUnit` LENGTHUNIT base, one level only;
-    /// - everything else in the assignment is skipped.
+    /// The first LENGTHUNIT entry of the assignment that resolves through
+    /// the general resolver (the same answer as
+    /// [`UnitTable::resolve_unit_type`]`("LENGTHUNIT")` for a pure factor),
+    /// GH #197:
+    /// - `IfcSIUnit`: name `METRE` (or `METER`) × prefix;
+    /// - `IfcConversionBasedUnit` / `…WithOffset`: `ConversionFactor` value ×
+    ///   the factor of its base, recursively (yard → foot → metre);
+    /// - a length unit with a non-zero offset has no metres-per-unit
+    ///   factor: skipped with a warning.
     ///
-    /// Where [`UnitTable::resolve_unit_type`]`("LENGTHUNIT")` is more
-    /// capable (and so could differ): a conversion base that is itself
-    /// conversion-based, and `IfcConversionBasedUnitWithOffset`. Neither
-    /// occurs in any file we have; aligning them would move `unit_scale`
-    /// for such files and is left as a follow-up.
+    /// Warnings for entries that do not resolve are the pre-UnitTable
+    /// texts. Other unit kinds in the assignment (context-dependent,
+    /// derived) are skipped silently, as before.
     pub(crate) fn length_scale(&self, warnings: &mut Vec<String>) -> Option<f64> {
         for unit_ref in &self.assigned {
             match self.records.get(unit_ref) {
@@ -514,60 +537,47 @@ impl UnitTable {
                     prefix,
                     name,
                 }) => {
-                    if unit_type.eq_ignore_ascii_case("LENGTHUNIT") {
-                        match si_length_scale_checked(prefix, name) {
-                            Ok(scale) => return Some(scale),
-                            Err(SiScaleError::UnknownPrefix) => warnings.push(format!(
-                                "IfcSIUnit #{unit_ref} declares LENGTHUNIT with an \
-                                 unrecognised IfcSIPrefix {prefix:?} (name {name:?}); \
-                                 it cannot be converted to metres and is IGNORED \
-                                 rather than treated as the un-prefixed base unit \
-                                 (which would be wrong by a power of ten)."
-                            )),
-                            Err(SiScaleError::NotLength) => warnings.push(format!(
-                                "IfcSIUnit #{unit_ref} declares UnitType LENGTHUNIT but \
-                                 an IfcSIUnitName of {name:?}, which is not a length \
-                                 unit; the declaration is inconsistent and is IGNORED."
-                            )),
-                        }
+                    if !unit_type.eq_ignore_ascii_case("LENGTHUNIT") {
+                        continue;
+                    }
+                    // Identical to `resolve_si` for a LENGTHUNIT (METRE ×
+                    // prefix^1), kept for its two distinct warnings.
+                    match si_length_scale_checked(prefix, name) {
+                        Ok(scale) => return Some(scale),
+                        Err(SiScaleError::UnknownPrefix) => warnings.push(format!(
+                            "IfcSIUnit #{unit_ref} declares LENGTHUNIT with an \
+                             unrecognised IfcSIPrefix {prefix:?} (name {name:?}); \
+                             it cannot be converted to metres and is IGNORED \
+                             rather than treated as the un-prefixed base unit \
+                             (which would be wrong by a power of ten)."
+                        )),
+                        Err(SiScaleError::NotLength) => warnings.push(format!(
+                            "IfcSIUnit #{unit_ref} declares UnitType LENGTHUNIT but \
+                             an IfcSIUnitName of {name:?}, which is not a length \
+                             unit; the declaration is inconsistent and is IGNORED."
+                        )),
                     }
                 }
                 Some(UnitRecord::Conversion {
                     unit_type,
                     name: conv_name,
-                    factor,
-                    offset: None,
+                    ..
                 }) => {
                     if !unit_type.eq_ignore_ascii_case("LENGTHUNIT") {
                         continue;
                     }
-                    let resolved = factor
-                        .and_then(|fr| match self.records.get(&fr) {
-                            Some(UnitRecord::Measure { value, unit }) => Some((*value, *unit)),
-                            _ => None,
-                        })
-                        .and_then(|(value, base_ref)| {
-                            let v = value?;
-                            let base_ref = base_ref?;
-                            let (base_ut, base_prefix, base_name) =
-                                match self.records.get(&base_ref)? {
-                                    UnitRecord::Si {
-                                        unit_type,
-                                        prefix,
-                                        name,
-                                    } => (unit_type, prefix, name),
-                                    _ => return None,
-                                };
-                            if !base_ut.eq_ignore_ascii_case("LENGTHUNIT") {
-                                return None;
-                            }
-                            let base_scale =
-                                si_length_scale_checked(base_prefix, base_name).ok()?;
-                            Some(v * base_scale)
-                        });
-                    match resolved {
-                        Some(scale) => return Some(scale),
-                        None => warnings.push(format!(
+                    match self.resolve(*unit_ref, 0) {
+                        // No sign / finiteness filter: the one-level rule
+                        // never had one and `unit_scale` must not move.
+                        Ok(r) if r.offset == 0.0 => return Some(r.scale),
+                        Ok(r) => warnings.push(format!(
+                            "IfcConversionBasedUnit (LENGTHUNIT, name={conv_name:?}, \
+                             #{unit_ref}) resolves to {} m per unit with an offset of {} m; \
+                             a length unit with an offset has no metres-per-unit scale \
+                             and is IGNORED.",
+                            r.scale, r.offset
+                        )),
+                        Err(_) => warnings.push(format!(
                             "IfcConversionBasedUnit (LENGTHUNIT, name={conv_name:?}, \
                              #{unit_ref}) could not be resolved to a metres-per-unit \
                              scale; its ConversionFactor → IfcMeasureWithUnit → \
@@ -607,21 +617,25 @@ fn pure_scale(r: Result<ResolvedUnit, UnitError>) -> Option<f64> {
     }
 }
 
-/// Entity types [`UnitCollector::feed`] accepts; lets
+/// Entity types [`UnitCollector::feed`] accepts, as STEP type tokens.
+/// The indexer's dispatch map routes exactly these to the collector, so
+/// its `unit_scale` sees the same records as [`UnitTable::from_table`].
+pub(crate) const UNIT_ENTITY_TYPES: &[&[u8]] = &[
+    b"IFCSIUNIT",
+    b"IFCCONVERSIONBASEDUNIT",
+    b"IFCCONVERSIONBASEDUNITWITHOFFSET",
+    b"IFCDERIVEDUNIT",
+    b"IFCDERIVEDUNITELEMENT",
+    b"IFCMONETARYUNIT",
+    b"IFCCONTEXTDEPENDENTUNIT",
+    b"IFCMEASUREWITHUNIT",
+    b"IFCUNITASSIGNMENT",
+];
+
+/// Whether [`UnitCollector::feed`] accepts `t`; lets
 /// [`UnitTable::from_table`] skip the arg split for everything else.
-fn is_unit_entity(t: &[u8]) -> bool {
-    const NAMES: &[&[u8]] = &[
-        b"IFCSIUNIT",
-        b"IFCCONVERSIONBASEDUNIT",
-        b"IFCCONVERSIONBASEDUNITWITHOFFSET",
-        b"IFCDERIVEDUNIT",
-        b"IFCDERIVEDUNITELEMENT",
-        b"IFCMONETARYUNIT",
-        b"IFCCONTEXTDEPENDENTUNIT",
-        b"IFCMEASUREWITHUNIT",
-        b"IFCUNITASSIGNMENT",
-    ];
-    NAMES.iter().any(|n| t.eq_ignore_ascii_case(n))
+pub(crate) fn is_unit_entity(t: &[u8]) -> bool {
+    UNIT_ENTITY_TYPES.iter().any(|n| t.eq_ignore_ascii_case(n))
 }
 
 /// `IfcSIPrefix` → multiplier. `""` (a `$` prefix) is 1. `None` for an
@@ -876,10 +890,69 @@ FILE_SCHEMA(('IFC4'));\nENDSEC;\nDATA;\n{data}ENDSEC;\nEND-ISO-10303-21;\n"
         // The general resolver follows the chain…
         assert!(close(u.scale_for_unit_type("LENGTHUNIT"), 0.9144));
         assert!(close(u.scale_for_unit_step(4), 0.3048));
-        // …the legacy length path does not (one level only), and says so.
+        // …and so does unit_scale since GH #197 (was None + 2 warnings).
         let mut w = Vec::new();
-        assert_eq!(u.length_scale(&mut w), None);
-        assert_eq!(w.len(), 2, "{w:?}");
+        assert!(close(u.length_scale(&mut w), 0.9144));
+        assert_eq!(
+            u.length_scale(&mut w).map(f64::to_bits),
+            u.scale_for_unit_type("LENGTHUNIT").map(f64::to_bits)
+        );
+        assert!(w.is_empty(), "{w:?}");
+        assert_eq!(u.project_unit_step("LENGTHUNIT"), Some(2));
+        assert_eq!(u.project_unit_step("lengthunit"), Some(2));
+        assert_eq!(u.project_unit_step("AREAUNIT"), None);
+    }
+
+    /// GH #197: `IfcConversionBasedUnitWithOffset` LENGTHUNIT. A zero
+    /// offset is a plain factor; a non-zero one has no metres-per-unit
+    /// scale and is skipped with a warning, falling through to the next
+    /// LENGTHUNIT entry.
+    #[test]
+    fn length_unit_with_offset() {
+        let zero = table_from(
+            "#1=IFCUNITASSIGNMENT((#2));\n\
+             #2=IFCCONVERSIONBASEDUNITWITHOFFSET(#9,.LENGTHUNIT.,'foot',#3,0.);\n\
+             #3=IFCMEASUREWITHUNIT(IFCLENGTHMEASURE(0.3048),#6);\n\
+             #6=IFCSIUNIT(*,.LENGTHUNIT.,$,.METRE.);\n\
+             #9=IFCDIMENSIONALEXPONENTS(1,0,0,0,0,0,0);\n",
+        );
+        let mut w = Vec::new();
+        assert_eq!(zero.length_scale(&mut w), Some(0.3048));
+        assert!(w.is_empty(), "{w:?}");
+
+        let shifted = table_from(
+            "#1=IFCUNITASSIGNMENT((#2,#7));\n\
+             #2=IFCCONVERSIONBASEDUNITWITHOFFSET(#9,.LENGTHUNIT.,'odd',#3,10.);\n\
+             #3=IFCMEASUREWITHUNIT(IFCLENGTHMEASURE(0.3048),#6);\n\
+             #6=IFCSIUNIT(*,.LENGTHUNIT.,$,.METRE.);\n\
+             #7=IFCSIUNIT(*,.LENGTHUNIT.,.MILLI.,.METRE.);\n\
+             #9=IFCDIMENSIONALEXPONENTS(1,0,0,0,0,0,0);\n",
+        );
+        let mut w = Vec::new();
+        assert_eq!(shifted.length_scale(&mut w), Some(1e-3));
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(w[0].contains("offset"), "{w:?}");
+    }
+
+    /// GH #198: the quantity unit fallback picks from the first non-empty
+    /// assignment, conversion-based units included.
+    #[test]
+    fn project_unit_step_any_unit_kind_first_assignment() {
+        let u = table_from(
+            "#1=IFCUNITASSIGNMENT((#2,#5));\n\
+             #2=IFCCONVERSIONBASEDUNIT(#9,.LENGTHUNIT.,'FOOT',#3);\n\
+             #3=IFCMEASUREWITHUNIT(IFCLENGTHMEASURE(0.3048),#4);\n\
+             #4=IFCSIUNIT(*,.LENGTHUNIT.,$,.METRE.);\n\
+             #5=IFCSIUNIT(*,.AREAUNIT.,.KILLO.,.SQUARE_METRE.);\n\
+             #6=IFCUNITASSIGNMENT((#7));\n\
+             #7=IFCSIUNIT(*,.VOLUMEUNIT.,$,.CUBIC_METRE.);\n\
+             #9=IFCDIMENSIONALEXPONENTS(1,0,0,0,0,0,0);\n",
+        );
+        assert_eq!(u.project_unit_step("LENGTHUNIT"), Some(2));
+        // Declared but unresolvable: still the declared unit.
+        assert_eq!(u.project_unit_step("AREAUNIT"), Some(5));
+        // Only in a second assignment: not the project unit.
+        assert_eq!(u.project_unit_step("VOLUMEUNIT"), None);
     }
 
     #[test]

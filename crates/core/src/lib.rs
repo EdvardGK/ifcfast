@@ -36,6 +36,7 @@
 //! crate is pure-Rust — used by the standalone `ifcfast-bench` and
 //! `ifcfast-mesh` binaries.
 
+pub(crate) mod body_rep;
 pub mod clock;
 pub mod doc;
 pub mod entity_table;
@@ -43,6 +44,7 @@ pub mod extractors;
 pub mod guid;
 pub mod indexer;
 pub mod lexer;
+pub(crate) mod schema_products;
 pub mod source;
 pub mod units;
 
@@ -405,6 +407,13 @@ mod python {
             )?;
             products.set_item("object_type", PyList::new(py, &idx.product_object_type)?)?;
             products.set_item("tag", PyList::new(py, &idx.product_tag)?)?;
+            // GH #202: body-representation flag, read from the
+            // representation records (no meshing).
+            products.set_item("has_body", PyList::new(py, &idx.product_has_body)?)?;
+            products.set_item(
+                "body_rep_type",
+                PyList::new(py, &idx.product_body_rep_type)?,
+            )?;
             dict.set_item("products", products)?;
 
             let storeys = PyDict::new(py);

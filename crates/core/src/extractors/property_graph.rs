@@ -112,8 +112,11 @@ pub enum PropClass {
     QuantityTime,
     /// `IfcPhysicalComplexQuantity`; members in [`PropDef::children`].
     ComplexQuantity,
-    /// An `IfcQuantity*` class with no parser here (IFC4X3
-    /// `IfcQuantityNumber`, …).
+    /// An `IfcQuantity*` class the public QuantityTable has no column
+    /// rule for (IFC4X3 `IfcQuantityNumber`, …). It still gets a value
+    /// slot when its layout is known ([`unhandled_quantity_measure`],
+    /// GH #199), so the IDS property facet can read it; the
+    /// QuantityTable keeps its `unhandled:IFCXXX` marker row.
     UnhandledQuantity,
 }
 
@@ -360,10 +363,11 @@ pub struct PropertyGraph<'a> {
     /// `IfcExtendedMaterialProperties.Material`, IFC4
     /// `IfcProfileProperties.ProfileDefinition`.
     pub material_sets: Vec<(u64, u64)>,
-    /// `QuantityTable.unit_step_id` fallback: the `IfcSIUnit` per unit
-    /// type reachable from any `IfcUnitAssignment` (GH #43 / #76 item 4).
-    /// SI-only by that table's long-standing contract; general unit
-    /// resolution is `crate::units::UnitTable`.
+    /// `QuantityTable.unit_step_id` fallback: the project unit per
+    /// quantity unit type, as [`crate::units::UnitTable::project_unit_step`]
+    /// picks it — the first non-empty `IfcUnitAssignment` (the rule
+    /// `unit_scale` uses), any unit kind incl. conversion-based feet
+    /// (GH #198; was: `IfcSIUnit` only, unioned over every assignment).
     pub(crate) quantity_default_units: HashMap<&'static str, u64>,
     by_object: OnceLock<HashMap<u64, Vec<u64>>>,
 }
@@ -427,11 +431,15 @@ impl<'a> PropertyGraph<'a> {
             quantity_default_units: HashMap::new(),
             by_object: OnceLock::new(),
         };
-        // Quantity unit fallback inputs (see `quantity_default_units`).
-        let mut project_unit_refs: HashSet<u64> = HashSet::with_capacity(16);
-        let mut si_unit_by_type: HashMap<String, Vec<u64>> = HashMap::with_capacity(16);
+        // Quantity unit fallback input (see `quantity_default_units`).
+        let mut units = crate::units::UnitCollector::default();
 
         for (step, t, args) in table.iter() {
+            if scope.quantities && crate::units::is_unit_entity(t) {
+                let f = split_top_level_args(args);
+                units.feed(step, t, &f);
+                continue;
+            }
             if !is_candidate(t) {
                 // Geometry and everything else: only type objects matter.
                 if is_type_object(t) {
@@ -560,35 +568,14 @@ impl<'a> PropertyGraph<'a> {
                     ref_list_at(&f, 1),
                 );
                 g.link_material(step, ref_at(&f, 0));
-            } else if t.eq_ignore_ascii_case(b"IFCUNITASSIGNMENT") {
-                if !scope.quantities {
-                    continue;
-                }
-                // (Units). Every assignment counts (union), GH #43.
-                let f = split_top_level_args(args);
-                project_unit_refs.extend(ref_list_at(&f, 0));
-            } else if t.eq_ignore_ascii_case(b"IFCSIUNIT") {
-                if !scope.quantities {
-                    continue;
-                }
-                // (Dimensions, UnitType, Prefix, Name). Keep every SIUnit per
-                // type in file order; assignment membership picks after the
-                // pass, so a dangling duplicate cannot shadow the assigned
-                // one (GH #76 item 4).
-                let f = split_top_level_args(args);
-                if let Some(ut) = f.get(1).copied().and_then(parse_enum_uppercase) {
-                    si_unit_by_type.entry(ut).or_default().push(step);
-                }
             }
         }
 
-        if !project_unit_refs.is_empty() {
-            for (unit_type, steps) in &si_unit_by_type {
-                let Some(canonical) = canonical_quantity_unit_type(unit_type) else {
-                    continue;
-                };
-                if let Some(assigned) = steps.iter().find(|id| project_unit_refs.contains(id)) {
-                    g.quantity_default_units.insert(canonical, *assigned);
+        if scope.quantities {
+            let units = units.finish();
+            for unit_type in QUANTITY_UNIT_TYPES {
+                if let Some(step) = units.project_unit_step(unit_type) {
+                    g.quantity_default_units.insert(unit_type, step);
                 }
             }
         }
@@ -782,8 +769,6 @@ fn is_candidate(t: &[u8]) -> bool {
                 || t.eq_ignore_ascii_case(b"IFCEXTENDEDMATERIALPROPERTIES")
         }
         b'M' => t.eq_ignore_ascii_case(b"IFCMATERIALPROPERTIES"),
-        b'U' => t.eq_ignore_ascii_case(b"IFCUNITASSIGNMENT"),
-        b'S' => t.eq_ignore_ascii_case(b"IFCSIUNIT"),
         _ => false,
     }
 }
@@ -968,7 +953,18 @@ fn quantity_def<'a>(
     match class {
         // (Name, Description, HasQuantities, Discrimination, Quality, Usage)
         PropClass::ComplexQuantity => d.children = ref_list_at(f, 2),
-        PropClass::UnhandledQuantity => {}
+        // A known IfcPhysicalSimpleQuantity layout without a table column
+        // (GH #199): same (Name, Description, Unit, <kind>Value[, Formula])
+        // slots as the six handled kinds.
+        PropClass::UnhandledQuantity => {
+            if let Some(measure) = unhandled_quantity_measure(t) {
+                d.values.push(TypedValue {
+                    ifc_type: Some(measure),
+                    src: field(f, 3),
+                });
+                d.unit_step = ref_at(f, 2);
+            }
+        }
         // (Name, Description, Unit, <kind>Value[, Formula])
         _ => {
             d.values.push(TypedValue {
@@ -1038,27 +1034,26 @@ fn is_type_object(t: &[u8]) -> bool {
     suffix_ok || ifc2x3_style || bare_base
 }
 
-/// The quantity fallback's accepted unit types, pinned to `&'static str`.
-fn canonical_quantity_unit_type(uppercase: &str) -> Option<&'static str> {
-    match uppercase {
-        "LENGTHUNIT" => Some("LENGTHUNIT"),
-        "AREAUNIT" => Some("AREAUNIT"),
-        "VOLUMEUNIT" => Some("VOLUMEUNIT"),
-        "MASSUNIT" => Some("MASSUNIT"),
-        "TIMEUNIT" => Some("TIMEUNIT"),
-        _ => None,
-    }
-}
+/// The unit types the quantity `unit_step_id` fallback resolves.
+const QUANTITY_UNIT_TYPES: [&str; 5] = [
+    "LENGTHUNIT",
+    "AREAUNIT",
+    "VOLUMEUNIT",
+    "MASSUNIT",
+    "TIMEUNIT",
+];
 
-/// `.LENGTHUNIT.` → `"LENGTHUNIT"` (trimmed, uppercased); `None` for any
-/// other shape.
-fn parse_enum_uppercase(raw: &[u8]) -> Option<String> {
-    let t = trim(raw);
-    if t.len() < 2 || t.first() != Some(&b'.') || t.last() != Some(&b'.') {
-        return None;
+/// The value measure of an [`PropClass::UnhandledQuantity`] class whose
+/// attribute layout is the IfcPhysicalSimpleQuantity one (value at
+/// index 3, Unit at 2). `None` → no value slot (layout unknown).
+///
+/// IFC4X3 `IfcQuantityNumber.NumberValue : IfcNumericMeasure` (GH #199).
+pub(crate) fn unhandled_quantity_measure(t: &[u8]) -> Option<&'static str> {
+    if t.eq_ignore_ascii_case(b"IFCQUANTITYNUMBER") {
+        Some("IFCNUMERICMEASURE")
+    } else {
+        None
     }
-    let s = std::str::from_utf8(&t[1..t.len() - 1]).ok()?;
-    Some(s.to_ascii_uppercase())
 }
 
 fn string_at(fields: &[&[u8]], idx: usize) -> Option<String> {
@@ -1344,16 +1339,49 @@ mod tests {
         assert_eq!(row("Temp").0.as_deref(), Some("-5..30"));
         assert_eq!(row("Curve").0.as_deref(), Some("1=>10, 2=>20"));
         assert_eq!(row("Profile.Width").0.as_deref(), Some("200"));
-        // Long-standing PsetTable behaviour, kept for byte identity:
-        // defined types missing from the indexer's entity-name table are
-        // title-cased as one word (ifcopenshell says IfcPressureMeasure).
-        // The graph keeps the wrapper as written.
-        assert_eq!(row("Pressure").1.as_deref(), Some("IfcPressuremeasure"));
+        // Canonical CamelCase, as ifcopenshell (GH #195; was the one-word
+        // title case "IfcPressuremeasure"). The graph keeps the wrapper as
+        // written.
+        assert_eq!(row("Pressure").1.as_deref(), Some("IfcPressureMeasure"));
+        assert_eq!(
+            row("Temp").1.as_deref(),
+            Some("IfcThermodynamicTemperatureMeasure")
+        );
         assert_eq!(row("IsExternal").2, "type");
-        assert_eq!(p.prop_name.iter().filter(|n| *n == "FireRating").count(), 1);
+        // Product rows first (8, unchanged), then the type object's own
+        // HasPropertySets under the type's guid, source "instance" (GH #196).
+        assert_eq!(p.len(), 10);
+        let wall: Vec<usize> = (0..p.len())
+            .filter(|&i| p.guid[i] == "1Wall00000000000000001")
+            .collect();
+        assert_eq!(wall, (0..8).collect::<Vec<_>>());
+        assert_eq!(
+            wall.iter()
+                .filter(|&&i| p.prop_name[i] == "FireRating")
+                .count(),
+            1
+        );
+        let own: Vec<(&str, &str, Option<&str>, &str)> = (8..10)
+            .map(|i| {
+                assert_eq!(p.guid[i], "1Type00000000000000001");
+                assert_eq!(p.pset_name[i], "Pset_WallCommon");
+                (
+                    p.prop_name[i].as_str(),
+                    p.value[i].as_deref().unwrap_or(""),
+                    p.value_type[i].as_deref(),
+                    p.source[i].as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            own,
+            vec![
+                ("FireRating", "EI30", Some("IfcLabel"), "instance"),
+                ("IsExternal", "False", Some("IfcBoolean"), "instance"),
+            ]
+        );
         // Material properties never reach m.psets (no guid, not a product).
         assert!(!p.prop_name.iter().any(|n| n == "CompressiveStrength"));
-        assert_eq!(p.len(), 8);
         // Same rows through the scoped build.
         let scoped = crate::extractors::psets::build(&table, &map);
         assert_eq!(scoped.prop_name, p.prop_name);

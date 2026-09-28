@@ -178,7 +178,42 @@ file declared a length unit that could not be resolved
 (`m.unit_scale is None`) — an absent value beats a fabricated metre
 one. Storey columns are now `guid, name, elevation, building_guid,
 elevation_m`; `diff()`'s `storey_deltas` carry both `elevation` and
-`elevation_m` pairs.
+`elevation_m` pairs. Nested conversion chains (yard → foot → metre)
+and `IfcConversionBasedUnitWithOffset` with a zero offset resolve
+since cache schema v35 (GH #197); a length unit with a non-zero
+offset stays unresolved with a warning.
+
+**`ProductRow` / `products_df` columns:** `guid, entity, name,
+predefined_type, object_type, tag, storey_guid, storey_name,
+parent_guid, mode, step_id, type_guid, type_name, type_source,
+has_body, body_rep_type`. One row per whitelisted `IfcProduct` instance
+(see [Coverage boundary](#coverage-boundary)); `IfcSpace` rows are in
+here too.
+
+- `has_body` (bool, GH #202) — the product has a 3D body
+  representation, read from `IfcProductDefinitionShape.Representations`,
+  **no meshing**. True when an `IfcShapeRepresentation` has
+  `RepresentationIdentifier` `Body` / `Body-FallBack` / `Facetation`
+  (case-insensitive), or has no identifier and a 3D solid/surface
+  `RepresentationType` (`SweptSolid`, `AdvancedSweptSolid`, `Brep`,
+  `AdvancedBrep`, `CSG`, `Clipping`, `SurfaceModel`, `Tessellation`,
+  `SolidModel`, `SectionedSpine`, or `MappedRepresentation` whose mapped
+  source is one of those). `Axis`, `FootPrint`, `Box`, `Annotation`,
+  `GeometricSet`, … are not bodies. `False` for a product with no
+  representation — ports, aggregate containers (`IfcStair`, `IfcRoof`,
+  `IfcCurtainWall`, `IfcElementAssembly` whose parts carry the
+  geometry), axis-only members.
+- `body_rep_type` (str | None) — the `RepresentationType` of the chosen
+  body representation, verbatim (`"MappedRepresentation"` for a mapped
+  body, not the source's type); `None` when `has_body` is false. The
+  choice is by precedence tier, first listed within a tier: `Body` /
+  `Facetation`, then `Body-FallBack`, then an identifier-less solid —
+  so a later `Body` beats an earlier `Body-FallBack`.
+- The mesher tessellates exactly that representation (one shared
+  definition, `crates/core/src/body_rep.rs`). A product with
+  `has_body == False` may still get geometry from `meshes()` / `bundle()`
+  through the legacy first-representation fallback (a `Box` or
+  `FootPrint`); that geometry is not a body.
 
 ## Decision tree for common tasks
 
@@ -208,7 +243,8 @@ elevation_m`; `diff()`'s `storey_deltas` carry both `elevation` and
 | Type catalogue (TypeBank-shaped) | `m.type_summary()` / `m.type_bank()` |
 | Products of an entity type (incl. subtypes) | `m.by_type("IfcWall")` — mirrors `ifcopenshell.file.by_type(type, include_subtypes=True)`: **expands subtypes by default** (`by_type("IfcWall")` includes `IfcWallStandardCase`; `by_type("IfcElement")` / `by_type("IfcProduct")` return all element/product subtypes present), and matches the entity name **case-insensitively**. Pass `include_subtypes=False` for an exact single-entity match. Counts are over the *meshable-product* substrate, so abstract supertypes resolve to the concrete products the model actually carries (e.g. `IfcProduct` excludes non-meshable products like `IfcSpace`). Unknown names raise `ValueError`. (GH #81.) |
 | Iterate every product as `ProductRow` | `for p in m:` (or `m.products`, `m.filter(entity=...)`). `filter(storey_guid=…)` returns the **same set** as `m.products_in(storey_guid)` — the denormalised `storey_guid` inherits transitively through `IfcRelAggregates`, so aggregate parts (curtain-wall plates, stair flights) are included (GH #88, cache schema v21). |
-| Count of products (matches `m.products`) | `len(m)` |
+| Count of product ROWS (matches `m.products`; includes openings, ports, spaces, aggregate containers) | `len(m)` |
+| Count ELEMENTS with a 3D body, excluding subtractions (model-control denominator) | `df = m.products_df; (df.has_body & ~df.entity.isin(ifcfast.classify.subtypes_of("IfcFeatureElementSubtraction", m.schema))).sum()` — see [Counting elements](#counting-elements) |
 | Same data as a pandas DataFrame | `m.products_df` |
 | One product row by GlobalId | `m.product(guid)` → `ProductRow` or `None` |
 | `IfcSpace` rows / as a DataFrame | `m.spaces` (list) / `m.spaces_df` (joined with product name + storey) |
@@ -288,19 +324,52 @@ describing via `pq.read_schema(...)`):
   bucketed area columns, `largest_surface_m2`, `smallest_surface_m2`,
   `surface_count`, `mesh_quality` (`"closed"` / `"open_shell"` /
   `"degenerate"`).
-- **Coverage boundary (GH #122).** The meshable-product substrate emits
-  building elements plus `IfcSpace`. Two categories are intentionally
-  absent, so a differential against a raw `ifcopenshell.geom` iterator
-  (which meshes *every* product with a representation) shows them as
-  "missing": (1) **subtractive void features** (`IfcOpeningElement` and
-  the rest of `IfcFeatureElementSubtraction`) — under the default
-  `mesh_qto(cut_openings=True)` these are folded into their host's volume
-  and get no standalone row (use `cut_openings=False` to see them as
-  reveal-all operands); (2) **spatial containers**
-  (`IfcSite` / `IfcBuilding` / `IfcBuildingStorey`) — structure, not
-  building-element geometry, so their representations are not quantified.
-  Everything else ifcopenshell meshes, ifcfast meshes too (G55_ARK:
-  identical product set once these two categories are aligned).
+- <a id="coverage-boundary"></a>**Coverage boundary (GH #122, #203).**
+  Two layers, two different contracts:
+  - **Tier-1 `products` table = reveal-all index.** One row for every
+    instance of a whitelisted `IfcProduct` class — every concrete
+    `IfcProduct` subtype of IFC2X3 / IFC4 / IFC4X3 except `IfcSite`,
+    `IfcBuilding`, `IfcBuildingStorey` (own tables; `IfcProject` is not
+    a product). That INCLUDES `IfcOpeningElement` and the rest of
+    `IfcFeatureElementSubtraction`, `IfcDistributionPort`, `IfcSpace`,
+    `IfcAnnotation`, `IfcGrid`, structural-analysis items, and aggregate
+    containers (`IfcStair`, `IfcRoof`, `IfcCurtainWall`,
+    `IfcElementAssembly`) whose parts carry the geometry. A row says
+    "this instance exists", nothing more. What it means is in two
+    columns: `mode` (take-off role; subtractions, ports, spaces, grids,
+    annotations, structural items are `'skip'`) and `has_body` (GH #202:
+    a 3D body representation exists). Nothing in this table is folded
+    or dropped.
+  - **Mesh / QTO substrate = geometry layer.** It meshes building
+    elements plus `IfcSpace`, and it is where subtractions are folded:
+    under the default `mesh_qto(cut_openings=True)` / `meshes(cut_openings=True)`
+    an `IfcOpeningElement` is subtracted from its host (via
+    `m.voids`) and gets no standalone row (`cut_openings=False` shows
+    it as a reveal-all operand). Spatial containers (`IfcSite` /
+    `IfcBuilding` / `IfcBuildingStorey`) are structure, not element
+    geometry, and are not quantified. A differential against a raw
+    `ifcopenshell.geom` iterator (which meshes *every* product with a
+    representation) shows exactly these two categories as "missing";
+    everything else ifcopenshell meshes, ifcfast meshes too (G55_ARK:
+    identical product set once the two are aligned).
+  - `IfcSite` has no row in `products` / `spaces` (the spatial graph
+    knows it only as a container), so a site body (terrain, marker) is
+    not counted by `has_body`.
+- <a id="counting-elements"></a>**Counting elements.** `len(m)` and
+  `m.summary()["products"]` are ROW counts of the `products` table —
+  openings, ports, spaces and aggregate containers included — never an
+  element count. The element denominator a model-control check wants
+  ("every product with a 3D body, excluding subtractions") is one
+  expression:
+  ```python
+  from ifcfast.classify import subtypes_of
+  df = m.products_df
+  subtractions = subtypes_of("IfcFeatureElementSubtraction", m.schema)
+  elements = df[df.has_body & ~df.entity.isin(subtractions)]
+  ```
+  Add `& (df.entity != "IfcSpace")` if spaces are not elements for you.
+  G55_ARK (IFC2X3 Revit): 13 606 rows, 13 520 with a body, 1 304 of
+  them `IfcOpeningElement` → 12 216 elements.
 - Volume reliability (since cache schema v16, GH #60; open-shell routing
   GH #121, cache schema v24): `volume_m3` is the **best** estimate (mesh
   volume when trustworthy, else a min-over-three-axes prism fallback — so
@@ -654,10 +723,22 @@ deciding what to hide. Precedence (first match wins):
 
 | value          | rule                                                                                                                                  |
 |----------------|---------------------------------------------------------------------------------------------------------------------------------------|
-| `non_physical` | either side ∈ {`Grid`, `Annotation`, `Space`, `OpeningElement`, `VirtualElement`}                                                     |
+| `non_physical` | either side ∈ {`Grid`, `Annotation`, `Space`, `OpeningElement`, `VirtualElement`, …} — full list below                               |
 | `insulation`   | either side is `Covering`                                                                                                             |
 | `connection`   | same family prefix, one side ends in `Fitting`, the other in `Segment` — e.g. `PipeFitting`↔`PipeSegment`, `DuctFitting`↔`DuctSegment` |
 | `clash`        | default — everything else                                                                                                             |
+
+Since the generated whitelist (GH #201) `non_physical` also covers
+`SpatialZone`, `ExternalSpatialElement`, `OpeningStandardCase`,
+`VoidingFeature`, `DistributionPort`, every structural-analysis item
+(`StructuralCurveMember[Varying]`, `StructuralSurfaceMember[Varying]`,
+`Structural{Point,Curve,Surface}Connection`, the `Structural*Action` /
+`Structural*Reaction` activities), the IFC4X3 alignment / positioning
+classes (`Alignment`, `AlignmentSegment`, `AlignmentHorizontal`,
+`AlignmentVertical`, `AlignmentCant`, `Referent`,
+`LinearPositioningElement`, `LinearElement`) and facility wrappers
+(`Facility`, `FacilityPartCommon`, `Bridge`, `BridgePart`, `Road`,
+`RoadPart`, `Railway`, `RailwayPart`, `MarineFacility`, `MarinePart`).
 
 Two fittings (or two segments) of the same family colliding is NOT a
 joint and stays `clash`; cross-family `PipeFitting`↔`DuctSegment`
@@ -767,11 +848,17 @@ list / bounded value with no bound), `PROP_UNSUPPORTED` (a complex
 property or quantity, or a reference value: IDS 1.0 cannot check them,
 so they count as absent — `optional` and `prohibited` pass),
 `PROP_DATATYPE_MISMATCH` (`actual` = the value's wrapper, e.g.
-`IFCTEXT`), `PROP_VALUE_MISMATCH`, `CLASS_MISSING`,
+`IfcText`, CamelCase since v35), `PROP_VALUE_MISMATCH`, `CLASS_MISSING`,
 `CLASS_VALUE_MISMATCH`, `CLASS_SYSTEM_MISMATCH`, `MATERIAL_MISSING`,
 `MATERIAL_VALUE_MISMATCH` (`actual` = the sorted candidate set),
 `PROHIBITED_PRESENT`, `SPEC_NO_APPLICABLE`, `SPEC_PROHIBITED_APPLICABLE`.
 Reserved for slice 3: `PARTOF_MISSING`, `PARTOF_ENTITY_MISMATCH`.
+
+`actual` on `PROP_DATATYPE_MISMATCH` is the value's type in CamelCase
+(`IfcText`, `IfcLengthMeasure`), as IfcTester prints it (GH #200).
+IFC4X3 `IfcQuantityNumber` is read by the property facet (dataType
+`IFCNUMERICMEASURE`, GH #199); `m.quantities` still shows it as an
+`unhandled:IFCQUANTITYNUMBER` row.
 
 **Semantics you can rely on.** Entity matching is exact class (no
 subtypes), as IDS 1.0 and IfcTester. In IFC2X3 an IFC4 occurrence name
@@ -1047,24 +1134,39 @@ Gated by `crates/wasm/test/limits.mjs`.
   stays unique, and `m.summary()["duplicate_step_ids"]` reports how many
   rows were collapsed (0 on a well-formed file). Treat a non-zero count
   as a loud "this source is malformed" signal.
-- **Unknown product classes are reported, not dropped (GH #178).** The
-  tier-1 indexer only emits rows for entity types in its product
-  whitelist. A file whose products are all of some class outside it
-  used to open as `len(m) == 0` with no error and no warning — the
-  type objects still listed, so the model looked half-parsed rather
-  than unsupported. `IfcGeographicElement` and `IfcCivilElement` (the
-  correct IFC4 classes for terrain, survey markers and landscape
-  objects) were two such classes; they are whitelisted now, along with
-  18 others `classify.py` already called take-off products. More
-  durably: any record with the `IfcProduct` attribute shape that the
-  whitelist does not claim is counted by class and surfaced as
-  `m.skipped_product_types` / `m.summary()["skipped_product_types"]`
-  (`{"IfcTubeBundle": 3}`, ifcopenshell title case; empty on a
-  fully-covered file). `ifcfast.open()` emits a `UserWarning` when
-  that dict is non-empty **and** the model indexed zero products, and
-  `ifcfast index` prints a `SKIPPED` block. Treat a non-empty dict as
-  "these elements are in the file but in no table on this model" —
-  parse with ifcopenshell, or open an issue naming the class.
+- **The product whitelist is the schema, not a hand list (GH #178,
+  #201).** The tier-1 indexer emits rows only for classes in its product
+  whitelist. That list was hand-maintained and drifted three times:
+  `IfcGeographicElement` / `IfcCivilElement` (a terrain model opened as
+  `len(m) == 0`, GH #178), missing title-case spellings (GH #186), and
+  62 schema classes, among them `IfcCooledBeam` and 12 other
+  distribution classes and `IfcOpeningStandardCase` (163 cooled beams absent from every table
+  of a client model, no warning because the file had other products,
+  GH #201). Since GH #201 it is GENERATED from the schema tables
+  (`scripts/gen_schema_supertypes.py` →
+  `crates/core/src/schema_products.rs`): every entity that descends
+  from `IfcProduct` in IFC2X3, IFC4 or IFC4X3 and is concrete in at
+  least one of them, minus `IfcSite` / `IfcBuilding` /
+  `IfcBuildingStorey` / `IfcSpace` (routed to their own dispatch;
+  spaces still get a product row). `ifcfast.whitelist.product_types()`
+  returns it in ifcopenshell spelling; CI pins it EQUAL to the closure
+  computed from `ifcfast.data.schema_supertypes`. Newly indexed classes
+  that are not take-off products (structural-analysis items, alignment
+  / positioning, `IfcSpatialZone`, facility wrappers) classify
+  `mode == 'skip'`. `tag` is read from the schema's `Tag` position
+  (`IfcProxy`: argument 8; classes without `Tag`: `None`).
+- **Unknown product classes are reported, not dropped (GH #178).** A
+  record with the `IfcProduct` attribute shape whose class is in no
+  supported schema (a vendor extension, a newer schema) is counted by
+  class and surfaced as `m.skipped_product_types` /
+  `m.summary()["skipped_product_types"]` (`{"IFCACMEWIDGET": 3}` —
+  ifcopenshell title case when the class is known to a schema, the
+  STEP spelling otherwise; empty on a fully-covered file).
+  `ifcfast.open()` emits a `UserWarning` when that dict is non-empty
+  **and** the model indexed zero products, and `ifcfast index` prints a
+  `SKIPPED` block. Treat a non-empty dict as "these elements are in the
+  file but in no table on this model" — parse with ifcopenshell, or
+  open an issue naming the class.
 - **Empty tables report canonical dtypes (GH #71).** A model with no
   quantities / no geometry used to report `schemas["quantities"]` /
   `schemas["drift"]` columns as all-`float64` (the empty-DataFrame
@@ -1073,7 +1175,8 @@ Gated by `crates/wasm/test/limits.mjs`.
   `int64` for counts/indices, `float64` for measures), so a dtype check
   behaves the same whether the table has rows or not.
 - **`spaces_df` carries name + storey (GH #71).** Columns are now
-  `guid`, `step_id`, `name`, `storey_guid`, `storey_name` — the
+  `guid`, `step_id`, `name`, `storey_guid`, `storey_name`, `has_body`,
+  `body_rep_type` (the last two GH #202) — the
   name/container joined from the `products` table (IfcSpace *is* a
   product, mode-filtered into its own collection). Previously the bare
   `(guid, step_id)` couldn't tell you a space's name, inviting a wrong
@@ -1228,6 +1331,12 @@ Gated by `crates/wasm/test/limits.mjs`.
   arguments; only genuine panics map to `IfcfastError`.) From the CLI
   it is caught like any other recoverable failure: `ifcfast: <message>`
   on stderr and exit code 1, never a traceback (GH #162).
+- **`psets.value_type` is the schema's CamelCase spelling**
+  (`IfcPressureMeasure`, `IfcPositiveLengthMeasure`), matching
+  ifcopenshell `NominalValue.is_a()`, since cache schema v35 (GH
+  #195). Before v35 multi-word measure types were single-word
+  title-cased (`IfcPressuremeasure`). `unhandled:IFCXXX` markers stay
+  uppercase.
 - **`m.psets` inherits type-level properties by default** (since
   v0.4.29, cache schema v7). Properties carried on an
   `IfcTypeObject.HasPropertySets` and bound via
@@ -1237,7 +1346,12 @@ Gated by `crates/wasm/test/limits.mjs`.
   shadow same-named type properties (instance wins on collision —
   matches `ifcopenshell.util.element.get_psets(..., should_inherit=True)`).
   Filter with `m.psets[m.psets.source == "instance"]` if you need
-  the pre-v0.4.29 shape. Common payoff: manufacturer / type marks /
+  the pre-v0.4.29 shape — and since cache schema v35 also restrict to
+  product guids, because **a type object's own property sets are
+  listed under the type's guid** with `source = "instance"` (declared
+  on that object), after every product row (GH #196). The same holds
+  for `m.quantities` (a type's own `IfcElementQuantity`). Product
+  rows are unchanged. Common payoff: manufacturer / type marks /
   fire ratings on Revit / Tekla / Archicad exports that live at the
   type level were silently dropped before this fix (GH #36).
   Type inheritance covers bare `IfcTypeProduct` / `IfcTypeObject`
@@ -1252,9 +1366,13 @@ Gated by `crates/wasm/test/limits.mjs`.
   `Volume`→`VOLUMEUNIT`, `Weight`→`MASSUNIT`, `Time`→`TIMEUNIT`).
   `Count` stays null — it's dimensionless. Explicit per-quantity
   `Unit` refs still win (no fallback fires when the slot is set).
-  Resolution is `IfcSIUnit`-only; `IfcConversionBasedUnit` /
-  `IfcDerivedUnit` resolution is a separate feature (GH #43). Since
-  cache schema v20 (GH #76) the fallback prefers the `IfcSIUnit` the
+  Since cache schema v35 (GH #198) the fallback is the project unit
+  of the quantity's kind from the **first non-empty
+  `IfcUnitAssignment`** — the same assignment `unit_scale` reads —
+  and any unit kind counts: a feet project's
+  `IfcConversionBasedUnit` FOOT is the `unit_step_id` of its length
+  quantities (was null). `Count` and `unhandled:` marker rows stay
+  null. Since cache schema v20 (GH #76) the fallback prefers the `IfcSIUnit` the
   `IfcUnitAssignment` actually references when two units share a
   `UnitType` — a dangling duplicate (e.g. nested in an unresolved
   `IfcConversionBasedUnit`) no longer clobbers the real default
@@ -1944,25 +2062,35 @@ ifcfast bundle  FILE [OUT_DIR]     # parquet substrate (see "Substrate output")
 
 ## Dev scripts (repo, not the wheel)
 
-Two generators live in `scripts/` and are run by maintainers, never by
-consumers — neither ships in the wheel:
+Three generators live in `scripts/` and are run by maintainers, never
+by consumers — none ship in the wheel:
 
-- `scripts/gen_schema_supertypes.py` — regenerates
-  `python/ifcfast/data/schema_supertypes.py` (the per-schema entity →
-  supertype map that `ifcfast.classify` walks) from ifcopenshell's
-  schema bundle. Re-run it when the pinned ifcopenshell changes. The
-  map is folded into the parquet cache's classifier signature, so a
+- `scripts/gen_schema_supertypes.py` — regenerates, from ONE walk of
+  ifcopenshell's schema bundle, `python/ifcfast/data/schema_supertypes.py`
+  (the per-schema entity → supertype map `ifcfast.classify` walks, plus
+  `ALL_ENTITIES` and `ABSTRACT`) and `crates/core/src/schema_products.rs`
+  (the Rust tier-1 product whitelist, the `Tag` position per class and
+  the STEP-token → ifcopenshell spelling table, GH #201). Re-run it when
+  the pinned ifcopenshell changes; `tests/test_schema_codegen_drift_201.py`
+  fails if either committed file differs from a fresh run. The map is
+  folded into the parquet cache's classifier signature, so a
   regeneration invalidates cached `mode` columns automatically
   (GH #158).
+- `scripts/gen_defined_type_names.py` — regenerates
+  `crates/core/src/extractors/defined_type_names.rs`, the 409 defined
+  and enumeration types across IFC2X3 / IFC4 / IFC4X3 with their
+  schema CamelCase spelling. Drift-gated by
+  `tests/test_defined_type_names_drift.py`.
 - `scripts/generate_sample_sidecars.py` — builds the sample sidecar
   artefacts (substrate + per-type glTF minis + manifest) used for
   demos and viewer smoke-tests.
 
-`crates/core/src/indexer.rs::PRODUCT_TYPES` is the canonical
-product-membership source; `tests/test_product_whitelist_parity_178.py`
-asserts it covers `classify.py`'s COUNT/MEASURE/LINEAR sets via
-`_core.product_types()`. Adding an entity to `classify.py` without
-adding it to `PRODUCT_TYPES` (and to `ENTITY_NAME_PAIRS`) now fails CI.
+`crates/core/src/indexer.rs::PRODUCT_TYPES` (re-exported from the
+generated `schema_products.rs`) is the canonical product-membership
+source. Never edit it by hand: `tests/test_product_whitelist_parity_178.py`
+asserts via `_core.product_types()` that it EQUALS the concrete
+`IfcProduct` closure of the Python schema tables and covers every
+concrete class in `classify.py`'s COUNT/MEASURE/LINEAR sets.
 
 `AGENTS.md` itself is mirrored into `python/ifcfast/data/AGENTS.md` so
 the wheel can serve it; `tests/test_agents_guide.py` fails if the copy

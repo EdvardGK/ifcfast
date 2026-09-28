@@ -43,7 +43,7 @@ pub type Rollup = HashMap<String, (Option<f64>, Option<f64>, Option<f64>)>;
 /// Mirrors `python/ifcfast/header.py::_CACHE_SCHEMA_VERSION`. Bump in
 /// lockstep — it is hashed into `cache_key`, so a mismatch shows up as a
 /// changed key rather than stale data.
-const CACHE_SCHEMA_VERSION: u32 = 34;
+const CACHE_SCHEMA_VERSION: u32 = 35;
 const HASH_HEAD_BYTES: usize = 4 * 1024 * 1024;
 const HASH_TAIL_BYTES: usize = 4 * 1024 * 1024;
 /// `header.py::_HEADER_READ_BYTES` — the window FILE_SCHEMA is read from.
@@ -116,6 +116,10 @@ pub struct ProductRow {
     pub parent_guid: Option<String>,
     pub type_name: Option<String>,
     pub type_source: &'static str,
+    /// GH #202 — `IndexedFile::product_has_body`, the wheel's column.
+    pub has_body: bool,
+    /// GH #202 — `IndexedFile::product_body_rep_type`.
+    pub body_rep_type: Option<String>,
 }
 
 pub struct StoreyRow {
@@ -445,6 +449,8 @@ impl Analysis {
                 parent_guid: parent_lookup.get(&sid).cloned(),
                 type_name,
                 type_source,
+                has_body: idx.product_has_body.get(i).copied().unwrap_or(false),
+                body_rep_type: idx.product_body_rep_type.get(i).cloned().flatten(),
             };
             match index_by_step.get(&sid) {
                 None => {
@@ -1122,6 +1128,8 @@ const COLS: &[(&str, &[&str])] = &[
             "type_guid",
             "type_name",
             "type_source",
+            "has_body",
+            "body_rep_type",
         ],
     ),
     // `elevation_m` is LAST because Python's column list is
@@ -1133,7 +1141,15 @@ const COLS: &[(&str, &[&str])] = &[
     ),
     (
         "spaces",
-        &["guid", "step_id", "name", "storey_guid", "storey_name"],
+        &[
+            "guid",
+            "step_id",
+            "name",
+            "storey_guid",
+            "storey_name",
+            "has_body",
+            "body_rep_type",
+        ],
     ),
     ("type_objects", &["guid", "entity", "name", "step_id"]),
     (
@@ -1486,6 +1502,8 @@ impl Analysis {
                 "typed": p.type_source == "ifctype",
                 "type_name": jstr(&type_name),
                 "type_source": p.type_source,
+                "has_body": p.has_body,
+                "body_rep_type": jstr(&p.body_rep_type),
                 "materials": self.materials_by_guid.get(&p.guid).cloned().unwrap_or_default(),
                 "layer_set": self.layer_set_by_guid.get(&p.guid).cloned().map(Value::String).unwrap_or(Value::Null),
                 "m3": jnum(m3),

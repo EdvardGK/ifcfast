@@ -13,13 +13,22 @@ Two guards live here:
 
 * :func:`product_types` re-exports the Rust list so
   ``tests/test_product_whitelist_parity_178.py`` can fail the build on
-  the next drift instead of waiting for a user to find it.
+  the next drift instead of waiting for a user to find it. Since GH #201
+  the Rust list is GENERATED from the schema tables
+  (``scripts/gen_schema_supertypes.py`` →
+  ``crates/core/src/schema_products.rs``): every concrete ``IfcProduct``
+  subtype of IFC2X3 / IFC4 / IFC4X3 except ``IfcSite`` /
+  ``IfcBuilding`` / ``IfcBuildingStorey`` (own tables) and ``IfcSpace``
+  (dispatched separately, still emitted as a product row). A hand list
+  missed 62 schema classes, ``IfcCooledBeam`` among them.
 * :func:`note_skipped` turns the indexer's count of *"entities shaped
   like an IfcProduct that no whitelist entry claimed"* into a
   :class:`UserWarning` whenever the model came back with zero products.
   A silent zero is worse than a loud refusal: downstream a model-health
   tool reports "0 elements" as a finding about the MODEL rather than
-  about ifcfast.
+  about ifcfast. With the whitelist derived from the schemas, what can
+  still land here is a class outside IFC2X3 / IFC4 / IFC4X3 (a vendor
+  extension, a newer schema), reported in its STEP spelling.
 """
 
 from __future__ import annotations
@@ -73,7 +82,7 @@ def note_skipped(model, raw_counts) -> dict[str, int]:
     The warning fires ONLY on the combination that is indefensible: the
     model has no products at all AND the file contained entities that
     look like products. A model with 5000 walls and three skipped
-    ``IfcTubeBundle`` rows is a coverage gap, reported through
+    vendor-class rows is a coverage gap, reported through
     ``summary()["skipped_product_types"]``, not a warning on every open.
     """
     counts: dict[str, int] = {}

@@ -364,8 +364,10 @@ def test_spaces_collection_present_on_empty_model(minimal):
     df = minimal.spaces_df
     # GH #71 (7): spaces_df is enriched with name/storey joined from the
     # products table, so it carries more than the bare (guid, step_id).
+    # GH #202 adds the body flag, also joined from products.
     assert list(df.columns) == [
-        "guid", "step_id", "name", "storey_guid", "storey_name"
+        "guid", "step_id", "name", "storey_guid", "storey_name",
+        "has_body", "body_rep_type",
     ]
 
 

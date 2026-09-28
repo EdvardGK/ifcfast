@@ -787,7 +787,25 @@ def _resolve_step_escapes(s: str) -> str:
 #       their chord count and sector-area scale (still computed on the
 #       f32 path) and move by at most a last-ulp cast. A cache written
 #       before this bump would keep serving the 13 000 km beams.
-_CACHE_SCHEMA_VERSION = 34
+#   35: GH #201 / #202 — the tier-1 product whitelist is generated from
+#       the IFC schemas (every concrete IfcProduct subtype, IFC2X3 / IFC4
+#       / IFC4X3), so `products` gains rows for classes the hand list
+#       missed (IfcCooledBeam, IfcOpeningStandardCase, IfcStructural*,
+#       IFC4X3 alignment / facility classes, …); `products` gains the
+#       `has_body` / `body_rep_type` columns; `tag` is read from the
+#       schema's Tag position (IfcProxy: arg 8; classes without Tag:
+#       None); `type_objects.entity` uses the ifcopenshell spelling
+#       (`IfcWallType`, was `IfcWalltype`). The data-layer changes of
+#       the same release ride on this bump too: #195 —
+#       `psets.value_type` uses the schema's CamelCase spelling for
+#       multi-word measure types (`IfcPressureMeasure`, was
+#       `IfcPressuremeasure`); #196 — a type object's own property and
+#       quantity sets are now listed under the type's guid (tagged
+#       `source="instance"`), after every product row; #198 —
+#       `quantities.unit_step_id` falls back to the first non-empty
+#       `IfcUnitAssignment`'s unit of any kind (conversion-based feet
+#       included), not just `IfcSIUnit`.
+_CACHE_SCHEMA_VERSION = 35
 
 _FIELD_RE = re.compile(r"\(\s*(.*?)\s*\)\s*;", re.DOTALL)
 

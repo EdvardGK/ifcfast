@@ -11,6 +11,9 @@
 //!
 //! [`psets`] and [`quantities`] are flattened views of [`property_graph`],
 //! the shared typed property pass the IDS property facet also reads.
+//! [`type_names`] is the canonical CamelCase spelling of IFC value
+//! wrappers (`IFCPRESSUREMEASURE` → `IfcPressureMeasure`) shared by
+//! `psets.value_type` and the IDS failure strings.
 //!
 //! All four are independent and can be called in any combination. The
 //! `extract_all` PyO3 entry point in [`crate`] shares the entity table
@@ -18,7 +21,9 @@
 //! files.
 
 pub mod classifications;
+mod defined_type_names;
 pub mod materials;
 pub mod property_graph;
 pub mod psets;
 pub mod quantities;
+pub mod type_names;

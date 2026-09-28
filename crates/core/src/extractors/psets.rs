@@ -37,6 +37,10 @@ use crate::lexer::{parse_field, Field};
 /// `should_inherit=True` default: an instance-declared property
 /// shadows a same-named type property (instance wins on collision; no
 /// `source="type"` row is emitted in that case).
+///
+/// A type object's own `HasPropertySets` are listed under the type's
+/// guid with `source="instance"` (declared on that object), after every
+/// product row (GH #196).
 #[derive(Debug, Default)]
 pub struct PsetTable {
     pub guid: Vec<String>,
@@ -74,7 +78,11 @@ pub fn build(table: &EntityTable, product_step_to_guid: &HashMap<u64, String>) -
 /// `"ProfileGeometry.Width"`); then, by product step id, the leaves of
 /// each product's type `HasPropertySets` whose `(pset_name, prop_name)`
 /// no instance row on the same guid already carries (instance wins,
-/// ifcopenshell `should_inherit=True`).
+/// ifcopenshell `should_inherit=True`); then, by type step id, each type
+/// object's own `HasPropertySets` under its guid (GH #196).
+///
+/// `value_type` is the wrapper's canonical spelling
+/// (`IfcPressureMeasure`, GH #195, via [`super::type_names`]).
 pub fn build_from_graph(
     graph: &PropertyGraph,
     product_step_to_guid: &HashMap<u64, String>,
@@ -182,7 +190,81 @@ pub fn build_from_graph(
         }
     }
 
+    // A type object's own `HasPropertySets` (GH #196), under the type's
+    // guid, `source="instance"`: declared on that object, the same
+    // meaning the column has for a product's own sets (and
+    // `PropertyGraph::records_for(type)` → `Source::Instance`). Appended
+    // after every product row, so the product half is unchanged. A set
+    // the type already received through `IfcRelDefinesByProperties`
+    // (emitted above) is not repeated.
+    for_each_type_own_set(
+        graph,
+        product_step_to_guid,
+        PsetKind::PropertySet,
+        |guid, set| {
+            graph.walk_set_leaves(set, &mut |path, def| {
+                let Some((value, value_type)) = &formatted[def.ord] else {
+                    return;
+                };
+                out.guid.push(guid.to_string());
+                out.pset_name.push(set.name.clone());
+                out.prop_name.push(prop_name(path, &def.name));
+                out.value.push(value.clone());
+                out.value_type.push(value_type.clone());
+                out.source.push("instance".to_string());
+            });
+        },
+    );
+
     out
+}
+
+/// Visit, in type step-id order, every `(type guid, set)` of the type
+/// objects' own `HasPropertySets` of `kind` (GH #196): types with a guid
+/// in `step_to_guid`, set ids deduplicated per type and skipping sets the
+/// same type is also related to by `IfcRelDefinesByProperties` (those rows
+/// come from the relation walk). Shared with `quantities`.
+pub(crate) fn for_each_type_own_set<'g, F>(
+    graph: &'g PropertyGraph,
+    step_to_guid: &'g HashMap<u64, String>,
+    kind: PsetKind,
+    mut visit: F,
+) where
+    F: FnMut(&'g str, &'g super::property_graph::SetDef),
+{
+    if graph.type_sets.is_empty() {
+        return;
+    }
+    let mut types: Vec<(u64, &Vec<u64>)> = graph
+        .type_sets
+        .iter()
+        .filter(|(t, _)| step_to_guid.contains_key(t))
+        .map(|(t, ids)| (*t, ids))
+        .collect();
+    if types.is_empty() {
+        return;
+    }
+    types.sort_unstable_by_key(|(t, _)| *t);
+    let related: HashSet<(u64, u64)> = graph
+        .defines
+        .iter()
+        .filter(|(obj, _)| graph.type_sets.contains_key(obj))
+        .copied()
+        .collect();
+    for (type_step, set_ids) in types {
+        let guid = step_to_guid[&type_step].as_str();
+        let mut done: Vec<u64> = Vec::with_capacity(set_ids.len());
+        for set_id in set_ids {
+            if done.contains(set_id) || related.contains(&(type_step, *set_id)) {
+                continue;
+            }
+            done.push(*set_id);
+            match graph.sets.get(set_id) {
+                Some(s) if s.kind == kind => visit(guid, s),
+                _ => {}
+            }
+        }
+    }
 }
 
 /// `"{complex}.{complex}.{leaf}"`: each enclosing complex name followed by
@@ -288,7 +370,7 @@ fn parse_nominal_value(raw: Option<&[u8]>) -> (Option<String>, Option<String>) {
     if let Some((type_name, inner)) = split_type_wrapper(trimmed) {
         let inner_field = trim(inner);
         let raw_value = scalar_to_string(inner_field);
-        let type_str = crate::indexer::type_name_uppercase_with_proper_case(type_name);
+        let type_str = super::type_names::camel_type_name(type_name);
         // ifcopenshell stringifies IfcBoolean.T/.F via Python bool → str
         // (-> "True"/"False"), but IfcLogical.U has no bool representation
         // and falls back to the all-caps schema enum literal "UNKNOWN".

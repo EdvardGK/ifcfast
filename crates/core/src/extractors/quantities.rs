@@ -30,7 +30,7 @@
 //!
 //! Discovery is the shared typed pass in [`super::property_graph`]; this
 //! module is the flattened public view of it, with its row order, number
-//! formatting, SI-only `unit_step_id` fallback and marker rows unchanged.
+//! formatting and marker rows unchanged.
 
 use std::collections::{HashMap, HashSet};
 
@@ -78,10 +78,14 @@ pub fn build(table: &EntityTable, product_step_to_guid: &HashMap<u64, String>) -
 /// `HasPropertySets` quantities not shadowed by an instance row on the
 /// same guid (GH #45, instance wins).
 ///
-/// `unit_step_id` is the quantity's own `Unit`, else the project
-/// `IfcSIUnit` of its kind (GH #43). `IfcConversionBasedUnit` /
-/// `IfcDerivedUnit` project units are not a fallback target here; the
-/// general resolver is `crate::units::UnitTable`.
+/// Then every type object's own `IfcElementQuantity` sets under the
+/// type's guid, `source="instance"` (GH #196).
+///
+/// `unit_step_id` is the quantity's own `Unit`, else the project unit of
+/// its kind from the first non-empty `IfcUnitAssignment`, any unit kind
+/// (`IfcSIUnit`, `IfcConversionBasedUnit` feet, …; GH #43 / #198, via
+/// `crate::units::UnitTable::project_unit_step`). Null for `Count` and
+/// for `unhandled:` marker rows.
 pub fn build_from_graph(
     graph: &PropertyGraph,
     product_step_to_guid: &HashMap<u64, String>,
@@ -168,6 +172,20 @@ pub fn build_from_graph(
         }
     }
 
+    // A type object's own quantity sets (GH #196): see
+    // `psets::for_each_type_own_set`. Appended after every product row.
+    super::psets::for_each_type_own_set(
+        graph,
+        product_step_to_guid,
+        PsetKind::ElementQuantity,
+        |guid, set| {
+            graph.walk_set_leaves(set, &mut |path, def| {
+                let name = quantity_name(path, &def.name);
+                push_row(&mut out, graph, guid, &set.name, name, def, "instance");
+            });
+        },
+    );
+
     out
 }
 
@@ -203,10 +221,17 @@ fn push_row(
             None,
         ),
     };
-    let unit = def.unit_step.or_else(|| {
-        unit_type_for_quantity_class(def.class)
-            .and_then(|ut| graph.quantity_default_units.get(ut).copied())
-    });
+    // Marker rows keep a null unit: the graph now gives some unhandled
+    // classes a value slot and their own Unit (GH #199, for IDS), which
+    // this table does not surface.
+    let unit = if def.class == PropClass::UnhandledQuantity {
+        None
+    } else {
+        def.unit_step.or_else(|| {
+            unit_type_for_quantity_class(def.class)
+                .and_then(|ut| graph.quantity_default_units.get(ut).copied())
+        })
+    };
     out.guid.push(guid.to_string());
     out.qto_name.push(qto_name.to_string());
     out.quantity_name.push(name);

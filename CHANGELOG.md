@@ -7,6 +7,64 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed — tables and whitelist (GH #195–#203, cache schema v35)
+
+- **Product whitelist is generated from the IFC schemas (GH #201).**
+  Every entity descending from `IfcProduct` in IFC2X3 / IFC4 / IFC4X3
+  and concrete in at least one, minus `IfcSite` / `IfcBuilding` /
+  `IfcBuildingStorey` / `IfcSpace` (own dispatch). 62 classes gain
+  rows, including `IfcCooledBeam`, `IfcAirToAirHeatRecovery`,
+  `IfcElectricTimeControl`, `IfcEngine`, `IfcFlowInstrument`,
+  `IfcInterceptor`, `IfcTubeBundle`, `IfcElectricDistributionPoint`,
+  `IfcOpeningStandardCase`, structural-analysis and IFC4X3
+  alignment/facility classes. `scripts/gen_schema_supertypes.py`
+  writes `crates/core/src/schema_products.rs`; CI pins the Rust list
+  equal to the Python closure. Dead token `IfcFlowValve` removed. Side
+  effects: `type_objects_df.entity` now uses ifcopenshell spelling
+  (`IfcColumnType`, was `IfcColumntype`); `tag` is read from each
+  class's schema Tag position (IfcProxy now reads it; spatial classes
+  such as IfcFacility get None instead of LongName).
+- **`has_body` / `body_rep_type` on `products_df`, `ProductRow` and
+  `spaces_df` (GH #202).** Read from
+  `IfcProductDefinitionShape.Representations` without meshing; the
+  mesher selects its body with the same function (`body_rep.rs`), so
+  flag and geometry agree. Precedence: `Body` / `Facetation` first
+  (reproduces the pre-v35 mesher pick exactly), then `Body-FallBack`,
+  then an identifier-less solid or mapped body — a product whose only
+  body is `Body-FallBack` behind a `Box` rep is now meshed from the
+  fallback instead of the box. Element denominator:
+  `df[df.has_body & ~df.entity.isin(subtypes_of("IfcFeatureElementSubtraction", m.schema))]`.
+- **Guide and table agree on openings (GH #203).** `products` is the
+  reveal-all tier-1 index (openings, ports, spaces, containers
+  included, `mode == "skip"` where not a take-off element); the
+  mesh/QTO substrate folds subtractions. AGENTS.md "Coverage
+  boundary" rewritten, "Counting elements" note added.
+- #195: `psets.value_type` uses the schema's CamelCase for
+  multi-word measure types (`IfcPressureMeasure`, was
+  `IfcPressuremeasure`); generated spelling table
+  `extractors/defined_type_names.rs`.
+- #196: `m.psets` / `m.quantities` list a type object's own property
+  and quantity sets under the type's guid (`source="instance"`);
+  product rows unchanged.
+- #197: `unit_scale` resolves nested conversion-based length units
+  (yard→foot→metre) and zero-offset
+  `IfcConversionBasedUnitWithOffset`; the tier-1 indexer now feeds
+  every unit entity (including `WithOffset`) to the unit table under
+  its real type, so `m.unit_scale` and the extractor-side scale agree.
+- Clash: `IfcSpatialZone`, `IfcExternalSpatialElement`,
+  `IfcOpeningStandardCase`, `IfcVoidingFeature`, `IfcDistributionPort`,
+  structural-analysis items, alignment/positioning and facility classes
+  categorise `non_physical` (they are meshed and clashed like every
+  other product with a body; the engine categorises, never drops).
+- #198: `quantities.unit_step_id` falls back to the first non-empty
+  `IfcUnitAssignment`'s unit of any kind, conversion-based feet
+  included (was SI-only, unioned over all assignments).
+- #199: IDS property facet reads IFC4X3 `IfcQuantityNumber` values
+  instead of reporting `PROP_UNSUPPORTED`; the `quantities` marker
+  row is unchanged.
+- #200: IDS `PROP_DATATYPE_MISMATCH` `actual` is CamelCase
+  (`IfcText`), matching IfcTester.
+
 ## [0.5.3] - 2026-09-21
 
 ### Fixed — geometry precision (GH #188 #189 #190, cache schema v34)

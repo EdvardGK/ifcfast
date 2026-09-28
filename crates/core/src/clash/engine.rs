@@ -56,9 +56,10 @@ pub enum ClashCategory {
     /// expected geometry, not a real clash.
     Connection,
     /// At least one side is a non-physical class
-    /// (`Grid`, `Annotation`, `Space`, `OpeningElement`,
-    /// `VirtualElement`) — never an actionable clash, regardless of
-    /// the other side.
+    /// ([`NON_PHYSICAL_CLASSES`]: grids, annotations, spaces and zones,
+    /// openings / voids, virtual elements, ports, structural-analysis
+    /// items, IFC4X3 alignment / positioning / facility wrappers) —
+    /// never an actionable clash, regardless of the other side.
     NonPhysical,
 }
 
@@ -75,17 +76,73 @@ impl ClashCategory {
 
 /// Classes the engine treats as non-physical. Substrate stores
 /// classes with the `Ifc` prefix stripped (e.g. `"Grid"` for
-/// `IfcGrid`).
-const NON_PHYSICAL_CLASSES: &[&str] = &[
+/// `IfcGrid`); matching is exact on that name.
+///
+/// Hand list, pinned by a unit test to the generated product whitelist
+/// ([`crate::schema_products::PRODUCT_TYPES`], plus `IfcSpace`): every
+/// entry is a class that can reach the substrate. The GH #201 additions
+/// are the reference / analysis / wrapper classes the generated
+/// whitelist started meshing. The engine categorises, never drops.
+pub(crate) const NON_PHYSICAL_CLASSES: &[&str] = &[
     "Grid",
     "Annotation",
     "Space",
     "OpeningElement",
     "VirtualElement",
+    // GH #201: zones, openings / voids, ports.
+    "SpatialZone",
+    "ExternalSpatialElement",
+    "OpeningStandardCase",
+    "VoidingFeature",
+    "DistributionPort",
+    // GH #201: structural-analysis items (members, connections,
+    // actions, reactions) — analytical idealisations, not solids.
+    "StructuralCurveMember",
+    "StructuralCurveMemberVarying",
+    "StructuralSurfaceMember",
+    "StructuralSurfaceMemberVarying",
+    "StructuralPointConnection",
+    "StructuralCurveConnection",
+    "StructuralSurfaceConnection",
+    "StructuralPointAction",
+    "StructuralCurveAction",
+    "StructuralLinearAction",
+    "StructuralLinearActionVarying",
+    "StructuralSurfaceAction",
+    "StructuralPlanarAction",
+    "StructuralPlanarActionVarying",
+    "StructuralPointReaction",
+    "StructuralCurveReaction",
+    "StructuralSurfaceReaction",
+    // GH #201: IFC4X3 alignment / positioning reference geometry.
+    "Alignment",
+    "AlignmentSegment",
+    "AlignmentHorizontal",
+    "AlignmentVertical",
+    "AlignmentCant",
+    "Referent",
+    "LinearPositioningElement",
+    "LinearElement",
+    // GH #201: IFC4X3 facility wrappers (the parts are the products).
+    "Facility",
+    "FacilityPartCommon",
+    "Bridge",
+    "BridgePart",
+    "Road",
+    "RoadPart",
+    "Railway",
+    "RailwayPart",
+    "MarineFacility",
+    "MarinePart",
 ];
 
 fn is_non_physical(class: &str) -> bool {
-    NON_PHYSICAL_CLASSES.contains(&class)
+    // The mesh-substrate path folds `StandardCase` away (`normalize_class`:
+    // `IfcOpeningStandardCase` → `"Opening"`); the streaming path keeps
+    // it. Accept both spellings.
+    NON_PHYSICAL_CLASSES
+        .iter()
+        .any(|c| *c == class || c.strip_suffix("StandardCase") == Some(class))
 }
 
 /// Detect a same-family MEP joint: one side ends with `"Fitting"`,
@@ -904,6 +961,40 @@ mod tests {
             categorise("VirtualElement", "Door"),
             ClashCategory::NonPhysical,
         );
+    }
+
+    #[test]
+    fn categorise_spatial_zone_is_non_physical() {
+        assert_eq!(
+            categorise("Wall", "SpatialZone"),
+            ClashCategory::NonPhysical
+        );
+        assert_eq!(
+            categorise("StructuralCurveMember", "Beam"),
+            ClashCategory::NonPhysical
+        );
+        // IfcOpeningStandardCase under both substrate spellings.
+        assert_eq!(
+            categorise("OpeningStandardCase", "Wall"),
+            ClashCategory::NonPhysical
+        );
+        assert_eq!(categorise("Opening", "Wall"), ClashCategory::NonPhysical);
+    }
+
+    #[test]
+    fn non_physical_classes_are_whitelisted_products() {
+        // Every entry must be a class that can reach the substrate: the
+        // generated whitelist, or IfcSpace (own dispatch, meshed too).
+        for class in NON_PHYSICAL_CLASSES {
+            let token = format!("IFC{}", class.to_ascii_uppercase());
+            let known = crate::schema_products::PRODUCT_TYPES.contains(&token.as_bytes())
+                || token.as_bytes() == crate::indexer::SPACE_TYPE;
+            assert!(known, "{class} is not a whitelisted product class");
+        }
+        let mut seen = std::collections::HashSet::new();
+        for class in NON_PHYSICAL_CLASSES {
+            assert!(seen.insert(class), "duplicate entry {class}");
+        }
     }
 
     #[test]

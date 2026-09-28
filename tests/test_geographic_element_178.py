@@ -8,11 +8,14 @@ Two halves, and the second matters more than the first:
    no error, no warning. The type object was still listed, so the model
    looked half-parsed rather than unsupported.
 
-2. ``unlisted_product.ifc`` is the same file with ``IFCTUBEBUNDLE``, a
-   real IFC4 product that is deliberately NOT whitelisted. It stands in
-   for every class ifcfast does not yet index: the model still comes back
-   empty, but it now SAYS SO — a warning at open and a
-   ``skipped_product_types`` entry in ``summary()``.
+2. ``unlisted_product.ifc`` is the same file with ``IFCACMEWIDGET``, a
+   product-shaped class that is in no IFC schema. Since GH #201 the
+   whitelist is every concrete IfcProduct subtype of IFC2X3 / IFC4 /
+   IFC4X3 (this fixture used ``IFCTUBEBUNDLE`` until then), so what can
+   still be skipped is a vendor extension or a newer schema's class. The
+   model still comes back empty, but it SAYS SO — a warning at open and
+   a ``skipped_product_types`` entry in ``summary()``, keyed by the STEP
+   spelling because no schema knows the class.
 """
 
 from __future__ import annotations
@@ -82,10 +85,10 @@ def test_no_silent_zero_warning_on_a_covered_file():
 
 
 def test_unlisted_product_class_warns_instead_of_returning_a_silent_zero():
-    with pytest.warns(UserWarning, match="IfcTubeBundle"):
+    with pytest.warns(UserWarning, match="IFCACMEWIDGET"):
         m = ifcfast.open(UNLISTED, use_cache=False, write_cache=False)
     assert len(m) == 0
-    assert m.skipped_product_types == {"IfcTubeBundle": 1}
+    assert m.skipped_product_types == {"IFCACMEWIDGET": 1}
 
 
 def test_unlisted_product_class_shows_up_in_summary():
@@ -94,7 +97,7 @@ def test_unlisted_product_class_shows_up_in_summary():
         m = ifcfast.open(UNLISTED, use_cache=False, write_cache=False)
     s = m.summary()
     assert s["products"] == 0
-    assert s["skipped_product_types"] == {"IfcTubeBundle": 1}
+    assert s["skipped_product_types"] == {"IFCACMEWIDGET": 1}
 
 
 def test_relationship_entities_are_not_mistaken_for_products():
@@ -104,7 +107,7 @@ def test_relationship_entities_are_not_mistaken_for_products():
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         m = ifcfast.open(UNLISTED, use_cache=False, write_cache=False)
-    assert set(m.skipped_product_types) == {"IfcTubeBundle"}
+    assert set(m.skipped_product_types) == {"IFCACMEWIDGET"}
 
 
 def test_cache_hit_reports_the_same_gap(tmp_path, monkeypatch):
@@ -114,6 +117,6 @@ def test_cache_hit_reports_the_same_gap(tmp_path, monkeypatch):
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         ifcfast.open(UNLISTED, use_cache=False, write_cache=True)
-    with pytest.warns(UserWarning, match="IfcTubeBundle"):
+    with pytest.warns(UserWarning, match="IFCACMEWIDGET"):
         m = ifcfast.open(UNLISTED, use_cache=True, write_cache=False)
-    assert m.summary()["skipped_product_types"] == {"IfcTubeBundle": 1}
+    assert m.summary()["skipped_product_types"] == {"IFCACMEWIDGET": 1}

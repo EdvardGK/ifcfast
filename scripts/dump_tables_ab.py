@@ -16,7 +16,8 @@ def dump(out, paths):
     import ifcfast
     out = pathlib.Path(out); out.mkdir(parents=True, exist_ok=True)
     for p in paths:
-        m = ifcfast.open(p)
+        # No cache: a stale bundle from another build would hide the A/B.
+        m = ifcfast.open(p, strict=False, use_cache=False, write_cache=False)
         stem = pathlib.Path(p).stem
         for t in TABLES:
             df = getattr(m, t)

@@ -703,6 +703,15 @@ fn extract(ctx: &Ctx, pd: &PropData, pv: &PropView) -> Result<PropValues, IdsErr
                 Err(py) => PropValues::Empty(py),
             },
         },
+        // An IfcQuantity* class with a known value slot (IFC4X3
+        // IfcQuantityNumber, GH #199): read like the six handled kinds.
+        PropClass::UnhandledQuantity if !d.values.is_empty() => match d.values.first() {
+            None => PropValues::Empty("None".into()),
+            Some(tv) => match typed_item(tv, d.unit_step) {
+                Ok(i) => PropValues::One(i),
+                Err(py) => PropValues::Empty(py),
+            },
+        },
         PropClass::EnumeratedValue | PropClass::ListValue | PropClass::BoundedValue => {
             let unit = match (d.class, d.enumeration_ref) {
                 (PropClass::EnumeratedValue, Some(e)) => pd.enumeration_unit(ctx, e)?,
@@ -768,6 +777,17 @@ fn to_si(ctx: &Ctx, pd: &PropData, it: &Item) -> Result<Option<Actual>, IdsError
     }
 }
 
+/// The `actual` of a dataType mismatch: the value's wrapper in the
+/// schema spelling IfcTester prints (`IfcText`, not the STEP token
+/// `IFCTEXT`; `facet.py:737`), `"None"` when it has none. Same table as
+/// `psets.value_type` (GH #200 / #195).
+fn wrapper_label(it: &Item) -> String {
+    it.wrapper.as_deref().map_or_else(
+        || "None".into(),
+        |w| crate::extractors::type_names::camel_type_name(w.as_bytes()),
+    )
+}
+
 fn dt_ok(it: &Item, dt: &str) -> bool {
     it.wrapper
         .as_deref()
@@ -802,8 +822,7 @@ fn check_prop(
                     .iter()
                     .flatten()
                     .next()
-                    .and_then(|i| i.wrapper.clone())
-                    .unwrap_or_else(|| "None".into());
+                    .map_or_else(|| "None".into(), wrapper_label);
                 return Ok(Some(Outcome::fail(
                     reason::PROP_DATATYPE_MISMATCH,
                     Some(found),
@@ -819,7 +838,7 @@ fn check_prop(
         if let Some(bad) = items.iter().find(|i| !dt_ok(i, dt)) {
             return Ok(Some(Outcome::fail(
                 reason::PROP_DATATYPE_MISMATCH,
-                Some(bad.wrapper.clone().unwrap_or_else(|| "None".into())),
+                Some(wrapper_label(bad)),
                 src,
             )));
         }

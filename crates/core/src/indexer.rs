@@ -17,184 +17,26 @@ use crate::lexer::{
 // Static type sets — keep tight; downstream is the fastparse cache schema.
 // ----------------------------------------------------------------------
 
-/// IfcProduct subtypes we extract as "products". This list is the union
-/// of types observed across the LBK Building C model set plus the common
-/// IFC4 building elements. Unknown types simply don't appear in the
-/// product table — they're still counted in `all_entity_counts` so the
-/// caller can spot a missing type.
+/// IfcProduct subtypes we extract as "products": every entity that
+/// descends from `IfcProduct` in IFC2X3 / IFC4 / IFC4X3 and is concrete
+/// in at least one of them, minus the spatial classes the indexer routes
+/// to their own tables (`IfcSite`, `IfcBuilding`, `IfcBuildingStorey`,
+/// and `IfcSpace`, which it dispatches separately and ALSO emits as a
+/// product row).
+///
+/// GENERATED from the schemas (`scripts/gen_schema_supertypes.py` →
+/// `crate::schema_products`), never hand-maintained. The hand list it
+/// replaced drifted three times — `IfcGeographicElement` (GH #178),
+/// title-case gaps (GH #186), 62 schema classes including `IfcCooledBeam`
+/// and `IfcOpeningStandardCase` (GH #201) — and every drift dropped a real product class from
+/// every table with no warning while the file had other products.
+/// `tests/test_product_whitelist_parity_178.py` pins it EQUAL to the
+/// closure computed from `ifcfast.data.schema_supertypes`.
 ///
 /// `pub(crate)` so the mesh dispatcher can ask the canonical question
 /// "is this entity a meshable product?" instead of carrying its own
 /// permissive blacklist. See [`is_meshable_product`].
-pub(crate) const PRODUCT_TYPES: &[&[u8]] = &[
-    // Walls
-    b"IFCWALL",
-    b"IFCWALLSTANDARDCASE",
-    b"IFCWALLELEMENTEDCASE",
-    b"IFCCURTAINWALL",
-    // Slabs / plates
-    b"IFCSLAB",
-    b"IFCSLABSTANDARDCASE",
-    b"IFCSLABELEMENTEDCASE",
-    b"IFCPLATE",
-    b"IFCPLATESTANDARDCASE",
-    // Structural members
-    b"IFCBEAM",
-    b"IFCBEAMSTANDARDCASE",
-    b"IFCCOLUMN",
-    b"IFCCOLUMNSTANDARDCASE",
-    b"IFCMEMBER",
-    b"IFCMEMBERSTANDARDCASE",
-    b"IFCFOOTING",
-    b"IFCPILE",
-    // Openings / fenestration
-    b"IFCDOOR",
-    b"IFCDOORSTANDARDCASE",
-    b"IFCWINDOW",
-    b"IFCWINDOWSTANDARDCASE",
-    b"IFCOPENINGELEMENT",
-    b"IFCVOIDINGFEATURE",
-    b"IFCSURFACEFEATURE",
-    // Stairs / ramps / rails
-    b"IFCSTAIR",
-    b"IFCSTAIRFLIGHT",
-    b"IFCRAMP",
-    b"IFCRAMPFLIGHT",
-    b"IFCRAILING",
-    b"IFCROOF",
-    b"IFCCHIMNEY",
-    // Covering / finish
-    b"IFCCOVERING",
-    b"IFCSHADINGDEVICE",
-    // Generic
-    b"IFCBUILDINGELEMENTPROXY",
-    b"IFCPROXY",
-    b"IFCBUILDINGELEMENTPART",
-    b"IFCELEMENTASSEMBLY",
-    b"IFCTRANSPORTELEMENT",
-    b"IFCANNOTATION",
-    b"IFCVIRTUALELEMENT",
-    b"IFCDISCRETEACCESSORY",
-    b"IFCFASTENER",
-    b"IFCMECHANICALFASTENER",
-    b"IFCVIBRATIONISOLATOR",
-    b"IFCVIBRATIONDAMPER",
-    b"IFCREINFORCINGBAR",
-    b"IFCREINFORCINGMESH",
-    b"IFCREINFORCINGELEMENT",
-    b"IFCTENDON",
-    b"IFCTENDONANCHOR",
-    b"IFCTENDONCONDUIT",
-    // Distribution / MEP
-    b"IFCDISTRIBUTIONELEMENT",
-    b"IFCDISTRIBUTIONFLOWELEMENT",
-    b"IFCDISTRIBUTIONCONTROLELEMENT",
-    b"IFCDISTRIBUTIONCHAMBERELEMENT",
-    b"IFCDISTRIBUTIONPORT",
-    b"IFCFLOWFITTING",
-    b"IFCFLOWSEGMENT",
-    b"IFCFLOWTERMINAL",
-    b"IFCFLOWCONTROLLER",
-    b"IFCFLOWMOVINGDEVICE",
-    b"IFCFLOWSTORAGEDEVICE",
-    b"IFCFLOWTREATMENTDEVICE",
-    b"IFCENERGYCONVERSIONDEVICE",
-    b"IFCPIPEFITTING",
-    b"IFCPIPESEGMENT",
-    b"IFCDUCTFITTING",
-    b"IFCDUCTSEGMENT",
-    b"IFCDUCTSILENCER",
-    b"IFCCABLECARRIERFITTING",
-    b"IFCCABLECARRIERSEGMENT",
-    b"IFCCABLEFITTING",
-    b"IFCCABLESEGMENT",
-    b"IFCVALVE",
-    b"IFCFLOWVALVE",
-    b"IFCSANITARYTERMINAL",
-    b"IFCLIGHTFIXTURE",
-    b"IFCOUTLET",
-    b"IFCSWITCHINGDEVICE",
-    b"IFCELECTRICAPPLIANCE",
-    b"IFCELECTRICDISTRIBUTIONBOARD",
-    b"IFCELECTRICFLOWSTORAGEDEVICE",
-    b"IFCELECTRICGENERATOR",
-    b"IFCELECTRICMOTOR",
-    b"IFCTRANSFORMER",
-    b"IFCAIRTERMINAL",
-    b"IFCAIRTERMINALBOX",
-    b"IFCDAMPER",
-    b"IFCFILTER",
-    b"IFCBOILER",
-    b"IFCBURNER",
-    b"IFCCHILLER",
-    b"IFCCOMPRESSOR",
-    b"IFCCONDENSER",
-    b"IFCCOOLINGTOWER",
-    b"IFCEVAPORATOR",
-    b"IFCEVAPORATIVECOOLER",
-    b"IFCFAN",
-    b"IFCHEATEXCHANGER",
-    b"IFCHUMIDIFIER",
-    b"IFCMOTORCONNECTION",
-    b"IFCPUMP",
-    b"IFCTANK",
-    b"IFCUNITARYEQUIPMENT",
-    b"IFCSENSOR",
-    b"IFCACTUATOR",
-    b"IFCCONTROLLER",
-    b"IFCALARM",
-    b"IFCFLOWMETER",
-    b"IFCPROTECTIVEDEVICE",
-    b"IFCPROTECTIVEDEVICETRIPPINGUNIT",
-    b"IFCJUNCTIONBOX",
-    b"IFCCOMMUNICATIONSAPPLIANCE",
-    b"IFCAUDIOVISUALAPPLIANCE",
-    b"IFCFIRESUPPRESSIONTERMINAL",
-    b"IFCMEDICALDEVICE",
-    b"IFCMOBILETELECOMMUNICATIONSAPPLIANCE",
-    b"IFCSOLARDEVICE",
-    b"IFCSTACKTERMINAL",
-    b"IFCSPACEHEATER",
-    b"IFCWASTETERMINAL",
-    b"IFCUNITARYCONTROLELEMENT",
-    // Lights / lamps / additional MEP
-    b"IFCLAMP",
-    b"IFCCOIL",
-    // Survey / layout — IfcGrid is IfcProduct; IfcGridAxis is NOT
-    b"IFCGRID",
-    // Furnishings
-    b"IFCFURNISHINGELEMENT",
-    b"IFCFURNITURE",
-    b"IFCSYSTEMFURNITUREELEMENT",
-    // Civil / structural
-    b"IFCEARTHWORKSCUT",
-    b"IFCEARTHWORKSFILL",
-    b"IFCEARTHWORKSELEMENT",
-    b"IFCKERB",
-    b"IFCPAVEMENT",
-    b"IFCRAIL",
-    b"IFCROAD",
-    b"IFCBRIDGE",
-    b"IFCBRIDGEPART",
-    b"IFCMARINEFACILITY",
-    b"IFCMARINEPART",
-    // Civil / geographic catchalls (GH #178). `IfcGeographicElement` is
-    // the correct IFC4 class for terrain, survey markers and landscape
-    // reference objects; `IfcCivilElement` is its infrastructure
-    // sibling. Both were listed in `classify.py::MEASURE_ENTITIES` but
-    // missing here, so such a file indexed to ZERO products.
-    b"IFCGEOGRAPHICELEMENT",
-    b"IFCCIVILELEMENT",
-    // Infrastructure products named by `classify.py::COUNT_ENTITIES`
-    // (IFC4X3 additions) — added with the same drift fix, and now held
-    // in place by `tests/test_product_whitelist_parity_178.py`.
-    b"IFCIMPACTPROTECTIONDEVICE",
-    b"IFCMOORINGDEVICE",
-    b"IFCNAVIGATIONELEMENT",
-    b"IFCSIGN",
-    b"IFCVEHICLE",
-    b"IFCTRANSPORTATIONDEVICE",
-];
+pub(crate) use crate::schema_products::PRODUCT_TYPES;
 
 /// Spatial structure types — separate output table.
 const STOREY_TYPES: &[&[u8]] = &[b"IFCBUILDINGSTOREY"];
@@ -206,12 +48,27 @@ pub(crate) const SPACE_TYPE: &[u8] = b"IFCSPACE";
 const APPLICATION_TYPE: &[u8] = b"IFCAPPLICATION";
 const CONTAINED_TYPE: &[u8] = b"IFCRELCONTAINEDINSPATIALSTRUCTURE";
 const AGGREGATES_TYPE: &[u8] = b"IFCRELAGGREGATES";
+// Unit entities are dispatched from `crate::units::UNIT_ENTITY_TYPES`;
+// these four remain only for the legacy test oracle below.
+#[cfg(test)]
 const SI_UNIT_TYPE: &[u8] = b"IFCSIUNIT";
+#[cfg(test)]
 const CONVERSION_UNIT_TYPE: &[u8] = b"IFCCONVERSIONBASEDUNIT";
+#[cfg(test)]
 const MEASURE_WITH_UNIT_TYPE: &[u8] = b"IFCMEASUREWITHUNIT";
+#[cfg(test)]
 const UNIT_ASSIGN_TYPE: &[u8] = b"IFCUNITASSIGNMENT";
 const VOIDS_ELEMENT_TYPE: &[u8] = b"IFCRELVOIDSELEMENT";
 const DEFINES_BY_TYPE_TYPE: &[u8] = b"IFCRELDEFINESBYTYPE";
+/// Records [`crate::body_rep`] reads to answer `has_body` (GH #202):
+/// the product's shape, its representations, and — for an
+/// identifier-less `MappedRepresentation` only — the mapped source.
+const SHAPE_RECORD_TYPES: &[&[u8]] = &[
+    b"IFCPRODUCTDEFINITIONSHAPE",
+    b"IFCSHAPEREPRESENTATION",
+    b"IFCMAPPEDITEM",
+    b"IFCREPRESENTATIONMAP",
+];
 
 #[cfg(test)]
 use crate::units::{si_length_scale_checked, SiScaleError};
@@ -362,13 +219,15 @@ enum EntityKind {
     Space,
     Application,
     ContainedInSpatialStructure,
-    SiUnit,
-    ConversionBasedUnit,
-    MeasureWithUnit,
-    UnitAssignment,
+    /// Any of [`crate::units::UNIT_ENTITY_TYPES`], fed to the unit
+    /// collector under its own type token (GH #197).
+    Unit,
     Aggregates,
     VoidsElement,
     DefinesByType,
+    /// A record in [`SHAPE_RECORD_TYPES`]: kept by id (a borrowed slice,
+    /// no parse) so `has_body` can be resolved after the pass.
+    ShapeRecord,
     /// Any IfcXxxType (IfcWallType, IfcDoorType, IfcSensorType, …)
     /// — matched by a byte-suffix fallback rather than dispatch-map
     /// enumeration so new IFC schema additions don't drop silently.
@@ -380,8 +239,9 @@ enum EntityKind {
 fn dispatch_map() -> &'static HashMap<&'static [u8], EntityKind> {
     static MAP: OnceLock<HashMap<&'static [u8], EntityKind>> = OnceLock::new();
     MAP.get_or_init(|| {
-        let mut m: HashMap<&'static [u8], EntityKind> =
-            HashMap::with_capacity(PRODUCT_TYPES.len() + STOREY_TYPES.len() + 9);
+        let mut m: HashMap<&'static [u8], EntityKind> = HashMap::with_capacity(
+            PRODUCT_TYPES.len() + STOREY_TYPES.len() + SHAPE_RECORD_TYPES.len() + 15,
+        );
         for t in PRODUCT_TYPES {
             m.insert(t, EntityKind::Product);
         }
@@ -394,13 +254,15 @@ fn dispatch_map() -> &'static HashMap<&'static [u8], EntityKind> {
         m.insert(SPACE_TYPE, EntityKind::Space);
         m.insert(APPLICATION_TYPE, EntityKind::Application);
         m.insert(CONTAINED_TYPE, EntityKind::ContainedInSpatialStructure);
-        m.insert(SI_UNIT_TYPE, EntityKind::SiUnit);
-        m.insert(CONVERSION_UNIT_TYPE, EntityKind::ConversionBasedUnit);
-        m.insert(MEASURE_WITH_UNIT_TYPE, EntityKind::MeasureWithUnit);
-        m.insert(UNIT_ASSIGN_TYPE, EntityKind::UnitAssignment);
+        for t in crate::units::UNIT_ENTITY_TYPES {
+            m.insert(t, EntityKind::Unit);
+        }
         m.insert(AGGREGATES_TYPE, EntityKind::Aggregates);
         m.insert(VOIDS_ELEMENT_TYPE, EntityKind::VoidsElement);
         m.insert(DEFINES_BY_TYPE_TYPE, EntityKind::DefinesByType);
+        for t in SHAPE_RECORD_TYPES {
+            m.insert(t, EntityKind::ShapeRecord);
+        }
         m
     })
 }
@@ -438,6 +300,18 @@ pub struct IndexedFile {
     pub product_predefined_type: Vec<Option<String>>,
     pub product_object_type: Vec<Option<String>>,
     pub product_tag: Vec<Option<String>>,
+    /// Step id of the product's `Representation` attribute (normally an
+    /// `IfcProductDefinitionShape`), `None` when it is `$`.
+    pub product_representation: Vec<Option<u64>>,
+    /// The product has a 3D body representation (GH #202): decided by
+    /// [`crate::body_rep::select_body`], the same function the mesher
+    /// uses to pick the representation it tessellates. Read from the
+    /// representation records, never by meshing.
+    pub product_has_body: Vec<bool>,
+    /// `RepresentationType` of the representation that made
+    /// `product_has_body` true (`MappedRepresentation` for a mapped body);
+    /// `None` when there is no body.
+    pub product_body_rep_type: Vec<Option<String>>,
 
     // ----- Storeys (column-major) -----
     pub storey_step_id: Vec<u64>,
@@ -731,6 +605,11 @@ pub fn index(buf: &[u8]) -> IndexedFile {
     // entity (600K+ on ST28_RIV).
     let mut fields_buf: Vec<&[u8]> = Vec::with_capacity(16);
 
+    // Shape / representation records by id, borrowed from `buf` — the
+    // input to `has_body` once every product's Representation ref is
+    // known (GH #202). Borrowed slices, no parse on the hot path.
+    let mut shape_records: HashMap<u64, (&[u8], &[u8])> = HashMap::new();
+
     // Two-pass would let us resolve some refs, but a single pass is enough:
     // we only need step_id→guid maps that are built as we go, and downstream
     // (Python) does the final guid resolution for relationships.
@@ -796,6 +675,9 @@ pub fn index(buf: &[u8]) -> IndexedFile {
             }
         };
         match kind {
+            EntityKind::ShapeRecord => {
+                shape_records.insert(rec.id, (t, rec.args));
+            }
             EntityKind::Product => {
                 split_top_level_args_into(rec.args, &mut fields_buf);
                 extract_product(&mut out, rec.id, t, &fields_buf, is_ifc2x3);
@@ -865,30 +747,13 @@ pub fn index(buf: &[u8]) -> IndexedFile {
                     }
                 }
             }
-            EntityKind::SiUnit => {
-                // IfcSIUnit(Dimensions, UnitType, Prefix, Name).
+            EntityKind::Unit => {
+                // IfcSIUnit / IfcConversionBasedUnit[WithOffset] (how
+                // imperial files declare FOOT / INCH, GH #73) /
+                // IfcMeasureWithUnit / IfcUnitAssignment / derived …:
+                // the collector parses each by its real type token.
                 split_top_level_args_into(rec.args, &mut fields_buf);
-                units.feed(rec.id, SI_UNIT_TYPE, &fields_buf);
-            }
-            EntityKind::ConversionBasedUnit => {
-                // IfcConversionBasedUnit(Dimensions, UnitType, Name,
-                // ConversionFactor) — UnitType at [1], Name (string) at
-                // [2], ConversionFactor ref (→ IfcMeasureWithUnit) at [3].
-                // How imperial files declare FOOT / INCH (GH #73).
-                split_top_level_args_into(rec.args, &mut fields_buf);
-                units.feed(rec.id, CONVERSION_UNIT_TYPE, &fields_buf);
-            }
-            EntityKind::MeasureWithUnit => {
-                // IfcMeasureWithUnit(ValueComponent, UnitComponent) —
-                // value (often wrapped, e.g. IFCLENGTHMEASURE(0.3048))
-                // at [0], unit ref at [1].
-                split_top_level_args_into(rec.args, &mut fields_buf);
-                units.feed(rec.id, MEASURE_WITH_UNIT_TYPE, &fields_buf);
-            }
-            EntityKind::UnitAssignment => {
-                // IfcUnitAssignment(Units) — Units is a list of refs at arg[0].
-                split_top_level_args_into(rec.args, &mut fields_buf);
-                units.feed(rec.id, UNIT_ASSIGN_TYPE, &fields_buf);
+                units.feed(rec.id, t, &fields_buf);
             }
             EntityKind::Aggregates => {
                 // IfcRelAggregates(_,_,_,_, RelatingObject, RelatedObjects).
@@ -985,6 +850,21 @@ pub fn index(buf: &[u8]) -> IndexedFile {
     // ~5–15% of edges silently and made site/building-level
     // containment invisible to the spatial graph (GH #32).
 
+    // GH #202: has_body / body_rep_type from the representation records.
+    // One lookup of the product's shape record + its representations;
+    // `crate::body_rep` is shared with the mesher so the flag and the
+    // tessellated representation cannot disagree.
+    out.product_has_body
+        .reserve(out.product_representation.len());
+    out.product_body_rep_type
+        .reserve(out.product_representation.len());
+    for repr in &out.product_representation {
+        let body = repr.and_then(|id| crate::body_rep::select_body(&shape_records, id));
+        out.product_has_body.push(body.is_some());
+        out.product_body_rep_type
+            .push(body.and_then(|b| b.rep_type));
+    }
+
     // Resolve unit_scale (metres per model unit). Look through the
     // IfcUnitAssignment.Units list for a LENGTHUNIT — either an
     // IfcSIUnit (metric) or an IfcConversionBasedUnit (imperial:
@@ -1011,18 +891,12 @@ fn extract_product(
 
     let name = string_at(fields, 2);
     let object_type = string_at(fields, 4);
-    // Tag sits at arg[7] on IfcElement subtypes. The "we just get a
-    // non-string back and discard it" assumption holds only where arg[7]
-    // isn't a string on other branches of the hierarchy — and it FAILS
-    // on IfcSpatialStructureElement, where arg[7] is `LongName`, a
-    // perfectly good string. That produced `tag = "Kontor 3.04"` on
-    // every named IfcSpace (GH #159). Spatial elements have no Tag
-    // attribute at all in either schema, so the correct answer is None.
-    let tag = if is_spatial_structure_element(type_name) {
-        None
-    } else {
-        string_at(fields, 7)
-    };
+    // `Tag` sits at arg[7] on IfcElement subtypes and arg[8] on
+    // IfcProxy; spatial elements have no Tag at all and carry `LongName`
+    // at arg[7] (reading it as Tag put `"Kontor 3.04"` on every named
+    // IfcSpace, GH #159). The position comes from the generated schema
+    // table, so a class without the attribute gets None.
+    let tag = tag_position(type_name).and_then(|pos| string_at(fields, pos));
 
     // PredefinedType is the LAST enum field on most IfcElement subtypes —
     // but in IFC2X3, several entities use the trailing slot for a
@@ -1081,6 +955,12 @@ fn extract_product(
     out.product_predefined_type.push(predefined);
     out.product_object_type.push(object_type);
     out.product_tag.push(tag);
+    // IfcProduct.Representation is attribute 6 in every schema.
+    out.product_representation
+        .push(match fields.get(6).map(|f| parse_field(f)) {
+            Some(Field::Ref(id)) => Some(id),
+            _ => None,
+        });
 }
 
 fn extract_storey(out: &mut IndexedFile, step_id: u64, fields: &[&[u8]]) {
@@ -1143,24 +1023,20 @@ fn is_predefined_type_unavailable_in_ifc2x3(entity: &[u8]) -> bool {
     // suppression is what restores parity.
 }
 
-/// `IfcSpatialStructureElement` subtypes (plus the IFC4 spatial
-/// siblings). These carry `LongName` where `IfcElement` carries `Tag`,
-/// so the positional Tag read at arg[7] must be skipped for them
-/// (GH #159). Only entities that actually reach [`extract_product`]
-/// matter — today that is IfcSpace — but the full set is listed so a
-/// future dispatch change can't silently reintroduce the bug.
-fn is_spatial_structure_element(entity: &[u8]) -> bool {
-    matches!(
-        entity,
-        b"IFCSPACE"
-            | b"IFCSITE"
-            | b"IFCBUILDING"
-            | b"IFCBUILDINGSTOREY"
-            | b"IFCSPATIALZONE"
-            | b"IFCSPATIALSTRUCTUREELEMENT"
-            | b"IFCEXTERNALSPATIALELEMENT"
-            | b"IFCEXTERNALSPATIALSTRUCTUREELEMENT"
-    )
+/// STEP position of the `Tag` attribute on product class `entity`, or
+/// `None` when the class has no `Tag` (spatial elements, ports,
+/// annotations, grids, alignment / positioning elements, structural
+/// items, …). Generated table, see [`crate::schema_products`].
+fn tag_position(entity: &[u8]) -> Option<usize> {
+    static MAP: OnceLock<HashMap<&'static [u8], usize>> = OnceLock::new();
+    MAP.get_or_init(|| {
+        crate::schema_products::TAG_POSITION
+            .iter()
+            .copied()
+            .collect()
+    })
+    .get(entity)
+    .copied()
 }
 
 /// IFC4 entities whose PredefinedType is followed by a SECOND trailing enum
@@ -1210,231 +1086,12 @@ fn string_at(fields: &[&[u8]], idx: usize) -> Option<String> {
     }
 }
 
-/// All known STEP-uppercase → ifcopenshell-titlecase pairs. Exposed as
-/// a `&'static` slice so the lazy HashMap below can be built once.
-const ENTITY_NAME_PAIRS: &[(&[u8], &str)] = &[
-    // Walls
-    (b"IFCWALL", "IfcWall"),
-    (b"IFCWALLSTANDARDCASE", "IfcWallStandardCase"),
-    (b"IFCWALLELEMENTEDCASE", "IfcWallElementedCase"),
-    (b"IFCCURTAINWALL", "IfcCurtainWall"),
-    // Slabs / plates
-    (b"IFCSLAB", "IfcSlab"),
-    (b"IFCSLABSTANDARDCASE", "IfcSlabStandardCase"),
-    (b"IFCSLABELEMENTEDCASE", "IfcSlabElementedCase"),
-    (b"IFCPLATE", "IfcPlate"),
-    (b"IFCPLATESTANDARDCASE", "IfcPlateStandardCase"),
-    // Structural
-    (b"IFCBEAM", "IfcBeam"),
-    (b"IFCBEAMSTANDARDCASE", "IfcBeamStandardCase"),
-    (b"IFCCOLUMN", "IfcColumn"),
-    (b"IFCCOLUMNSTANDARDCASE", "IfcColumnStandardCase"),
-    (b"IFCMEMBER", "IfcMember"),
-    (b"IFCMEMBERSTANDARDCASE", "IfcMemberStandardCase"),
-    (b"IFCFOOTING", "IfcFooting"),
-    (b"IFCPILE", "IfcPile"),
-    // Fenestration
-    (b"IFCDOOR", "IfcDoor"),
-    (b"IFCDOORSTANDARDCASE", "IfcDoorStandardCase"),
-    (b"IFCDOORSTYLE", "IfcDoorStyle"),
-    (b"IFCWINDOW", "IfcWindow"),
-    (b"IFCWINDOWSTANDARDCASE", "IfcWindowStandardCase"),
-    (b"IFCWINDOWSTYLE", "IfcWindowStyle"),
-    (b"IFCOPENINGELEMENT", "IfcOpeningElement"),
-    (b"IFCVOIDINGFEATURE", "IfcVoidingFeature"),
-    (b"IFCSURFACEFEATURE", "IfcSurfaceFeature"),
-    // Stairs etc.
-    (b"IFCSTAIR", "IfcStair"),
-    (b"IFCSTAIRFLIGHT", "IfcStairFlight"),
-    (b"IFCRAMP", "IfcRamp"),
-    (b"IFCRAMPFLIGHT", "IfcRampFlight"),
-    (b"IFCRAILING", "IfcRailing"),
-    (b"IFCROOF", "IfcRoof"),
-    (b"IFCCOVERING", "IfcCovering"),
-    // Bare type base classes (#69) — Revit emits these for types
-    // with no schema-specific *Type subtype. The fallback
-    // title-caser would render multi-word names as single words
-    // ("Ifctypeproduct"); spell them out so the entity column is
-    // correctly cased without relying on the consumer's fold map.
-    (b"IFCTYPEPRODUCT", "IfcTypeProduct"),
-    (b"IFCTYPEOBJECT", "IfcTypeObject"),
-    // Generic
-    (b"IFCBUILDINGELEMENTPROXY", "IfcBuildingElementProxy"),
-    (b"IFCBUILDINGELEMENTPART", "IfcBuildingElementPart"),
-    (b"IFCELEMENTASSEMBLY", "IfcElementAssembly"),
-    (b"IFCTRANSPORTELEMENT", "IfcTransportElement"),
-    (b"IFCANNOTATION", "IfcAnnotation"),
-    (b"IFCVIRTUALELEMENT", "IfcVirtualElement"),
-    (b"IFCDISCRETEACCESSORY", "IfcDiscreteAccessory"),
-    (b"IFCFASTENER", "IfcFastener"),
-    (b"IFCMECHANICALFASTENER", "IfcMechanicalFastener"),
-    (b"IFCREINFORCINGBAR", "IfcReinforcingBar"),
-    (b"IFCREINFORCINGMESH", "IfcReinforcingMesh"),
-    (b"IFCTENDON", "IfcTendon"),
-    (b"IFCTENDONANCHOR", "IfcTendonAnchor"),
-    // Distribution / MEP
-    (b"IFCDISTRIBUTIONELEMENT", "IfcDistributionElement"),
-    (b"IFCDISTRIBUTIONFLOWELEMENT", "IfcDistributionFlowElement"),
-    (
-        b"IFCDISTRIBUTIONCONTROLELEMENT",
-        "IfcDistributionControlElement",
-    ),
-    (b"IFCDISTRIBUTIONPORT", "IfcDistributionPort"),
-    (b"IFCFLOWFITTING", "IfcFlowFitting"),
-    (b"IFCFLOWSEGMENT", "IfcFlowSegment"),
-    (b"IFCFLOWTERMINAL", "IfcFlowTerminal"),
-    (b"IFCFLOWCONTROLLER", "IfcFlowController"),
-    (b"IFCFLOWMOVINGDEVICE", "IfcFlowMovingDevice"),
-    (b"IFCFLOWSTORAGEDEVICE", "IfcFlowStorageDevice"),
-    (b"IFCFLOWTREATMENTDEVICE", "IfcFlowTreatmentDevice"),
-    (b"IFCENERGYCONVERSIONDEVICE", "IfcEnergyConversionDevice"),
-    (b"IFCPIPEFITTING", "IfcPipeFitting"),
-    (b"IFCPIPESEGMENT", "IfcPipeSegment"),
-    (b"IFCDUCTFITTING", "IfcDuctFitting"),
-    (b"IFCDUCTSEGMENT", "IfcDuctSegment"),
-    (b"IFCDUCTSILENCER", "IfcDuctSilencer"),
-    (b"IFCCABLECARRIERFITTING", "IfcCableCarrierFitting"),
-    (b"IFCCABLECARRIERSEGMENT", "IfcCableCarrierSegment"),
-    (b"IFCCABLEFITTING", "IfcCableFitting"),
-    (b"IFCCABLESEGMENT", "IfcCableSegment"),
-    (b"IFCVALVE", "IfcValve"),
-    (b"IFCFLOWVALVE", "IfcFlowValve"),
-    (b"IFCSANITARYTERMINAL", "IfcSanitaryTerminal"),
-    (b"IFCLIGHTFIXTURE", "IfcLightFixture"),
-    (b"IFCOUTLET", "IfcOutlet"),
-    (b"IFCSWITCHINGDEVICE", "IfcSwitchingDevice"),
-    (b"IFCELECTRICAPPLIANCE", "IfcElectricAppliance"),
-    (
-        b"IFCELECTRICDISTRIBUTIONBOARD",
-        "IfcElectricDistributionBoard",
-    ),
-    (
-        b"IFCELECTRICFLOWSTORAGEDEVICE",
-        "IfcElectricFlowStorageDevice",
-    ),
-    (b"IFCAIRTERMINAL", "IfcAirTerminal"),
-    (b"IFCAIRTERMINALBOX", "IfcAirTerminalBox"),
-    (b"IFCDAMPER", "IfcDamper"),
-    (b"IFCFILTER", "IfcFilter"),
-    (b"IFCBOILER", "IfcBoiler"),
-    (b"IFCBURNER", "IfcBurner"),
-    (b"IFCCHILLER", "IfcChiller"),
-    (b"IFCCOMPRESSOR", "IfcCompressor"),
-    (b"IFCCONDENSER", "IfcCondenser"),
-    (b"IFCCOOLINGTOWER", "IfcCoolingTower"),
-    (b"IFCEVAPORATOR", "IfcEvaporator"),
-    (b"IFCFAN", "IfcFan"),
-    (b"IFCHEATEXCHANGER", "IfcHeatExchanger"),
-    (b"IFCHUMIDIFIER", "IfcHumidifier"),
-    (b"IFCMOTORCONNECTION", "IfcMotorConnection"),
-    (b"IFCPUMP", "IfcPump"),
-    (b"IFCTANK", "IfcTank"),
-    (b"IFCUNITARYEQUIPMENT", "IfcUnitaryEquipment"),
-    (b"IFCSENSOR", "IfcSensor"),
-    (b"IFCACTUATOR", "IfcActuator"),
-    (b"IFCCONTROLLER", "IfcController"),
-    (b"IFCALARM", "IfcAlarm"),
-    (b"IFCFLOWMETER", "IfcFlowMeter"),
-    (b"IFCPROTECTIVEDEVICE", "IfcProtectiveDevice"),
-    (
-        b"IFCPROTECTIVEDEVICETRIPPINGUNIT",
-        "IfcProtectiveDeviceTrippingUnit",
-    ),
-    (b"IFCJUNCTIONBOX", "IfcJunctionBox"),
-    (b"IFCCOMMUNICATIONSAPPLIANCE", "IfcCommunicationsAppliance"),
-    (b"IFCAUDIOVISUALAPPLIANCE", "IfcAudioVisualAppliance"),
-    (b"IFCFIRESUPPRESSIONTERMINAL", "IfcFireSuppressionTerminal"),
-    (b"IFCMEDICALDEVICE", "IfcMedicalDevice"),
-    (
-        b"IFCMOBILETELECOMMUNICATIONSAPPLIANCE",
-        "IfcMobileTelecommunicationsAppliance",
-    ),
-    (b"IFCSOLARDEVICE", "IfcSolarDevice"),
-    (b"IFCSTACKTERMINAL", "IfcStackTerminal"),
-    (b"IFCSPACEHEATER", "IfcSpaceHeater"),
-    (b"IFCWASTETERMINAL", "IfcWasteTerminal"),
-    (b"IFCUNITARYCONTROLELEMENT", "IfcUnitaryControlElement"),
-    (b"IFCBUILDINGSYSTEM", "IfcBuildingSystem"),
-    (b"IFCLAMP", "IfcLamp"),
-    (b"IFCCOIL", "IfcCoil"),
-    (b"IFCGRID", "IfcGrid"),
-    (b"IFCGRIDAXIS", "IfcGridAxis"),
-    // Furnishings
-    (b"IFCFURNISHINGELEMENT", "IfcFurnishingElement"),
-    (b"IFCFURNITURE", "IfcFurniture"),
-    (b"IFCSYSTEMFURNITUREELEMENT", "IfcSystemFurnitureElement"),
-    // Civil
-    (b"IFCEARTHWORKSCUT", "IfcEarthworksCut"),
-    (b"IFCEARTHWORKSFILL", "IfcEarthworksFill"),
-    (b"IFCEARTHWORKSELEMENT", "IfcEarthworksElement"),
-    (b"IFCKERB", "IfcKerb"),
-    (b"IFCPAVEMENT", "IfcPavement"),
-    (b"IFCRAIL", "IfcRail"),
-    (b"IFCROAD", "IfcRoad"),
-    (b"IFCBRIDGE", "IfcBridge"),
-    (b"IFCBRIDGEPART", "IfcBridgePart"),
-    (b"IFCMARINEFACILITY", "IfcMarineFacility"),
-    (b"IFCMARINEPART", "IfcMarinePart"),
-    // Five entries that were in PRODUCT_TYPES but had no title-case
-    // spelling, so the fallback caser reported them as
-    // `IfcElectricflowstoragedevice` — a name `classify.py` cannot match,
-    // which silently demoted them to SKIP. Same drift family as GH #178,
-    // caught by `product_whitelist_tests::every_product_type_has_a_canonical_name`.
-    (
-        b"IFCDISTRIBUTIONCONTROLELEMENT",
-        "IfcDistributionControlElement",
-    ),
-    (
-        b"IFCELECTRICDISTRIBUTIONBOARD",
-        "IfcElectricDistributionBoard",
-    ),
-    (
-        b"IFCELECTRICFLOWSTORAGEDEVICE",
-        "IfcElectricFlowStorageDevice",
-    ),
-    (
-        b"IFCPROTECTIVEDEVICETRIPPINGUNIT",
-        "IfcProtectiveDeviceTrippingUnit",
-    ),
-    (
-        b"IFCMOBILETELECOMMUNICATIONSAPPLIANCE",
-        "IfcMobileTelecommunicationsAppliance",
-    ),
-    // Civil / geographic catchalls + infrastructure products (GH #178).
-    (b"IFCGEOGRAPHICELEMENT", "IfcGeographicElement"),
-    (b"IFCCIVILELEMENT", "IfcCivilElement"),
-    (b"IFCIMPACTPROTECTIONDEVICE", "IfcImpactProtectionDevice"),
-    (b"IFCMOORINGDEVICE", "IfcMooringDevice"),
-    (b"IFCNAVIGATIONELEMENT", "IfcNavigationElement"),
-    (b"IFCSIGN", "IfcSign"),
-    (b"IFCVEHICLE", "IfcVehicle"),
-    (b"IFCTRANSPORTATIONDEVICE", "IfcTransportationDevice"),
-    (b"IFCCHIMNEY", "IfcChimney"),
-    (b"IFCSHADINGDEVICE", "IfcShadingDevice"),
-    (b"IFCPROXY", "IfcProxy"),
-    (b"IFCVIBRATIONISOLATOR", "IfcVibrationIsolator"),
-    (b"IFCVIBRATIONDAMPER", "IfcVibrationDamper"),
-    (b"IFCREINFORCINGELEMENT", "IfcReinforcingElement"),
-    (b"IFCTENDONCONDUIT", "IfcTendonConduit"),
-    (
-        b"IFCDISTRIBUTIONCHAMBERELEMENT",
-        "IfcDistributionChamberElement",
-    ),
-    (b"IFCELECTRICGENERATOR", "IfcElectricGenerator"),
-    (b"IFCELECTRICMOTOR", "IfcElectricMotor"),
-    (b"IFCTRANSFORMER", "IfcTransformer"),
-    (b"IFCEVAPORATIVECOOLER", "IfcEvaporativeCooler"),
-    (b"IFCBUILDINGSTOREY", "IfcBuildingStorey"),
-    (b"IFCSITE", "IfcSite"),
-    (b"IFCBUILDING", "IfcBuilding"),
-    (b"IFCPROJECT", "IfcProject"),
-    (b"IFCAPPLICATION", "IfcApplication"),
-    (
-        b"IFCRELCONTAINEDINSPATIALSTRUCTURE",
-        "IfcRelContainedInSpatialStructure",
-    ),
-    (b"IFCRELAGGREGATES", "IfcRelAggregates"),
-];
+/// STEP-uppercase → ifcopenshell-titlecase for every entity in
+/// IFC2X3 / IFC4 / IFC4X3, generated from the same schema walk as
+/// [`PRODUCT_TYPES`] (GH #201), so a whitelisted class can never lack a
+/// canonical spelling. Before this, type objects fell through to the
+/// fallback caser (`IFCWALLTYPE` → `IfcWalltype`).
+use crate::schema_products::ENTITY_NAMES as ENTITY_NAME_PAIRS;
 
 /// Lazy lookup table from STEP uppercase bytes to ifcopenshell title-case.
 /// Replaces an earlier linear scan that became a measurable cost on big
@@ -1640,6 +1297,40 @@ END-ISO-10303-21;
             .zip(out.defines_by_type_type.iter())
             .any(|(&p, &t)| p == 10 && t == 32);
         assert!(linked, "roof occurrence must link to its bare type");
+    }
+
+    /// GH #197: a zero-offset `IfcConversionBasedUnitWithOffset`
+    /// LENGTHUNIT. The indexer's single pass must feed it to the unit
+    /// collector under its real type token, so tier-1 `unit_scale`
+    /// agrees with the standalone `UnitTable::from_table` walk.
+    const WITH_OFFSET_FIXTURE: &str = r#"ISO-10303-21;
+HEADER;
+FILE_DESCRIPTION((''),'2;1');
+FILE_NAME('offset.ifc','2026-09-27T00:00:00',(''),(''),'ifcfast','ifcfast','');
+FILE_SCHEMA(('IFC4'));
+ENDSEC;
+DATA;
+#1=IFCPROJECT('0Test00000000000000001',$,'p',$,$,$,$,(#5),#2);
+#2=IFCUNITASSIGNMENT((#4));
+#3=IFCSIUNIT(*,.LENGTHUNIT.,$,.METRE.);
+#4=IFCCONVERSIONBASEDUNITWITHOFFSET(#7,.LENGTHUNIT.,'FOOT',#9,0.);
+#7=IFCDIMENSIONALEXPONENTS(1,0,0,0,0,0,0);
+#9=IFCMEASUREWITHUNIT(IFCLENGTHMEASURE(0.3048),#3);
+#5=IFCGEOMETRICREPRESENTATIONCONTEXT($,'Model',3,1.0E-5,#6,$);
+#6=IFCAXIS2PLACEMENT3D(#8,$,$);
+#8=IFCCARTESIANPOINT((0.,0.,0.));
+ENDSEC;
+END-ISO-10303-21;
+"#;
+
+    #[test]
+    fn conversion_based_unit_with_offset_reaches_the_indexer() {
+        let out = index(WITH_OFFSET_FIXTURE.as_bytes());
+        let table = crate::entity_table::EntityTable::build(WITH_OFFSET_FIXTURE.as_bytes());
+        let mut w = Vec::new();
+        let expected = crate::units::UnitTable::from_table(&table).length_scale(&mut w);
+        assert_eq!(expected, Some(0.3048), "{w:?}");
+        assert_eq!(out.unit_scale, expected, "warnings: {:?}", out.warnings);
     }
 
     #[test]
@@ -1897,19 +1588,21 @@ FILE_SCHEMA(('IFC4'));\nENDSEC;\n";
         let src = format!(
             "{HDR}DATA;\n\
 #1=IFCPROJECT('0Test00000000000000001',$,'p',$,$,$,$,(),$);\n\
-#2=IFCTUBEBUNDLE('0Test00000000000000002',$,'tb',$,$,#3,$,$,$);\n\
+#2=IFCACMEWIDGET('0Test00000000000000002',$,'tb',$,$,#3,$,$,$);\n\
 #3=IFCLOCALPLACEMENT($,$);\n\
 #4=IFCPROPERTYSET('0Test00000000000000003',$,'Pset_X',$,());\n\
 ENDSEC;\nEND-ISO-10303-21;\n"
         );
         let idx = index(src.as_bytes());
+        // A vendor class outside every schema: IfcTubeBundle was the
+        // example here until GH #201 derived the whitelist from the schema.
         assert!(
             idx.product_step_id.is_empty(),
-            "IfcTubeBundle is not whitelisted"
+            "IfcAcmeWidget is not a schema class"
         );
         assert_eq!(
             idx.skipped_product_type_counts
-                .get("IFCTUBEBUNDLE")
+                .get("IFCACMEWIDGET")
                 .copied(),
             Some(1)
         );
@@ -1964,6 +1657,132 @@ ENDSEC;\nEND-ISO-10303-21;\n"
         let idx = index(src.as_bytes());
         assert_eq!(idx.product_entity, vec!["IfcGeographicElement".to_string()]);
         assert!(idx.skipped_product_type_counts.is_empty());
+    }
+
+    /// GH #201: the MEP classes the hand list missed are indexed, in
+    /// ifcopenshell spelling, and none of them is counted as skipped.
+    #[test]
+    fn schema_derived_whitelist_indexes_gh201_classes() {
+        let classes = [
+            ("IFCCOOLEDBEAM", "IfcCooledBeam"),
+            ("IFCAIRTOAIRHEATRECOVERY", "IfcAirToAirHeatRecovery"),
+            ("IFCELECTRICTIMECONTROL", "IfcElectricTimeControl"),
+            ("IFCENGINE", "IfcEngine"),
+            ("IFCFLOWINSTRUMENT", "IfcFlowInstrument"),
+            ("IFCINTERCEPTOR", "IfcInterceptor"),
+            ("IFCTUBEBUNDLE", "IfcTubeBundle"),
+            (
+                "IFCELECTRICDISTRIBUTIONPOINT",
+                "IfcElectricDistributionPoint",
+            ),
+            ("IFCCONVEYORSEGMENT", "IfcConveyorSegment"),
+            ("IFCDISTRIBUTIONBOARD", "IfcDistributionBoard"),
+            ("IFCOPENINGSTANDARDCASE", "IfcOpeningStandardCase"),
+        ];
+        let mut data = String::from(
+            "#1=IFCPROJECT('0Test00000000000000001',$,'p',$,$,$,$,(),$);\n#3=IFCLOCALPLACEMENT($,$);\n",
+        );
+        for (i, (tok, _)) in classes.iter().enumerate() {
+            data.push_str(&format!(
+                "#{}={tok}('0Test{:017}',$,'x',$,$,#3,$,$,$);\n",
+                10 + i,
+                10 + i
+            ));
+        }
+        let idx = index(format!("{HDR}DATA;\n{data}ENDSEC;\nEND-ISO-10303-21;\n").as_bytes());
+        let want: Vec<String> = classes.iter().map(|(_, n)| n.to_string()).collect();
+        assert_eq!(idx.product_entity, want);
+        assert!(idx.skipped_product_type_counts.is_empty());
+        assert!(!PRODUCT_TYPES.contains(&&b"IFCFLOWVALVE"[..]));
+        // Spatial structure keeps its own tables.
+        for t in [
+            &b"IFCSITE"[..],
+            b"IFCBUILDING",
+            b"IFCBUILDINGSTOREY",
+            b"IFCSPACE",
+        ] {
+            assert!(!PRODUCT_TYPES.contains(&t));
+        }
+    }
+
+    /// The spelling table is the full schema, so type objects no longer go
+    /// through the first-letter fallback caser (`IfcWalltype`).
+    #[test]
+    fn type_objects_get_ifcopenshell_spelling() {
+        assert_eq!(
+            type_name_uppercase_with_proper_case(b"IFCWALLTYPE"),
+            "IfcWallType"
+        );
+        assert_eq!(
+            type_name_uppercase_with_proper_case(b"IFCBUILDINGELEMENTPROXYTYPE"),
+            "IfcBuildingElementProxyType"
+        );
+    }
+
+    /// `Tag` is read from its schema position: arg 7 on IfcElement
+    /// subtypes, arg 8 on IfcProxy, and not at all on spatial elements
+    /// (arg 7 is `LongName` there, GH #159).
+    #[test]
+    fn tag_follows_the_schema_position() {
+        let src = format!(
+            "{HDR}DATA;\n\
+#3=IFCLOCALPLACEMENT($,$);\n\
+#4=IFCWALL('0Test00000000000000004',$,'w',$,$,#3,$,'T-wall',$);\n\
+#5=IFCPROXY('0Test00000000000000005',$,'p',$,$,#3,$,.PRODUCT.,'T-proxy');\n\
+#6=IFCSPATIALZONE('0Test00000000000000006',$,'z',$,$,#3,$,'Long name',.USERDEFINED.);\n\
+ENDSEC;\nEND-ISO-10303-21;\n"
+        );
+        let idx = index(src.as_bytes());
+        assert_eq!(
+            idx.product_tag,
+            vec![
+                Some("T-wall".to_string()),
+                Some("T-proxy".to_string()),
+                None
+            ]
+        );
+    }
+
+    /// GH #202: `has_body` / `body_rep_type` come from the representation
+    /// records, in either file order (shape before or after the product).
+    #[test]
+    fn has_body_is_read_from_representations() {
+        let src = format!(
+            "{HDR}DATA;\n\
+#1=IFCGEOMETRICREPRESENTATIONCONTEXT($,'Model',3,1.E-05,$,$);\n\
+#3=IFCLOCALPLACEMENT($,$);\n\
+#10=IFCSHAPEREPRESENTATION(#1,'Body','SweptSolid',());\n\
+#11=IFCSHAPEREPRESENTATION(#1,'Axis','Curve2D',());\n\
+#12=IFCSHAPEREPRESENTATION(#1,'Box','BoundingBox',());\n\
+#13=IFCSHAPEREPRESENTATION(#1,'FootPrint','GeometricSet',());\n\
+#20=IFCPRODUCTDEFINITIONSHAPE($,$,(#11,#10));\n\
+#21=IFCPRODUCTDEFINITIONSHAPE($,$,(#11,#12,#13));\n\
+#30=IFCWALL('0Test00000000000000030',$,'body',$,$,#3,#20,$,$);\n\
+#31=IFCWALL('0Test00000000000000031',$,'axis only',$,$,#3,#21,$,$);\n\
+#32=IFCWALL('0Test00000000000000032',$,'no rep',$,$,#3,$,$,$);\n\
+#33=IFCFLOWTERMINAL('0Test00000000000000033',$,'mapped',$,$,#3,#40,$);\n\
+#34=IFCSPACE('0Test00000000000000034',$,'space',$,$,#3,#20,$,.ELEMENT.,.INTERNAL.,$);\n\
+#40=IFCPRODUCTDEFINITIONSHAPE($,$,(#41));\n\
+#41=IFCSHAPEREPRESENTATION(#1,'Body','MappedRepresentation',(#42));\n\
+#42=IFCMAPPEDITEM(#43,#45);\n\
+#43=IFCREPRESENTATIONMAP(#44,#10);\n\
+#44=IFCAXIS2PLACEMENT3D(#46,$,$);\n\
+#45=IFCCARTESIANTRANSFORMATIONOPERATOR3D($,$,#46,$,$);\n\
+#46=IFCCARTESIANPOINT((0.,0.,0.));\n\
+ENDSEC;\nEND-ISO-10303-21;\n"
+        );
+        let idx = index(src.as_bytes());
+        assert_eq!(idx.product_has_body, vec![true, false, false, true, true]);
+        assert_eq!(
+            idx.product_body_rep_type,
+            vec![
+                Some("SweptSolid".to_string()),
+                None,
+                None,
+                Some("MappedRepresentation".to_string()),
+                Some("SweptSolid".to_string()),
+            ]
+        );
     }
 }
 

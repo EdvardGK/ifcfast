@@ -1640,60 +1640,22 @@ fn clone_local(m: &LocalMesh) -> LocalMesh {
     }
 }
 
-/// Collect the top-level Items list from a representation, preferring
-/// Body / Facetation contexts.
+/// Collect the top-level Items list of the representation to tessellate.
+///
+/// The body pick is [`crate::body_rep::select_body`] — the SAME function
+/// the tier-1 indexer uses for `has_body` / `body_rep_type` on the
+/// products table (GH #202). Keep it that way: the flag and the mesh must
+/// agree on which representation is the body. When no representation is
+/// a body (`has_body == false`) this falls back to the first listed
+/// representation (`Box`, `FootPrint`, …), the pre-#202 behaviour.
 fn body_items(table: &EntityTable, repr_id: u64) -> Vec<u64> {
-    let (type_name, args) = match table.get(repr_id) {
-        Some(x) => x,
-        None => return Vec::new(),
-    };
-    // IfcProductDefinitionShape(Name, Description, Representations: LIST OF IfcRepresentation)
-    if type_name.eq_ignore_ascii_case(b"IFCPRODUCTDEFINITIONSHAPE") {
-        let fields = split_top_level_args(args);
-        let body = match parse_field(fields.get(2).unwrap_or(&&[][..])) {
-            Field::List(b) => b,
-            _ => return Vec::new(),
-        };
-        // Try every representation; prefer Body / Facetation context.
-        let mut body_id: Option<u64> = None;
-        let mut any_id: Option<u64> = None;
-        for f in split_top_level_args(body) {
-            if let Field::Ref(rid) = parse_field(f) {
-                if is_body_or_facetation(table, rid) {
-                    body_id = Some(rid);
-                    break;
-                }
-                if any_id.is_none() {
-                    any_id = Some(rid);
-                }
-            }
-        }
-        let chosen = body_id.or(any_id);
-        return chosen
-            .map(|id| representation_items(table, id))
-            .unwrap_or_default();
+    if let Some(body) = crate::body_rep::select_body(table, repr_id) {
+        return representation_items(table, body.rep_id);
     }
-    // IfcShapeRepresentation directly (rare top-level).
-    representation_items(table, repr_id)
-}
-
-fn is_body_or_facetation(table: &EntityTable, repr_id: u64) -> bool {
-    let (type_name, args) = match table.get(repr_id) {
-        Some(x) => x,
-        None => return false,
-    };
-    if !type_name.eq_ignore_ascii_case(b"IFCSHAPEREPRESENTATION") {
-        return false;
-    }
-    let fields = split_top_level_args(args);
-    // IfcShapeRepresentation: (ContextOfItems, RepresentationIdentifier,
-    //                          RepresentationType, Items)
-    // RepresentationIdentifier at arg[1].
-    let ident = match parse_field(fields.get(1).unwrap_or(&&[][..])) {
-        Field::String(s) => s.to_lowercase(),
-        _ => return false,
-    };
-    matches!(ident.as_str(), "body" | "facetation")
+    crate::body_rep::representation_ids(table, repr_id)
+        .first()
+        .map(|&id| representation_items(table, id))
+        .unwrap_or_default()
 }
 
 pub(crate) fn representation_items(table: &EntityTable, repr_id: u64) -> Vec<u64> {
