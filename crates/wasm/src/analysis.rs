@@ -1347,31 +1347,42 @@ impl Analysis {
             table_meta_loaded("segments", self.segment_rows, meshed),
         );
 
-        // GH #184: entities with the `IfcProduct` attribute shape whose
-        // class no whitelist entry claimed. A file made entirely of such
-        // a class indexes to ZERO products, and without this the drop
-        // zone renders an empty model with no explanation.
+        // GH #184 / #186: entities with the `IfcProduct` attribute shape
+        // whose class no whitelist entry claimed. A file made entirely
+        // of such a class indexes to ZERO products, and without this
+        // the drop zone renders an empty model with no explanation.
         //
-        // Keys are the STEP tokens the indexer counted — `IFCACMEWIDGET`
-        // (a vendor class outside the schema), never title case. The
-        // wheel title-cases them through
-        // `ifcfast.data.schema_supertypes.ALL_ENTITIES`, the full
-        // IFC2X3/IFC4/IFC4X3 entity list generated into the Python
-        // package; the wasm crate has no such list and the core's
-        // `type_name_uppercase_with_proper_case` is (a) `pub(crate)` and
-        // (b) backed by the 153-entry PRODUCT whitelist spelling map,
-        // which by definition never contains a SKIPPED class — its
-        // fallback would produce `Ifctubebundle`, a wrong answer that
-        // looks right. The STEP spelling is what the file actually says,
-        // so that is what the browser reports; `crates/wasm/test/
-        // parity.mjs` normalises the key case (and only the case) when
-        // diffing against the wheel's summary. See the report on #184.
-        let mut skipped: Vec<(&String, &u32)> =
-            self.idx.skipped_product_type_counts.iter().collect();
-        skipped.sort_by(|a, b| a.0.cmp(b.0));
+        // Keys are the ifcopenshell spelling of the STEP token the
+        // indexer counted (`IfcTubeBundle`), resolved through
+        // `indexer::canonical_entity_name` — the generated
+        // IFC2X3/IFC4/IFC4X3 entity table (`schema_products::
+        // ENTITY_NAMES`, GH #201) that also backs
+        // `type_name_uppercase_with_proper_case` and, on the Python
+        // side, `ifcfast.whitelist.canonical_entity_name`. A class
+        // outside every supported schema (a vendor extension, e.g.
+        // `IFCACMEWIDGET`) comes back unchanged in its STEP spelling —
+        // there is no canonical answer to fabricate one for. Until
+        // GH #186 this field reported raw STEP tokens because the core
+        // had no public schema-wide lookup (only the whitelist's own
+        // spelling map, which by construction never covers a SKIPPED
+        // class); wheel and wasm now agree byte-for-byte, and
+        // `crates/wasm/test/parity.mjs` no longer normalises key case
+        // for this field.
+        let mut skipped: Vec<(String, &u32)> = self
+            .idx
+            .skipped_product_type_counts
+            .iter()
+            .map(|(name, count)| {
+                (
+                    indexer::canonical_entity_name(name.as_bytes()).into_owned(),
+                    count,
+                )
+            })
+            .collect();
+        skipped.sort_by(|a, b| a.0.cmp(&b.0));
         let mut skipped_types = Map::new();
         for (name, count) in skipped {
-            skipped_types.insert(name.clone(), json!(count));
+            skipped_types.insert(name, json!(count));
         }
 
         json!({
@@ -2399,11 +2410,37 @@ mod tests {
         let summary = a.summary_json();
         // The whole point: zero products, and a reason.
         assert_eq!(summary["products"], json!(0));
+        // GH #186: the key now goes through `indexer::canonical_entity_name`
+        // like everything else — it stays `IFCACMEWIDGET` here only
+        // because that class is not in IFC2X3/IFC4/IFC4X3 at all, so the
+        // canonical lookup has nothing to resolve it to and echoes the
+        // STEP token back unchanged. See `canonical_entity_name_is_used_
+        // for_a_real_schema_class_too` below for the resolving case, and
+        // the comment in `summary_json()` for why the fallback isn't a
+        // fabricated title-case guess.
         assert_eq!(
             summary["skipped_product_types"],
             json!({ "IFCACMEWIDGET": 1 }),
-            "STEP spelling, not the wheel's title case — see the comment \
-             in summary_json()"
+        );
+    }
+
+    /// GH #186: `unlisted_product.ifc`'s vendor class can't demonstrate
+    /// the resolving path (it's deliberately outside every schema), and
+    /// building a fixture around a real schema class the indexer still
+    /// treats as "skipped" would require faking the IfcProduct attribute
+    /// shape for a class that already has its own dispatch — not
+    /// representative. Assert the lookup this field is built on directly
+    /// instead: any real schema token canonicalises to its ifcopenshell
+    /// spelling, the same table `summary_json()` uses.
+    #[test]
+    fn canonical_entity_name_is_used_for_a_real_schema_class_too() {
+        assert_eq!(
+            indexer::canonical_entity_name(b"IFCTUBEBUNDLE").as_ref(),
+            "IfcTubeBundle"
+        );
+        assert_eq!(
+            indexer::canonical_entity_name(b"IFCWALLSTANDARDCASE").as_ref(),
+            "IfcWallStandardCase"
         );
     }
 

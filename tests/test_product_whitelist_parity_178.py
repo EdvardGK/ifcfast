@@ -30,7 +30,7 @@ from ifcfast.classify import (
     classify_by_name,
 )
 from ifcfast.data.schema_supertypes import ABSTRACT, ALL_ENTITIES, SUPERTYPE
-from ifcfast.whitelist import product_types
+from ifcfast.whitelist import canonical_entity_name, product_types
 
 
 CLASSIFIED_PRODUCTS = COUNT_ENTITIES | MEASURE_ENTITIES | LINEAR_ENTITIES
@@ -182,3 +182,59 @@ def test_whitelist_names_are_real_schema_entities():
     no fallback-caser `Ifcelectricflowstoragedevice`, no dead tokens."""
     unknown = sorted(n for n in product_types() if n not in ALL_ENTITIES)
     assert not unknown, f"not IFC schema entities: {unknown}"
+
+
+def test_python_and_rust_entity_lists_agree_on_every_spelling():
+    """GH #186: ``whitelist.canonical_entity_name`` now delegates to the
+    Rust core's schema entity table instead of building its own from
+    ``ALL_ENTITIES``. This pins the two generated lists equal — same
+    entities, same spelling for each — so that delegation cannot
+    silently change an answer the wheel used to give.
+
+    If this ever fails, the fix is NOT to make it pass quietly: restore a
+    Python-side lookup against ``ALL_ENTITIES`` in
+    ``ifcfast.whitelist.canonical_entity_name`` and report the
+    differences printed below (both lists come from
+    ``scripts/gen_schema_supertypes.py``, so a real disagreement means
+    one of the two generated files is stale — re-run it).
+    """
+    py_by_upper = {e.upper(): e for e in ALL_ENTITIES}
+
+    mismatched = []
+    missing_from_rust = []
+    for upper, py_name in py_by_upper.items():
+        rust_name = _core.canonical_entity_name(upper)
+        if rust_name == upper:
+            # canonical_entity_name() echoes an unresolved token back
+            # unchanged — the core table has no entry for it. (A real
+            # schema entity's ifcopenshell spelling is never all
+            # uppercase, so this cannot be a false positive.)
+            missing_from_rust.append(py_name)
+        elif rust_name != py_name:
+            mismatched.append((py_name, rust_name))
+
+    assert not missing_from_rust, (
+        "entities in ifcfast.data.schema_supertypes.ALL_ENTITIES with no "
+        f"Rust ENTITY_NAMES spelling: {sorted(missing_from_rust)}"
+    )
+    assert not mismatched, (
+        "Python ALL_ENTITIES and Rust ENTITY_NAMES disagree on spelling: "
+        f"{sorted(mismatched)}"
+    )
+
+
+@pytest.mark.parametrize(
+    "token,want",
+    [("IFCTUBEBUNDLE", "IfcTubeBundle"), ("IFCWALLSTANDARDCASE", "IfcWallStandardCase")],
+)
+def test_canonical_entity_name_delegates_to_core(token, want):
+    assert canonical_entity_name(token) == want
+    # Mixed-case input normalises the same way.
+    assert canonical_entity_name(token.lower()) == want
+
+
+def test_canonical_entity_name_echoes_unknown_tokens():
+    # Not a schema entity in any supported schema (GH #178 fixture class).
+    assert canonical_entity_name("IFCACMEWIDGET") == "IFCACMEWIDGET"
+    # Original casing is preserved on a miss.
+    assert canonical_entity_name("IfcAcmeWidget") == "IfcAcmeWidget"

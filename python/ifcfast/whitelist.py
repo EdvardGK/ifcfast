@@ -34,12 +34,8 @@ Two guards live here:
 from __future__ import annotations
 
 import warnings
-from typing import Optional
 
 __all__ = ["product_types", "canonical_entity_name", "note_skipped"]
-
-
-_CANONICAL_BY_UPPER: Optional[dict[str, str]] = None
 
 
 def product_types() -> frozenset[str]:
@@ -57,18 +53,29 @@ def product_types() -> frozenset[str]:
 def canonical_entity_name(upper: str) -> str:
     """``"IFCTUBEBUNDLE"`` → ``"IfcTubeBundle"``.
 
-    Resolved against the generated schema entity list that ships with the
-    wheel (:mod:`ifcfast.data.schema_supertypes`), which knows every
-    entity in IFC2X3 / IFC4 / IFC4X3 — including the ones the indexer
-    skips, which is the whole point. Unknown tokens (a non-standard or
-    vendor entity) come back unchanged, in their STEP spelling.
-    """
-    global _CANONICAL_BY_UPPER
-    if _CANONICAL_BY_UPPER is None:
-        from .data.schema_supertypes import ALL_ENTITIES
+    Resolved by the Rust core's schema entity table
+    (``ifcfast_core::indexer::canonical_entity_name``,
+    ``crates/core/src/schema_products.rs``), which knows every entity in
+    IFC2X3 / IFC4 / IFC4X3 — including the ones the indexer skips, which
+    is the whole point. Unknown tokens (a non-standard or vendor entity)
+    come back unchanged, in their STEP spelling.
 
-        _CANONICAL_BY_UPPER = {e.upper(): e for e in ALL_ENTITIES}
-    return _CANONICAL_BY_UPPER.get(upper.upper(), upper)
+    Until GH #186 this carried its own copy of the schema entity list
+    (:mod:`ifcfast.data.schema_supertypes` ``ALL_ENTITIES``) so the wheel
+    and the wasm build (which has no Python) canonicalised the same
+    ``skipped_product_types`` field two different ways.
+    ``tests/test_product_whitelist_parity_178.py`` pins
+    ``ALL_ENTITIES`` and the Rust table equal, entity for entity and
+    spelling for spelling, so this delegating to the core cannot silently
+    change an answer.
+    """
+    from . import _core
+
+    key = upper.upper()
+    canonical = _core.canonical_entity_name(key)
+    # A miss echoes the (uppercased) key back; preserve the caller's
+    # original casing on a miss, as this did before delegating.
+    return upper if canonical == key else canonical
 
 
 def note_skipped(model, raw_counts) -> dict[str, int]:

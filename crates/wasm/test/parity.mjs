@@ -192,24 +192,16 @@ if (!ref202) {
 check(
   'summary.json',
   diff(refSummary, summary, {
-    // GH #184: compared separately just below — the wheel title-cases the
-    // class names through its generated full-schema entity list
-    // (`ifcfast.data.schema_supertypes.ALL_ENTITIES`), the wasm build
-    // reports the STEP token it counted. Counts are diffed exactly; only
-    // the key SPELLING is normalised.
-    ignore: new Set(['path', 'parse_seconds', 'skipped_product_types']),
+    // GH #186: `skipped_product_types` used to need its own case-
+    // normalised comparison here — the wheel title-cased class names
+    // through its Python copy of the full-schema entity list
+    // (`ifcfast.data.schema_supertypes.ALL_ENTITIES`) while the wasm
+    // build reported the raw STEP token. Both now resolve through the
+    // same Rust core table (`indexer::canonical_entity_name`,
+    // `schema_products::ENTITY_NAMES`), so the key spelling is diffed
+    // exactly like everything else in this object.
+    ignore: new Set(['path', 'parse_seconds']),
   }),
-);
-
-const upperKeys = (o) => Object.fromEntries(Object.entries(o ?? {}).map(([k, v]) => [k.toUpperCase(), v]));
-check(
-  'summary.skipped_product_types (key case normalised)',
-  diff(
-    upperKeys(refSummary.skipped_product_types),
-    upperKeys(summary.skipped_product_types),
-    {},
-    'skipped_product_types',
-  ),
 );
 
 // Order-insensitive collections (HashMap iteration on the reference side).

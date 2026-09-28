@@ -355,6 +355,23 @@ mod python {
         catch_panic(|| Ok(indexer::product_type_names()))
     }
 
+    // ----- canonical_entity_name -----------------------------------------
+
+    /// STEP token → ifcopenshell spelling (`"IFCTUBEBUNDLE"` →
+    /// `"IfcTubeBundle"`), for any entity in IFC2X3 / IFC4 / IFC4X3 —
+    /// not just the product whitelist. A token outside every supported
+    /// schema (a vendor extension) comes back unchanged.
+    ///
+    /// Backs `ifcfast.whitelist.canonical_entity_name`, which used to
+    /// carry its own Python-side copy of the schema entity list
+    /// (`ifcfast.data.schema_supertypes.ALL_ENTITIES`); this is the same
+    /// table the wasm build uses for `skipped_product_types`, so the two
+    /// surfaces agree on spelling from one generator (GH #186).
+    #[pyfunction]
+    fn canonical_entity_name(token: &str) -> PyResult<String> {
+        catch_panic(|| Ok(indexer::canonical_entity_name(token.as_bytes()).into_owned()))
+    }
+
     // ----- index_ifc ----------------------------------------------------
 
     #[pyfunction]
@@ -3746,6 +3763,7 @@ mod python {
         m.add("IfcfastError", _py.get_type::<IfcfastError>())?;
         m.add_function(wrap_pyfunction!(index_ifc, m)?)?;
         m.add_function(wrap_pyfunction!(product_types, m)?)?;
+        m.add_function(wrap_pyfunction!(canonical_entity_name, m)?)?;
         m.add_function(wrap_pyfunction!(extract_psets, m)?)?;
         m.add_function(wrap_pyfunction!(extract_quantities, m)?)?;
         m.add_function(wrap_pyfunction!(extract_materials, m)?)?;

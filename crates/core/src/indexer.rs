@@ -5,6 +5,7 @@
 //! Output is column-major (Vec per attribute) so PyO3 can hand it to
 //! pandas / pyarrow without per-row Python object construction.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 
@@ -1312,6 +1313,26 @@ pub(crate) fn type_name_uppercase_with_proper_case(t: &[u8]) -> String {
     }
 }
 
+/// STEP token → ifcopenshell spelling, for GH #186: the wasm build's
+/// `skipped_product_types` keys and the wheel's `whitelist
+/// .canonical_entity_name` need one shared answer instead of two
+/// generators drifting apart.
+///
+/// Looked up against the same [`entity_name_map`] as
+/// [`type_name_uppercase_with_proper_case`], but the fallback is
+/// different on purpose: a class this table doesn't know is, by
+/// definition, outside IFC2X3 / IFC4 / IFC4X3 (a vendor extension or a
+/// newer schema) — it has no canonical spelling to fabricate, so it
+/// comes back byte-for-byte unchanged rather than through the
+/// `Ifcxxxxx`-style title-caser, which would print a wrong answer that
+/// looks right.
+pub fn canonical_entity_name(token: &[u8]) -> Cow<'static, str> {
+    match entity_name_map().get(token) {
+        Some(canonical) => Cow::Borrowed(*canonical),
+        None => Cow::Owned(String::from_utf8_lossy(token).into_owned()),
+    }
+}
+
 #[cfg(test)]
 mod unit_scale_tests {
     use super::index;
@@ -1722,8 +1743,8 @@ FILE_SCHEMA(('IFC2X3'));\nENDSEC;\n";
 #[cfg(test)]
 mod product_whitelist_tests {
     use super::{
-        entity_name_map, index, product_type_names, type_name_uppercase_with_proper_case,
-        PRODUCT_TYPES,
+        canonical_entity_name, entity_name_map, index, product_type_names,
+        type_name_uppercase_with_proper_case, PRODUCT_TYPES,
     };
 
     const HDR: &str = "ISO-10303-21;\nHEADER;\nFILE_DESCRIPTION((''),'2;1');\n\
@@ -1747,6 +1768,29 @@ FILE_SCHEMA(('IFC4'));\nENDSEC;\n";
             missing.is_empty(),
             "PRODUCT_TYPES entries with no ENTITY_NAME_PAIRS spelling: {missing:?}"
         );
+    }
+
+    /// GH #186: a real schema token that the indexer's product whitelist
+    /// still skips (structural analysis classes get a row but are not a
+    /// product per se — pick one that is unambiguously schema-known but
+    /// exercises the *lookup*, not whitelist membership) resolves to its
+    /// ifcopenshell spelling; a non-schema token comes back unchanged,
+    /// byte for byte, rather than through the fabricating fallback caser.
+    #[test]
+    fn canonical_entity_name_resolves_known_tokens_and_echoes_unknown_ones() {
+        assert_eq!(canonical_entity_name(b"IFCTUBEBUNDLE"), "IfcTubeBundle");
+        assert_eq!(
+            canonical_entity_name(b"IFCWALLSTANDARDCASE"),
+            "IfcWallStandardCase"
+        );
+        // Own-table dispatch classes are excluded from PRODUCT_TYPES but
+        // are still real schema entities with a real spelling.
+        assert_eq!(
+            canonical_entity_name(b"IFCBUILDINGSTOREY"),
+            "IfcBuildingStorey"
+        );
+        // Not in any supported schema: unchanged, not `Ifcacmewidget`.
+        assert_eq!(canonical_entity_name(b"IFCACMEWIDGET"), "IFCACMEWIDGET");
     }
 
     #[test]
