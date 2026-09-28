@@ -17,6 +17,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   present, `Body` is repointed and the fallback rep is left byte-identical.
 - **`summary()` / `schemas` advertised 5 spaces columns for a 7-column
   `spaces_df` (GH #206).** Pinned to the live frame.
+- **Mesh tessellation tolerance resolves the file's length unit through
+  the same `UnitTable` rule as `unit_scale` (GH #205).** Nested
+  conversion chains (yard → foot → metre) and zero-offset
+  `IfcConversionBasedUnitWithOffset` get their real scale instead of
+  falling back to metres, which had over-sampled curves. Output is
+  bit-identical for SI and one-level imperial files (G55 ×4 + every
+  fixture); a prefixed-base conversion unit (e.g. INCH over MILLIMETRE)
+  is now correctly rounded, 1 ulp from the old double-rounded f32.
 
 ### Added — IDS slice 3: PartOf facet + relation tables (GH #192)
 

@@ -766,112 +766,19 @@ fn resolve_plane_angle_scale(table: &EntityTable) -> f32 {
 }
 
 /// Metres per declared LENGTHUNIT, or `None` when the assignment carries
-/// no resolvable one. Same table walk as the plane-angle resolver: SI
-/// units read `Prefix` + `Name` (METRE only), conversion-based units
-/// (FOOT / INCH) follow `ConversionFactor` → `IfcMeasureWithUnit` →
-/// value × SI base unit. The indexer's `resolve_length_scale` is the
-/// warning-emitting authority for `unit_scale`; this is the quiet
-/// mesh-side twin (GH #170) and agrees with it on every corpus file.
+/// no resolvable one. A thin call into [`crate::units::UnitTable`], the
+/// resolver behind the indexer's tier-1 `unit_scale` (GH #205): SI
+/// `METRE` × prefix, conversion-based units resolved recursively (yard →
+/// foot → metre), zero-offset `IfcConversionBasedUnitWithOffset`. One
+/// rule for "what is this file's length unit", so the tessellation
+/// tolerance and `unit_scale` cannot disagree. Warnings are dropped here;
+/// the indexer pass over the same file reports them. The f64 → f32
+/// narrowing is the only rounding step.
 pub(crate) fn resolve_length_scale_opt(table: &EntityTable) -> Option<f32> {
-    let unit_refs = table
-        .unit_assignment_id()
-        .and_then(|id| table.get(id))
-        .map(|(_, args)| {
-            let fields = split_top_level_args(args);
-            match fields.first().copied().map(parse_field) {
-                Some(Field::List(b)) => parse_ref_list(b),
-                _ => Vec::new(),
-            }
-        })
-        .unwrap_or_default();
-    for uref in unit_refs {
-        let (utype, uargs) = match table.get(uref) {
-            Some(x) => x,
-            None => continue,
-        };
-        let uf = split_top_level_args(uargs);
-        let is_length = matches!(
-            uf.get(1).copied().map(parse_field),
-            Some(Field::Enum(b"LENGTHUNIT"))
-        );
-        if !is_length {
-            continue;
-        }
-        if utype.eq_ignore_ascii_case(b"IFCSIUNIT") {
-            if let Some(s) = si_length_scale_fields(&uf) {
-                return Some(s);
-            }
-        } else if utype.eq_ignore_ascii_case(b"IFCCONVERSIONBASEDUNIT") {
-            // (Dimensions, UnitType, Name, ConversionFactor)
-            let factor_ref = match uf.get(3).copied().map(parse_field) {
-                Some(Field::Ref(id)) => id,
-                _ => continue,
-            };
-            let (mtype, margs) = match table.get(factor_ref) {
-                Some(x) => x,
-                None => continue,
-            };
-            if !mtype.eq_ignore_ascii_case(b"IFCMEASUREWITHUNIT") {
-                continue;
-            }
-            let mf = split_top_level_args(margs);
-            let value = match mf.first().copied().and_then(parameter_value) {
-                Some(v) if v.is_finite() && v > 0.0 => v as f32,
-                _ => continue,
-            };
-            let base_ref = match mf.get(1).copied().map(parse_field) {
-                Some(Field::Ref(id)) => id,
-                _ => continue,
-            };
-            let base = match table.get(base_ref) {
-                Some((bt, bargs)) if bt.eq_ignore_ascii_case(b"IFCSIUNIT") => {
-                    si_length_scale_fields(&split_top_level_args(bargs))
-                }
-                _ => None,
-            };
-            if let Some(b) = base {
-                return Some(value * b);
-            }
-        }
-    }
-    None
-}
-
-/// `IfcSIUnit(Dimensions, UnitType, Prefix, Name)` → metres per unit, for
-/// `Name = METRE` with any SI prefix (`$` = none).
-fn si_length_scale_fields(uf: &[&[u8]]) -> Option<f32> {
-    let is_metre = matches!(
-        uf.get(3).copied().map(parse_field),
-        Some(Field::Enum(b"METRE")) | Some(Field::Enum(b"METER"))
-    );
-    if !is_metre {
-        return None;
-    }
-    let prefix = match uf.get(2).copied().map(parse_field) {
-        Some(Field::Enum(p)) => p,
-        _ => b"",
-    };
-    let exp: i32 = match prefix {
-        b"" => 0,
-        b"EXA" => 18,
-        b"PETA" => 15,
-        b"TERA" => 12,
-        b"GIGA" => 9,
-        b"MEGA" => 6,
-        b"KILO" => 3,
-        b"HECTO" => 2,
-        b"DECA" => 1,
-        b"DECI" => -1,
-        b"CENTI" => -2,
-        b"MILLI" => -3,
-        b"MICRO" => -6,
-        b"NANO" => -9,
-        b"PICO" => -12,
-        b"FEMTO" => -15,
-        b"ATTO" => -18,
-        _ => return None,
-    };
-    Some(10f32.powi(exp))
+    let mut quiet: Vec<String> = Vec::new();
+    crate::units::UnitTable::from_table(table)
+        .length_scale(&mut quiet)
+        .map(|s| s as f32)
 }
 
 /// The declared PLANEANGLEUNIT scale, or `None` when the file declares
@@ -1618,6 +1525,179 @@ ENDSEC;\nEND-ISO-10303-21;\n"
         assert_eq!(length_scale(&table), 1.0);
     }
 
+    /// GH #205 fixtures: a nested conversion chain (yard → foot → metre)
+    /// and a zero-offset `IfcConversionBasedUnitWithOffset` foot. The old
+    /// one-level resolver returned `None` for both (tessellation tolerance
+    /// read as metres); the mesher now uses the `UnitTable` rule.
+    const YARD_UNITS: &str = "#1=IFCUNITASSIGNMENT((#2));\n\
+#2=IFCCONVERSIONBASEDUNIT(#4,.LENGTHUNIT.,'YARD',#5);\n\
+#4=IFCDIMENSIONALEXPONENTS(1,0,0,0,0,0,0);\n\
+#5=IFCMEASUREWITHUNIT(IFCLENGTHMEASURE(3.),#7);\n\
+#7=IFCCONVERSIONBASEDUNIT(#4,.LENGTHUNIT.,'FOOT',#8);\n\
+#8=IFCMEASUREWITHUNIT(IFCLENGTHMEASURE(0.3048),#6);\n\
+#6=IFCSIUNIT(*,.LENGTHUNIT.,$,.METRE.);\n\
+#60=IFCCIRCLEPROFILEDEF(.AREA.,$,$,0.05);";
+    const OFFSET_FOOT_UNITS: &str = "#1=IFCUNITASSIGNMENT((#2));\n\
+#2=IFCCONVERSIONBASEDUNITWITHOFFSET(#4,.LENGTHUNIT.,'FOOT',#5,0.);\n\
+#4=IFCDIMENSIONALEXPONENTS(1,0,0,0,0,0,0);\n\
+#5=IFCMEASUREWITHUNIT(IFCLENGTHMEASURE(0.3048),#6);\n\
+#6=IFCSIUNIT(*,.LENGTHUNIT.,$,.METRE.);\n\
+#60=IFCCIRCLEPROFILEDEF(.AREA.,$,$,0.05);";
+
+    #[test]
+    fn length_scale_resolves_nested_and_zero_offset_units() {
+        // (fixture, expected metres per unit, chords at 0.05 units: new
+        // scale, old 1.0 fallback). 0.05 yd = 45.72 mm → 22 chords where
+        // the fallback read 50 mm → 23; 0.05 ft = 15.24 mm → 13 vs 23.
+        for (units, want, n_new, n_old) in [
+            (YARD_UNITS, 0.9144f32, 22usize, 23usize),
+            (OFFSET_FOOT_UNITS, 0.3048f32, 13, 23),
+        ] {
+            let ifc = units_ifc(units);
+            let table = EntityTable::build(ifc.as_bytes());
+            assert_eq!(
+                legacy_length_scale::resolve_length_scale_legacy(&table),
+                None,
+                "fixture must exercise the old resolver's fallback"
+            );
+            let s = resolve_length_scale_opt(&table).expect("resolves");
+            assert_eq!(s.to_bits(), want.to_bits(), "{s} != {want}");
+            assert_eq!(length_scale(&table).to_bits(), want.to_bits());
+            // Same factor as the indexer's tier-1 unit_scale, narrowed once.
+            let tier1 = crate::units::UnitTable::from_table(&table)
+                .length_scale(&mut Vec::new())
+                .unwrap();
+            assert_eq!(s.to_bits(), (tier1 as f32).to_bits());
+
+            assert_eq!(circle_samples(0.05, s), n_new);
+            assert_eq!(circle_samples(0.05, 1.0), n_old);
+            assert_eq!(
+                chord_count(std::f32::consts::PI / (1.0 - CHORD_TOLERANCE_M / (0.05 * s)).acos()),
+                n_new
+            );
+            let poly = extract(&table, 60).expect("circle profile");
+            assert_eq!(poly.outer.len(), n_new, "circle profile tessellation");
+        }
+    }
+
+    /// Wherever the pre-GH #205 one-level resolver succeeded, the
+    /// `UnitTable` path returns the bit-identical f32 — every SI prefix on
+    /// METRE except EXA / ATTO, a one-level FOOT / INCH on METRE, and every
+    /// `.ifc` fixture (plus `$IFCFAST_CORPUS`, colon-separated, when set).
+    /// The documented exceptions are where the old f32 arithmetic rounded
+    /// twice (`10f32.powi(±18)`, `value_f32 × prefix_f32`); there the new
+    /// value is the correctly rounded tier-1 `unit_scale`, one ulp away.
+    #[test]
+    fn length_scale_bit_identical_to_legacy_where_legacy_resolved() {
+        let si = |prefix: &str| {
+            units_ifc(&format!(
+                "#1=IFCUNITASSIGNMENT((#3,#2));\n\
+#2=IFCSIUNIT(*,.LENGTHUNIT.,{prefix},.METRE.);\n\
+#3=IFCSIUNIT(*,.PLANEANGLEUNIT.,$,.RADIAN.);"
+            ))
+        };
+        let conv = |value: &str, prefix: &str| {
+            units_ifc(&format!(
+                "#1=IFCUNITASSIGNMENT((#2));\n\
+#2=IFCCONVERSIONBASEDUNIT(#4,.LENGTHUNIT.,'INCH',#5);\n\
+#4=IFCDIMENSIONALEXPONENTS(1,0,0,0,0,0,0);\n\
+#5=IFCMEASUREWITHUNIT(IFCLENGTHMEASURE({value}),#6);\n\
+#6=IFCSIUNIT(*,.LENGTHUNIT.,{prefix},.METRE.);"
+            ))
+        };
+        let mut exact: Vec<String> = [
+            "$", ".PETA.", ".TERA.", ".GIGA.", ".MEGA.", ".KILO.", ".HECTO.", ".DECA.", ".DECI.",
+            ".CENTI.", ".MILLI.", ".MICRO.", ".NANO.", ".PICO.", ".FEMTO.",
+        ]
+        .iter()
+        .map(|p| si(p))
+        .collect();
+        exact.push(conv("0.0254", "$"));
+        exact.push(conv("0.3048", "$"));
+        exact.push(conv("2.54", ".CENTI."));
+        exact.push(conv("304.8", ".MILLI."));
+        for ifc in &exact {
+            let table = EntityTable::build(ifc.as_bytes());
+            let old = legacy_length_scale::resolve_length_scale_legacy(&table);
+            assert!(old.is_some(), "{ifc}");
+            assert_eq!(
+                old.map(f32::to_bits),
+                resolve_length_scale_opt(&table).map(f32::to_bits),
+                "{ifc}: {old:?}"
+            );
+        }
+        for ifc in [
+            si(".EXA."),
+            si(".ATTO."),
+            conv("25.4", ".MILLI."),
+            conv("30.48", ".CENTI."),
+        ] {
+            let table = EntityTable::build(ifc.as_bytes());
+            let old = legacy_length_scale::resolve_length_scale_legacy(&table).unwrap();
+            let new = resolve_length_scale_opt(&table).unwrap();
+            let tier1 = crate::units::UnitTable::from_table(&table)
+                .length_scale(&mut Vec::new())
+                .unwrap();
+            assert_eq!(new.to_bits(), (tier1 as f32).to_bits(), "{ifc}");
+            assert_eq!(
+                old.to_bits().abs_diff(new.to_bits()),
+                1,
+                "{ifc}: {old} vs {new}"
+            );
+        }
+
+        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            let Ok(rd) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    walk(&p, out);
+                } else if p.extension().is_some_and(|x| x.eq_ignore_ascii_case("ifc")) {
+                    out.push(p);
+                }
+            }
+        }
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut files = Vec::new();
+        walk(&root.join("tests/fixtures"), &mut files);
+        walk(&root.join("../../tests/fixtures"), &mut files);
+        if let Ok(corpus) = std::env::var("IFCFAST_CORPUS") {
+            files.extend(
+                corpus
+                    .split(':')
+                    .filter(|s| !s.is_empty())
+                    .map(std::path::PathBuf::from),
+            );
+        }
+        assert!(files.len() >= 20, "fixture walk found only {files:?}");
+        let (mut resolved, mut newly) = (0usize, 0usize);
+        for path in &files {
+            let buf = std::fs::read(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+            let table = EntityTable::build(&buf);
+            let old = legacy_length_scale::resolve_length_scale_legacy(&table);
+            let new = resolve_length_scale_opt(&table);
+            match old {
+                Some(o) => {
+                    resolved += 1;
+                    assert_eq!(
+                        Some(o.to_bits()),
+                        new.map(f32::to_bits),
+                        "{}: {old:?} -> {new:?}",
+                        path.display()
+                    );
+                }
+                None => newly += new.is_some() as usize,
+            }
+        }
+        eprintln!(
+            "mesh length_scale legacy equality: {} files, {resolved} resolved by legacy \
+             (all bit-identical), {newly} newly resolved",
+            files.len()
+        );
+    }
+
     #[test]
     fn arc_area_scale_reduces_to_the_closed_formula_and_is_exact() {
         assert!(
@@ -1784,5 +1864,126 @@ ENDSEC;\nEND-ISO-10303-21;\n";
                 .fold(f32::INFINITY, f32::min);
             assert!(d < 1e-3, "nearest vertex to {want:?} is {d} m away");
         }
+    }
+}
+
+/// Pre-GH #205 mesh-side length resolver, kept verbatim as the test
+/// oracle for routing [`resolve_length_scale_opt`] through
+/// [`crate::units::UnitTable`] (the same pattern `indexer.rs` uses for its
+/// legacy unit constants): wherever this one-level walk resolved, the new
+/// path must return the bit-identical f32.
+#[cfg(test)]
+mod legacy_length_scale {
+    use super::parameter_value;
+    use crate::entity_table::EntityTable;
+    use crate::lexer::{parse_field, parse_ref_list, split_top_level_args, Field};
+
+    /// Metres per declared LENGTHUNIT, or `None` when the assignment carries
+    /// no resolvable one. Same table walk as the plane-angle resolver: SI
+    /// units read `Prefix` + `Name` (METRE only), conversion-based units
+    /// (FOOT / INCH) follow `ConversionFactor` → `IfcMeasureWithUnit` →
+    /// value × SI base unit. The indexer's `resolve_length_scale` is the
+    /// warning-emitting authority for `unit_scale`; this is the quiet
+    /// mesh-side twin (GH #170) and agrees with it on every corpus file.
+    pub(super) fn resolve_length_scale_legacy(table: &EntityTable) -> Option<f32> {
+        let unit_refs = table
+            .unit_assignment_id()
+            .and_then(|id| table.get(id))
+            .map(|(_, args)| {
+                let fields = split_top_level_args(args);
+                match fields.first().copied().map(parse_field) {
+                    Some(Field::List(b)) => parse_ref_list(b),
+                    _ => Vec::new(),
+                }
+            })
+            .unwrap_or_default();
+        for uref in unit_refs {
+            let (utype, uargs) = match table.get(uref) {
+                Some(x) => x,
+                None => continue,
+            };
+            let uf = split_top_level_args(uargs);
+            let is_length = matches!(
+                uf.get(1).copied().map(parse_field),
+                Some(Field::Enum(b"LENGTHUNIT"))
+            );
+            if !is_length {
+                continue;
+            }
+            if utype.eq_ignore_ascii_case(b"IFCSIUNIT") {
+                if let Some(s) = si_length_scale_fields(&uf) {
+                    return Some(s);
+                }
+            } else if utype.eq_ignore_ascii_case(b"IFCCONVERSIONBASEDUNIT") {
+                // (Dimensions, UnitType, Name, ConversionFactor)
+                let factor_ref = match uf.get(3).copied().map(parse_field) {
+                    Some(Field::Ref(id)) => id,
+                    _ => continue,
+                };
+                let (mtype, margs) = match table.get(factor_ref) {
+                    Some(x) => x,
+                    None => continue,
+                };
+                if !mtype.eq_ignore_ascii_case(b"IFCMEASUREWITHUNIT") {
+                    continue;
+                }
+                let mf = split_top_level_args(margs);
+                let value = match mf.first().copied().and_then(parameter_value) {
+                    Some(v) if v.is_finite() && v > 0.0 => v as f32,
+                    _ => continue,
+                };
+                let base_ref = match mf.get(1).copied().map(parse_field) {
+                    Some(Field::Ref(id)) => id,
+                    _ => continue,
+                };
+                let base = match table.get(base_ref) {
+                    Some((bt, bargs)) if bt.eq_ignore_ascii_case(b"IFCSIUNIT") => {
+                        si_length_scale_fields(&split_top_level_args(bargs))
+                    }
+                    _ => None,
+                };
+                if let Some(b) = base {
+                    return Some(value * b);
+                }
+            }
+        }
+        None
+    }
+
+    /// `IfcSIUnit(Dimensions, UnitType, Prefix, Name)` → metres per unit, for
+    /// `Name = METRE` with any SI prefix (`$` = none).
+    fn si_length_scale_fields(uf: &[&[u8]]) -> Option<f32> {
+        let is_metre = matches!(
+            uf.get(3).copied().map(parse_field),
+            Some(Field::Enum(b"METRE")) | Some(Field::Enum(b"METER"))
+        );
+        if !is_metre {
+            return None;
+        }
+        let prefix = match uf.get(2).copied().map(parse_field) {
+            Some(Field::Enum(p)) => p,
+            _ => b"",
+        };
+        let exp: i32 = match prefix {
+            b"" => 0,
+            b"EXA" => 18,
+            b"PETA" => 15,
+            b"TERA" => 12,
+            b"GIGA" => 9,
+            b"MEGA" => 6,
+            b"KILO" => 3,
+            b"HECTO" => 2,
+            b"DECA" => 1,
+            b"DECI" => -1,
+            b"CENTI" => -2,
+            b"MILLI" => -3,
+            b"MICRO" => -6,
+            b"NANO" => -9,
+            b"PICO" => -12,
+            b"FEMTO" => -15,
+            b"ATTO" => -18,
+            _ => return None,
+        };
+        Some(10f32.powi(exp))
     }
 }
