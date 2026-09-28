@@ -17,6 +17,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   present, `Body` is repointed and the fallback rep is left byte-identical.
 - **`summary()` / `schemas` advertised 5 spaces columns for a 7-column
   `spaces_df` (GH #206).** Pinned to the live frame.
+- **wasm `summaryJson().tables` now reports `nests` / `groups` / `fills`
+  (GH #208).** The slice 3 tier-1 tables were wired into the wheel but
+  never mirrored into the browser build's `Analysis`, so `summary.json`
+  shape disagreed between the two surfaces; `CACHE_SCHEMA_VERSION` stays 36.
 - **`summaryJson()["skipped_product_types"]` key casing diverged between
   the wasm build and the wheel (GH #186).** wasm reported raw STEP tokens
   (`IFCTUBEBUNDLE`); the wheel resolved ifcopenshell spelling through its

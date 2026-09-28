@@ -222,6 +222,21 @@ pub struct Analysis {
     pub opening_guids: HashSet<String>,
     pub type_object_count: usize,
 
+    /// `IfcRelNests` rows, guid-resolved by `indexer::index` already
+    /// (either side can be any `IfcObjectDefinition`). Column order
+    /// mirrors `model.py::_NESTS_COLUMNS`:
+    /// `(parent_guid, child_guid, position, parent_step_id, child_step_id)`.
+    pub nests: Vec<(String, String, u32, u64, u64)>,
+    /// `IfcRelAssignsToGroup` rows, guid-resolved by `indexer::index`.
+    /// Column order mirrors `model.py::_GROUPS_COLUMNS`:
+    /// `(group_guid, group_entity, member_guid, group_step_id, member_step_id)`.
+    pub groups: Vec<(String, String, String, u64, u64)>,
+    /// `IfcRelFillsElement` rows. Both sides are products, so this
+    /// resolves through `product_step_to_guid` the same way `voids`
+    /// does — `model.py`'s comment on the matching join says so
+    /// verbatim. `(opening_guid, element_guid)`.
+    pub fills: Vec<(String, String)>,
+
     /// The four long-format data layers, retained verbatim so
     /// `psetsJson` / `quantitiesJson` / `materialsJson` /
     /// `classificationsJson` are a pure serialise (GH #183).
@@ -476,6 +491,43 @@ impl Analysis {
             }
         }
 
+        // GH #192 slice 3 / GH #208: nests and groups arrive already
+        // guid-resolved from `indexer::index` (`resolve_nests_and_groups`
+        // drops dangling-reference rows there, matching the Python
+        // wheel's warning). Fills resolves like voids, both sides being
+        // products — `model.py`'s comment on the equivalent join.
+        let mut nests: Vec<(String, String, u32, u64, u64)> =
+            Vec::with_capacity(idx.nests_parent_guid.len());
+        for i in 0..idx.nests_parent_guid.len() {
+            nests.push((
+                idx.nests_parent_guid[i].clone(),
+                idx.nests_child_guid[i].clone(),
+                idx.nests_position[i],
+                idx.nests_parent[i],
+                idx.nests_child[i],
+            ));
+        }
+        let mut groups: Vec<(String, String, String, u64, u64)> =
+            Vec::with_capacity(idx.groups_group_guid.len());
+        for i in 0..idx.groups_group_guid.len() {
+            groups.push((
+                idx.groups_group_guid[i].clone(),
+                idx.groups_group_entity[i].clone(),
+                idx.groups_member_guid[i].clone(),
+                idx.groups_group[i],
+                idx.groups_member[i],
+            ));
+        }
+        let mut fills: Vec<(String, String)> = Vec::new();
+        for (opening, element) in idx.fills_opening.iter().zip(idx.fills_element.iter()) {
+            if let (Some(og), Some(eg)) = (
+                product_step_to_guid.get(opening),
+                product_step_to_guid.get(element),
+            ) {
+                fills.push((og.clone(), eg.clone()));
+            }
+        }
+
         // ----- data layers -------------------------------------------
         let table = EntityTable::build(buf);
         if let Some(err) = table.scan_error() {
@@ -584,6 +636,9 @@ impl Analysis {
             storey_building,
             voids,
             opening_guids,
+            nests,
+            groups,
+            fills,
             psets_t,
             quantities_t,
             materials_t,
@@ -1160,6 +1215,27 @@ const COLS: &[(&str, &[&str])] = &[
     ("storey_building", &["storey_guid", "building_guid"]),
     ("voids", &["opening_guid", "host_guid"]),
     (
+        "nests",
+        &[
+            "parent_guid",
+            "child_guid",
+            "position",
+            "parent_step_id",
+            "child_step_id",
+        ],
+    ),
+    (
+        "groups",
+        &[
+            "group_guid",
+            "group_entity",
+            "member_guid",
+            "group_step_id",
+            "member_step_id",
+        ],
+    ),
+    ("fills", &["opening_guid", "element_guid"]),
+    (
         "psets",
         &[
             "guid",
@@ -1324,6 +1400,9 @@ impl Analysis {
             table_meta("storey_building", self.storey_building.len()),
         );
         tables.insert("voids".into(), table_meta("voids", self.voids.len()));
+        tables.insert("nests".into(), table_meta("nests", self.nests.len()));
+        tables.insert("groups".into(), table_meta("groups", self.groups.len()));
+        tables.insert("fills".into(), table_meta("fills", self.fills.len()));
         tables.insert("psets".into(), table_meta("psets", self.psets_t.guid.len()));
         tables.insert(
             "quantities".into(),
@@ -2347,6 +2426,104 @@ mod tests {
         assert_eq!(r["identification"], json!("232.1"));
         assert_eq!(r["name"], json!("Yttervegger"));
         assert_eq!(r["assignment_source"], json!("instance"));
+    }
+
+    // ----- GH #208 (GH #192 slice 3): nests / groups / fills --------
+    //
+    // These three tier-1 tables have no dedicated `*_json` accessor on
+    // `IfcModel` (unlike psets/quantities/materials/classifications),
+    // so the coverage that matters is `summaryJson().tables` — the
+    // exact thing `crates/wasm/test/parity.mjs` diffs against the
+    // Python-generated sidecar — plus the raw field counts underneath
+    // it. Row counts are cross-checked against the Python wheel:
+    // `ifcfast.open("crates/core/tests/fixtures/ids/partof_relations.ifc")`
+    // reports `len(m.nests)==1, len(m.groups)==3, len(m.fills)==1`.
+
+    fn core_fixture(name: &str) -> Analysis {
+        let path = format!(
+            "{}/../core/tests/fixtures/{name}",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
+        Analysis::run(&bytes, name).unwrap_or_else(|e| panic!("{name} parses: {e}"))
+    }
+
+    #[test]
+    fn nests_groups_fills_counts_and_summary_agree() {
+        let a = core_fixture("ids/partof_relations.ifc");
+        assert_eq!(a.nests.len(), 1, "nests row count vs Python wheel");
+        assert_eq!(a.groups.len(), 3, "groups row count vs Python wheel");
+        assert_eq!(a.fills.len(), 1, "fills row count vs Python wheel");
+
+        let summary = a.summary_json();
+        for (table, rows) in [("nests", 1), ("groups", 3), ("fills", 1)] {
+            assert_eq!(
+                summary["tables"][table]["rows"],
+                json!(rows),
+                "{table}: summaryJson row count"
+            );
+            assert_eq!(
+                summary["tables"][table]["loaded"],
+                json!(true),
+                "{table}: summaryJson loaded flag"
+            );
+        }
+        assert_eq!(
+            summary["tables"]["nests"]["columns"],
+            json!([
+                "parent_guid",
+                "child_guid",
+                "position",
+                "parent_step_id",
+                "child_step_id"
+            ]),
+            "nests: column list matches model.py::_NESTS_COLUMNS"
+        );
+        assert_eq!(
+            summary["tables"]["groups"]["columns"],
+            json!([
+                "group_guid",
+                "group_entity",
+                "member_guid",
+                "group_step_id",
+                "member_step_id"
+            ]),
+            "groups: column list matches model.py::_GROUPS_COLUMNS"
+        );
+        assert_eq!(
+            summary["tables"]["fills"]["columns"],
+            json!(["opening_guid", "element_guid"]),
+            "fills: column list matches model.py::_FILLS_COLUMNS"
+        );
+
+        // Values, not just shape — GH #192 slice 3's join.
+        assert_eq!(a.groups[2].1, "IfcZone");
+        let (opening_guid, element_guid) = &a.fills[0];
+        assert_ne!(opening_guid, element_guid);
+    }
+
+    #[test]
+    fn nests_groups_fills_drop_dangling_references() {
+        // `rel_field_pinning.ifc` pins IfcRel* field POSITIONS, not
+        // graph validity — every referenced id is intentionally
+        // dangling. `resolve_nests_and_groups` / the fills join must
+        // drop all of it, matching the Python wheel's warning
+        // ("… dangling reference; those rows are left out …") and its
+        // `len(m.nests) == len(m.groups) == len(m.fills) == 0`.
+        let a = fixture("rel_field_pinning.ifc");
+        assert_eq!(a.nests.len(), 0);
+        assert_eq!(a.groups.len(), 0);
+        assert_eq!(a.fills.len(), 0);
+
+        let summary = a.summary_json();
+        for table in ["nests", "groups", "fills"] {
+            assert_eq!(summary["tables"][table]["rows"], json!(0), "{table}: rows");
+            assert_eq!(
+                summary["tables"][table]["loaded"],
+                json!(true),
+                "{table}: still reports loaded:true when empty (tier-1, not mesh-derived)"
+            );
+        }
     }
 
     // ----- GH #181: StoreyRow.elevation_m -------------------------

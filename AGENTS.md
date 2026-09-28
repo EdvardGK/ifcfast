@@ -170,7 +170,7 @@ summary if the install is damaged (GH #157).
 
 `m.preview(table, n=5)` samples any of: `products`, `storeys`,
 `spaces`, `type_objects`, `contained_in`, `aggregates`,
-`storey_building`, `voids`, `psets`, `quantities`, `materials`,
+`storey_building`, `voids`, `nests`, `groups`, `fills`, `psets`, `quantities`, `materials`,
 `classifications`, `drift`, `segments`. An empty list means the model
 has no such rows; a build that *cannot produce* the layer (`drift` /
 `segments` need a wheel built with the `mesh` feature) raises instead
