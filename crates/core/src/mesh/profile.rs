@@ -1649,11 +1649,11 @@ ENDSEC;\nEND-ISO-10303-21;\n"
             let old = legacy_length_scale::resolve_length_scale_legacy(&table).unwrap();
             let new = resolve_length_scale_opt(&table).unwrap();
             assert_eq!(new.to_bits(), tier1_bits(&table), "{ifc}");
+            // Legacy may coincide with the correctly rounded value on some
+            // hosts (EXA did on the CI runner) and sit 1–2 ulps off on
+            // others; only the upper bound is a property of the maths.
             let ulps = old.to_bits().abs_diff(new.to_bits());
-            assert!(
-                (1..=2).contains(&ulps),
-                "{ifc}: {old} vs {new} ({ulps} ulps)"
-            );
+            assert!(ulps <= 2, "{ifc}: {old} vs {new} ({ulps} ulps)");
         }
 
         fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
