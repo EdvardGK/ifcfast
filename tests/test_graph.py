@@ -480,3 +480,13 @@ def test_cache_roundtrip_preserves_new_tables(tmp_path, monkeypatch):
         assert cold_types[row["guid"]] == (
             row["type_guid"], row["type_name"], row["type_source"]
         )
+
+
+def test_summary_spaces_columns_match_the_live_frame_206(minimal):
+    """GH #206: ``summary()`` / ``schemas()`` advertised 5 spaces columns
+    while ``spaces_df`` carried 7 after GH #202. Pin the advertised list
+    to the frame itself so the constant cannot drift again."""
+    live = list(minimal.spaces_df.columns)
+    assert minimal.summary()["tables"]["spaces"]["columns"] == live
+    assert minimal.schemas["spaces"]["columns"] == live
+    assert set(minimal.schemas["spaces"]["dtypes"]) == set(live)

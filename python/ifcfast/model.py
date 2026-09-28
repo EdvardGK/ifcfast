@@ -3239,13 +3239,21 @@ def _df_schema(df, loaded: Optional[bool] = None) -> dict:
 # GH #71 (7): spaces_df is SpaceRow (guid, step_id) left-joined with
 # name/storey from the products table. Keep the advertised column set in
 # one place so summary() and schemas() agree with the actual frame.
-_SPACES_DF_COLUMNS = ["guid", "step_id", "name", "storey_guid", "storey_name"]
+# Must match the frame `spaces_df` actually builds (GH #71 enrichment,
+# GH #202 body columns) — `tests/test_graph.py` pins summary() to the
+# live frame so the two cannot drift again (GH #206).
+_SPACES_DF_COLUMNS = [
+    "guid", "step_id", "name", "storey_guid", "storey_name",
+    "has_body", "body_rep_type",
+]
 _SPACES_DF_DTYPES = {
     "guid": "str",
     "step_id": "int",
     "name": "Optional[str]",
     "storey_guid": "Optional[str]",
     "storey_name": "Optional[str]",
+    "has_body": "bool",
+    "body_rep_type": "Optional[str]",
 }
 
 
