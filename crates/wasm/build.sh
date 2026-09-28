@@ -17,9 +17,18 @@ target_dir="${CARGO_TARGET_DIR:-$root/target}"
 wasm="$target_dir/wasm32-unknown-unknown/release/ifcfast_wasm.wasm"
 out="$here/pkg"
 
-echo "==> cargo build --release --target wasm32-unknown-unknown"
+# Optional crate features, comma-separated. `ids` adds
+# `IfcModel.validateIds` (GH #192 slice 4; +1.74 MB raw, +367 KB brotli —
+# opt-in, the site bundle ships without it).
+features="${IFCFAST_WASM_FEATURES:-}"
+feature_args=()
+if [[ -n "$features" ]]; then
+  feature_args=(--features "$features")
+fi
+
+echo "==> cargo build --release --target wasm32-unknown-unknown ${features:+(features: $features)}"
 cargo build --manifest-path "$root/Cargo.toml" \
-  -p ifcfast-wasm --target wasm32-unknown-unknown --release
+  -p ifcfast-wasm --target wasm32-unknown-unknown --release "${feature_args[@]}"
 
 echo "==> wasm-bindgen --target web"
 rm -rf "$out"
@@ -50,6 +59,11 @@ else
 
   echo "==> node test/stream.mjs"
   node "$here/test/stream.mjs"
+
+  # Self-skips (with a note) on a build without the `ids` feature; the
+  # wheel-vs-wasm half also needs the IDS suite + an importable ifcfast.
+  echo "==> node test/ids_parity.mjs"
+  node "$here/test/ids_parity.mjs"
 
   if [[ ! -f "$root/.local-samples/Duplex_A_20110907.ifc" ]]; then
     echo "==> parity skipped — .local-samples/Duplex_A_20110907.ifc not present"

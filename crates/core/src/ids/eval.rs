@@ -215,6 +215,13 @@ pub(crate) struct Outcome {
     pub reason: Option<&'static str>,
     pub actual: Option<String>,
     pub source: Option<&'static str>,
+    /// IfcTester reason type when the reason code alone does not decide it
+    /// (a direct partOf branch failing on predefinedType is `PREDEFINEDTYPE`,
+    /// not `ENTITY`). Feeds the IfcTester reason text only.
+    pub it_kind: Option<&'static str>,
+    /// IfcTester's `str(reason["actual"])` when it differs from `actual`
+    /// (a one-element list prints its element, `facet.py:1159-1161`).
+    pub it_actual: Option<String>,
 }
 
 impl Outcome {
@@ -224,6 +231,8 @@ impl Outcome {
             reason: None,
             actual: None,
             source: None,
+            it_kind: None,
+            it_actual: None,
         }
     }
 
@@ -233,6 +242,17 @@ impl Outcome {
             reason: Some(reason),
             actual,
             source,
+            it_kind: None,
+            it_actual: None,
+        }
+    }
+
+    /// A pass that records where the value came from.
+    fn pass_with(actual: Option<String>, source: Option<&'static str>) -> Outcome {
+        Outcome {
+            actual,
+            source,
+            ..Outcome::pass()
         }
     }
 }
@@ -522,6 +542,13 @@ fn eval_spec(
                 f.reason_code
                     .push(o.reason.unwrap_or(reason::ENTITY_MISMATCH));
                 f.expected.push(r.label.clone());
+                f.ifctester_reason.push(super::ifctester_json::reason_text(
+                    &r.facet,
+                    o.reason.unwrap_or(reason::ENTITY_MISMATCH),
+                    o.actual.as_deref(),
+                    o.it_kind,
+                    o.it_actual.as_deref(),
+                ));
                 f.actual.push(o.actual);
                 f.value_source.push(o.source);
             }
@@ -723,7 +750,15 @@ fn extract(ctx: &Ctx, pd: &PropData, pv: &PropView) -> Result<PropValues, IdsErr
                 (PropClass::EnumeratedValue, None) => None,
                 _ => d.unit_step,
             };
-            let items = items_of(&d.values, unit);
+            // IfcTester reads a bounded value Upper, Lower, SetPoint
+            // (facet.py:801-806); the property graph stores Lower first.
+            let items = if d.class == PropClass::BoundedValue && d.values.len() >= 2 {
+                let mut v = d.values.clone();
+                v.swap(0, 1);
+                items_of(&v, unit)
+            } else {
+                items_of(&d.values, unit)
+            };
             if items.is_empty() {
                 PropValues::Empty("None".into())
             } else {
@@ -866,6 +901,11 @@ fn check_prop(
     if ok {
         return Ok(None);
     }
+    // IfcTester prints a one-element list as its element and a longer
+    // list with the plural sentence (facet.py:1158-1165).
+    let it_actual =
+        (many && acts.len() == 1).then(|| acts[0].as_ref().map_or("None".into(), actual_py_str));
+    let it_kind = (many && acts.len() > 1).then_some("VALUES");
     let actual = if many {
         format!(
             "[{}]",
@@ -877,11 +917,11 @@ fn check_prop(
     } else {
         acts[0].as_ref().map_or("None".into(), actual_py_str)
     };
-    Ok(Some(Outcome::fail(
-        reason::PROP_VALUE_MISMATCH,
-        Some(actual),
-        src,
-    )))
+    Ok(Some(Outcome {
+        it_actual,
+        it_kind,
+        ..Outcome::fail(reason::PROP_VALUE_MISMATCH, Some(actual), src)
+    }))
 }
 
 /// Python `str()` of a decoded value.
@@ -1094,24 +1134,14 @@ pub(crate) fn eval_material(
         Some((mat, s)) => {
             let src = Some(source_str(s));
             match &m.value {
-                None => Outcome {
-                    pass: true,
-                    reason: None,
-                    actual: None,
-                    source: src,
-                },
+                None => Outcome::pass_with(None, src),
                 Some(v) => {
                     let strings = md.strings(mat);
                     if strings
                         .iter()
                         .any(|x| v.matches(&Actual::Str((*x).to_string())))
                     {
-                        Outcome {
-                            pass: true,
-                            reason: None,
-                            actual: None,
-                            source: src,
-                        }
+                        Outcome::pass_with(None, src)
                     } else {
                         let set = if strings.is_empty() {
                             "set()".to_string()
@@ -1125,7 +1155,18 @@ pub(crate) fn eval_material(
                                     .join(", ")
                             )
                         };
-                        Outcome::fail(reason::MATERIAL_VALUE_MISMATCH, Some(set), src)
+                        // IfcTester's set keeps None for a null / absent
+                        // name or category (facet.py:957-987).
+                        let it_actual = md.has_null_candidate(mat).then(|| {
+                            let mut v: Vec<String> =
+                                strings.iter().map(|x| py_repr_str(x)).collect();
+                            v.push("None".into());
+                            format!("{{{}}}", v.join(", "))
+                        });
+                        Outcome {
+                            it_actual,
+                            ..Outcome::fail(reason::MATERIAL_VALUE_MISMATCH, Some(set), src)
+                        }
                     }
                 }
             }
@@ -1152,9 +1193,12 @@ enum Walk {
     Missing,
     /// A related object matched the nested entity facet; its class.
     Match(String),
-    /// Related objects exist, none matched (IfcTester ENTITY /
-    /// PREDEFINEDTYPE); `actual` in IfcTester's form.
+    /// Related objects exist, none matched (IfcTester ENTITY);
+    /// `actual` in IfcTester's form.
     Mismatch(String),
+    /// A direct branch's related object failed on predefinedType
+    /// (IfcTester PREDEFINEDTYPE); `actual` is that predefined type.
+    PredefinedMismatch(String),
 }
 
 /// Upper-case class of `id` for the `actual` column (the raw token when
@@ -1265,7 +1309,7 @@ fn direct(
     if group_rule || matches!(out, Walk::Match(_)) {
         let (ok, pt) = part_of_predefined(ctx, e, id)?;
         if !ok {
-            out = Walk::Mismatch(pt.unwrap_or_else(|| "None".into()));
+            out = Walk::PredefinedMismatch(pt.unwrap_or_else(|| "None".into()));
         }
     }
     Ok(out)
@@ -1320,17 +1364,20 @@ pub(crate) fn eval_part_of(
         // `optional` never reaches here: the IDS 1.0 XSD allows only
         // required / prohibited on <partOf> (the parser refuses it).
         Walk::Missing => Outcome::fail(reason::PARTOF_MISSING, None, None),
-        Walk::Match(class) => Outcome {
-            pass: true,
-            reason: None,
-            actual: Some(class),
-            source: Some("instance"),
-        },
+        Walk::Match(class) => Outcome::pass_with(Some(class), Some("instance")),
         Walk::Mismatch(actual) => Outcome::fail(
             reason::PARTOF_ENTITY_MISMATCH,
             Some(actual),
             Some("instance"),
         ),
+        Walk::PredefinedMismatch(actual) => Outcome {
+            it_kind: Some("PREDEFINEDTYPE"),
+            ..Outcome::fail(
+                reason::PARTOF_ENTITY_MISMATCH,
+                Some(actual),
+                Some("instance"),
+            )
+        },
     };
     if card == FacetCardinality::Prohibited {
         return Ok(if base.pass {

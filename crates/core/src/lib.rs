@@ -3615,18 +3615,33 @@ mod python {
     ///
     /// Returns `{"specs": {col: list}, "elements": {…}, "failures": {…},
     /// "schema", "warnings", "entity_table_ms", "validate_ms"}`; column
-    /// meanings in `ids::report`. Raises `IdsInvalidError`,
+    /// meanings in `ids::report`. With `ifctester_json=True` it also
+    /// carries `"ifctester_json"`: one IfcTester-shaped JSON text per IDS
+    /// document (`ids::ifctester_json`; `json_date` / `json_filepath` fill
+    /// its `date` / `filepath`). Raises `IdsInvalidError`,
     /// `IdsUnsupportedError` (`on_unsupported="raise"`), `IdsUnitError`,
     /// or `IfcfastError` (truncated IFC, unknown FILE_SCHEMA).
     #[cfg(feature = "ids")]
     #[pyfunction]
-    #[pyo3(signature = (ifc, ids_list, on_unsupported = "raise", filter_ifc_version = false))]
+    #[pyo3(signature = (
+        ifc,
+        ids_list,
+        on_unsupported = "raise",
+        filter_ifc_version = false,
+        ifctester_json = false,
+        json_date = String::new(),
+        json_filepath = None,
+    ))]
+    #[allow(clippy::too_many_arguments)]
     fn validate_ids<'py>(
         py: Python<'py>,
         ifc: &Bound<'py, PyAny>,
         ids_list: Vec<Vec<u8>>,
         on_unsupported: &str,
         filter_ifc_version: bool,
+        ifctester_json: bool,
+        json_date: String,
+        json_filepath: Option<String>,
     ) -> PyResult<Bound<'py, PyDict>> {
         catch_panic(|| {
             use crate::ids::{OnUnsupported, ValidateOptions};
@@ -3666,17 +3681,34 @@ mod python {
                 let table_ms = t_table.elapsed().as_secs_f64() * 1000.0;
                 let t_val = Instant::now();
                 let docs: Vec<&[u8]> = ids_list.iter().map(|d| d.as_slice()).collect();
-                let rep = crate::ids::validate_with(&docs, &table, schema, opts)?;
+                let (rep, json) = if ifctester_json {
+                    let ident = crate::ids::schema_identifier_from_header(buf);
+                    let meta = crate::ids::ifctester_json::JsonMeta {
+                        date: &json_date,
+                        filepath: json_filepath.as_deref(),
+                        schema_identifier: &ident,
+                    };
+                    let (rep, json) =
+                        crate::ids::validate_ifctester_json(&docs, &table, schema, opts, &meta)?;
+                    (rep, Some(json))
+                } else {
+                    (
+                        crate::ids::validate_with(&docs, &table, schema, opts)?,
+                        None,
+                    )
+                };
                 let val_ms = t_val.elapsed().as_secs_f64() * 1000.0;
                 Ok::<_, crate::ids::IdsError>((
                     rep,
+                    json,
                     schema,
                     table.warnings().to_vec(),
                     table_ms,
                     val_ms,
                 ))
             });
-            let (rep, schema, warnings, table_ms, val_ms) = result.map_err(|e| ids_err(py, e))?;
+            let (rep, json, schema, warnings, table_ms, val_ms) =
+                result.map_err(|e| ids_err(py, e))?;
 
             let out = PyDict::new(py);
             let s = &rep.specs;
@@ -3738,6 +3770,9 @@ mod python {
             out.set_item("failures", d)?;
 
             out.set_item("schema", schema.ids_token())?;
+            if let Some(json) = json {
+                out.set_item("ifctester_json", json)?;
+            }
             out.set_item("warnings", warnings)?;
             out.set_item("entity_table_ms", table_ms)?;
             out.set_item("validate_ms", val_ms)?;

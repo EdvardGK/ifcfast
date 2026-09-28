@@ -17,6 +17,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   present, `Body` is repointed and the fallback rep is left byte-identical.
 - **`summary()` / `schemas` advertised 5 spaces columns for a 7-column
   `spaces_df` (GH #206).** Pinned to the live frame.
+- **`summaryJson()["skipped_product_types"]` key casing diverged between
+  the wasm build and the wheel (GH #186).** wasm reported raw STEP tokens
+  (`IFCTUBEBUNDLE`); the wheel resolved ifcopenshell spelling through its
+  own Python copy of the schema entity list. Both now go through one
+  generated core table (`indexer::canonical_entity_name`, 1006 entities),
+  exposed to Python as `_core.canonical_entity_name()`.
 - **Mesh tessellation tolerance resolves the file's length unit through
   the same `UnitTable` rule as `unit_scale` (GH #205).** Nested
   conversion chains (yard → foot → metre) and zero-offset
@@ -25,6 +31,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   bit-identical for SI and one-level imperial files (G55 ×4 + every
   fixture); a prefixed-base conversion unit (e.g. INCH over MILLIMETRE)
   is now correctly rounded, 1 ulp from the old double-rounded f32.
+
+### Added — IDS slice 4: IfcTester JSON, CLI, MCP, browser (GH #192)
+
+- **`IdsReport.to_ifctester_json(ids_index=None) -> dict`.** The report in
+  IfcTester 0.8.5's `reporter.Json` structure (specifications →
+  requirements → passed / failed entities, IfcTester's reason sentences
+  word for word, totals and percents), built by the native core
+  (`ids::ifctester_json`) so the wheel and the browser share one
+  implementation. New oracle `tests/oracle/ids_json_parity.py` diffs it
+  field by field against IfcTester on the IDS suite: 289 comparable cases,
+  0 mismatches. Deliberate differences: `element` / `element_type` are the
+  source record (`#id=IfcClass(args as written)`), entity lists are in
+  step-id order, extra keys are prefixed `ifcfast_`. `IdsReport` stays a
+  3-tuple.
+- **`ifcfast ids SPEC.ids… MODEL.ifc`** CLI subcommand: `--json [OUT.json]`
+  (IfcTester JSON; bare `--json` to stdout), `--parquet DIR`,
+  `--on-unsupported`, `--filter-ifc-version`, `--top`. Exit 0 when every
+  spec passes, 3 when not, 1 on an invalid IDS / unreadable IFC.
+- **`validate_ids` MCP tool** on `ifcfast-mcp`: `{ok, specs, n_failures,
+  failures}` (failures head, default 20).
+- **`IfcModel.validateIds(idsXml, onUnsupported?, filterIfcVersion?)`** in
+  the browser build, returning the same JSON as `to_ifctester_json()`
+  (gated by `crates/wasm/test/ids_parity.mjs`: wasm = wheel on every suite
+  case). Opt-in crate feature `ids` (`IFCFAST_WASM_FEATURES=ids
+  crates/wasm/build.sh`): it grows the module from 1.27 MB to 3.01 MB raw
+  (+562 KB gzip, +367 KB brotli), past the 400 KB budget, so the default
+  site bundle is built without it.
+- `_core.validate_ids(..., ifctester_json=True, json_date=, json_filepath=)`
+  returns the JSON in the same pass.
+
+### Changed — IDS
+
+- `failures.actual` of `PROP_VALUE_MISMATCH` on a bounded property lists the
+  values upper, lower, set point (IfcTester's order; was lower first).
 
 ### Added — IDS slice 3: PartOf facet + relation tables (GH #192)
 

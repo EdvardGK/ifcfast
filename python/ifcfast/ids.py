@@ -23,10 +23,13 @@ Usage::
     rep.failures                 # one row per spec x element x failing requirement
     m = ifcfast.open("model.ifc")
     rep = m.validate_ids(["a.ids", "b.ids"])   # one EntityTable, several IDS files
+    rep.to_ifctester_json(ids_index=0)         # IfcTester reporter.Json shape
 """
 
 from __future__ import annotations
 
+import datetime
+import json
 import os
 from pathlib import Path
 from typing import NamedTuple, Sequence, Union
@@ -79,7 +82,13 @@ REASON_CODES = [
 VALUE_SOURCE = ["instance", "type"]
 
 
-class IdsReport(NamedTuple):
+class _IdsFrames(NamedTuple):
+    specs: "object"
+    elements: "object"
+    failures: "object"
+
+
+class IdsReport(_IdsFrames):
     """Result of :func:`validate_ids`: three long-format DataFrames.
 
     * ``specs`` — one row per specification (``spec_index`` runs across
@@ -88,11 +97,14 @@ class IdsReport(NamedTuple):
     * ``failures`` — one row per spec x element x failing requirement.
 
     Join ``elements`` / ``failures`` to ``specs`` on ``spec_index``.
+
+    Still a 3-tuple (``specs, elements, failures = rep`` works); it also
+    remembers its inputs so :meth:`to_ifctester_json` can build the
+    IfcTester-shaped report on demand.
     """
 
-    specs: "object"
-    elements: "object"
-    failures: "object"
+    # No __slots__: instances carry a __dict__ for the validation inputs
+    # (`_inputs`) and a JSON computed in the same native pass (`_json`).
 
     @property
     def ok(self) -> bool:
@@ -113,12 +125,53 @@ class IdsReport(NamedTuple):
         self.failures.to_parquet(d / "failures.parquet", index=False)
         return d
 
-    def to_ifctester_json(self) -> dict:
-        """IfcTester ``reporter.Json`` shape — not built yet (GH #192 slice 4)."""
-        raise NotImplementedError(
-            "IdsReport.to_ifctester_json() lands in GH #192 slice 4 (IfcTester JSON interop); "
-            "use .specs / .elements / .failures, or run IfcTester for its JSON report"
-        )
+    def to_ifctester_json(self, ids_index: Union[int, None] = None) -> dict:
+        """The report in IfcTester's ``reporter.Json`` shape (GH #192 slice 4).
+
+        Same structure IfcTester 0.8.5 emits (``Json(ids).report()``):
+        ``title`` / ``date`` / ``filepath`` / ``filename`` / totals, and
+        ``specifications`` -> ``requirements`` -> ``passed_entities`` /
+        ``failed_entities``, each failed entity with IfcTester's ``reason``
+        sentence word for word — a tool that reads IfcTester JSON reads
+        this. Built by the native core (the same code as the browser's
+        ``IfcModel.validateIds``). Gated against IfcTester on the IDS
+        suite by ``tests/oracle/ids_json_parity.py``.
+
+        Differences: ``element`` / ``element_type`` are the source STEP
+        record ``#id=IfcClass(args as written)`` (IfcTester prints
+        ifcopenshell's re-serialisation, same id and class); extra keys
+        are prefixed ``ifcfast_`` (``ifcfast_status`` keeps
+        ``unsupported`` / ``skipped_ifc_version`` apart, failed entities
+        carry ``ifcfast_reason_code``); entity lists are in step-id order.
+
+        One IfcTester report covers one IDS document. ``ids_index`` picks
+        the document when the report came from several (``None`` is
+        allowed only for a single-document report). The native pass is
+        re-run with the same inputs unless the report already carries the
+        JSON (the CLI builds both in one pass); ``date`` is the time the
+        JSON was built.
+        """
+        texts = self.__dict__.get("_json")
+        if texts is None:
+            inputs = self.__dict__.get("_inputs")
+            if inputs is None:
+                raise ValueError(
+                    "to_ifctester_json() needs a report returned by validate_ids(); "
+                    "this IdsReport was constructed by hand"
+                )
+            texts = _run(*inputs, want_json=True).__dict__["_json"]
+            self.__dict__["_json"] = texts
+        n = len(texts)
+        if ids_index is None:
+            if n != 1:
+                raise ValueError(
+                    f"this report covers {n} IDS documents; pass ids_index= (0..{n - 1}) — "
+                    "one IfcTester report per IDS document"
+                )
+            ids_index = 0
+        if not 0 <= int(ids_index) < n:
+            raise IndexError(f"ids_index {ids_index} out of range for {n} IDS document(s)")
+        return json.loads(texts[int(ids_index)])
 
 
 def _ids_bytes(item) -> bytes:
@@ -248,9 +301,42 @@ def validate_ids(
             declare (``on_unsupported="raise"``).
         IfcfastError: the IFC is truncated or declares an unsupported schema.
     """
+    return _run(_ifc_arg(ifc), _ids_list(ids), str(on_unsupported), bool(filter_ifc_version),
+                _json_filepath(ifc), want_json=False)
+
+
+def _json_filepath(ifc) -> Union[str, None]:
+    """IfcTester's ``filepath``: the IFC path as given; ``None`` for bytes."""
+    if isinstance(ifc, (str, os.PathLike)):
+        return os.fspath(ifc)
+    return None
+
+
+def _run(ifc_arg, ids_list, on_unsupported, filter_ifc_version, json_filepath, *, want_json):
+    """One native pass -> IdsReport; ``want_json`` also builds the
+    IfcTester JSON of every document in the same pass."""
     native = _native("validate_ids")
-    raw = native(_ifc_arg(ifc), _ids_list(ids), str(on_unsupported), bool(filter_ifc_version))
-    return _frames(raw)
+    kw = {}
+    if want_json:
+        kw = {
+            "ifctester_json": True,
+            "json_date": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "json_filepath": json_filepath,
+        }
+    raw = native(ifc_arg, ids_list, on_unsupported, filter_ifc_version, **kw)
+    rep = _frames(raw)
+    rep.__dict__["_inputs"] = (ifc_arg, ids_list, on_unsupported, filter_ifc_version, json_filepath)
+    if want_json:
+        rep.__dict__["_json"] = list(raw["ifctester_json"])
+    return rep
+
+
+def _validate_with_json(ids: IdsInput, ifc, *, on_unsupported: str = "raise",
+                        filter_ifc_version: bool = False) -> IdsReport:
+    """:func:`validate_ids` that also builds the IfcTester JSON in the
+    same native pass (the CLI's ``--json``; internal)."""
+    return _run(_ifc_arg(ifc), _ids_list(ids), str(on_unsupported), bool(filter_ifc_version),
+                _json_filepath(ifc), want_json=True)
 
 
 def _native(name: str):

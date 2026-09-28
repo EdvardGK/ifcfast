@@ -8,6 +8,7 @@ Subcommands::
     ifcfast extract FILE         # extract data layers
     ifcfast drift   FILE         # placement-vs-mesh drift report
     ifcfast cache   FILE [...]   # inspect / clear cache for a file
+    ifcfast ids     SPEC.ids... MODEL.ifc   # IDS 1.0 validation (exit 3 = not satisfied)
 
 All subcommands accept ``--json`` to print machine-parseable output for
 agents and pipelines (pipe through ``jq`` etc). This wraps the library
@@ -338,6 +339,70 @@ def _cmd_cache(args: argparse.Namespace) -> int:
     return 0
 
 
+#: `ifcfast ids` exit code when the model does not satisfy the IDS (any
+#: spec failed or could not be checked). 1 stays "could not run" (bad
+#: IDS, unreadable IFC), 2 is argparse's usage error.
+EXIT_IDS_NOT_SATISFIED = 3
+
+
+def _cmd_ids(args: argparse.Namespace) -> int:
+    """Validate one IFC against one or more IDS 1.0 documents (GH #192)."""
+    from .ids import _validate_with_json, validate_ids
+
+    if len(args.paths) < 2:
+        raise ValueError("ifcfast ids: give at least one IDS file and then the IFC (SPEC.ids... MODEL.ifc)")
+    *ids_paths, model = args.paths
+    args.file = model  # error messages name the model
+    for p in [*ids_paths, model]:
+        if not Path(p).is_file():
+            raise FileNotFoundError(f"not found: {p}")
+    want_json = args.json is not None
+    run = _validate_with_json if want_json else validate_ids
+    rep = run(
+        [str(p) for p in ids_paths],
+        str(model),
+        on_unsupported=args.on_unsupported,
+        filter_ifc_version=args.filter_ifc_version,
+    )
+    if args.parquet is not None:
+        rep.to_parquet(args.parquet)
+    if want_json:
+        docs = [rep.to_ifctester_json(ids_index=i) for i in range(len(ids_paths))]
+        payload = docs[0] if len(docs) == 1 else docs
+        text = json.dumps(payload, ensure_ascii=False, indent=1)
+        if args.json == "-":
+            print(text)
+        else:
+            Path(args.json).write_text(text, encoding="utf-8")
+    if args.json != "-":
+        specs = rep.specs
+        lines = []
+        for r in specs.itertuples(index=False):
+            status = str(r.status)
+            tag = {"pass": "PASS", "fail": "FAIL"}.get(status, status.upper())
+            extra = f"  [{r.unsupported_feature}]" if isinstance(r.unsupported_feature, str) else ""
+            why = f"  ({r.reason_code})" if isinstance(r.reason_code, str) else ""
+            lines.append(f"[{tag}] ({int(r.passed)}/{int(r.applicable)}) {r.name}{why}{extra}")
+        n_fail = len(rep.failures)
+        lines.append("")
+        lines.append(
+            f"{'OK' if rep.ok else 'NOT SATISFIED'}: {int((specs['status'] == 'pass').sum())}/{len(specs)} "
+            f"specs pass, {n_fail} failing requirement check(s)"
+        )
+        if n_fail and args.top > 0:
+            lines.append(f"first {min(args.top, n_fail)} failure(s):")
+            for f in rep.failures.head(args.top).itertuples(index=False):
+                actual = f.actual if isinstance(f.actual, str) else "-"
+                lines.append(f"  #{f.step_id} {f.guid}  {f.reason_code}  expected: {f.expected}  actual: {actual}")
+        if args.parquet is not None:
+            lines.append(f"parquet: {args.parquet}")
+        if want_json:
+            lines.append(f"json: {args.json}")
+        for line in lines:
+            print(line)
+    return 0 if rep.ok else EXIT_IDS_NOT_SATISFIED
+
+
 # ----------------------------------------------------------------------
 # Entry point
 # ----------------------------------------------------------------------
@@ -463,6 +528,30 @@ def main(argv: list[str] | None = None) -> int:
     )
     _add_json(pb)
     pb.set_defaults(func=_cmd_bundle)
+
+    pids = sub.add_parser(
+        "ids",
+        help="validate an IFC against IDS 1.0 files (exit 0 ok, 3 not satisfied, 1 error)",
+        description=(
+            "Validate MODEL against one or more IDS 1.0 documents (one parse of the IFC). "
+            "Exit 0 when every specification passes, 3 when any fails or could not be "
+            "checked, 1 on an invalid IDS / unreadable IFC."
+        ),
+    )
+    pids.add_argument("paths", nargs="+", help="SPEC.ids [SPEC.ids ...] MODEL.ifc (the IFC last)")
+    pids.add_argument(
+        "--json", nargs="?", const="-", default=None, metavar="OUT.json",
+        help="write the IfcTester-shaped JSON report (one object per IDS; a list for several); "
+             "bare --json prints it to stdout. Put it after the paths.",
+    )
+    pids.add_argument("--parquet", type=Path, default=None, metavar="DIR",
+                      help="write specs/elements/failures.parquet into DIR")
+    pids.add_argument("--on-unsupported", choices=["raise", "mark"], default="raise",
+                      help="raise (default) or mark a spec using an unimplemented construct")
+    pids.add_argument("--filter-ifc-version", action="store_true",
+                      help="skip specs whose ifcVersion excludes the model's schema")
+    pids.add_argument("--top", type=int, default=10, help="failures listed in text mode (default 10)")
+    pids.set_defaults(func=_cmd_ids)
 
     args = p.parse_args(argv)
     try:

@@ -94,6 +94,7 @@ The full tool set:
   `storey_of`, `building_of`, `products_in`.
 - **Data:** `psets`, `quantities`, `materials`, `classifications`,
   `product_card`.
+- **Check:** `validate_ids` (IDS 1.0, see below).
 - **Session:** `list_open`, `close`.
 
 Plus the `ifcfast://agents-guide` resource — this document, served
@@ -114,6 +115,14 @@ The data tools answer the common questions in one call:
 - `product_card(path, guid)` — one element's product row + psets +
   quantities + materials + classifications + resolved storey /
   building / ancestors, in a single round-trip.
+- `validate_ids(path, ids, on_unsupported="raise", filter_ifc_version=False, failures=20)`
+  — check the model against IDS 1.0 file(s): `ids` is an IDS path, an
+  XML string or a list of those. Returns `{ok, specs, n_failures,
+  failures}`: every `specs` row (the `rep.specs` columns of
+  [IDS validation](#ids-validation-mvalidate_ids)) and the first
+  `failures` rows of `rep.failures` (0 for none). For the full
+  IfcTester-shaped report use `rep.to_ifctester_json()` in Python or
+  `ifcfast ids … --json`.
 
 **Every tool that returns rows caps output at `limit` (default 200)** —
 the data tools above, and since GH #162 also the tree walkers
@@ -811,8 +820,53 @@ Keyword args: `on_unsupported="raise"|"mark"`, `filter_ifc_version=False`
 (IfcTester default: every spec is checked whatever its `ifcVersion`;
 `True` skips specs whose `ifcVersion` excludes the file's schema →
 `status="skipped_ifc_version"`). Each call stands alone — nothing is cached
-on the Model. `rep.to_ifctester_json()` raises `NotImplementedError`
-until slice 4.
+on the Model. `IdsReport` is still a 3-tuple (`specs, elements, failures = rep`).
+
+**IfcTester JSON (`rep.to_ifctester_json(ids_index=None) -> dict`, GH #192
+slice 4).** The report in the exact structure IfcTester 0.8.5's JSON
+reporter emits (`ifctester.reporter.Json(ids).report()`): top-level
+`title` / `date` / `filepath` / `filename` / `status` / totals and
+percents, `specifications[]` (`name`, `description`, `instructions`,
+`status`, `is_skipped`, `is_ifc_version`, `total_applicable*`,
+`applicable_entities`, `total_checks*`, `cardinality`, `applicability`
+labels) → `requirements[]` (`facet_type`, `metadata`, `label`, `value`,
+`description`, `status`, `passed_entities`, `failed_entities`, totals).
+Every failed entity carries IfcTester's `reason` sentence word for word
+(`The property value "2.5" does not match the requirements`). A tool that
+reads IfcTester JSON reads this; `tests/oracle/ids_json_parity.py` gates
+it field by field against IfcTester on the suite (289/289 comparable
+cases identical). Use it to hand results to an IfcTester-based pipeline;
+for analysis, the three DataFrames are the better surface.
+
+- One IfcTester report = one IDS document. `ids_index` picks it when the
+  report came from several (`None` only for a single-document report,
+  else `ValueError`).
+- The JSON is built natively (the same Rust code as the browser's
+  `validateIds`). Called on a report from `validate_ids`, it re-runs the
+  validation with the same inputs; `ifcfast ids --json` builds both in
+  one pass. `date` = when the JSON was built; `filepath` / `filename` =
+  the IFC path you passed (`null` for bytes).
+- Differences from IfcTester, all deliberate: `element` / `element_type`
+  are the source record `#<id>=<IfcClass>(<args as written>)` (IfcTester
+  prints ifcopenshell's re-serialisation — same id and class, reals and
+  strings may be spelled differently); entity lists are in step-id order
+  (IfcTester's `passed_entities` is a set); extra keys are prefixed
+  `ifcfast_` — `ifcfast_status` on each spec (`pass` / `fail` /
+  `unsupported` / `skipped_ifc_version`, which IfcTester's `status: null`
+  cannot tell apart), `ifcfast_unsupported_feature`, `ifcfast_spec_index`,
+  `ifcfast_reason_code` on each failed entity, `ifcfast_ids_index` /
+  `ifcfast_schema` at the top.
+- Top-level `status` follows IfcTester: `false` as soon as one spec's
+  `status` is not `true` — including a spec skipped by
+  `filter_ifc_version=True` (`status: null`), which `rep.ok` counts as ok.
+
+**CLI / MCP / browser.** `ifcfast ids SPEC.ids [SPEC.ids …] MODEL.ifc
+[--json [OUT.json]] [--parquet DIR] [--on-unsupported mark]
+[--filter-ifc-version]` exits 0 when `rep.ok`, **3** when not, 1 on an
+invalid IDS / unreadable IFC (see [CLI quick reference](#cli-quick-reference)).
+The MCP tool is `validate_ids` ([Via MCP](#via-mcp-zero-config-any-agent-ecosystem)).
+The browser build has `IfcModel.validateIds(idsXml)` behind an opt-in
+feature ([Running ifcfast in the browser](#running-ifcfast-in-the-browser-gh-172)).
 
 **`specs`** — one row per specification:
 
@@ -1007,7 +1061,7 @@ The loud unit signal also rides in the first-call snapshot:
 `m.summary()` (and the MCP `summary` tool) carry `unit_resolved` and
 `length_unit`, so an agent sees the problem without a second call.
 `summary()` also carries `skipped_product_types` (GH #178) — see the
-gotcha list.
+gotcha list. The wasm build's `summaryJson()["skipped_product_types"]` used to report raw STEP tokens, disagreeing with the wheel on key casing for a known-but-skipped class (GH #186); both surfaces now resolve through the same generated core table (`indexer::canonical_entity_name`, backed by `schema_products::ENTITY_NAMES`), exposed to Python as `_core.canonical_entity_name()`.
 
 ## Running ifcfast in the browser (GH #172)
 
@@ -1031,8 +1085,24 @@ JSON.parse(m.classificationsJson()); // [{guid, system_name, edition, identifica
 const glb = m.toGlb(true, true);   // Uint8Array — same writer as m.to_gltf()
 JSON.parse(m.shiftJson());    // [sx, sy, sz] metres — add back for absolute coords
 JSON.parse(m.bySourceJson()); // GH #166 counters
+// IDS 1.0 (GH #192 slice 4) — only in a build with the `ids` feature:
+JSON.parse(m.validateIds(idsXml));   // IfcTester-shaped report (= rep.to_ifctester_json())
+m.validateIds(idsXml, "mark", true); // onUnsupported, filterIfcVersion
 m.free();
 ```
+
+**`validateIds` is opt-in** (`IFCFAST_WASM_FEATURES=ids crates/wasm/build.sh`).
+It adds roxmltree, regex (Unicode tables) and the per-schema IDS tables
+to the module: +1.74 MB raw / +562 KB gzip / +367 KB brotli over the
+1.27 MB base, past the design's 400 KB budget, so the default (site)
+bundle is built without it and `typeof m.validateIds === "undefined"`
+there. It returns the same JSON text as the wheel's
+`rep.to_ifctester_json()` — one Rust builder, gated case by case on the
+IDS suite by `crates/wasm/test/ids_parity.mjs` — with `filepath` /
+`filename` = the name given to `fromBytes`. One IDS document per call.
+Errors throw `Error("IdsInvalidError: …")` / `"IdsUnsupportedError: …"` /
+`"IdsUnitError: …"` / `"IfcfastError: …"` (branch on the prefix).
+Mesh-free: it runs on the retained STEP bytes.
 
 The JSON shapes are byte-for-byte those of `scripts/generate_sample_sidecars.py`
 (gated by `crates/wasm/test/parity.mjs`), so anything built on the
@@ -1867,7 +1937,7 @@ Decision rules:
 
 ## What `ifcfast` does NOT do (yet)
 
-- IDS `to_ifctester_json()` (GH #192 slice 4), and XSD regex constructs with no Rust `regex` equivalent
+- IDS: XSD regex constructs with no Rust `regex` equivalent
   (e.g. some `\p{Is…}` blocks, complex class subtraction) —
   `IdsUnsupportedError` names the construct. Use IfcTester for those.
 - Mutate quantity values (`IfcElementQuantity`), enumerated / bounded /
@@ -2061,6 +2131,14 @@ ifcfast cache   FILE  --json       # inspect the cache FOR THAT FILE
 ifcfast bundle  FILE [OUT_DIR]     # parquet substrate (see "Substrate output")
                                    # writes instances.parquet +
                                    # representations.parquet + view.sql
+ifcfast ids SPEC.ids [SPEC.ids ...] MODEL.ifc
+                                   # IDS 1.0 validation, one parse of the IFC
+                                   # (IFC path LAST). Text: one [PASS]/[FAIL]
+                                   # line per spec + the first --top failures.
+                                   # EXIT 0 = every spec passes (rep.ok),
+                                   # 3 = not satisfied (a spec failed or is
+                                   # unsupported), 1 = invalid IDS / unreadable
+                                   # IFC, 2 = usage.
 
 # Flags beyond --json:
 #   --no-cache        index / schema / types — bypass the parquet cache
@@ -2074,6 +2152,16 @@ ifcfast bundle  FILE [OUT_DIR]     # parquet substrate (see "Substrate output")
 #                     drift (default 10, also added to the --json payload
 #                     as the top drift offenders)
 #   --clear           cache — delete that file's cache dir
+#   ids only:
+#   --json [OUT.json] IfcTester-shaped JSON report (rep.to_ifctester_json();
+#                     an object for one IDS, a list for several). Bare
+#                     --json prints it to stdout INSTEAD of the text —
+#                     put it after the paths so it does not eat one.
+#   --parquet DIR     specs/elements/failures.parquet (rep.to_parquet)
+#   --on-unsupported raise|mark   (default raise)
+#   --filter-ifc-version          skip specs whose ifcVersion excludes
+#                     the model's schema
+#   --top N           failures listed in text mode (default 10)
 #
 # `ifcfast cache` takes an IFC FILE, not a cache directory: the cache
 # key is derived from the file, and the command reports (or clears)

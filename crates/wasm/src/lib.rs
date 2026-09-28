@@ -37,6 +37,8 @@
 //! as v1 computed it.
 
 mod analysis;
+#[cfg(feature = "ids")]
+mod ids;
 
 use analysis::Analysis;
 use ifcfast_core::mesh::gltf::{self, WriteOptions};

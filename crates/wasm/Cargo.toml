@@ -9,6 +9,16 @@ repository.workspace = true
 [lib]
 crate-type = ["cdylib", "rlib"]
 
+[features]
+# GH #192 slice 4: `IfcModel.validateIds` (native IDS 1.0). Opt-in: it
+# pulls roxmltree + regex (Unicode tables) + the generated per-schema IDS
+# tables into the module, +1.74 MB raw / +562 KB gzip / +367 KB brotli
+# over the 1.27 MB base — past the design's 400 KB budget, so the site
+# bundle stays without it. Build with `IFCFAST_WASM_FEATURES=ids
+# crates/wasm/build.sh`.
+default = []
+ids = ["ifcfast_core/ids"]
+
 [dependencies]
 # No pyo3, no arrow/parquet, no parry, no manifold — `mesh` only. The
 # `mmap` feature is off: the browser hands us bytes, never a path.

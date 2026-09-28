@@ -33,7 +33,7 @@ from __future__ import annotations
 import os
 from collections import OrderedDict
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Union
 
 from mcp.server.fastmcp import FastMCP
 
@@ -418,6 +418,50 @@ def product_card(path: str, guid: str, limit: int = 200) -> Optional[dict]:
     card["building_guid"] = m.building_of(guid)
     card["ancestors"] = m.ancestors(guid)
     return card
+
+
+def _json_rows(df, limit: int) -> list[dict]:
+    """First ``limit`` rows with every missing value (NaN, pd.NA) as None
+    and categoricals as plain strings — JSON-safe for the MCP transport."""
+    head = df.head(limit).astype(object)
+    head = head.where(head.notna(), None)
+    return head.to_dict(orient="records")
+
+
+@mcp.tool()
+def validate_ids(
+    path: str,
+    ids: Union[str, list[str]],
+    on_unsupported: str = "raise",
+    filter_ifc_version: bool = False,
+    failures: int = 20,
+) -> dict:
+    """Check the IFC at ``path`` against IDS 1.0 file(s) (GH #192).
+
+    ``ids`` is an IDS path, an IDS XML string, or a list of those (one
+    parse of the IFC for all). Returns ``ok`` (every spec passed),
+    ``specs`` (one row per specification: ``name`` / ``status`` pass |
+    fail | unsupported | skipped_ifc_version / ``reason_code`` /
+    ``applicable`` / ``passed`` / ``failed`` / labels), ``n_failures`` and
+    the first ``failures`` rows of the failures table (``guid`` /
+    ``requirement_index`` / ``facet_type`` / ``reason_code`` /
+    ``expected`` / ``actual``; 0 for none). ``on_unsupported="mark"``
+    reports a spec using an unimplemented construct as ``unsupported``
+    instead of raising. The full IfcTester-shaped JSON is the Python
+    ``rep.to_ifctester_json()`` / ``ifcfast ids --json``.
+    """
+    m = _resolve(path)
+    rep = m.validate_ids(
+        ids if isinstance(ids, list) else [ids],
+        on_unsupported=on_unsupported,
+        filter_ifc_version=filter_ifc_version,
+    )
+    return {
+        "ok": rep.ok,
+        "specs": _json_rows(rep.specs, len(rep.specs)),
+        "n_failures": int(len(rep.failures)),
+        "failures": _json_rows(rep.failures, max(0, int(failures))),
+    }
 
 
 @mcp.tool()

@@ -312,6 +312,8 @@ Recoverable native failures raise ifcfast.IfcfastError.
 IDS 1.0 checks (all six facets incl. PartOf; unimplemented constructs raise IdsUnsupportedError):
     rep = m.validate_ids("spec.ids")   # or ifcfast.validate_ids(ids, ifc)
     rep.ok; rep.specs; rep.elements; rep.failures   # failures.reason_code
+    rep.to_ifctester_json()            # IfcTester reporter.Json shape (one IDS doc)
+    # MCP: validate_ids(path, ids) -> {ok, specs, n_failures, failures}
 
 CLI (all subcommands accept --json for machine output):
     ifcfast demo                  # showcase against the bundled IFC
@@ -322,6 +324,8 @@ CLI (all subcommands accept --json for machine output):
     ifcfast drift FILE            # placement-vs-mesh drift report (--top N)
     ifcfast cache FILE            # inspect the parse cache for that FILE (--clear)
     ifcfast bundle FILE OUT_DIR   # write the parquet substrate
+    ifcfast ids SPEC.ids MODEL.ifc  # IDS check; --json [OUT] IfcTester JSON,
+                                  # --parquet DIR; exit 0 ok / 3 not satisfied
 
 For zero-network demos: ifcfast.open(ifcfast.example_path()).
 """

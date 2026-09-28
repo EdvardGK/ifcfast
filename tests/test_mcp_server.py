@@ -19,7 +19,7 @@ EXPECTED_TOOLS = {
     "parent", "children", "ancestors", "descendants",
     "storey_of", "building_of", "products_in",
     "psets", "quantities", "materials", "product_card",
-    "diff", "list_open", "close",
+    "diff", "list_open", "close", "validate_ids",
 }
 
 

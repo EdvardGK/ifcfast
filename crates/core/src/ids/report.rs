@@ -122,6 +122,7 @@ impl FailuresTable {
         self.expected.truncate(n);
         self.actual.truncate(n);
         self.value_source.truncate(n);
+        self.ifctester_reason.truncate(n);
     }
 }
 
@@ -164,6 +165,10 @@ pub struct FailuresTable {
     pub actual: Vec<Option<String>>,
     /// `instance` / `type`; `None` when there was no value.
     pub value_source: Vec<Option<&'static str>>,
+    /// IfcTester's `FacetFailure.reason` sentence for this failure
+    /// (`ifctester/facet.py:1100-1179`), word for word. Feeds
+    /// [`super::ifctester_json`]; not a Python DataFrame column.
+    pub ifctester_reason: Vec<String>,
 }
 
 /// The three tables. Rows are ordered by (spec_index, step_id,
@@ -409,7 +414,7 @@ fn nonempty(v: Option<&Val>) -> Option<&Val> {
 
 /// Python `str()` of a parsed IfcTester parameter: a simple value is the
 /// string itself, a restriction is `str(options)`. `None` for absent.
-fn py_str_val(v: Option<&Val>) -> Option<String> {
+pub(crate) fn py_str_val(v: Option<&Val>) -> Option<String> {
     match v? {
         Val::Simple(s) => Some(s.clone()),
         Val::Restriction(r) => Some(restriction_repr(r)),
@@ -420,7 +425,7 @@ fn py_str_val(v: Option<&Val>) -> Option<String> {
 /// values unwrap, repeated facets are lists, `enumeration` is always a
 /// list, length facets are ints (the XSD types them
 /// `xs:nonNegativeInteger`), everything else is a string.
-fn restriction_repr(r: &Restriction) -> String {
+pub(crate) fn restriction_repr(r: &Restriction) -> String {
     let mut parts: Vec<String> = Vec::new();
     let list = |v: &[String]| {
         format!(

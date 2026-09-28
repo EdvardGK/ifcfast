@@ -842,3 +842,133 @@ fn ids_part_of_relations_reason_codes_and_labels() {
         "An element with an IFCRELAGGREGATES relationship with an IFCELEMENTASSEMBLY"
     );
 }
+
+/// GH #192 slice 4: the IfcTester-shaped JSON (reporter.py `Json.report`)
+/// over the same fixture as `ids_report_columns_and_reason_codes`.
+#[test]
+fn ids_ifctester_json_shape() {
+    use _core::ids::ifctester_json::JsonMeta;
+    let buf = IFC.as_bytes();
+    let table = EntityTable::build(buf);
+    let schema = schema_from_header(buf).unwrap_or_else(|e| panic!("{e}"));
+    let x = ids(&format!("{WALL_NAME}{DOORS}{NO_SLABS}"));
+    let ident = _core::ids::schema_identifier_from_header(buf);
+    let meta = JsonMeta {
+        date: "2026-09-28 12:00:00",
+        filepath: Some("/tmp/x/model.ifc"),
+        schema_identifier: &ident,
+    };
+    let (rep, json) = _core::ids::validate_ifctester_json(
+        &[x.as_bytes()],
+        &table,
+        schema,
+        ValidateOptions::default(),
+        &meta,
+    )
+    .unwrap_or_else(|e| panic!("{e}"));
+    assert!(!rep.ok());
+    assert_eq!(json.len(), 1);
+    let j: serde_json::Value = serde_json::from_str(&json[0]).unwrap();
+    assert_eq!(j["title"], "T");
+    assert_eq!(j["filename"], "model.ifc");
+    assert_eq!(j["status"], false);
+    assert_eq!(j["total_specifications"], 3);
+    assert_eq!(j["total_specifications_pass"], 0);
+    let s0 = &j["specifications"][0];
+    assert_eq!(s0["name"], "walls named");
+    assert_eq!(s0["description"], "");
+    assert_eq!(s0["status"], false);
+    assert_eq!(s0["is_ifc_version"], true);
+    assert_eq!(s0["total_applicable"], 2);
+    assert_eq!(s0["total_applicable_pass"], 1);
+    assert_eq!(s0["percent_applicable_pass"], 50);
+    assert_eq!(s0["total_checks"], 4);
+    assert_eq!(s0["total_checks_pass"], 2);
+    assert_eq!(s0["applicability"][0], "All IFCWALL data");
+    let r0 = &s0["requirements"][0];
+    assert_eq!(r0["facet_type"], "Attribute");
+    assert_eq!(r0["label"], "Name");
+    assert_eq!(r0["description"], "The Name shall be provided");
+    assert_eq!(
+        r0["metadata"],
+        serde_json::json!({"name": {"simpleValue": "Name"}, "@cardinality": "required"})
+    );
+    assert_eq!(r0["passed_entities"].as_array().unwrap().len(), 1);
+    let f0 = &r0["failed_entities"][0];
+    assert_eq!(f0["reason"], "The attribute value \"None\" is empty");
+    assert_eq!(f0["id"], 2);
+    assert_eq!(f0["class"], "IfcWall");
+    assert_eq!(f0["ifcfast_reason_code"], "ATTR_MISSING");
+    assert!(f0["element"].as_str().unwrap().starts_with("#2=IfcWall("));
+    assert!(f0["element_type"].as_str().unwrap().starts_with("#3="));
+    let r1 = &s0["requirements"][1];
+    assert_eq!(r1["label"], "IFC Class / Predefined Type");
+    assert_eq!(r1["value"], "IFCWALL.SOLIDWALL");
+    assert_eq!(
+        r1["failed_entities"][0]["reason"],
+        "The predefined type \"X\" does not meet the required type"
+    );
+    // Required spec, nothing applicable.
+    let s1 = &j["specifications"][1];
+    assert_eq!(s1["status"], false);
+    assert_eq!(s1["percent_applicable_pass"], "N/A");
+    // Prohibited spec: requirements are never evaluated.
+    let s2 = &j["specifications"][2];
+    assert_eq!(s2["cardinality"], "prohibited");
+    assert_eq!(s2["status"], false);
+    assert_eq!(s2["total_applicable"], 1);
+    assert_eq!(s2["total_applicable_pass"], 1);
+}
+
+/// Dev aid for `tests/oracle/ids_json_parity.py`: with
+/// `IFCFAST_IDS_JSON_DUMP=<dir>` set, writes the IfcTester-shaped JSON of
+/// every suite case (`<folder>__<stem>.json`, or `.err` with the error) so
+/// the parity diff can run against a fresh core without rebuilding the
+/// wheel. A no-op otherwise.
+#[test]
+fn ids_dump_ifctester_json_for_parity() {
+    let Some(out) = std::env::var_os("IFCFAST_IDS_JSON_DUMP").map(PathBuf::from) else {
+        return;
+    };
+    let Some(root) = suite_root() else {
+        panic!("IFCFAST_IDS_JSON_DUMP set but the suite is not fetched");
+    };
+    std::fs::create_dir_all(&out).unwrap();
+    for folder in FOLDERS {
+        let mut entries: Vec<PathBuf> = std::fs::read_dir(root.join(folder))
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().is_some_and(|x| x == "ids"))
+            .collect();
+        entries.sort();
+        for ids_path in entries {
+            let ifc_path = ids_path.with_extension("ifc");
+            let stem = ids_path.file_stem().unwrap().to_string_lossy().into_owned();
+            let Ok(ifc) = std::fs::read(&ifc_path) else {
+                continue;
+            };
+            let ids = std::fs::read(&ids_path).unwrap();
+            let res = schema_from_header(&ifc).and_then(|schema| {
+                let table = EntityTable::build(&ifc);
+                let ident = _core::ids::schema_identifier_from_header(&ifc);
+                let meta = _core::ids::ifctester_json::JsonMeta {
+                    date: "",
+                    filepath: None,
+                    schema_identifier: &ident,
+                };
+                _core::ids::validate_ifctester_json(
+                    &[ids.as_slice()],
+                    &table,
+                    schema,
+                    ValidateOptions::default(),
+                    &meta,
+                )
+            });
+            let base = out.join(format!("{folder}__{stem}"));
+            match res {
+                Ok((_, json)) => std::fs::write(base.with_extension("json"), &json[0]).unwrap(),
+                Err(e) => std::fs::write(base.with_extension("err"), e.to_string()).unwrap(),
+            }
+        }
+    }
+}

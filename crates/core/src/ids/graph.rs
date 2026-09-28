@@ -628,12 +628,27 @@ impl MaterialData {
     /// The candidate strings of a material definition (M2, A23):
     /// deduplicated, sorted, `None` dropped.
     pub fn strings<'g>(&'g self, m: u64) -> Vec<&'g str> {
+        let mut out: Vec<&'g str> = self.candidates(m).into_iter().flatten().collect();
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
+    /// Whether IfcTester's candidate set of `m` holds `None` (a name or
+    /// category that is null or absent, `facet.py:957-987`). Feeds the
+    /// IfcTester reason sentence only.
+    pub fn has_null_candidate(&self, m: u64) -> bool {
+        self.candidates(m).iter().any(Option::is_none)
+    }
+
+    /// Every candidate IfcTester reads, in its order, `None` kept.
+    fn candidates<'g>(&'g self, m: u64) -> Vec<Option<&'g str>> {
         let ix = &self.scan.index;
-        let mut out: Vec<&'g str> = Vec::new();
-        let mat = |id: Option<u64>, out: &mut Vec<&'g str>| {
+        let mut out: Vec<Option<&'g str>> = Vec::new();
+        let mat = |id: Option<u64>, out: &mut Vec<Option<&'g str>>| {
             if let Some(r) = id.and_then(|i| ix.materials.get(&i)) {
-                out.extend(r.name.as_deref());
-                out.extend(r.category.as_deref());
+                out.push(r.name.as_deref());
+                out.push(r.category.as_deref());
             }
         };
         if ix.materials.contains_key(&m) {
@@ -643,10 +658,10 @@ impl MaterialData {
                 mat(Some(*id), &mut out);
             }
         } else if let Some(layer_ids) = ix.layer_sets.get(&m) {
-            out.extend(ix.set_names.get(&m).and_then(|n| n.as_deref()));
+            out.push(ix.set_names.get(&m).and_then(|n| n.as_deref()));
             for l in layer_ids.iter().filter_map(|i| ix.layers.get(i)) {
-                out.extend(l.name_override.as_deref());
-                out.extend(l.category_override.as_deref());
+                out.push(l.name_override.as_deref());
+                out.push(l.category_override.as_deref());
                 mat(l.material_ref, &mut out);
             }
         } else if let Some(items) = ix
@@ -655,23 +670,21 @@ impl MaterialData {
             .map(|v| (v, &ix.constituents))
             .or_else(|| ix.profile_sets.get(&m).map(|v| (v, &ix.profiles)))
         {
-            out.extend(ix.set_names.get(&m).and_then(|n| n.as_deref()));
+            out.push(ix.set_names.get(&m).and_then(|n| n.as_deref()));
             for c in items.0.iter().filter_map(|i| items.1.get(i)) {
-                out.extend(c.name_override.as_deref());
-                out.extend(c.category_override.as_deref());
+                out.push(c.name_override.as_deref());
+                out.push(c.category_override.as_deref());
                 mat(c.material_ref, &mut out);
             }
         } else if let Some(l) = ix.layers.get(&m) {
-            out.extend(l.name_override.as_deref());
-            out.extend(l.category_override.as_deref());
+            out.push(l.name_override.as_deref());
+            out.push(l.category_override.as_deref());
             mat(l.material_ref, &mut out);
         } else if let Some(c) = ix.constituents.get(&m).or_else(|| ix.profiles.get(&m)) {
-            out.extend(c.name_override.as_deref());
-            out.extend(c.category_override.as_deref());
+            out.push(c.name_override.as_deref());
+            out.push(c.category_override.as_deref());
             mat(c.material_ref, &mut out);
         }
-        out.sort_unstable();
-        out.dedup();
         out
     }
 }

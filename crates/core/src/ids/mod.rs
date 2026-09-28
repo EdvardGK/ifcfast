@@ -27,6 +27,7 @@ pub mod compile;
 pub mod datatypes;
 pub mod eval;
 pub mod graph;
+pub mod ifctester_json;
 pub mod ir;
 pub mod report;
 pub mod restriction;
@@ -119,17 +120,59 @@ pub fn validate_with(
     schema: Schema,
     opts: ValidateOptions,
 ) -> Result<IdsReport, IdsError> {
+    validate_docs(ids_docs, table, schema, opts).map(|(_, rep)| rep)
+}
+
+/// [`validate_with`], also returning the parsed documents (in call order).
+fn validate_docs(
+    ids_docs: &[&[u8]],
+    table: &EntityTable,
+    schema: Schema,
+    opts: ValidateOptions,
+) -> Result<(Vec<IdsDocument>, IdsReport), IdsError> {
     if let Some(err) = table.scan_error() {
         return Err(IdsError::IfcInput {
             msg: format!("refusing a truncated IFC: {err}"),
         });
     }
+    let mut docs = Vec::with_capacity(ids_docs.len());
     let mut plans = Vec::with_capacity(ids_docs.len());
     for xml in ids_docs {
         let doc = parse_ids(xml)?;
         plans.push(compile::compile_with(&doc, schema, opts)?);
+        docs.push(doc);
     }
-    eval::run(&plans, table, schema)
+    let rep = eval::run(&plans, table, schema)?;
+    Ok((docs, rep))
+}
+
+/// [`validate_with`] plus the IfcTester-shaped JSON report of every IDS
+/// document ([`ifctester_json::build`]; one JSON text per document, in
+/// call order). The wheel (`IdsReport.to_ifctester_json`, `ifcfast ids
+/// --json`) and the browser (`IfcModel.validateIds`) both come through
+/// here.
+pub fn validate_ifctester_json(
+    ids_docs: &[&[u8]],
+    table: &EntityTable,
+    schema: Schema,
+    opts: ValidateOptions,
+    meta: &ifctester_json::JsonMeta,
+) -> Result<(IdsReport, Vec<String>), IdsError> {
+    let (docs, rep) = validate_docs(ids_docs, table, schema, opts)?;
+    let json = ifctester_json::build(&docs, &rep, table, schema, meta)
+        .iter()
+        .map(ifctester_json::J::to_json)
+        .collect();
+    Ok((rep, json))
+}
+
+/// The header `FILE_SCHEMA` identifier as written, trimmed and
+/// upper-cased (ifcopenshell's `schema_identifier`; empty when absent).
+pub fn schema_identifier_from_header(buf: &[u8]) -> String {
+    crate::indexer::extract_header(buf)
+        .0
+        .trim()
+        .to_ascii_uppercase()
 }
 
 /// Map a header `FILE_SCHEMA` identifier onto the IDS schema set.

@@ -23,7 +23,7 @@ the slice that implements it.
 |---|---|---|
 | Agent (Python) | `ifcfast.validate_ids(ids, ifc)` / `m.validate_ids(ids)` | Tables it can filter, with reason codes; typed errors, never guesses |
 | Agent (MCP) | `validate_ids(path, ids_path)` | A summary plus capped failure rows in one round trip |
-| Browser (ifcfast.com) | drop an IFC and an IDS → `validateIdsJson` | Runs client-side only, single-threaded wasm |
+| Browser (ifcfast.com) | drop an IFC and an IDS → `validateIds` | Runs client-side only, single-threaded wasm |
 | CI / BEP gate | `ifcfast ids MODEL.ifc SPEC.ids` | Exit code, a report in IfcTester JSON shape, and speed on 100–800 MB models where IfcTester is slow or runs out of memory |
 
 Roadmap gate (docs/plans/2026-07-04_coordinator-staple-roadmap.md:88-89) [V]: "buildingSMART IDS
@@ -222,7 +222,7 @@ as absent (`optional` and `prohibited` pass). A unit that cannot be resolved is 
 |---|---|
 | CLI | `ifcfast ids MODEL SPEC.ids [SPEC2.ids…] [--json] [--out DIR] [--ifctester-json PATH] [--on-unsupported raise\|mark]`. Exit codes: 0 all pass, 1 any fail, 2 error. |
 | MCP | `validate_ids(path, ids_path, only_failures=True, limit=200)`: full specs table, capped failure rows, `truncated`. Follows the `limit` convention (AGENTS.md:117-125 [V]). |
-| wasm | `IfcModel.validateIdsJson(idsXml: string) -> string` returning `{specs, elements, failures}` as row objects. Builds the EntityTable from retained `source` (analysis.rs:188 [V]). |
+| wasm | `IfcModel.validateIds(idsXml: string) -> string` returning `{specs, elements, failures}` as row objects. Builds the EntityTable from retained `source` (analysis.rs:188 [V]). |
 | Errors | `IdsInvalidError` (malformed IDS; `.path`/`.line`), `IdsUnsupportedError` (`.feature`, `.spec_index`; message points to IfcTester as the reference), `IdsUnitError`. All subclass `IfcfastError`. A truncated parse is refused as today (lib.rs:529 [V]). |
 
 ## 4. Correctness strategy
@@ -257,7 +257,7 @@ as absent (`optional` and `prohibited` pass). A unit that cannot be resolved is 
 | 1 | **Core + fast path + harness** | `scripts/gen_schema_tables.py`, `ids/{xml,ir,compile,xsd_regex,restriction,candidates,attrs,eval,report,schema_tables}.rs`, core Cargo.toml (roxmltree, regex), lib.rs `_core.validate_ids`, `python/ifcfast/ids.py`, `scripts/fetch_ids_testcases.py`, `tests/oracle/ids_conformance.py`, `ids_xfail.toml`, `docs/ids/ambiguities.md` | entity, attribute, restriction and ids folders green; zero unattributed `ifcfast_bug`; parse differential clean; cargo tests | 4–5 |
 | 2 | **Property, Classification, Material + units** | `extractors/property_graph.rs` (pass 1 refactored out of psets.rs and quantities.rs), `units.rs` (indexer.rs:324-420 routed through it), `ids/graph.rs` | property, classification, material and tolerance folders green; **PsetTable, QuantityTable and unit_scale bitwise-identical** on the corpus; existing oracle tests unchanged | 4–5 |
 | 3 | **PartOf + relation capture** | `ids/graph.rs` edges via `doc::rel_rules`; indexer.rs gains nests, group-membership and fills columns; model.py `m.nests`, `m.groups` | partof folder green; **full suite green**; **`_CACHE_SCHEMA_VERSION` 35 → 36** (v35 shipped in v0.6.0 with GH #195–#203 before slice 3 landed) (header.py:790 [V]) | 2 |
-| 4 | **Surfaces + interop** | cli.py `ids`, mcp_server.py `validate_ids`, `to_ifctester_json`, wasm lib.rs/analysis.rs `validateIdsJson`, `crates/wasm/test/ids_parity.mjs` | IfcTester JSON equality on the suite; wasm = Python on the suite; wasm size recorded | 2–3 |
+| 4 | **Surfaces + interop** | cli.py `ids`, mcp_server.py `validate_ids`, `to_ifctester_json`, wasm lib.rs/analysis.rs `validateIds`, `crates/wasm/test/ids_parity.mjs` | IfcTester JSON equality on the suite; wasm = Python on the suite; wasm size recorded | 2–3 |
 | 5 | **G55 differential + benchmark** | `tests/oracle/ids_solibri.py`, scratch truth files | per-element agreement with every miss attributed; benchmark table | 2–3 (+ Ed's Solibri session) |
 
 Total: **14–18 days.** Only slice 3 bumps the cache. Validation results are never cached (IDS input is arbitrary).
@@ -288,3 +288,6 @@ deliverable; no slice.
 | Full XSD validation of the IDS in Rust | No mature crate. Strict structural parse + `invalid-*` cases + parse differential covers the same risk. |
 | `regex-lite` in wasm | No Unicode classes; would diverge silently from native. |
 | Git submodule for the suite | Heavy; licence argues for keeping it outside the tree. Pinned fetch with checksums is lighter. |
+
+
+> **Slice 4 outcome (2026-09-28):** wasm `ids` feature is OPT-IN (`IFCFAST_WASM_FEATURES=ids crates/wasm/build.sh`): the delta is +1.74 MB raw / +562 KB gzip / +367 KB brotli (1.27 MB → 3.01 MB), far past the 400 KB budget. Site path: separate lazily-loaded IDS wasm module (issue filed). JSON parity vs IfcTester 0/289 mismatches; wasm = wheel 334/334.
