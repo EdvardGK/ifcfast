@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-09-28
+
+### Added — native IDS 1.0 validation (GH #192, slices 1–2)
+
+- **`ifcfast.validate_ids(ids, ifc)` / `m.validate_ids(ids)`.** Native
+  IDS 1.0 checking in the Rust core (feature `ids`, default on): strict
+  XML parse with a schema-free audit, XSD-regex translation, restriction
+  matching with the IDS tolerance rule, generated per-schema attribute /
+  entity / measure tables (ifcopenshell 0.8.5, drift-tested), one
+  EntityTable pass, no ifcopenshell at runtime. IfcTester is the reference
+  implementation; conformance is gated against the buildingSMART IDS test
+  suite with IfcTester as the second voice
+  (`tests/oracle/ids_conformance.py`): 278/334 green, 34 unsupported (all
+  PartOf), 22 IfcTester disagreements attributed in GH #193, 0 ifcfast
+  bugs.
+- **Facets: Entity, Attribute, Property, Classification, Material.**
+  PartOf raises `IdsUnsupportedError` (or marks the spec
+  `status="unsupported"` with `on_unsupported="mark"`) until slice 3.
+  `filter_ifc_version=True` skips specs whose `ifcVersion` excludes the
+  file's schema. Typed errors: `IdsInvalidError`, `IdsUnsupportedError`.
+- **`IdsReport`** — `specs` / `elements` / `failures` DataFrames with
+  IfcTester-style labels and reason codes (`SPEC_NO_APPLICABLE`,
+  `PROP_MISSING`, `PROP_DATATYPE_MISMATCH`, `CLASS_SYSTEM_MISMATCH`,
+  `MATERIAL_MISSING`, …), `.ok`, `.to_parquet(dir)`.
+  `to_ifctester_json()` lands with slice 4.
+- **Shared extractor substrate.** `extractors::property_graph::PropertyGraph`
+  (typed property / quantity / material-pset truth) and
+  `crate::units::UnitTable` (every unit-assignment entry: SI prefix^dim,
+  conversion-based, derived, offset, monetary) now feed `psets`,
+  `quantities` and the IDS facets from one place; the public tables were
+  bitwise identical through the refactor (then deliberately changed by
+  #195–#198 below).
+
 ### Changed — tables and whitelist (GH #195–#203, cache schema v35)
 
 - **Product whitelist is generated from the IFC schemas (GH #201).**
