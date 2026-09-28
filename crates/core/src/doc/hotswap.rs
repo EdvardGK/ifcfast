@@ -22,8 +22,14 @@
 //! ## What the swap does, precisely
 //!
 //! 1. Resolve `guid` → product; follow `Representation`@6 →
-//!    `IfcProductDefinitionShape.Representations`@2 → the shape rep whose
-//!    `RepresentationIdentifier`@1 is `Body`.
+//!    `IfcProductDefinitionShape.Representations`@2 → the *body*
+//!    representation, chosen by [`crate::body_rep::select_body`] (GH
+//!    #204) — the SAME tiered rule the tier-1 indexer's `has_body` and
+//!    the mesher's `mesh::body_items` use: `Body`/`Facetation` first,
+//!    else `Body-FallBack`, else an identifier-less solid/surface or
+//!    mapped body. This is the representation the mesher would have
+//!    tessellated, so it's the correct write target even when the
+//!    product has no plain `Body` rep at all.
 //! 2. Mint `#(max_id+1)` = point list, `#(max_id+2)` = faceset.
 //! 3. Override the body rep: `Items`@3 → `(#faceset)`,
 //!    `RepresentationType`@2 → `'Tessellation'`. Every other byte of that
@@ -73,8 +79,14 @@ pub struct HotswapStats {
     /// visible geometry of every one of them, not just `product`
     /// (GH #132 item 6). Legal IFC; the caller decides if it's intended.
     pub pds_shared_with: usize,
-    /// `Body` shape representations found under the PDS. Only the first
-    /// is swapped; a value > 1 means further body reps were left as-is.
+    /// Candidate body representations found directly under the PDS —
+    /// every one of `IfcProductDefinitionShape.Representations` that
+    /// [`crate::body_rep::select_body`] would itself classify as a body
+    /// at some tier (GH #204: `Body`/`Facetation`, `Body-FallBack`, or an
+    /// identifier-less solid/surface/mapped body). Only the highest-tier
+    /// one is swapped; a value > 1 means further body-classified reps
+    /// (typically a `Body-FallBack` sitting alongside a `Body`) were left
+    /// as-is.
     pub body_reps: usize,
 }
 
@@ -97,8 +109,9 @@ pub enum HotswapError {
     UnknownGuid(String),
     /// The product has no `Representation` (field 6 is `$`).
     NoRepresentation,
-    /// No `Body` `IfcShapeRepresentation` was found under the product's
-    /// `IfcProductDefinitionShape`.
+    /// No body representation ([`crate::body_rep::select_body`], any
+    /// tier) was found under the product's `IfcProductDefinitionShape` —
+    /// it has representations, but none of them qualify as a body.
     NoBodyRepresentation,
     /// The mesh is empty or a triangle indexes a vertex out of range.
     BadMesh(String),
@@ -112,7 +125,7 @@ impl std::fmt::Display for HotswapError {
             HotswapError::UnknownGuid(g) => write!(f, "unknown GlobalId: {g}"),
             HotswapError::NoRepresentation => write!(f, "product has no Representation"),
             HotswapError::NoBodyRepresentation => {
-                write!(f, "product has no 'Body' shape representation")
+                write!(f, "product has no body shape representation")
             }
             HotswapError::BadMesh(m) => write!(f, "bad mesh: {m}"),
             HotswapError::Malformed(m) => write!(f, "malformed record: {m}"),
@@ -277,39 +290,41 @@ fn field_refs_at(doc: &Doc, id: u64, field: RelField) -> Vec<u64> {
     field_refs(&split, field)
 }
 
-/// Among the shape representations under `pds`
-/// (`IfcProductDefinitionShape.Representations`@2), the id of the FIRST
-/// one whose `RepresentationIdentifier`@1 decodes to `Body`, plus how many
-/// `Body` reps exist in total (only the first is swapped — the count goes
-/// to stats so a multi-body product isn't silently half-swapped).
+/// A thin [`crate::body_rep::RecordSource`] over [`Doc`], so hotswap's
+/// representation lookup runs through the exact same tiered rule
+/// (GH #204) as the tier-1 indexer's `has_body` and the mesher's
+/// `mesh::body_items` — the three consumers of "what is this product's
+/// body representation" must never disagree.
+struct DocBodySource<'a>(&'a Doc);
+
+impl crate::body_rep::RecordSource for DocBodySource<'_> {
+    fn record(&self, id: u64) -> Option<(&[u8], &[u8])> {
+        let span = self.0.record_bytes(id)?;
+        let (_id, ty, args) = crate::lexer::parse_record_span(span)?;
+        Some((ty, args))
+    }
+}
+
+/// The body representation under `pds`
+/// (`IfcProductDefinitionShape.Representations`@2) by the tiered rule in
+/// [`crate::body_rep::select_body`], plus how many of `pds`'s direct
+/// representations are *themselves* body-classified at some tier (only
+/// the winner is swapped — the count goes to stats so a product carrying
+/// e.g. both `Body` and `Body-FallBack` isn't silently missing the fact
+/// that a second candidate was left untouched).
 fn find_body_rep(doc: &Doc, pds: u64) -> Result<(u64, usize), HotswapError> {
-    let reps = list_refs(doc, pds, 2);
+    let src = DocBodySource(doc);
+    let reps = crate::body_rep::representation_ids(&src, pds);
     if reps.is_empty() {
         return Err(HotswapError::NoRepresentation);
     }
-    let mut first: Option<u64> = None;
-    let mut count = 0usize;
-    for rep in reps {
-        let Some(span) = doc.record_bytes(rep) else {
-            continue;
-        };
-        let Some((_id, _ty, args)) = crate::lexer::parse_record_span(span) else {
-            continue;
-        };
-        let split = crate::lexer::split_top_level_args(args);
-        if let Some(ident) = split.get(1).and_then(|f| crate::lexer::decode_string(f)) {
-            if ident.eq_ignore_ascii_case("Body") {
-                count += 1;
-                if first.is_none() {
-                    first = Some(rep);
-                }
-            }
-        }
-    }
-    match first {
-        Some(rep) => Ok((rep, count)),
-        None => Err(HotswapError::NoBodyRepresentation),
-    }
+    let chosen =
+        crate::body_rep::select_body(&src, pds).ok_or(HotswapError::NoBodyRepresentation)?;
+    let body_reps = reps
+        .iter()
+        .filter(|&&rid| crate::body_rep::select_body(&src, rid).is_some())
+        .count();
+    Ok((chosen.rep_id, body_reps))
 }
 
 /// Rebuild the body rep's bytes with `Items`@3 pointing at `(#root)` and

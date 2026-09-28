@@ -1,0 +1,57 @@
+ISO-10303-21;
+HEADER;
+FILE_DESCRIPTION(('ViewDefinition [ReferenceView]'),'2;1');
+FILE_NAME('hotswap_body_tiers.ifc','2026-09-28T00:00:00',('ifcfast tests'),('Skiplum'),'ifcfast','ifcfast-tests','');
+FILE_SCHEMA(('IFC4'));
+ENDSEC;
+DATA;
+/* GH #204: hotswap's representation lookup must route through
+   body_rep::select_body (the same tiered rule the indexer's has_body and
+   the mesher use), not just accept a plain 'Body' identifier. Three
+   products exercise the tiers that were previously invisible to hotswap:
+     - FallbackOnly: the ONLY body is 'Body-FallBack' (tier 2).
+     - UnnamedSolid: the ONLY body is an identifier-less SweptSolid (tier 3).
+     - BodyPlusFallback: BOTH 'Body' (tier 1) and 'Body-FallBack' (tier 2)
+       are present — the swap must repoint Body and leave FallBack intact. */
+#10=IFCGEOMETRICREPRESENTATIONCONTEXT($,'Model',3,1.E-05,#11,$);
+#11=IFCAXIS2PLACEMENT3D(#12,$,$);
+#12=IFCCARTESIANPOINT((0.,0.,0.));
+#13=IFCDIRECTION((0.,0.,1.));
+
+/* product A: only body is Body-FallBack (tier 2) */
+#20=IFCCARTESIANPOINT((0.,0.));
+#21=IFCAXIS2PLACEMENT2D(#20,$);
+#22=IFCRECTANGLEPROFILEDEF(.AREA.,$,#21,1.,1.);
+#23=IFCEXTRUDEDAREASOLID(#22,#11,#13,1.);
+#24=IFCSHAPEREPRESENTATION(#10,'Body-FallBack','SweptSolid',(#23));
+#25=IFCPRODUCTDEFINITIONSHAPE($,$,(#24));
+#26=IFCLOCALPLACEMENT($,#11);
+#27=IFCWALL('2HS204FallbackOnly000A',$,'Fallback-only wall',$,$,#26,#25,'tag-fb',.STANDARD.);
+
+/* product B: only body is an identifier-less SweptSolid (tier 3) */
+#30=IFCCARTESIANPOINT((0.,0.));
+#31=IFCAXIS2PLACEMENT2D(#30,$);
+#32=IFCRECTANGLEPROFILEDEF(.AREA.,$,#31,1.,1.);
+#33=IFCEXTRUDEDAREASOLID(#32,#11,#13,1.);
+#34=IFCSHAPEREPRESENTATION(#10,$,'SweptSolid',(#33));
+#35=IFCPRODUCTDEFINITIONSHAPE($,$,(#34));
+#36=IFCLOCALPLACEMENT($,#11);
+#37=IFCWALL('2HS204UnnamedSolid000A',$,'Unnamed-solid wall',$,$,#36,#35,'tag-un',.STANDARD.);
+
+/* product C: Body (tier 1) + Body-FallBack (tier 2). Hotswap must repoint
+   the Body rep #44 and leave the fallback rep #49 byte-identical. */
+#40=IFCCARTESIANPOINT((0.,0.));
+#41=IFCAXIS2PLACEMENT2D(#40,$);
+#42=IFCRECTANGLEPROFILEDEF(.AREA.,$,#41,1.,1.);
+#43=IFCEXTRUDEDAREASOLID(#42,#11,#13,1.);
+#44=IFCSHAPEREPRESENTATION(#10,'Body','SweptSolid',(#43));
+#45=IFCCARTESIANPOINT((0.,0.));
+#46=IFCAXIS2PLACEMENT2D(#45,$);
+#47=IFCRECTANGLEPROFILEDEF(.AREA.,$,#46,2.,2.);
+#48=IFCEXTRUDEDAREASOLID(#47,#11,#13,2.);
+#49=IFCSHAPEREPRESENTATION(#10,'Body-FallBack','SweptSolid',(#48));
+#50=IFCPRODUCTDEFINITIONSHAPE($,$,(#44,#49));
+#51=IFCLOCALPLACEMENT($,#11);
+#52=IFCWALL('2HS204BodyPlusFback000',$,'Body plus fallback wall',$,$,#51,#50,'tag-bf',.STANDARD.);
+ENDSEC;
+END-ISO-10303-21;

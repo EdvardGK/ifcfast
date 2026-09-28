@@ -21,6 +21,11 @@ import ifcfast
 FIXTURE = Path(__file__).parent / "fixtures" / "hotswap_body.ifc"
 WALL1 = "7XvctVUKr0kugbFTf53O9L"
 
+TIERS_FIXTURE = Path(__file__).parent / "fixtures" / "hotswap_body_tiers.ifc"
+FALLBACK_ONLY_GUID = "2HS204FallbackOnly000A"
+UNNAMED_SOLID_GUID = "2HS204UnnamedSolid000A"
+BODY_PLUS_FALLBACK_GUID = "2HS204BodyPlusFback000"
+
 
 def _unit_cube():
     v = [
@@ -194,3 +199,91 @@ def test_sharing_telemetry_in_stats(model, tmp_path):
     stats = model.hotswap(WALL1, v, t, out_path=str(tmp_path / "s.ifc"))
     assert stats["pds_shared_with"] == 0
     assert stats["body_reps"] == 1
+
+
+# GH #204: hotswap's representation lookup must agree with has_body / the
+# mesher (crates/core/src/body_rep.rs::select_body) instead of accepting
+# only a plain 'Body' identifier — a product whose only body is
+# 'Body-FallBack' or an identifier-less solid used to fail loud with
+# NoBodyRepresentation despite has_body being True and the mesher already
+# tessellating it.
+
+
+@pytest.fixture(scope="module")
+def tiers_model():
+    return ifcfast.open(TIERS_FIXTURE, use_cache=False, write_cache=False)
+
+
+def test_hotswap_body_fallback_only_succeeds_and_reparsed_model_meshes_it(
+    tiers_model, tmp_path
+):
+    """Tier 2: the product's only body representation is Body-FallBack."""
+    v, t = _unit_cube()
+    out = tmp_path / "fallback_only.ifc"
+    stats = tiers_model.hotswap(FALLBACK_ONLY_GUID, v, t, out_path=str(out))
+    assert stats["body_reps"] == 1
+
+    reopened = ifcfast.open(out, use_cache=False, write_cache=False)
+    prod = next(p for p in reopened.products if p.guid == FALLBACK_ONLY_GUID)
+    assert prod.has_body is True
+    mesh = reopened.mesh(FALLBACK_ONLY_GUID)
+    assert mesh is not None
+    assert mesh.faces.shape == (12, 3)
+    assert mesh.vertices.shape == (8, 3)
+
+
+def test_hotswap_identifier_less_solid_succeeds_and_reparsed_model_meshes_it(
+    tiers_model, tmp_path
+):
+    """Tier 3: the product's only body representation has no
+    RepresentationIdentifier at all (a bare SweptSolid)."""
+    v, t = _unit_cube()
+    out = tmp_path / "unnamed_solid.ifc"
+    stats = tiers_model.hotswap(UNNAMED_SOLID_GUID, v, t, out_path=str(out))
+    assert stats["body_reps"] == 1
+
+    reopened = ifcfast.open(out, use_cache=False, write_cache=False)
+    prod = next(p for p in reopened.products if p.guid == UNNAMED_SOLID_GUID)
+    assert prod.has_body is True
+    mesh = reopened.mesh(UNNAMED_SOLID_GUID)
+    assert mesh is not None
+    assert mesh.faces.shape == (12, 3)
+    assert mesh.vertices.shape == (8, 3)
+
+
+def test_hotswap_body_plus_fallback_repoints_body_leaves_fallback_untouched(
+    tiers_model, tmp_path
+):
+    """Tier 1 beats tier 2: with both a Body and a Body-FallBack
+    representation present, the swap repoints Body and the fallback rep's
+    bytes are left byte-identical."""
+    fixture_bytes = TIERS_FIXTURE.read_bytes()
+    fallback_rep_line = next(
+        line for line in fixture_bytes.splitlines() if line.startswith(b"#49=")
+    )
+    assert b"Body-FallBack" in fallback_rep_line
+
+    v, t = _unit_cube()
+    out = tmp_path / "body_plus_fallback.ifc"
+    stats = tiers_model.hotswap(BODY_PLUS_FALLBACK_GUID, v, t, out_path=str(out))
+    # Two candidate bodies (Body + Body-FallBack); only the tier-1 winner
+    # is swapped.
+    assert stats["body_reps"] == 2
+
+    out_bytes = out.read_bytes()
+    out_fallback_line = next(
+        line for line in out_bytes.splitlines() if line.startswith(b"#49=")
+    )
+    assert out_fallback_line == fallback_rep_line, (
+        "Body-FallBack rep must survive the swap byte-identical"
+    )
+    assert b"IFCTRIANGULATEDFACESET" in out_bytes
+
+    reopened = ifcfast.open(out, use_cache=False, write_cache=False)
+    prod = next(p for p in reopened.products if p.guid == BODY_PLUS_FALLBACK_GUID)
+    assert prod.has_body is True
+    assert prod.body_rep_type == "Tessellation"
+    mesh = reopened.mesh(BODY_PLUS_FALLBACK_GUID)
+    assert mesh is not None
+    assert mesh.faces.shape == (12, 3)
+    assert mesh.vertices.shape == (8, 3)
