@@ -38,6 +38,7 @@
 //!    false-negative harmless — the kernel, not this check, decides
 //!    whether the cut happens.
 
+#[cfg(test)]
 use crate::mesh::halfspace_clip::ON_PLANE_EPS_BASE_M;
 
 /// Resolve the half-space clip's "on-plane" round-off guard, in the
@@ -70,16 +71,10 @@ use crate::mesh::halfspace_clip::ON_PLANE_EPS_BASE_M;
 /// validated, byte-identical-to-v0.4.32 choice and is tracked for a
 /// follow-up.
 pub fn on_plane_eps(unit_scale: f32) -> f32 {
-    // Source-unit numerical guard, validated on metre + mm files.
-    const NUMERICAL_GUARD_SRC: f32 = 1.0e-3;
-    // Physical 1 mm expressed in source units; only binds (is smaller)
-    // for large-unit files, where it keeps the band sub-millimetre.
-    let physical_mm_in_src = if unit_scale.is_finite() && unit_scale > 1.0e-12 {
-        ON_PLANE_EPS_BASE_M / unit_scale
-    } else {
-        NUMERICAL_GUARD_SRC
-    };
-    NUMERICAL_GUARD_SRC.min(physical_mm_in_src)
+    // Single-sourced in `halfspace_clip` (not csg-gated) since GH #194:
+    // the half-space clip now runs inside the boolean evaluation in every
+    // build, including wasm, so the policy can't live behind `csg`.
+    crate::mesh::halfspace_clip::on_plane_eps(unit_scale)
 }
 
 /// `true` if `indices` describes a closed 2-manifold (every undirected

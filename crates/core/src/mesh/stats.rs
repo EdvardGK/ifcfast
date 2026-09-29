@@ -647,6 +647,7 @@ mod drift_floor_tests {
             mesh_anchor: [0.0, 0.0, 0.0],
             surface_color: None,
             bounded_halfspaces: Vec::new(),
+            clip_unapplied: false,
         }
     }
 

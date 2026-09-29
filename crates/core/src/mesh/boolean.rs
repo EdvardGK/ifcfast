@@ -1,5 +1,12 @@
 //! Reveal-all handlers for IFC composite / clipped solids.
 //!
+//! **Exception — half-space clips (GH #194).** A half-space second operand
+//! of a DIFFERENCE (`IfcBooleanClippingResult`, or `IfcBooleanResult`
+//! `.DIFFERENCE.`) is the element's own shape, not an opening:
+//! [`boolean_result`] applies it to the first operand here, in every mode,
+//! and emits only the clipped host (see `clip_first_operand`). Everything
+//! below about emitting both operands applies to solid operands.
+//!
 //! The driving philosophy: an IFC file is a snapshot of what the author
 //! actually wrote, not a curated view of what they "meant". A wall
 //! authored as `wall_extrusion - door_void` lives in the file as an
@@ -101,6 +108,18 @@ pub fn boolean_result(
         _ => None,
     });
 
+    // GH #194: a half-space second operand of a DIFFERENCE is the
+    // element's own shape, not an opening — clip the first operand here,
+    // in every mode, so every consumer (mesh / meshes / QTO / substrate /
+    // clash / drift / point cloud / glTF / wasm) inherits the clipped
+    // solid. Chains recurse naturally: the inner clipping result arrives
+    // already clipped as this level's first operand.
+    if second_role == "boolean_second_operand" {
+        if let Some(cut) = second_id.and_then(|sid| resolve_halfspace_operand(table, sid)) {
+            return clip_first_operand(table, id, first_id, &cut, shape_cache, recurse);
+        }
+    }
+
     let mut out: Vec<MeshFragment> = Vec::new();
     if let Some(fid) = first_id {
         for frag in recurse(table, fid, shape_cache) {
@@ -113,6 +132,279 @@ pub fn boolean_result(
         }
     }
     out
+}
+
+/// A half-space second operand, resolved to what the clip needs (GH #194).
+#[derive(Debug, Clone)]
+pub(crate) enum HalfspaceCut {
+    /// `IfcHalfSpaceSolid` / `IfcBoxedHalfSpace`: remove the side
+    /// `normal` points into (the de-facto AgreementFlag convention, GH #39).
+    Plane { point: Vec3, normal: Vec3 },
+    /// `IfcPolygonalBoundedHalfSpace`: the plane intersected with the
+    /// boundary polygon's column.
+    Bounded(BoundedHalfspacePayload),
+    /// A half-space entity we cannot evaluate (non-`IfcPlane` base
+    /// surface, unreadable boundary curve). The host stays unclipped and
+    /// is marked [`crate::mesh::CLIP_UNAPPLIED_TAG`] — never silently.
+    Unresolvable,
+}
+
+/// `Some` when `id` is a half-space solid of any flavour; `None` for every
+/// other operand (solids, nested booleans), which keep the reveal-all path.
+pub(crate) fn resolve_halfspace_operand(table: &EntityTable, id: u64) -> Option<HalfspaceCut> {
+    let (type_name, _) = table.get(id)?;
+    if type_name.eq_ignore_ascii_case(b"IFCPOLYGONALBOUNDEDHALFSPACE") {
+        return Some(match polygonal_bounded_halfspace(table, id) {
+            Some((_, _, payload)) => HalfspaceCut::Bounded(payload),
+            None => HalfspaceCut::Unresolvable,
+        });
+    }
+    if type_name.eq_ignore_ascii_case(b"IFCHALFSPACESOLID")
+        || type_name.eq_ignore_ascii_case(b"IFCBOXEDHALFSPACE")
+    {
+        return Some(match halfspace_plane(table, id) {
+            Some((point, normal)) => HalfspaceCut::Plane { point, normal },
+            None => HalfspaceCut::Unresolvable,
+        });
+    }
+    None
+}
+
+/// What one clip did to one host fragment.
+enum ClipOutcome {
+    /// Nothing of the host lies in the removed region.
+    Unchanged,
+    /// Clipped (possibly to nothing — the host was consumed).
+    Clipped(LocalMesh),
+    /// Clipped by the Manifold fallback (`csg` builds only).
+    #[cfg_attr(not(feature = "csg"), allow(dead_code))]
+    Manifold(LocalMesh),
+    /// Could not be evaluated; host returned unclipped and marked.
+    Unapplied,
+}
+
+/// Mesh the first operand and apply the half-space `cut` to every host
+/// fragment. The half-space itself is consumed (no stand-in slab is
+/// emitted). Fragments that are revealed *cutters* nested inside the
+/// first operand (`boolean_second_operand` somewhere in their chain) are
+/// passed through untouched: they are not host material.
+fn clip_first_operand(
+    table: &EntityTable,
+    id: u64,
+    first_id: Option<u64>,
+    cut: &HalfspaceCut,
+    shape_cache: &super::ShapeCache,
+    recurse: &dyn Fn(&EntityTable, u64, &super::ShapeCache) -> Vec<MeshFragment>,
+) -> Vec<MeshFragment> {
+    let mut out: Vec<MeshFragment> = Vec::new();
+    let Some(fid) = first_id else {
+        return out;
+    };
+    let eps = crate::mesh::halfspace_clip::on_plane_eps(crate::mesh::profile::length_scale(table));
+    for frag in recurse(table, fid, shape_cache) {
+        let MeshFragment::Mesh {
+            mesh,
+            source,
+            mut roles,
+            rep_step_id,
+            instance_transform,
+            bounded_halfspace,
+        } = frag
+        else {
+            out.push(frag);
+            continue;
+        };
+        if roles.contains(&"boolean_second_operand") {
+            roles.push("boolean_first_operand");
+            out.push(MeshFragment::Mesh {
+                mesh,
+                source,
+                roles,
+                rep_step_id,
+                instance_transform,
+                bounded_halfspace,
+            });
+            continue;
+        }
+        let (mesh, rep_step_id) = match clip_fragment(&mesh, instance_transform, cut, eps) {
+            ClipOutcome::Unchanged => (mesh, rep_step_id),
+            // The clipped shape is a function of THIS boolean node, not of
+            // the leaf it came from: key it by the boolean's step id so the
+            // substrate's rep dedup can never share it with an unclipped
+            // use of the same leaf. (`styles` resolves the boolean id to the
+            // leaf's colour when the boolean itself is unstyled.)
+            ClipOutcome::Clipped(m) => {
+                if m.indices.is_empty() {
+                    continue; // host consumed by the clip
+                }
+                (m, id)
+            }
+            ClipOutcome::Manifold(m) => {
+                roles.push(crate::mesh::CLIP_MANIFOLD_TAG);
+                if m.indices.is_empty() {
+                    continue;
+                }
+                (m, id)
+            }
+            ClipOutcome::Unapplied => {
+                roles.push(crate::mesh::CLIP_UNAPPLIED_TAG);
+                (mesh, rep_step_id)
+            }
+        };
+        roles.push("boolean_first_operand");
+        out.push(MeshFragment::Mesh {
+            mesh,
+            source,
+            roles,
+            rep_step_id,
+            instance_transform,
+            bounded_halfspace,
+        });
+    }
+    out
+}
+
+/// Apply one half-space to one fragment. The cut is authored in the
+/// boolean's operand frame; the fragment's vertices are local to
+/// `instance_transform * translate(rep_origin)` (identity + the far-origin
+/// rebase for facesets / breps), so the cut is mapped into that frame in
+/// f64 first.
+fn clip_fragment(
+    mesh: &LocalMesh,
+    instance_transform: Mat4,
+    cut: &HalfspaceCut,
+    eps: f32,
+) -> ClipOutcome {
+    use glam::{DMat4, DVec3};
+    if mesh.indices.len() < 3 {
+        return ClipOutcome::Unchanged;
+    }
+    let fwd = instance_transform.as_dmat4()
+        * DMat4::from_translation(DVec3::new(
+            mesh.rep_origin[0],
+            mesh.rep_origin[1],
+            mesh.rep_origin[2],
+        ));
+    if fwd.determinant().abs() < 1.0e-18 {
+        return ClipOutcome::Unapplied;
+    }
+    let inv = fwd.inverse();
+    // Normals map with the inverse-transpose of the point map (`inv`),
+    // i.e. the transpose of `fwd`'s linear part.
+    let to_local_point = |p: Vec3| inv.transform_point3(p.as_dvec3()).as_vec3();
+    let to_local_normal = |n: Vec3| {
+        glam::DMat3::from_mat4(fwd)
+            .transpose()
+            .mul_vec3(n.as_dvec3())
+            .normalize_or_zero()
+            .as_vec3()
+    };
+    match cut {
+        HalfspaceCut::Unresolvable => ClipOutcome::Unapplied,
+        HalfspaceCut::Plane { point, normal } => {
+            let (p, n) = (to_local_point(*point), to_local_normal(*normal));
+            if n.length_squared() < 0.5 {
+                return ClipOutcome::Unapplied;
+            }
+            // Only material strictly past the on-plane band is removed: a
+            // host face lying ON the plane (Revit anchors clip planes on
+            // wall faces) merely touches the half-space — nothing to clip,
+            // same rule as the bounded route.
+            let removes_any = mesh
+                .vertices
+                .as_chunks::<3>()
+                .0
+                .iter()
+                .any(|c| (Vec3::new(c[0], c[1], c[2]) - p).dot(n) > eps);
+            if !removes_any {
+                return ClipOutcome::Unchanged;
+            }
+            let (v, i) = crate::mesh::bounded_clip::clip_plane_closed(
+                &mesh.vertices,
+                &mesh.indices,
+                p,
+                n,
+                eps,
+            );
+            ClipOutcome::Clipped(LocalMesh {
+                vertices: v,
+                indices: i,
+                rep_origin: mesh.rep_origin,
+            })
+        }
+        HalfspaceCut::Bounded(payload) => {
+            use crate::mesh::bounded_clip::{clip_bounded, BoundedClip};
+            let p = to_local_point(payload.plane_point);
+            let n = to_local_normal(payload.plane_normal);
+            let xform = inv.as_mat4() * payload.boundary_xform;
+            if n.length_squared() < 0.5 {
+                return ClipOutcome::Unapplied;
+            }
+            match clip_bounded(
+                &mesh.vertices,
+                &mesh.indices,
+                &payload.boundary,
+                xform,
+                p,
+                n,
+                eps,
+            ) {
+                BoundedClip::Unchanged => ClipOutcome::Unchanged,
+                BoundedClip::Clipped { vertices, indices } => ClipOutcome::Clipped(LocalMesh {
+                    vertices,
+                    indices,
+                    rep_origin: mesh.rep_origin,
+                }),
+                BoundedClip::NonConvex | BoundedClip::Failed => {
+                    manifold_bounded_fallback(mesh, &payload.boundary, xform, p, n, eps)
+                }
+            }
+        }
+    }
+}
+
+/// Non-convex (or refused) bounded clip: `host − finite column cutter`
+/// through Manifold when `csg` is compiled in; otherwise unapplied.
+#[cfg(feature = "csg")]
+fn manifold_bounded_fallback(
+    mesh: &LocalMesh,
+    boundary: &crate::mesh::profile::Polygon2D,
+    xform: Mat4,
+    p: Vec3,
+    n: Vec3,
+    eps: f32,
+) -> ClipOutcome {
+    let Some((cv, ci)) = crate::mesh::halfspace_clip::bounded_halfspace_cutter(
+        &mesh.vertices,
+        boundary,
+        xform,
+        p,
+        n,
+        eps,
+    ) else {
+        // Nothing of the host on the remove side / degenerate boundary.
+        return ClipOutcome::Unchanged;
+    };
+    match crate::geom::csg::subtract(&mesh.vertices, &mesh.indices, &cv, &ci) {
+        Ok((v, i)) => ClipOutcome::Manifold(LocalMesh {
+            vertices: v,
+            indices: i,
+            rep_origin: mesh.rep_origin,
+        }),
+        Err(_) => ClipOutcome::Unapplied,
+    }
+}
+
+#[cfg(not(feature = "csg"))]
+fn manifold_bounded_fallback(
+    _mesh: &LocalMesh,
+    _boundary: &crate::mesh::profile::Polygon2D,
+    _xform: Mat4,
+    _p: Vec3,
+    _n: Vec3,
+    _eps: f32,
+) -> ClipOutcome {
+    ClipOutcome::Unapplied
 }
 
 /// `IfcCsgSolid(TreeRootExpression: IfcCsgSelect)` — the tree root is
@@ -327,7 +619,11 @@ fn transform_point_local(m: &Mat4, p: Vec3) -> Vec3 {
 /// IfcBooleanClippingResult tree).
 pub fn halfspace_solid(table: &EntityTable, id: u64) -> Option<(LocalMesh, bool)> {
     let (type_name, args) = table.get(id)?;
-    if !type_name.eq_ignore_ascii_case(b"IFCHALFSPACESOLID") {
+    // `IfcBoxedHalfSpace` is an `IfcHalfSpaceSolid` whose `Enclosure` box
+    // is a computational hint only — same geometry (GH #194).
+    if !type_name.eq_ignore_ascii_case(b"IFCHALFSPACESOLID")
+        && !type_name.eq_ignore_ascii_case(b"IFCBOXEDHALFSPACE")
+    {
         return None;
     }
     let fields = split_top_level_args(args);
@@ -374,6 +670,49 @@ pub fn halfspace_solid(table: &EntityTable, id: u64) -> Option<(LocalMesh, bool)
     };
     let mesh = extrude_polygon(&polygon, Vec3::Z, HALFSPACE_SLAB_THICKNESS * 0.01, frame);
     Some((mesh, agreement))
+}
+
+/// The cutting plane of an `IfcHalfSpaceSolid` / `IfcBoxedHalfSpace`:
+/// `(point on plane, unit normal into the REMOVED side)`, in the operand
+/// frame. Same orientation as the stand-in slab [`halfspace_solid`] builds
+/// (its first-triangle normal) — `.T.` removes `-Position.Z`, `.F.`
+/// removes `+Position.Z` (the de-facto convention, GH #39) — but read
+/// exactly from `BaseSurface.Position` instead of re-derived from the
+/// slab, whose centroid sits half a slab thickness off the plane.
+/// `None` when the base surface is not an `IfcPlane` (GH #194 counts that
+/// host as unclipped rather than guessing).
+pub fn halfspace_plane(table: &EntityTable, id: u64) -> Option<(Vec3, Vec3)> {
+    let (type_name, args) = table.get(id)?;
+    if !type_name.eq_ignore_ascii_case(b"IFCHALFSPACESOLID")
+        && !type_name.eq_ignore_ascii_case(b"IFCBOXEDHALFSPACE")
+    {
+        return None;
+    }
+    let fields = split_top_level_args(args);
+    let surface_id = match fields.first().copied().map(parse_field) {
+        Some(Field::Ref(sid)) => sid,
+        _ => return None,
+    };
+    let agreement = parse_agreement_flag(fields.get(1).copied());
+    let (s_type, s_args) = table.get(surface_id)?;
+    if !s_type.eq_ignore_ascii_case(b"IFCPLANE") {
+        return None;
+    }
+    let s_fields = split_top_level_args(s_args);
+    let position = s_fields
+        .first()
+        .copied()
+        .and_then(|f| match parse_field(f) {
+            Field::Ref(pid) => Some(axis_placement_3d_from_id(table, pid)),
+            _ => None,
+        })
+        .unwrap_or(Mat4::IDENTITY);
+    let axis = transform_vector(&position, Vec3::Z).normalize_or_zero();
+    if axis.length_squared() < 0.5 {
+        return None;
+    }
+    let normal = if agreement { -axis } else { axis };
+    Some((transform_point_local(&position, Vec3::ZERO), normal))
 }
 
 /// Annotate a fragment with its structural position inside the current

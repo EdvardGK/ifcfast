@@ -162,6 +162,23 @@ impl StyleIndex {
             }
         }
 
+        // Phase 5 (GH #194) — a half-space-clipped host fragment carries
+        // its `IfcBooleanResult` / `IfcBooleanClippingResult` step id as
+        // `rep_step_id` (the clipped shape belongs to the boolean node,
+        // not to its leaf). Exporters style either the boolean (then
+        // phase 2 bound it) or the leaf solid (Revit), so an unstyled
+        // boolean inherits the colour of its first-operand chain.
+        let mut inherited: Vec<(u64, [f32; 4])> = Vec::new();
+        for &id in table.order() {
+            if idx.item.contains_key(&id) {
+                continue;
+            }
+            if let Some(c) = first_operand_colour(table, id, &idx.item) {
+                inherited.push((id, c));
+            }
+        }
+        idx.item.extend(inherited);
+
         idx
     }
 
@@ -173,6 +190,35 @@ impl StyleIndex {
             .copied()
             .or_else(|| self.product.get(&product_id).copied())
     }
+}
+
+/// Colour of a boolean node's first-operand chain: walk `FirstOperand`
+/// through nested `IfcBooleanResult` / `IfcBooleanClippingResult` until a
+/// styled item is found. `None` for a non-boolean `id` or an unstyled
+/// chain. Depth-capped against malformed cycles.
+fn first_operand_colour(
+    table: &EntityTable,
+    id: u64,
+    item: &HashMap<u64, [f32; 4]>,
+) -> Option<[f32; 4]> {
+    let mut cur = id;
+    for _ in 0..64 {
+        let (t, args) = table.get(cur)?;
+        if !t.eq_ignore_ascii_case(b"IFCBOOLEANRESULT")
+            && !t.eq_ignore_ascii_case(b"IFCBOOLEANCLIPPINGRESULT")
+        {
+            return None;
+        }
+        let fields = split_top_level_args(args);
+        cur = match fields.get(1).copied().map(parse_field) {
+            Some(Field::Ref(r)) => r,
+            _ => return None,
+        };
+        if let Some(&c) = item.get(&cur) {
+            return Some(c);
+        }
+    }
+    None
 }
 
 /// Bind `colour` to every **leaf representation item** step_id

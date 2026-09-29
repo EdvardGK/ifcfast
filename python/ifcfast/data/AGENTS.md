@@ -358,7 +358,8 @@ describing via `pq.read_schema(...)`):
     under the default `mesh_qto(cut_openings=True)` / `meshes(cut_openings=True)`
     an `IfcOpeningElement` is subtracted from its host (via
     `m.voids`) and gets no standalone row (`cut_openings=False` shows
-    it as a reveal-all operand). Spatial containers (`IfcSite` /
+    it as a reveal-all operand). Half-space clips of a clipping body are
+    the element's own shape and are applied in both modes (GH #194). Spatial containers (`IfcSite` /
     `IfcBuilding` / `IfcBuildingStorey`) are structure, not element
     geometry, and are not quantified. A differential against a raw
     `ifcopenshell.geom` iterator (which meshes *every* product with a
@@ -405,8 +406,11 @@ describing via `pq.read_schema(...)`):
   (`< bound × 1e-3`) escalates. Send `false` rows to an authoritative
   kernel. `volume_method` is `"mesh"` (closed manifold), `"mesh_open"`
   (trusted open shell — same trust as `mesh`, split out so you can filter
-  on watertightness via `mesh_quality == "closed"`), or `"prism_fallback"`
-  (the only `volume_reliable == false` method); `volume_mesh_m3` is the
+  on watertightness via `mesh_quality == "closed"`), `"prism_fallback"`,
+  or `"mesh_unclipped"` (GH #194: a half-space clip of the element could
+  not be applied, so the mesh is the unclipped operand and the volume
+  an upper bound) — the last two are the `volume_reliable == false`
+  methods; `volume_mesh_m3` is the
   raw mesh volume regardless of reliability; `volume_prism_bound_m3` is
   the prism bound — the min over the three axis projections of
   `footprint × perpendicular-extent`, tight for beams/columns/slabs alike
@@ -1547,8 +1551,8 @@ for chunk in m.iter_point_cloud(per_m2=200.0, seed=0,
 
 When the mesh pipeline meets a composite solid (`IfcBooleanResult`,
 `IfcBooleanClippingResult`, `IfcCsgSolid`) it does **not** perform the
-boolean by default. **Authored** operands are emitted as their own
-visible mesh segments with compound tags like
+solid-vs-solid boolean by default. **Authored** operands are emitted as
+their own visible mesh segments with compound tags like
 `boolean_first_operand|extrusion` (the host wall) and
 `boolean_second_operand|extrusion` (a void modelled as a real solid).
 This is deliberate: the file says "wall minus opening volume"; we
@@ -1558,27 +1562,74 @@ summary. The glTF emitter writes each segment's `(start, count,
 source)` into per-node `extras.segments` so viewers can colour /
 split / filter by role.
 
-**Exception — synthetic half-space stand-ins are stripped (GH #66,
-v0.4.38+).** An *infinite* `IfcHalfSpaceSolid` cutter has no authored
-extent, so the tessellator invents a ±20 000-model-unit visualisation
-slab to stand in for it. That slab is **tool geometry, not element
-geometry** — left in the output it blew a 7 m floor strip up to a
-54 m plane, poisoned AABBs/centroids (drift, instances.parquet),
-soaked up point-cloud sampling budget, and fed `clash()` false
-positives against geometry that doesn't exist. Every no-cut surface
-(`meshes()` / `iter_meshes` / `to_gltf` / `point_cloud` / `drift` /
-`segments` / `mesh_qto(cut_openings=False)` / the bundle substrate)
-now strips fragments whose chain matches `boolean_second_operand` +
-`halfspace_plane*`/`halfspace_bounded*` before emitting. Authored
-solid subtractors still emit verbatim; union/intersection operands are
-untouched; `cut_openings=True` is unaffected (the cut consumes the
-cutters). To inspect the synthetic cutters (debugging cut placement),
-pass **`keep_cutters=True`** to `meshes()` / `iter_meshes()`. The
-native `extract_meshes` dict counts `cutters_stripped` either way;
-`Model.meshes()` surfaces the mesh-pass counters as **`MeshList.stats`**
-(`products_seen` / `products_meshed` / `products_deferred` /
-`by_source`, GH #166) but not the cut / cutter counters — for those
-`m.to_gltf()` is still the surface (see "Cut diagnostics" below).
+**Clipping bodies are the element's own shape — applied in every mode
+(GH #194, cache schema v37).** A half-space second operand of a
+DIFFERENCE (`IfcBooleanClippingResult`, or `IfcBooleanResult` with
+`.DIFFERENCE.`) — `IfcHalfSpaceSolid`, `IfcBoxedHalfSpace`,
+`IfcPolygonalBoundedHalfSpace` — is **not** an opening. It is how
+Revit / ArchiCAD shape a wall under a sloped roof or a beam end cut,
+and ifcopenshell applies it even with opening subtraction disabled. The
+mesher applies it inside the boolean evaluation, so **every** surface
+carries the clipped solid with no flag: `meshes()` / `iter_meshes()` /
+`mesh()` / `mesh_qto(cut_openings=False)` / `to_gltf` / `point_cloud` /
+`drift` / the bundle substrate (`representations` + `instances.parquet`
+geometry, `volume_m3`, bboxes, fingerprints — so `clash()` sees clipped
+walls) / the browser build. Chains of clips (clip of clip) apply at any
+depth, `AgreementFlag` as ifcopenshell reads it (GH #39: `.T.` keeps the
+`+BaseSurface.Position.Z` side). The half-space itself is consumed: no
+`halfspace_*` segment is emitted, and the clipped host keeps its
+`boolean_first_operand|…` tag. The bounded case runs pure Rust in every
+build (wasm included): an oversized boundary is the plane clip; a
+convex boundary that crosses the element is cut as `host − (half-space
+∩ boundary column)` with the column swept along the plane normal. Before
+GH #194 the clip ran only under `cut_openings=True`, so no-cut meshes,
+the substrate and `clash()` saw the **unclipped** operand (G55_RIB: up
+to +95 % volume on half-space-clipped walls, all flagged
+`volume_reliable=True`).
+
+A clip that **cannot** be applied (non-`IfcPlane` base surface,
+unreadable boundary curve, a degenerate or non-convex bounded case with
+no Manifold to fall back on — the browser build) is never silent: the
+host is returned **unclipped**, its segment chain gains the token
+`halfspace_unclipped`, its QTO row gets `volume_reliable = False` /
+`volume_method = "mesh_unclipped"` (the volume is an upper bound), and
+the mesh-pass stats count it as **`halfspace_clip_unapplied`**. Native
+builds resolve non-convex / degenerate bounded clips through Manifold
+instead; those hosts are tagged `halfspace_clip_manifold` and counted as
+**`halfspace_clip_manifold`**. Both counters are on every mesh-stats
+surface (`m.meshes().stats`, `m.mesh_qto()[0].attrs["mesh_stats"]`,
+`to_gltf` / `point_cloud` / `bundle()` dicts).
+
+**What `cut_openings` changes — decision table.**
+
+| geometry | `cut_openings=False` (reveal-all) | `cut_openings=True` (net) |
+|---|---|---|
+| half-space 2nd operand of a DIFFERENCE (`IfcHalfSpaceSolid` / `IfcBoxedHalfSpace` / `IfcPolygonalBoundedHalfSpace`) | **applied** — element's own shape | **applied** — identical |
+| solid 2nd operand of a DIFFERENCE (void modelled as a solid) | emitted as its own `boolean_second_operand\|…` segment | subtracted from the host |
+| `IfcRelVoidsElement` opening | host and opening emitted as separate products | subtracted; opening product suppressed |
+| `.UNION.` / `.INTERSECTION.` operand | emitted | emitted (typed counter, below) |
+
+So on a clipped wall with no opening, `meshes()` and
+`meshes(cut_openings=True)` return the same solid.
+
+**`keep_cutters` (GH #66 → GH #194).** GH #66 (v0.4.38) stripped the
+±20 000-model-unit stand-in slabs the tessellator used to emit for an
+infinite half-space from every no-cut surface, and `keep_cutters=True`
+kept them for debugging. Since GH #194 the half-space is consumed by
+the clip, so there is no stand-in left to keep: `keep_cutters=True`
+returns exactly what the default returns — the clipped hosts plus the
+authored solid operands (which were never stripped). The flag is kept
+for API compatibility. The legacy stand-in slab (and the GH #66 strip
+of it) survives only for a half-space that is NOT directly a
+DIFFERENCE's second operand — e.g. inside a `.UNION.` operand, which no
+mainstream exporter writes — so the native `extract_meshes` dict's
+`cutters_stripped` is 0 on real files.
+`Model.meshes()` surfaces the mesh-pass counters as
+**`MeshList.stats`** (`products_seen` / `products_meshed` /
+`products_deferred` / `by_source` / `halfspace_clip_unapplied` /
+`halfspace_clip_manifold`, GH #166 / #194) but not the cut counters —
+for those `m.to_gltf()` is still the surface (see "Cut diagnostics"
+below).
 
 **Source-tag chain encoding (v0.4.35+, GH #58 / W1).** The `source`
 field on `MeshSegment` / `InstancePart` / `instances.parquet.source`
@@ -1619,9 +1670,11 @@ because the true union / intersection volume is not computed.
 **Opt-in cut: `m.meshes(cut_openings=True)`.** For viewer / rendering
 work where you want the net solid (doors and windows as actual
 holes), pass `cut_openings=True`. The mesher then folds every
-`boolean_second_operand|...` segment into the host via CSG
-(`manifold3d`) before returning, so the output has a single segment
-per product tagged `cut_openings`. The substrate stays reveal-all —
+remaining `boolean_second_operand|...` segment (solid operands — the
+half-space clips were already applied, see above) and every
+`IfcRelVoidsElement` opening into the host via CSG (`manifold3d`)
+before returning, so the output has a single segment per product
+tagged `cut_openings`. The substrate stays reveal-all —
 this flag only affects `m.meshes()` / `m.iter_meshes()` callers,
 not `instances.parquet` / `representations.parquet`. Requires a
 wheel built with the `csg` feature (raises `RuntimeError` otherwise).
@@ -1723,7 +1776,8 @@ non-default `unit=` (native units are the contract) — both raise
 **`m.mesh_qto(cut_openings=True)` is the default since v0.4.28** —
 authored `Qto_*Volume` values are net (openings subtracted), and so
 is the new geometric default. Pass `cut_openings=False` if you want
-the gross (uncut) host volume.
+the gross volume: the element's own shape — half-space clips applied
+(GH #194) — without opening / solid-operand subtractions.
 Both opening patterns are covered: **in-representation** booleans
 (`IfcBooleanClippingResult(host, opening)`) AND **cross-product**
 openings (`IfcRelVoidsElement` linking a separately-modelled

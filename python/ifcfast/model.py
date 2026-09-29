@@ -88,7 +88,14 @@ LocalMesh = namedtuple(
 def _mesh_stats(d) -> dict:
     """Mesh-pass counters shared by every native mesh entry point (GH #166)."""
     out = {}
-    for k in ("products_seen", "products_meshed", "products_deferred", "triangles"):
+    for k in (
+        "products_seen",
+        "products_meshed",
+        "products_deferred",
+        "triangles",
+        "halfspace_clip_unapplied",
+        "halfspace_clip_manifold",
+    ):
         if k in d:
             out[k] = int(d[k])
     out["by_source"] = dict(d.get("by_source", {}))
@@ -109,7 +116,12 @@ class MeshList(list):
     #: representation kinds the mesher met (``"extrusion"``, ``"brep"``,
     #: ``"faceset"``, …). Anything ifcfast could **not** tessellate shows up
     #: as ``"unhandled:IFCXXX"``; that is the supported answer to "what did
-    #: this file contain that I am not seeing".
+    #: this file contain that I am not seeing". ``halfspace_clip_unapplied``
+    #: counts products whose clipping-body half-space could not be applied
+    #: (their mesh is the unclipped operand, tagged
+    #: ``"halfspace_unclipped"`` in its segment chain) and
+    #: ``halfspace_clip_manifold`` those clipped via the Manifold fallback
+    #: (GH #194).
     stats: dict = {}
 
 
@@ -794,8 +806,11 @@ class Model:
           kernel (see ``examples/hybrid_qto_routing.py``).
           ``volume_method`` is ``"mesh"`` (closed manifold), ``"mesh_open"``
           (trusted open shell — same trust as ``mesh``, split out so you
-          can filter on watertightness), or ``"prism_fallback"`` (the only
-          ``volume_reliable == False`` method); ``volume_mesh_m3`` is the
+          can filter on watertightness), ``"prism_fallback"``, or
+          ``"mesh_unclipped"`` (GH #194: a half-space clip of the element
+          could not be applied — the mesh is the unclipped operand and the
+          volume an upper bound); the last two are the
+          ``volume_reliable == False`` methods; ``volume_mesh_m3`` is the
           raw mesh value regardless of reliability; ``volume_prism_bound_m3``
           is the prism bound, computed for every non-closed row (``NaN`` on
           closed rows — the watertight hot path stays raster-free);
@@ -1470,21 +1485,30 @@ class Model:
                 not user-visible products). Default ``False``
                 preserves the reveal-all stance for **authored**
                 operands (a void modelled as a real solid still
-                emits verbatim). Requires a wheel built with the
+                emits verbatim). Half-space clips (clipping bodies)
+                are the element's own shape and are applied in BOTH
+                modes (GH #194). Requires a wheel built with the
                 ``csg`` feature — raises ``RuntimeError`` if the
                 underlying ``ifcfast._core`` was compiled without it.
-            keep_cutters: by default (``False``) the **synthetic
-                half-space visualisation slabs** — the ±20 000
-                model-unit stand-ins ``boolean.rs`` emits so an
-                *infinite* ``IfcHalfSpaceSolid`` cutter has something
-                visible — are stripped from no-cut output. They are
-                tool geometry, not element geometry, and they used to
-                blow a 7 m floor strip up to a 54 m plane (GH #66).
-                Pass ``True`` to get the full reveal-all geometry
-                including the synthetic cutter slabs (debugging the
-                cut pipeline, inspecting cutter placement). Ignored
-                when ``cut_openings=True`` — the cut consumes the
-                cutters entirely.
+            keep_cutters: compatibility flag (GH #66 → GH #194). A
+                half-space second operand of an
+                ``IfcBooleanClippingResult`` (``IfcHalfSpaceSolid`` /
+                ``IfcBoxedHalfSpace`` / ``IfcPolygonalBoundedHalfSpace``)
+                is the element's own shape and is applied in every mode,
+                so no stand-in slab is emitted for it and there is
+                nothing to keep. The flag only affects the legacy
+                ±20 000-unit half-space slab that survives for a
+                half-space nested inside a ``.UNION.`` operand (not
+                directly a DIFFERENCE's second operand) — ``True`` keeps
+                that slab, ``False`` strips it (GH #66). No mainstream
+                exporter writes that shape, so on real files ``True`` and
+                ``False`` return the same clipped hosts plus the authored
+                solid operands. A clip that could not be applied leaves
+                the host unclipped, counted in
+                ``stats["halfspace_clip_unapplied"]`` (its segment chain
+                carries ``"halfspace_unclipped"``, visible in
+                ``stats["by_source"]``), and its ``mesh_qto`` row is
+                ``volume_reliable=False`` in both modes.
             frame: ``"world"`` (default) — the contract above.
                 ``"local"`` (GH #127) — each product's **representation-
                 item frame**: the coordinates its ``Body`` items store,
@@ -1653,8 +1677,8 @@ class Model:
         ``cut_openings`` / ``keep_cutters`` mirror :meth:`meshes` exactly
         — cross-product ``IfcRelVoidsElement`` openings are folded via the
         same CSG path (requires a wheel built with the ``csg`` feature),
-        and the synthetic half-space cutter slabs are stripped unless
-        ``keep_cutters`` (ignored in cut mode). The cut result is
+        and half-space clips are applied in both modes (GH #194;
+        ``keep_cutters`` is a compatibility no-op). The cut result is
         identical to the matching product from ``meshes(cut_openings=True)``.
 
         ``frame="local"`` (GH #127) returns a :data:`LocalMesh` instead:

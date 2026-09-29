@@ -814,7 +814,21 @@ def _resolve_step_escapes(s: str) -> str:
 #       reader requires all three, so a v35 bundle would read as corrupt
 #       rather than as "no edges"; the bump keys it away instead. No
 #       existing table changes.
-_CACHE_SCHEMA_VERSION = 36
+#   37: GH #194 — clipping bodies are the element's own shape in every
+#       mode. A half-space second operand of an `IfcBooleanClippingResult`
+#       (or DIFFERENCE `IfcBooleanResult`) — `IfcHalfSpaceSolid`,
+#       `IfcBoxedHalfSpace`, `IfcPolygonalBoundedHalfSpace` — is applied
+#       inside the extractor, not only under `cut_openings=True`: no-cut
+#       meshes, `mesh_qto(cut_openings=False)`, the substrate
+#       (`representations` / `instances` geometry, `volume_m3`, bboxes,
+#       fingerprints → `clash()` input), drift, point clouds, glTF and
+#       wasm all carry the clipped solid; the synthetic `halfspace_*`
+#       stand-in segments are gone. Clipped host parts are keyed by the
+#       boolean node's step id (`rep_id` changes for those rows). A clip
+#       that cannot be applied leaves the unclipped operand tagged
+#       `halfspace_unclipped` with `volume_reliable=False` /
+#       `volume_method="mesh_unclipped"`.
+_CACHE_SCHEMA_VERSION = 37
 
 _FIELD_RE = re.compile(r"\(\s*(.*?)\s*\)\s*;", re.DOTALL)
 

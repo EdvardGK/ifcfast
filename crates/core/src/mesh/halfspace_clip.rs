@@ -57,6 +57,27 @@ use crate::mesh::profile::Polygon2D;
 /// foot files — three different physical tolerances for one constant.
 pub const ON_PLANE_EPS_BASE_M: f32 = 1.0e-3;
 
+/// Resolve the clip's "on-plane" round-off guard, in the model's SOURCE
+/// units, from its `unit_scale` (source→metres: mm→0.001, m→1.0,
+/// ft→0.3048). `1e-3` source units, tightened only for large-unit
+/// (km-scale) files so the band never exceeds a physical millimetre.
+/// Full rationale (GH #65, W3) on
+/// [`crate::mesh::cut_validate::on_plane_eps`], which delegates here.
+/// Lives in this non-`csg` module since GH #194: the half-space clip runs
+/// inside the boolean evaluation in every build, wasm included.
+pub fn on_plane_eps(unit_scale: f32) -> f32 {
+    // Source-unit numerical guard, validated on metre + mm files.
+    const NUMERICAL_GUARD_SRC: f32 = 1.0e-3;
+    // Physical 1 mm expressed in source units; only binds (is smaller)
+    // for large-unit files, where it keeps the band sub-millimetre.
+    let physical_mm_in_src = if unit_scale.is_finite() && unit_scale > 1.0e-12 {
+        ON_PLANE_EPS_BASE_M / unit_scale
+    } else {
+        NUMERICAL_GUARD_SRC
+    };
+    NUMERICAL_GUARD_SRC.min(physical_mm_in_src)
+}
+
 /// Clip a closed triangle mesh by a plane, returning the closed
 /// portion on the **negative** side (i.e. the half-space *opposite*
 /// the one `plane_normal` points into).
@@ -423,63 +444,13 @@ pub fn bounded_halfspace_cutter(
     on_plane_eps: f32,
 ) -> Option<(Vec<f32>, Vec<u32>)> {
     use crate::mesh::extrusion::extrude_polygon;
-    use crate::mesh::profile::Polygon2D as P2D;
-    use glam::{Mat4, Vec2, Vec4};
+    use glam::{Mat4, Vec4};
 
-    if boundary.outer.len() < 3 || host_vertices.len() < 9 {
+    if host_vertices.len() < 9 {
         return None;
     }
-    let n = plane_normal.normalize_or_zero();
-    if n.length_squared() < 0.5 {
-        return None;
-    }
-
-    // In-plane orthonormal basis (e1, e2) ⟂ n. Same construction the
-    // prism-csg-fast path uses, so the two W6 routes agree on the
-    // boundary footprint frame.
-    let helper = if n.x.abs() < 0.9 { Vec3::X } else { Vec3::Y };
-    let e1 = n.cross(helper).normalize_or_zero();
-    if e1.length_squared() < 0.5 {
-        return None;
-    }
-    let e2 = n.cross(e1).normalize_or_zero();
-
-    // Map each boundary 2D point (its own `Position` frame, z = 0) into the
-    // working frame via `boundary_xform`, then PROJECT onto the cutting
-    // plane's `(e1, e2)` basis — dropping the normal component. This is the
-    // proven-correct treatment from the prism fast-path's `project_boundary`:
-    // it makes the cut robust when the boundary `Position` frame diverges
-    // from the BaseSurface plane (the GH #52 tilted-axis case), because the
-    // swept column always runs along the BaseSurface normal, not the
-    // polygon frame's local Z.
-    let to_footprint = |v: &Vec2| -> Vec2 {
-        let w = boundary_xform * Vec4::new(v.x, v.y, 0.0, 1.0);
-        let d = Vec3::new(w.x, w.y, w.z) - plane_point;
-        Vec2::new(d.dot(e1), d.dot(e2))
-    };
-    let mut outer: Vec<Vec2> = boundary.outer.iter().map(to_footprint).collect();
-    if outer.len() < 3 {
-        return None;
-    }
-    // Force the outer ring CCW so `extrude_polygon`'s caps + side strip
-    // wind outward (the CSG kernel needs an outward-facing closed cutter).
-    // The boundary may be authored either way; projecting it through
-    // `boundary_xform` can also flip its sense for a mirrored placement.
-    if ring_signed_area(&outer) < 0.0 {
-        outer.reverse();
-    }
-    let mut holes: Vec<Vec<Vec2>> = boundary
-        .holes
-        .iter()
-        .map(|h| h.iter().map(to_footprint).collect())
-        .collect();
-    // Holes must wind opposite the outer ring (CW) for the triangulator.
-    for h in &mut holes {
-        if h.len() >= 3 && ring_signed_area(h) > 0.0 {
-            h.reverse();
-        }
-    }
-    let footprint = P2D { outer, holes };
+    let (e1, e2, n, footprint) =
+        bounded_footprint(boundary, boundary_xform, plane_point, plane_normal)?;
 
     // Host extent along +n measured from the plane: how far the host
     // reaches into the removed half-space. Size the cutter to span that
@@ -517,6 +488,74 @@ pub fn bounded_halfspace_cutter(
         return None;
     }
     Some((cutter.vertices, cutter.indices))
+}
+
+/// Project an `IfcPolygonalBoundedHalfSpace` boundary onto its cutting
+/// plane: returns the in-plane orthonormal basis `(e1, e2)` (with
+/// `e1 × e2 = n`), the unit remove-direction normal `n`, and the boundary
+/// as a 2D footprint in `(e1, e2)` coordinates relative to `plane_point`,
+/// outer ring forced CCW (viewed from `+n`), holes CW.
+///
+/// Each boundary 2D point (its own `Position` frame, `z = 0`) is mapped
+/// into the working frame by `boundary_xform` and then PROJECTED onto the
+/// plane along `n` — the proven-correct treatment from the prism
+/// fast-path: the swept column always runs along the BaseSurface normal,
+/// not the polygon frame's local Z, which keeps the cut robust when the
+/// two frames diverge (the GH #52 tilted-axis case). Shared by the
+/// finite CSG cutter ([`bounded_halfspace_cutter`]) and the pure-Rust
+/// bounded clip ([`crate::mesh::bounded_clip`], GH #194) so both routes
+/// agree on the footprint. `None` on a degenerate normal / boundary.
+pub fn bounded_footprint(
+    boundary: &Polygon2D,
+    boundary_xform: glam::Mat4,
+    plane_point: Vec3,
+    plane_normal: Vec3,
+) -> Option<(Vec3, Vec3, Vec3, Polygon2D)> {
+    use glam::{Vec2, Vec4};
+
+    if boundary.outer.len() < 3 {
+        return None;
+    }
+    let n = plane_normal.normalize_or_zero();
+    if n.length_squared() < 0.5 {
+        return None;
+    }
+    // In-plane orthonormal basis (e1, e2) ⟂ n. Same construction the
+    // prism-csg-fast path uses, so the W6 routes agree on the boundary
+    // footprint frame.
+    let helper = if n.x.abs() < 0.9 { Vec3::X } else { Vec3::Y };
+    let e1 = n.cross(helper).normalize_or_zero();
+    if e1.length_squared() < 0.5 {
+        return None;
+    }
+    let e2 = n.cross(e1).normalize_or_zero();
+
+    let to_footprint = |v: &Vec2| -> Vec2 {
+        let w = boundary_xform * Vec4::new(v.x, v.y, 0.0, 1.0);
+        let d = Vec3::new(w.x, w.y, w.z) - plane_point;
+        Vec2::new(d.dot(e1), d.dot(e2))
+    };
+    let mut outer: Vec<Vec2> = boundary.outer.iter().map(to_footprint).collect();
+    // Force the outer ring CCW so `extrude_polygon`'s caps + side strip
+    // wind outward (the CSG kernel needs an outward-facing closed cutter)
+    // and the bounded clip's side planes face out of the column. The
+    // boundary may be authored either way; projecting it through
+    // `boundary_xform` can also flip its sense for a mirrored placement.
+    if ring_signed_area(&outer) < 0.0 {
+        outer.reverse();
+    }
+    let mut holes: Vec<Vec<Vec2>> = boundary
+        .holes
+        .iter()
+        .map(|h| h.iter().map(to_footprint).collect())
+        .collect();
+    // Holes must wind opposite the outer ring (CW) for the triangulator.
+    for h in &mut holes {
+        if h.len() >= 3 && ring_signed_area(h) > 0.0 {
+            h.reverse();
+        }
+    }
+    Some((e1, e2, n, Polygon2D { outer, holes }))
 }
 
 /// Signed area (shoelace) of a 2D ring; CCW positive.

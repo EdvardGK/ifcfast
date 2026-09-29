@@ -283,7 +283,11 @@ pub fn pair_split(
     // we just bbox'd. Runs before the rep-record build so the same
     // cache-warm vertex buffer feeds both. Sub-ms on typical
     // products, ~30ms on the biggest individual meshes.
-    let qto: MeshQto = qto::compute(&mesh.vertices, &mesh.indices, unit_scale);
+    let mut qto: MeshQto = qto::compute(&mesh.vertices, &mesh.indices, unit_scale);
+    // GH #194: an unapplied half-space clip leaves the unclipped operand.
+    if crate::mesh::has_unapplied_clip(&mesh) {
+        qto::mark_clip_unapplied(&mut qto);
+    }
 
     // Build the representation record. For single-fragment products
     // the rep carries the LOCAL (untransformed) mesh from

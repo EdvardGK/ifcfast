@@ -271,6 +271,17 @@ mod python {
             by_source.set_item(tag.as_str(), *n as u64)?;
         }
         out.set_item("by_source", by_source)?;
+        // GH #194: products whose half-space clip could not be applied
+        // (unclipped operand, `volume_reliable == False`), and products
+        // whose bounded clip needed the Manifold fallback.
+        out.set_item(
+            "halfspace_clip_unapplied",
+            stats.halfspace_clip_unapplied as u64,
+        )?;
+        out.set_item(
+            "halfspace_clip_manifold",
+            stats.halfspace_clip_manifold as u64,
+        )?;
         Ok(())
     }
 
@@ -992,7 +1003,12 @@ mod python {
                 /// streaming `on_product` and the post-stream cross-product
                 /// flush.
                 fn record(&mut self, mesh: ProductMesh) {
-                    let q = qto::compute(&mesh.vertices, &mesh.indices, self.unit_scale);
+                    let mut q = qto::compute(&mesh.vertices, &mesh.indices, self.unit_scale);
+                    // GH #194: an unapplied half-space clip leaves the
+                    // unclipped operand — never a trusted volume.
+                    if crate::mesh::has_unapplied_clip(&mesh) {
+                        qto::mark_clip_unapplied(&mut q);
+                    }
                     self.guid.push(mesh.guid.clone());
                     self.entity.push(mesh.entity.clone());
                     self.volume_m3.push(q.volume_best_m3);

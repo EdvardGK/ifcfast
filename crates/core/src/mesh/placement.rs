@@ -193,13 +193,7 @@ pub fn axis_placement_3d_f64(table: &EntityTable, id: u64) -> DMat4 {
     } else {
         z
     };
-    let mut x = ref_x.unwrap_or(DVec3::X);
-    x = (x - z * x.dot(z)).normalize_or_zero();
-    let x = if x.length_squared() < 1e-12 {
-        DVec3::X
-    } else {
-        x
-    };
+    let x = first_proj_axis_f64(z, ref_x);
     let y = z.cross(x);
 
     DMat4::from_cols(
@@ -258,6 +252,61 @@ fn direction_f64(table: &EntityTable, id: u64) -> Option<DVec3> {
     ))
 }
 
+/// IFC `IfcFirstProjAxis(ZAxis, Arg)` (the x-axis half of
+/// `IfcBuildAxes`), f64. `z` is the unit axis. `RefDirection` defaults to
+/// the global X — unless the axis is parallel to X, where the default is
+/// the global Y — and is orthonormalised against `z`:
+/// `x = normalise(ref − (ref·z) z)`. An explicit RefDirection parallel to
+/// the axis (invalid per the spec's `WR` rules) falls back to the same
+/// default instead of yielding a singular frame.
+///
+/// Before this helper the default was X in every case, so `Axis=(1,0,0)`
+/// with `RefDirection=$` produced x = X, y = z × x = 0 — a singular
+/// matrix that collapsed e.g. a bounded half-space's boundary to a line.
+/// Every frame that was non-singular before is built bit-identically.
+fn first_proj_axis_f64(z: DVec3, ref_x: Option<DVec3>) -> DVec3 {
+    let project = |v: DVec3| (v - z * v.dot(z)).normalize_or_zero();
+    if let Some(r) = ref_x {
+        let x = project(r);
+        if x.length_squared() >= 1e-12 {
+            return x;
+        }
+    }
+    let x = project(DVec3::X);
+    if x.length_squared() >= 1e-12 {
+        return x;
+    }
+    // Axis parallel to X: the spec's default is the global Y (already
+    // orthogonal to a ±X axis).
+    let y = project(DVec3::Y);
+    if y.length_squared() >= 1e-12 {
+        y
+    } else {
+        DVec3::X
+    }
+}
+
+/// f32 twin of [`first_proj_axis_f64`] for [`axis_placement_3d_from_id`].
+fn first_proj_axis_f32(z: Vec3, ref_x: Option<Vec3>) -> Vec3 {
+    let project = |v: Vec3| (v - z * v.dot(z)).normalize_or_zero();
+    if let Some(r) = ref_x {
+        let x = project(r);
+        if x.length_squared() >= 1e-12 {
+            return x;
+        }
+    }
+    let x = project(Vec3::X);
+    if x.length_squared() >= 1e-12 {
+        return x;
+    }
+    let y = project(Vec3::Y);
+    if y.length_squared() >= 1e-12 {
+        y
+    } else {
+        Vec3::X
+    }
+}
+
 /// Build the 4×4 from an `IfcAxis2Placement3D` (or 2D) by step_id.
 pub fn axis_placement_3d_from_id(table: &EntityTable, id: u64) -> Mat4 {
     let (type_name, args) = match table.get(id) {
@@ -311,13 +360,7 @@ pub fn axis_placement_3d_from_id(table: &EntityTable, id: u64) -> Mat4 {
     } else {
         z
     };
-    let mut x = ref_x.unwrap_or(Vec3::X);
-    x = (x - z * x.dot(z)).normalize_or_zero();
-    let x = if x.length_squared() < 1e-12 {
-        Vec3::X
-    } else {
-        x
-    };
+    let x = first_proj_axis_f32(z, ref_x);
     let y = z.cross(x);
 
     Mat4::from_cols(
@@ -419,6 +462,70 @@ END-ISO-10303-21;
             "the broken cycle must be counted, got {}",
             r.cycle_count()
         );
+    }
+
+    /// `IfcFirstProjAxis` defaults (GH #194 review). `#2`: Axis = X with
+    /// RefDirection `$` — the spec's default x is the global Y (the old
+    /// "always X" default gave y = X × X = 0, a singular frame). `#3`: the
+    /// all-default frame. `#4`: a RefDirection that is not orthogonal to
+    /// the axis is orthonormalised, `x = normalise(ref − (ref·z) z)`.
+    /// `#5`: an explicit RefDirection parallel to the axis falls back to
+    /// the default instead of a singular frame.
+    const FIRST_PROJ_AXIS_IFC: &str = r#"ISO-10303-21;
+HEADER;
+FILE_DESCRIPTION(('ViewDefinition [ReferenceView]'),'2;1');
+FILE_NAME('fpa.ifc','2026-09-28T00:00:00',('test'),('skiplum'),'ifcfast','ifcfast','');
+FILE_SCHEMA(('IFC4'));
+ENDSEC;
+DATA;
+#1=IFCCARTESIANPOINT((1.,2.,3.));
+#10=IFCDIRECTION((1.,0.,0.));
+#11=IFCDIRECTION((0.,1.,0.));
+#12=IFCDIRECTION((1.,1.,0.));
+#13=IFCDIRECTION((0.,0.,1.));
+#14=IFCDIRECTION((-1.,0.,0.));
+#2=IFCAXIS2PLACEMENT3D(#1,#10,$);
+#3=IFCAXIS2PLACEMENT3D(#1,$,$);
+#4=IFCAXIS2PLACEMENT3D(#1,#11,#12);
+#5=IFCAXIS2PLACEMENT3D(#1,#13,#13);
+#6=IFCAXIS2PLACEMENT3D(#1,#14,$);
+ENDSEC;
+END-ISO-10303-21;
+"#;
+
+    fn cols64(m: DMat4) -> [[f64; 3]; 4] {
+        let c = m.to_cols_array_2d();
+        [
+            [c[0][0], c[0][1], c[0][2]],
+            [c[1][0], c[1][1], c[1][2]],
+            [c[2][0], c[2][1], c[2][2]],
+            [c[3][0], c[3][1], c[3][2]],
+        ]
+    }
+
+    #[test]
+    fn first_proj_axis_defaults_match_the_spec() {
+        let table = EntityTable::build(FIRST_PROJ_AXIS_IFC.as_bytes());
+        let t = [1.0, 2.0, 3.0];
+        let cases: [(u64, [[f64; 3]; 4]); 5] = [
+            // Axis = X, Ref $ → x = Y, y = X × Y = Z, z = X.
+            (2, [[0., 1., 0.], [0., 0., 1.], [1., 0., 0.], t]),
+            // All defaults → identity rotation.
+            (3, [[1., 0., 0.], [0., 1., 0.], [0., 0., 1.], t]),
+            // Axis = Y, Ref (1,1,0) → x = X, y = Y × X = −Z.
+            (4, [[1., 0., 0.], [0., 0., -1.], [0., 1., 0.], t]),
+            // Ref parallel to Axis = Z → default x = X.
+            (5, [[1., 0., 0.], [0., 1., 0.], [0., 0., 1.], t]),
+            // Axis = −X, Ref $ → x = Y, y = −X × Y = −Z.
+            (6, [[0., 1., 0.], [0., 0., -1.], [-1., 0., 0.], t]),
+        ];
+        for (id, want) in cases {
+            let m64 = axis_placement_3d_f64(&table, id);
+            assert_eq!(cols64(m64), want, "f64 #{id}");
+            assert!(m64.determinant() > 0.5, "f64 #{id} singular");
+            let m32 = axis_placement_3d_from_id(&table, id);
+            assert_eq!(cols64(m32.as_dmat4()), want, "f32 #{id}");
+        }
     }
 
     #[test]

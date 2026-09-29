@@ -130,7 +130,15 @@ pub struct MeshQto {
     ///   provably too big, collapsed to ~0 against a real solid, or the
     ///   rep is degenerate. A tighter bound than the AABB; reproduces the
     ///   QTO-convention prism value tools like Solibri report for open
-    ///   slabs. The only `volume_reliable == false` method.
+    ///   slabs. A `volume_reliable == false` method.
+    /// - `"mesh_unclipped"`: the product's representation carries a
+    ///   half-space clip (`IfcBooleanClippingResult`) that could not be
+    ///   applied (GH #194 — non-planar base surface, unreadable boundary,
+    ///   or a bounded clip refused with no Manifold fallback). The mesh is
+    ///   the unclipped operand, so `volume_best_m3` is an UPPER bound, not
+    ///   the element volume. Set by [`mark_clip_unapplied`] (only over a
+    ///   mesh-derived method — a `"prism_fallback"` row keeps its name and
+    ///   is just marked unreliable); always `volume_reliable == false`.
     pub volume_method: &'static str,
     /// The best single volume estimate: the mesh volume when reliable,
     /// else the prism fallback (`volume_prism_bound_m3`). This is what
@@ -170,6 +178,21 @@ fn quantize_normal(nx: f32, ny: f32, nz: f32) -> (i32, i32, i32) {
         (ny * NORMAL_QUANT_SCALE).round() as i32,
         (nz * NORMAL_QUANT_SCALE).round() as i32,
     )
+}
+
+/// Downgrade a QTO row whose product carries an unapplied half-space
+/// clip (GH #194, [`crate::mesh::has_unapplied_clip`]): the mesh is the
+/// unclipped operand, so its volume is an upper bound. `volume_best_m3`
+/// is left as computed; the row is routed out of trusted sums. The
+/// method is relabelled `"mesh_unclipped"` only when the best volume
+/// actually came from the mesh (`"mesh"` / `"mesh_open"`); a prism
+/// fallback keeps its own method name (it is already unreliable and the
+/// label says which number is carried).
+pub fn mark_clip_unapplied(q: &mut MeshQto) {
+    q.volume_reliable = false;
+    if matches!(q.volume_method, "mesh" | "mesh_open") {
+        q.volume_method = "mesh_unclipped";
+    }
 }
 
 /// Compute QTO for one product. `unit_scale` is the IFC project's

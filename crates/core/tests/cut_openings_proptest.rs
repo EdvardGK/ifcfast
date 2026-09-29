@@ -189,6 +189,7 @@ fn build_pair_product_mesh(host: &Box3, cutter: &Box3) -> ProductMesh {
         mesh_anchor: [0.0; 3],
         surface_color: None,
         bounded_halfspaces: Vec::new(),
+        clip_unapplied: false,
     }
 }
 

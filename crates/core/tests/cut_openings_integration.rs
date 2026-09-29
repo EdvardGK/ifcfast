@@ -202,14 +202,33 @@ fn halfspace_clip_with_agreement_false_keeps_lower_half() {
         .find(|m| m.entity == "IfcWall")
         .expect("clipped wall must reach the sink");
 
-    let outcome = apply(&mut mesh, 1.0);
-    assert_eq!(outcome, Outcome::Cut);
+    // GH #194: the clip is the element's own shape — the extractor has
+    // already applied it (no cut mode needed), and no half-space cutter is
+    // left for `apply` to consume.
+    assert!(
+        mesh.segments
+            .iter()
+            .all(|s| !s.source.contains("halfspace")),
+        "the half-space must be consumed by the clip, got {:?}",
+        mesh.segments
+    );
     let m = csg::build_manifold(&mesh.vertices, &mesh.indices)
-        .expect("post-clip wall must be a closed manifold");
+        .expect("clipped wall must be a closed manifold");
     let vol = m.volume() * 1.0e-9_f64;
     assert!(
         (vol - 0.3).abs() < 0.02,
-        "expected ~0.3 m³ (lower half), got {vol} m³"
+        "expected ~0.3 m³ (lower half) WITHOUT cut mode, got {vol} m³"
+    );
+    let before = mesh.vertices.clone();
+    let outcome = apply(&mut mesh, 1.0);
+    assert_eq!(
+        outcome,
+        Outcome::Passthrough,
+        "no cutters left for cut mode"
+    );
+    assert_eq!(
+        mesh.vertices, before,
+        "cut mode must not move a clipped body"
     );
     // Bbox check: surviving half must be z ∈ [0, 1500].
     let mut zmax = f32::NEG_INFINITY;
@@ -319,14 +338,12 @@ fn deep_bcr_with_three_halfspaces_cuts_correctly() {
     // (1.0 source units), which suppressed cut-caps and over-reported;
     // the metre `unit_scale` 1.0 took the tiny band and stayed correct,
     // so this test never exercised the broken path.
-    let outcome = apply(&mut mesh, 0.001);
-    assert_eq!(
-        outcome,
-        Outcome::Cut,
-        "three sequential half-space clips must succeed via halfspace_clip"
-    );
+    //
+    // GH #194: the three clips are applied by the extractor itself (every
+    // mode); cut mode finds no cutter left.
     let m = csg::build_manifold(&mesh.vertices, &mesh.indices)
-        .expect("post-clip wall must remain a closed manifold");
+        .expect("clipped wall must remain a closed manifold");
+    assert_eq!(apply(&mut mesh, 0.001), Outcome::Passthrough);
     let vol = m.volume() * 1.0e-9_f64;
     let expected = 0.05_f64; // 500 × 50 × 2000 mm³
     assert!(
@@ -677,8 +694,9 @@ fn polygonal_bounded_uses_base_surface_position_normal() {
         .into_iter()
         .find(|m| m.entity == "IfcWall")
         .expect("wall must reach the sink");
-    let outcome = apply(&mut mesh, 1.0);
-    assert_eq!(outcome, Outcome::Cut);
+    // GH #194: clipped by the extractor in every mode; cut mode has
+    // nothing left to consume.
+    assert_eq!(apply(&mut mesh, 1.0), Outcome::Passthrough);
     let m = csg::build_manifold(&mesh.vertices, &mesh.indices)
         .expect("post-clip wall is a closed manifold");
     let vol_m3 = m.volume() * 1.0e-9_f64;
@@ -1195,59 +1213,33 @@ fn manifold_volume_m3(mesh: &ProductMesh) -> f64 {
     m.volume() * 1.0e-9_f64
 }
 
-/// W6 test 1 (DEFAULT build): the bounded halfspace now honors its
-/// bounding polygon even on the default cut path (GH #114, commit
-/// `add0465`). Before that fix the default path treated the cutter as an
-/// infinite plane and over-cut to ~0.20 m³ (only the slab above the plane
-/// survived); the default path now removes ONLY the 300×200 boundary
-/// column below the plane → 0.48 m³, matching the `prism-csg-fast`
-/// fast-path (the sibling test below) and the 3D-CSG oracle. The two
-/// builds therefore agree; the historical default-vs-feature divergence
-/// this test used to document is closed.
-#[cfg(not(feature = "prism-csg-fast"))]
+/// W6 / GH #194: the bounded halfspace honors its bounding polygon, and
+/// since GH #194 it does so INSIDE the extractor in every mode and every
+/// build (pure-Rust `mesh::bounded_clip`, no Manifold, no `cut_openings`):
+/// only the 300×200 boundary column below the plane is removed → 0.48 m³.
+/// The payload is consumed, so `cut_openings::apply` has nothing to do.
 #[test]
 fn tight_bounded_halfspace_default_honors_polygon() {
     let mut mesh = capture_wall_from(WALL_WITH_TIGHT_BOUNDED_HALFSPACE);
-    let outcome = apply(&mut mesh, 1.0);
-    assert_eq!(outcome, Outcome::Cut, "bounded halfspace must cut the wall");
+    assert!(
+        mesh.bounded_halfspaces.is_empty(),
+        "the bounded payload is consumed by the extractor clip (GH #194)",
+    );
     let vol = manifold_volume_m3(&mesh);
     assert!(
         (vol - 0.48).abs() < 0.02,
-        "default bounded-halfspace cut should honor the polygon → ~0.48 m³ \
-         (0.6 − 0.12 column, GH #114), got {vol} m³",
+        "no-cut extraction must honor the polygon → ~0.48 m³ \
+         (0.6 − 0.12 column), got {vol} m³",
     );
+    assert_eq!(apply(&mut mesh, 1.0), Outcome::Passthrough);
 }
 
-/// W6 test 2 (`prism-csg-fast`): the bounded fast-path removes only the
-/// boundary column below the plane → 0.48 m³ (the analytic correct cut).
-#[cfg(feature = "prism-csg-fast")]
-#[test]
-fn tight_bounded_halfspace_bounded_path_is_correct() {
-    let mut mesh = capture_wall_from(WALL_WITH_TIGHT_BOUNDED_HALFSPACE);
-    assert!(
-        !mesh.bounded_halfspaces.is_empty(),
-        "fixture must carry a bounded-halfspace payload",
-    );
-    let outcome = apply(&mut mesh, 1.0);
-    assert_eq!(outcome, Outcome::Cut, "bounded halfspace must cut the wall");
-    let vol = manifold_volume_m3(&mesh);
-    assert!(
-        (vol - 0.48).abs() < 0.02,
-        "bounded path should keep ~0.48 m³ (0.6 − 0.12 column), got {vol} m³",
-    );
-}
-
-/// W6 test 3 (oracle, `prism-csg-fast` + `csg`): build the EXACT bounded
-/// cutter solid (the 300×200 boundary extruded over the removed band
-/// Z∈[0,2000]) and subtract it from the host extrusion via manifold.
-/// The 2D fast-path result must match this independent 3D-CSG oracle
-/// within 1 %.
-#[cfg(feature = "prism-csg-fast")]
+/// Oracle: the extractor's pure-Rust bounded clip must match the EXACT
+/// bounded cutter (the 300×200 boundary extruded over Z∈[0,2000])
+/// subtracted from the host box by Manifold, within 1 %.
 #[test]
 fn tight_bounded_halfspace_matches_csg_oracle() {
-    // Fast-path result.
-    let mut fast = capture_wall_from(WALL_WITH_TIGHT_BOUNDED_HALFSPACE);
-    let _ = apply(&mut fast, 1.0);
+    let fast = capture_wall_from(WALL_WITH_TIGHT_BOUNDED_HALFSPACE);
     let fast_vol = manifold_volume_m3(&fast);
 
     // Oracle: host box X∈[-500,500] Y∈[-100,100] Z∈[0,3000] minus the
@@ -1265,7 +1257,7 @@ fn tight_bounded_halfspace_matches_csg_oracle() {
     );
     assert!(
         (fast_vol - oracle_vol).abs() / oracle_vol < 0.01,
-        "fast-path {fast_vol} m³ vs CSG oracle {oracle_vol} m³ — must agree within 1 %",
+        "extractor clip {fast_vol} m³ vs CSG oracle {oracle_vol} m³ — must agree within 1 %",
     );
 }
 
@@ -1288,7 +1280,6 @@ fn tight_bounded_halfspace_matches_csg_oracle() {
 // infinite clip removed ALL of Z<2000 across the full footprint —
 // over-cutting far past 0.40. The redesign evaluates every cutter
 // against the ORIGINAL prism, so both reduce in 2D.
-#[cfg(feature = "prism-csg-fast")]
 const WALL_WITH_TWO_TIGHT_BOUNDED_HALFSPACES: &str = r#"ISO-10303-21;
 HEADER;
 FILE_DESCRIPTION(('ViewDefinition [ReferenceView]'),'2;1');
@@ -1350,21 +1341,14 @@ END-ISO-10303-21;
 /// 0.40 m³, not the over-cut the old chaining path produced for the 2nd
 /// cutter. Cross-checked against a 3D-CSG oracle (host minus the two
 /// boundary columns).
-#[cfg(feature = "prism-csg-fast")]
 #[test]
 fn two_tight_bounded_halfspaces_both_apply() {
+    // GH #194: a chain of two bounded clips, each applied by the
+    // extractor at its own boolean level (the 2nd sees the 1st's result —
+    // the pure-Rust clip handles a non-prism host, so chaining is exact).
     let mut mesh = capture_wall_from(WALL_WITH_TWO_TIGHT_BOUNDED_HALFSPACES);
-    assert_eq!(
-        mesh.bounded_halfspaces.len(),
-        2,
-        "fixture must carry two bounded-halfspace payloads",
-    );
-    let outcome = apply(&mut mesh, 1.0);
-    assert_eq!(
-        outcome,
-        Outcome::Cut,
-        "two bounded halfspaces must cut the wall"
-    );
+    assert!(mesh.bounded_halfspaces.is_empty(), "payloads consumed");
+    assert_eq!(apply(&mut mesh, 1.0), Outcome::Passthrough);
     let vol = manifold_volume_m3(&mesh);
     assert!(
         (vol - 0.40).abs() < 0.02,
@@ -1396,7 +1380,6 @@ fn two_tight_bounded_halfspaces_both_apply() {
 // This guards against "fixing" the disjoint case into a fallback to the
 // infinite-plane clip: that clip ignores the boundary and would shear
 // off all of Z<2000 → 0.20 m³, the F6 over-cut. Uncut (0.6) is correct.
-#[cfg(feature = "prism-csg-fast")]
 const WALL_WITH_BOUNDED_HALFSPACE_MISSING_HOST: &str = r#"ISO-10303-21;
 HEADER;
 FILE_DESCRIPTION(('ViewDefinition [ReferenceView]'),'2;1');
@@ -1446,15 +1429,10 @@ END-ISO-10303-21;
 /// is entirely outside the host removes nothing — the wall stays at its
 /// full 0.6 m³. NOT 0.20 m³ (the infinite-clip over-cut you'd get by
 /// routing the disjoint case to the fallback plane clip).
-#[cfg(feature = "prism-csg-fast")]
 #[test]
 fn bounded_halfspace_missing_host_is_uncut() {
     let mut mesh = capture_wall_from(WALL_WITH_BOUNDED_HALFSPACE_MISSING_HOST);
-    assert_eq!(
-        mesh.bounded_halfspaces.len(),
-        1,
-        "fixture carries one payload"
-    );
+    assert!(mesh.bounded_halfspaces.is_empty(), "payload consumed");
     let _ = apply(&mut mesh, 1.0);
     let vol = manifold_volume_m3(&mesh);
     assert!(
@@ -1475,7 +1453,6 @@ fn bounded_halfspace_missing_host_is_uncut() {
 // Result: the whole Z<2000 side is removed → 0.20 m³, identical to the
 // default-build F6 behavior — confirming the payload-plane fallback is
 // equivalent to the old slab-plane fallback for the non-tight case.
-#[cfg(feature = "prism-csg-fast")]
 const WALL_WITH_OVERSIZED_BOUNDED_HALFSPACE: &str = r#"ISO-10303-21;
 HEADER;
 FILE_DESCRIPTION(('ViewDefinition [ReferenceView]'),'2;1');
@@ -1526,21 +1503,13 @@ END-ISO-10303-21;
 /// infinite clip via its EXACT payload plane (not a slab-derived one,
 /// not a geometric `drop_matching_plane` match). Removes all of Z<2000
 /// → 0.20 m³, identical to the default-build F6 result.
-#[cfg(feature = "prism-csg-fast")]
 #[test]
 fn oversized_bounded_halfspace_falls_back_via_payload_plane() {
+    // GH #194: the covering boundary takes `bounded_clip`'s route 1 —
+    // exactly the plane clip — inside the extractor.
     let mut mesh = capture_wall_from(WALL_WITH_OVERSIZED_BOUNDED_HALFSPACE);
-    assert_eq!(
-        mesh.bounded_halfspaces.len(),
-        1,
-        "fixture carries one payload"
-    );
-    let outcome = apply(&mut mesh, 1.0);
-    assert_eq!(
-        outcome,
-        Outcome::Cut,
-        "oversized bounded halfspace still cuts"
-    );
+    assert!(mesh.bounded_halfspaces.is_empty(), "payload consumed");
+    assert_eq!(apply(&mut mesh, 1.0), Outcome::Passthrough);
     let vol = manifold_volume_m3(&mesh);
     assert!(
         (vol - 0.20).abs() < 0.02,
@@ -1550,7 +1519,6 @@ fn oversized_bounded_halfspace_falls_back_via_payload_plane() {
 }
 
 /// Axis-aligned closed box as (vertices, indices), CCW outward winding.
-#[cfg(feature = "prism-csg-fast")]
 fn axis_box(min: [f32; 3], max: [f32; 3]) -> (Vec<f32>, Vec<u32>) {
     let v: Vec<f32> = vec![
         min[0], min[1], min[2], max[0], min[1], min[2], max[0], max[1], min[2], min[0], max[1],

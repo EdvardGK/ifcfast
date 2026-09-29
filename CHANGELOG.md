@@ -7,6 +7,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Clipping bodies are the element's own shape in every mode (GH #194,
+  cache schema v37).** A half-space second operand of an
+  `IfcBooleanClippingResult` (or `.DIFFERENCE.` `IfcBooleanResult`) —
+  `IfcHalfSpaceSolid`, `IfcBoxedHalfSpace`, `IfcPolygonalBoundedHalfSpace`
+  — is now applied inside the boolean evaluation, not only under
+  `cut_openings=True`. `meshes()` / `iter_meshes()` / `mesh()` /
+  `mesh_qto(cut_openings=False)` / `to_gltf()` / `point_cloud()` / `drift`
+  / the bundle substrate (and so `clash()`'s input) / the browser build all
+  carry the clipped solid; before, they saw the unclipped operand (G55_RIB:
+  18 of 38 clipped products off by > 0.1 %, up to +95 %, all
+  `volume_reliable=True`). Solid-operand differences and
+  `IfcRelVoidsElement` openings stay under `cut_openings` exactly as
+  before. The bounded case is pure Rust in every build, wasm included
+  (`mesh::bounded_clip`: the plane clip when the boundary covers the
+  element, else a convex-column subtraction with verified-closed caps);
+  native builds fall back to Manifold for non-convex / degenerate bounded
+  clips. The half-space is consumed — no `halfspace_*` stand-in segment is
+  emitted any more, so `keep_cutters=True` now returns the same as the
+  default (kept for compatibility). Clipped host parts are keyed by the
+  boolean node's step id (`rep_id` changes for those substrate rows; the
+  unstyled boolean inherits its first operand's colour). A clip that
+  cannot be applied is never silent: the host is left unclipped, tagged
+  `halfspace_unclipped` in its segment chain, given
+  `volume_reliable=False` / `volume_method="mesh_unclipped"`, and counted
+  in the new `halfspace_clip_unapplied` mesh stat (`halfspace_clip_manifold`
+  counts Manifold-resolved ones). Plain half-space planes are read exactly
+  from `BaseSurface.Position` instead of from the stand-in slab's centroid
+  (half a slab thickness off the plane).
+- **An unapplied half-space clip survives `cut_openings=True` (GH #194
+  review).** The fact is carried as `ProductMesh.clip_unapplied`, a typed
+  flag, instead of only the `halfspace_unclipped` segment token, which the
+  opening-cut pass collapses; before, an unresolvable clip plus an
+  `IfcRelVoidsElement` opening reported `volume_reliable=True` while
+  `halfspace_clip_unapplied` counted it. `volume_method="mesh_unclipped"`
+  now replaces only a mesh-derived method; a `prism_fallback` row keeps its
+  name and is just marked unreliable.
+- **`IfcAxis2Placement3D` with `RefDirection=$` follows `IfcFirstProjAxis`.**
+  The default x-axis is global X, or global Y when the Axis is parallel to
+  X. The old "always X" default gave a singular frame for Axis=(1,0,0),
+  which collapsed e.g. an `IfcPolygonalBoundedHalfSpace` boundary to a
+  line. Frames that were non-singular before are bit-identical (0 changed
+  products on G55_ARK / G55_RIB). ifcopenshell 0.8.5 deviates from the
+  spec for Axis=+X (x=+Z) and is singular for −X; ifcfast keeps the spec.
+
 ## [0.6.1] - 2026-09-28
 
 ### Fixed

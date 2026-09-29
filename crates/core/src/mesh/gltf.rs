@@ -1575,6 +1575,7 @@ mod material_naming_tests {
             mesh_anchor: [0.0; 3],
             surface_color: None,
             bounded_halfspaces: Vec::new(),
+            clip_unapplied: false,
         }
     }
 
@@ -1753,6 +1754,7 @@ mod far_origin_instancing_tests {
             mesh_anchor: anchor,
             surface_color: None,
             bounded_halfspaces: Vec::new(),
+            clip_unapplied: false,
         }
     }
 
@@ -1920,6 +1922,7 @@ mod quantization_extension_tests {
             mesh_anchor: [0.0; 3],
             surface_color: None,
             bounded_halfspaces: Vec::new(),
+            clip_unapplied: false,
         }
     }
 

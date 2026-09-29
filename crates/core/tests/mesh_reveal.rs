@@ -185,10 +185,10 @@ fn unhandled_representation_appears_as_labeled_bucket() {
 }
 
 /// Synthetic file modelling the Duplex pattern: a wall clipped by an
-/// `IfcPolygonalBoundedHalfSpace`. The second operand of the clipping
-/// result MUST surface as the compound tag
-/// `"boolean_second_operand|halfspace_bounded"` — losing either fact
-/// would violate reveal-all.
+/// `IfcPolygonalBoundedHalfSpace`. Since GH #194 the half-space is the
+/// element's own shape, not a revealed operand: it is consumed by the clip
+/// in every mode, the wall surfaces as `boolean_first_operand|extrusion`
+/// carrying the CLIPPED geometry, and no `halfspace_*` stand-in is emitted.
 const BOOLEAN_OVER_HALFSPACE_IFC: &str = r#"ISO-10303-21;
 HEADER;
 FILE_DESCRIPTION(('ViewDefinition [ReferenceView]'),'2;1');
@@ -225,31 +225,25 @@ END-ISO-10303-21;
 "#;
 
 #[test]
-fn boolean_over_halfspace_preserves_both_facts() {
+fn boolean_over_halfspace_consumes_the_clip() {
     let (meshes, _stats) = mesh_ifc(BOOLEAN_OVER_HALFSPACE_IFC.as_bytes());
     assert_eq!(meshes.len(), 1, "expected one wall");
     let wall = &meshes[0];
     let tags: Vec<&str> = wall.segments.iter().map(|s| s.source.as_str()).collect();
-
-    // The wall's bulk volume — first operand, leaf = extrusion.
-    assert!(
-        tags.contains(&"boolean_first_operand|extrusion"),
-        "wall bulk volume should surface as boolean_first_operand|extrusion, got {:?}",
-        tags
+    assert_eq!(
+        tags,
+        vec!["boolean_first_operand|extrusion"],
+        "the clipped host is the only fragment; the half-space is consumed"
     );
-    // The clip volume — second operand, leaf = halfspace_bounded:*.
-    // Since v0.4.32 the halfspace tag carries an `:agree` / `:disagree`
-    // suffix encoding `IfcPolygonalBoundedHalfSpace.AgreementFlag` so
-    // `cut_openings` can route the cutter through `mesh::halfspace_clip`
-    // on the correct side of the plane. Losing either fact (just
-    // `boolean_second_operand` or just `halfspace_bounded:*`) would
-    // mean the reveal-all stance leaked.
+    // Wall 1000×200×3000 mm; `.F.` on the z=0 plane removes z>0 inside
+    // the 200×200 boundary column → 0.6 − 0.12 = 0.48 m³, in no-cut mode.
+    let q = _core::mesh::qto::compute(&wall.vertices, &wall.indices, 0.001);
     assert!(
-        tags.iter().any(|t| *t == "boolean_second_operand|halfspace_bounded:agree"
-            || *t == "boolean_second_operand|halfspace_bounded:disagree"),
-        "clip volume should surface as boolean_second_operand|halfspace_bounded:{{agree|disagree}}, got {:?}",
-        tags
+        (q.volume_m3.abs() - 0.48).abs() < 1e-4,
+        "clipped wall volume {} m³, expected 0.48",
+        q.volume_m3
     );
+    assert_eq!(q.mesh_quality, "closed");
 }
 
 #[test]

@@ -20,6 +20,14 @@
 //! Reveal-all stance preserved: both paths are opt-in per call. The
 //! substrate writer never invokes them, so `instances.parquet` /
 //! `representations.parquet` keep their operand-by-operand fidelity.
+//!
+//! **GH #194:** half-space cutters (`IfcHalfSpaceSolid` / `IfcBoxedHalfSpace`
+//! / `IfcPolygonalBoundedHalfSpace` as a DIFFERENCE's second operand) no
+//! longer reach this pass — `boolean::boolean_result` applies them in every
+//! mode as the element's own shape. The half-space branches below only
+//! see a half-space left elsewhere in a tree (e.g. under a `.UNION.`
+//! operand); in practice this pass subtracts solid operands and
+//! `IfcRelVoidsElement` openings.
 
 use std::collections::{HashMap, HashSet};
 
@@ -1630,6 +1638,7 @@ mod tests {
             mesh_anchor: [0.0, 0.0, 0.0],
             surface_color: None,
             bounded_halfspaces: Vec::new(),
+            clip_unapplied: false,
         }
     }
 
@@ -1669,6 +1678,7 @@ mod tests {
             mesh_anchor: [0.0, 0.0, 0.0],
             surface_color: None,
             bounded_halfspaces: Vec::new(),
+            clip_unapplied: false,
         };
         let before_verts = mesh.vertices.clone();
         assert_eq!(apply(&mut mesh, 1.0), Outcome::Passthrough);

@@ -16,6 +16,7 @@
 //! human readers need to make decisions and surgically edit the model.
 
 pub mod boolean;
+pub mod bounded_clip;
 pub mod brep;
 pub mod csg_primitive;
 pub mod curveset;
@@ -386,6 +387,15 @@ pub struct ProductMesh {
     /// [`BoundedHalfspacePayload`]. Always-present (not cfg-gated) so
     /// constructors stay free of feature blocks.
     pub bounded_halfspaces: Vec<BoundedHalfspacePayload>,
+    /// `true` when at least one half-space clip in this product's
+    /// representation could not be applied (GH #194): the geometry
+    /// includes the UNCLIPPED operand, so every volume measured on it is
+    /// an upper bound. This flag is the source of truth for
+    /// [`has_unapplied_clip`] and the QTO downgrade — it survives the
+    /// `cut_openings` rewrite, which collapses `segments` to a single
+    /// `"cut_openings"` segment and clears `parts`. The
+    /// [`CLIP_UNAPPLIED_TAG`] segment token is informational only.
+    pub clip_unapplied: bool,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -402,6 +412,14 @@ pub struct MeshStats {
     pub products_emitted_geometryless: usize,
     pub triangles: usize,
     pub by_source: HashMap<String, usize>,
+    /// Products carrying at least one half-space clip that could not be
+    /// applied (GH #194) — their mesh is the unclipped operand and their
+    /// `volume_reliable` is `false`. See [`CLIP_UNAPPLIED_TAG`].
+    pub halfspace_clip_unapplied: usize,
+    /// Products with at least one bounded half-space clip computed by the
+    /// Manifold fallback instead of the pure-Rust route (always 0 in
+    /// builds without `csg`). See [`CLIP_MANIFOLD_TAG`].
+    pub halfspace_clip_manifold: usize,
     /// Model-wide global shift in MODEL UNITS, decided once per pass
     /// before the first emission — see [`ProductSink::on_global_shift`].
     /// `[0, 0, 0]` for a near-origin model, and also for a model whose
@@ -994,6 +1012,9 @@ fn tessellate_one(
     // (clip only the boundary column), and the `prism-csg-fast` fast-path
     // consumes them for its 2D region decomposition.
     let mut bounded_halfspaces: Vec<BoundedHalfspacePayload> = Vec::new();
+    // GH #194: carried as data, not only as a segment token — the cut
+    // pass rewrites `segments`, the flag survives it.
+    let mut clip_unapplied = false;
 
     for item_id in items {
         let fragments = mesh_item(table, item_id, shape_cache);
@@ -1007,6 +1028,9 @@ fn tessellate_one(
                     instance_transform,
                     bounded_halfspace,
                 } => {
+                    if roles.contains(&CLIP_UNAPPLIED_TAG) {
+                        clip_unapplied = true;
+                    }
                     let seg_index_start = combined_i.len() as u32;
                     let base = (combined_v.len() / 3) as u32;
                     let effective = world * instance_transform;
@@ -1245,6 +1269,7 @@ fn tessellate_one(
             mesh_anchor,
             surface_color: product_surface_color,
             bounded_halfspaces,
+            clip_unapplied,
         },
         triangle_count,
         segment_tags,
@@ -1345,6 +1370,13 @@ fn apply_outcome<S: ProductSink>(outcome: ProductOutcome, sink: &mut S, stats: &
         } => {
             stats.products_meshed += 1;
             stats.triangles += triangle_count;
+            let has_tag = |t: &str| segment_tags.iter().any(|s| s.split('|').any(|l| l == t));
+            if product.clip_unapplied {
+                stats.halfspace_clip_unapplied += 1;
+            }
+            if has_tag(CLIP_MANIFOLD_TAG) {
+                stats.halfspace_clip_manifold += 1;
+            }
             for tag in segment_tags {
                 *stats.by_source.entry(tag).or_insert(0) += 1;
             }
@@ -1421,6 +1453,7 @@ fn emit_geometryless<S: ProductSink>(
             mesh_anchor: world_origin,
             surface_color: None,
             bounded_halfspaces: Vec::new(),
+            clip_unapplied: false,
         });
     }
 }
@@ -1544,7 +1577,13 @@ pub(crate) fn mesh_item(
             }],
             None => Vec::new(),
         }
-    } else if type_name.eq_ignore_ascii_case(b"IFCHALFSPACESOLID") {
+    } else if type_name.eq_ignore_ascii_case(b"IFCHALFSPACESOLID")
+        || type_name.eq_ignore_ascii_case(b"IFCBOXEDHALFSPACE")
+    {
+        // Reached only for a half-space that is NOT the second operand of
+        // a DIFFERENCE (those are consumed by the clip in
+        // `boolean::boolean_result`, GH #194) — e.g. an operand of a
+        // UNION / INTERSECTION, kept reveal-all as before.
         match boolean::halfspace_solid(table, item_id) {
             Some((m, agreement)) => single(
                 Some(m),
@@ -1706,6 +1745,35 @@ fn bytes_to_string(b: &[u8]) -> String {
 }
 
 // ----------------------------------------------------------------------
+// Half-space clip provenance (GH #194)
+// ----------------------------------------------------------------------
+
+/// Segment-chain role marking a host fragment whose half-space clip could
+/// NOT be applied (non-`IfcPlane` base surface, unreadable boundary, or a
+/// bounded clip the pure-Rust route refused with no Manifold to fall back
+/// on). The fragment is the UNCLIPPED operand — an upper bound on the
+/// element — so the product's [`ProductMesh::clip_unapplied`] flag is set
+/// (the durable signal: `volume_reliable` forced `false`, counted in
+/// `MeshStats::halfspace_clip_unapplied`). The token itself is
+/// informational — `cut_openings` collapses segments and drops it.
+/// Never silent.
+pub const CLIP_UNAPPLIED_TAG: &str = "halfspace_unclipped";
+
+/// Segment-chain role marking a host fragment whose bounded half-space
+/// clip was computed by the Manifold fallback (non-convex footprint, or a
+/// degenerate incidence the pure-Rust route refused). The geometry IS
+/// clipped; the tag is telemetry (`MeshStats::halfspace_clip_manifold`).
+pub const CLIP_MANIFOLD_TAG: &str = "halfspace_clip_manifold";
+
+/// True when the product's geometry includes a half-space clip that was
+/// not applied — reads [`ProductMesh::clip_unapplied`], which survives
+/// the `cut_openings` segment rewrite (the [`CLIP_UNAPPLIED_TAG`] token
+/// in `segments` does not, and is informational only).
+pub fn has_unapplied_clip(mesh: &ProductMesh) -> bool {
+    mesh.clip_unapplied
+}
+
+// ----------------------------------------------------------------------
 // Synthetic-cutter stripping (GH #66)
 // ----------------------------------------------------------------------
 
@@ -1738,7 +1806,18 @@ pub fn is_synthetic_cutter_tag(tag: &str) -> bool {
 }
 
 /// Remove synthetic half-space cutter fragments from a tessellated
-/// product (GH #66). Runs **instead of** `cut_openings::apply` — apply
+/// product (GH #66).
+///
+/// **Since GH #194 this is a backstop, not the main path.** A half-space
+/// that is the second operand of a DIFFERENCE is consumed by the clip in
+/// [`boolean::boolean_result`] (the element's own shape, every mode), so
+/// no stand-in slab is emitted for it and there is nothing to strip. The
+/// strip still catches a half-space that sits elsewhere in a tree under a
+/// `boolean_second_operand` role (e.g. inside a `.UNION.` operand of a
+/// subtracted solid), which keeps the legacy slab. Solid-operand
+/// fragments are authored geometry and are never stripped.
+///
+/// Runs **instead of** `cut_openings::apply` — apply
 /// consumes the cutter fragments as cut payloads and removes them
 /// itself; this pass is for every path where the cut does NOT run
 /// (`cut_openings=False`, builds without the `csg` feature, the bundle
@@ -1885,6 +1964,7 @@ mod strip_cutter_tests {
             mesh_anchor: [0.0; 3],
             surface_color: None,
             bounded_halfspaces: Vec::new(),
+            clip_unapplied: false,
         }
     }
 
