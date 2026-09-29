@@ -1,7 +1,7 @@
 ## Agent signature
 - **Agent**: `claude-fable-5-1` (coordinator; opus agents for slice 3, slice 4, #205; sonnet for #204, #186, site sync)
 - **Working tree**: `/home/edkjo/workspace/inbox/ifcfast`
-- **Branch**: `main` @ `cb32539` → `2be3ad7` (commits: `1754d22` #204, `0a848cd` slice 3, `31053d6` #205, `e30026c` #186, `2be3ad7` slice 4)
+- **Branch**: `main` @ `cb32539` → `75693aa` (commits: `1754d22` #204, `0a848cd` slice 3, `31053d6` #205, `e30026c` #186, `2be3ad7` slice 4, `3a60d3a` #208, `4c52b02`+`fd405ea` test host-robustness, `12fbfde` release v0.6.1, + worklog commits)
 - **Session scope**: IDS slices 3–4 (PartOf facet, nests/groups/fills, IfcTester JSON, CLI/MCP/wasm) + #186/#204/#205 fixes, after the v0.6.0 release
 - **Touched paths**: crates/core/src/{indexer.rs,lib.rs,ids/**,doc/hotswap.rs,mesh/profile.rs}, crates/core/tests/ids_eval.rs + fixtures/ids/partof_relations.ifc, crates/wasm/{Cargo.toml,build.sh,src/{lib.rs,ids.rs,analysis.rs},test/{parity.mjs,ids_parity.mjs}}, python/ifcfast/{model,cache,header,ids,cli,mcp_server,whitelist,__init__}.py, AGENTS.md (+data copy), CHANGELOG.md, docs/ids/{facet-semantics-slice3.md,ambiguities.md}, docs/plans/2026-09-24_ids-validation-design.md, tests/{test_relations_192,test_ids_surfaces_192,test_hotswap,test_minor_batch_71,test_product_whitelist_parity_178,test_mcp_server}.py, tests/oracle/ids_json_parity.py, tests/fixtures/hotswap_body_tiers.ifc
 - **Parallel sessions observed**: none on origin/main
@@ -41,10 +41,10 @@ file ownership + `flock` on builds, then two more.
 - #192 epic: slices 1–4 done; slice 5 (G55 vs Solibri, needs Ed + release-build bench) open.
 
 ## Next
-1. Release **v0.6.1** (slices 3–4 + #186/#204/#205/#206) once CI on `2be3ad7` is green
-   and the site is synced to cache v36.
+1. ~~Release v0.6.1~~ DONE (see addendum). PyPI resolves `ifcfast==0.6.1` (confirmed 15:57 UTC).
 2. #194 still waits on Ed's contract choice.
-3. #207 (lazy IDS wasm), slice 5, then #187, #185, #182, #117, #191.
+3. #207 (lazy IDS wasm), IDS slice 5 (needs Ed's Solibri export), then #187, #185, #182, #117, #191.
+4. Ed by hand: `pr24-reply.md` on PR #24 + close; close PR #90.
 
 ## Release addendum
 
@@ -56,3 +56,9 @@ file ownership + `flock` on builds, then two more.
 - **v0.6.1** released: `12fbfde` tagged `v0.6.1`, GH release created from CHANGELOG
   0.6.1; PyPI publish via CI (check with `pip download ifcfast==0.6.1`; PyPI CDN lag of
   ~1 h was seen for 0.6.0).
+
+- **Closed:** v0.6.1 on PyPI (all 5 artifacts; `pip download ifcfast==0.6.1` resolved at
+  15:57 UTC, ~50 min after upload — PyPI index/CDN lag is normal, not a publish failure).
+- **Lesson (memory `platform-libm-tessellation` updated):** never pin a test to bit-identity
+  with an `f32::powi`-based computation across hosts; pin to the correctly rounded f64→f32
+  value and give the legacy path ulp slack.
