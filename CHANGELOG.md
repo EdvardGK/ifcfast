@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.2] - 2026-09-29
+
 ### Changed
 
 - **Clipping bodies are the element's own shape in every mode (GH #194,
