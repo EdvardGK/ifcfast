@@ -21,7 +21,28 @@ episodes where synthetic gates passed a real regression).
 - maturin gotcha: `env -u CONDA_PREFIX maturin develop` (fails when both
   VIRTUAL_ENV and CONDA_PREFIX are set).
 
-## Steps (fan out 3–5 as parallel agents once the .so is built)
+## The gate in one command (preferred)
+
+`scripts/ship_gate.sh <out-dir>` runs every step below as ONE chained,
+serialized script — Rust suite, csg-only check, release rebuild, cut and
+no-cut class sweeps on the four G55 models, the five Solibri clash truth
+rounds, mesh round-trip, corpus pytest — and prints `<step>_rc=` lines plus
+a final `DONE`. Run it detached and watch the log:
+
+```
+mkdir -p /tmp/gate && setsid nohup scripts/ship_gate.sh /tmp/gate > /tmp/gate/log.txt 2>&1 &
+```
+
+About 45 minutes on the release .so (the corpus pytest alone is 14 min on
+release vs 79 min on a debug build). Do NOT fan the sweeps out to parallel
+agents on this machine: four concurrent ifcopenshell processes OOM-killed a
+session (2026-09-06). Agents may edit Rust and run `cargo test` under
+`flock /tmp/ifcfast-build.lock` while a gate runs, but must not run
+`maturin develop` until the log shows `DONE` (it swaps the .so under the
+gate). Expected non-zero exit: a no-cut or cut sweep that drifted TOWARD 1.0
+because of the change under test — attribute it, then rewrite that baseline.
+
+## Steps (what the script does; run by hand only to debug one step)
 
 1. **Rust suite** (coordinator, serialized):
    `cargo test -p ifcfast-core` — plus the corpus-gated doc tests when
