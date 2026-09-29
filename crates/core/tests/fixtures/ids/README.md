@@ -28,3 +28,8 @@ own `Unit`, a type-inherited pset shadowed by the instance, a quantity
 with its own `Unit`, an IFC2X3 `IfcExtendedMaterialProperties`, and a
 unit assignment with SI, conversion-based, derived, monetary and
 offset (°C) units.
+
+`duplicate_pset_names.ifc` (and its `../ids_own/duplicate_pset_names.ids`, kept out of this walked tree) are also ifcfast's own (MIT): three
+walls carrying two `Pset_WallCommon` sets each, with `FireRating` in the
+second set only (A), the first only (B), or both with different values (C),
+and four Property specs over them (GH #193, `docs/ids/ambiguities.md` A47).

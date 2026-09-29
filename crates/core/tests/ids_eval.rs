@@ -972,3 +972,49 @@ fn ids_dump_ifctester_json_for_parity() {
         }
     }
 }
+
+// --------------------------------------------------------------------------
+// Several same-named property sets on one element (GH #193, jonatanjacobsson)
+// --------------------------------------------------------------------------
+
+/// Revit writes one `IfcPropertySet` per export rule, all named
+/// `Pset_WallCommon`. ifcfast evaluates a Property requirement against
+/// EVERY same-named set: required / optional pass when any set satisfies,
+/// prohibited fails when any set carries the property (A47). Stock
+/// IfcTester reads `get_psets()`, a dict keyed by pset name, so it sees one
+/// set (on this fixture the first in file order) and differs on A and C.
+/// Walls: A = FireRating only in the second set (EI60), B = only in the
+/// first (EI30), C = in both (EI30 first, EI60 second).
+#[test]
+fn ids_duplicate_pset_names_evaluate_every_set() {
+    const IFC_TEXT: &str = include_str!("fixtures/ids/duplicate_pset_names.ifc");
+    const IDS_TEXT: &str = include_str!("fixtures/ids_own/duplicate_pset_names.ids");
+    let buf = IFC_TEXT.as_bytes();
+    let table = EntityTable::build(buf);
+    let schema = schema_from_header(buf).unwrap_or_else(|e| panic!("{e}"));
+    let r = validate(IDS_TEXT.as_bytes(), &table, schema, OnUnsupported::Raise)
+        .unwrap_or_else(|e| panic!("{e}"));
+    // Specs: 0 required present, 1 required EI60, 2 prohibited, 3 optional EI60.
+    assert_eq!(r.specs.status, vec!["pass", "fail", "fail", "fail"]);
+    let rows: Vec<(i32, i64, &str)> = (0..r.failures.spec_index.len())
+        .map(|i| {
+            (
+                r.failures.spec_index[i],
+                r.failures.step_id[i],
+                r.failures.reason_code[i],
+            )
+        })
+        .collect();
+    assert_eq!(
+        rows,
+        vec![
+            // wall B: EI30 is the only value it carries
+            (1, 3, "PROP_VALUE_MISMATCH"),
+            // prohibited: every wall carries FireRating in SOME set
+            (2, 2, "PROHIBITED_PRESENT"),
+            (2, 3, "PROHIBITED_PRESENT"),
+            (2, 4, "PROHIBITED_PRESENT"),
+            (3, 3, "PROP_VALUE_MISMATCH"),
+        ]
+    );
+}

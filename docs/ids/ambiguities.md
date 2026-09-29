@@ -197,3 +197,14 @@ and labels).
 Not ambiguities, recorded so nobody re-derives them: `optional` on `<partOf>` and a single
 `IFCRELVOIDSELEMENT` / `IFCRELFILLSELEMENT` relation are both outside the IDS 1.0 XSD; both
 engines refuse them (`IdsInvalidError` / `IdsXmlValidationError`).
+
+## Duplicate same-named property sets, 2026-09-29
+
+Reported from a 416-model real-model sweep (GH #193 comment, jonatanjacobsson on #192). Fixture
+and specs: `crates/core/tests/fixtures/ids/duplicate_pset_names.ifc` + `fixtures/ids_own/duplicate_pset_names.ids` (the `ids/` tree is walked by `ids_xml.rs` as vendored); pinned by
+`ids_eval.rs` `ids_duplicate_pset_names_evaluate_every_set` and
+`tests/test_ids_duplicate_psets_193.py` (which also pins IfcTester 0.8.5's answers).
+
+| # | Point | IfcTester reading (source) | ifcfast | Pinning |
+|---|---|---|---|---|
+| A47 | One element with several `IfcPropertySet`s of the same `Name` (Revit writes one per export rule) | `get_psets()` returns a dict keyed by pset name, so only one same-named set is visible; on the fixture it is the first in file order, so the verdict depends on set order (`element.py` `get_psets`) | A Property requirement is evaluated against every same-named set. Required / optional: any set satisfying it satisfies the facet. Prohibited: must hold across all, so one set carrying the property fails it. (Observed engine behaviour equals this rule on all four specs x three walls; see the table in the test.) | `ids_eval.rs` `ids_duplicate_pset_names_evaluate_every_set`; `test_ids_duplicate_psets_193.py` |

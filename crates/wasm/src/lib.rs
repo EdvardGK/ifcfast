@@ -109,7 +109,11 @@ impl IfcModel {
     }
 
     /// `<prefix>.qto.json` — per-entity-class aggregates over the same
-    /// per-product mesh stats.
+    /// per-product mesh stats. `volume_m3` is the total;
+    /// `volume_reliable_m3` + `volume_unreliable_m3` split it, the latter
+    /// being products whose half-space clip could not be applied (their
+    /// volume is the unclipped operand's, an upper bound; GH #194/#211),
+    /// counted in `products_clip_unapplied`.
     #[wasm_bindgen(js_name = qtoJson)]
     pub fn qto_json(&mut self) -> String {
         self.inner.ensure_stats();
@@ -258,7 +262,8 @@ impl IfcModel {
     }
 
     /// Engine counters for the UI: products seen / meshed / deferred,
-    /// triangles, mesh milliseconds.
+    /// triangles, mesh milliseconds, and the two half-space clip counters
+    /// (`halfspace_clip_unapplied`, `halfspace_clip_manifold`; GH #211).
     #[wasm_bindgen(js_name = statsJson)]
     pub fn stats_json(&mut self) -> String {
         self.inner.ensure_stats();

@@ -149,6 +149,9 @@ pub struct DriftRow {
     pub volume_abs_m3: Option<f64>,
     pub max_extent_m: Option<f64>,
     pub triangle_count: u32,
+    /// The product's half-space clip was not applied (GH #194, #211):
+    /// its volume is the unclipped operand's, an upper bound.
+    pub clip_unapplied: bool,
 }
 
 #[derive(Default)]
@@ -157,6 +160,12 @@ pub struct MeshCounters {
     pub products_meshed: usize,
     pub products_deferred: usize,
     pub triangles: usize,
+    /// Products whose half-space clip could not be applied (GH #194):
+    /// mesh is the unclipped operand, volume an upper bound.
+    pub halfspace_clip_unapplied: usize,
+    /// Products clipped via the Manifold fallback (never in this build —
+    /// the wasm crate has no `csg` — but the counter is the wheel's).
+    pub halfspace_clip_manifold: usize,
     pub mesh_ms: f64,
     pub entity_table_ms: f64,
     pub by_source: Vec<(String, usize)>,
@@ -545,28 +554,15 @@ impl Analysis {
         // over first. Every extractor above returns owned columns.
         drop(table);
 
-        let mut materials_by_guid: HashMap<String, Vec<String>> = HashMap::new();
-        let mut layer_set_by_guid: HashMap<String, String> = HashMap::new();
-        for i in 0..materials_t.guid.len() {
-            let guid = &materials_t.guid[i];
-            let role = materials_t.role[i];
-            let mname = materials_t.material_name[i].clone().unwrap_or_default();
-            match role {
-                "layer" | "single" => {
-                    if role == "single" && mname.is_empty() {
-                        continue;
-                    }
-                    let bucket = materials_by_guid.entry(guid.clone()).or_default();
-                    if !mname.is_empty() && !bucket.contains(&mname) {
-                        bucket.push(mname);
-                    }
-                }
-                "set" if !mname.is_empty() => {
-                    layer_set_by_guid.insert(guid.clone(), mname);
-                }
-                _ => {}
-            }
-        }
+        // Every role the extractor emits (`direct`, `list`, `layer`,
+        // `constituent`, `profile`) contributes its name — deduped,
+        // first-seen order (GH #185). `unknown` (unresolvable
+        // association) has no name and is skipped. `layer_set_by_guid`
+        // stays empty: the public materials table carries no set-name
+        // column, so the per-product `layer_set` is null, as in the
+        // Python generator.
+        let materials_by_guid = roll_up_materials(&materials_t);
+        let layer_set_by_guid: HashMap<String, String> = HashMap::new();
 
         let mut pset_attrs: PsetAttrs = HashMap::new();
         for i in 0..psets_t.guid.len() {
@@ -863,6 +859,7 @@ fn drift_row(m: &ProductMesh, unit_scale: f64, unit_scale_f32: f32) -> DriftRow 
         volume_abs_m3: round10_opt(s.volume.abs() as f64 * us_vol),
         max_extent_m: round10_opt(s.max_extent as f64 * us_len),
         triangle_count: s.triangle_count,
+        clip_unapplied: mesh::has_unapplied_clip(m),
     }
 }
 
@@ -878,6 +875,8 @@ fn counters_from(mesh_stats: &mesh::MeshStats) -> MeshCounters {
         products_meshed: mesh_stats.products_meshed,
         products_deferred: mesh_stats.products_deferred,
         triangles: mesh_stats.triangles,
+        halfspace_clip_unapplied: mesh_stats.halfspace_clip_unapplied,
+        halfspace_clip_manifold: mesh_stats.halfspace_clip_manifold,
         mesh_ms: mesh_stats.elapsed_ms,
         entity_table_ms: mesh_stats.entity_table_build_ms,
         by_source,
@@ -1672,6 +1671,11 @@ impl Analysis {
             storeys: Vec<String>,
             area: f64,
             volume: f64,
+            // GH #211: `volume` = reliable + unreliable. Unreliable is
+            // the sum over products whose half-space clip was not applied.
+            volume_reliable: f64,
+            volume_unreliable: f64,
+            clip_unapplied: usize,
             triangles: u64,
             with_mesh: usize,
             without_mesh: usize,
@@ -1693,6 +1697,9 @@ impl Analysis {
                     storeys: Vec::new(),
                     area: 0.0,
                     volume: 0.0,
+                    volume_reliable: 0.0,
+                    volume_unreliable: 0.0,
+                    clip_unapplied: 0,
                     triangles: 0,
                     with_mesh: 0,
                     without_mesh: 0,
@@ -1714,8 +1721,16 @@ impl Analysis {
                     if let Some(v) = d.surface_area_m2 {
                         row.area += v;
                     }
+                    if d.clip_unapplied {
+                        row.clip_unapplied += 1;
+                    }
                     if let Some(v) = d.volume_abs_m3 {
                         row.volume += v;
+                        if d.clip_unapplied {
+                            row.volume_unreliable += v;
+                        } else {
+                            row.volume_reliable += v;
+                        }
                     }
                     row.triangles += d.triangle_count as u64;
                 }
@@ -1732,10 +1747,16 @@ impl Analysis {
             let r = &rows[k];
             let mut storeys = r.storeys.clone();
             storeys.sort();
-            let (area, volume, source) = if r.with_mesh == 0 {
-                (Value::Null, Value::Null, "none")
+            let (area, volume, vol_ok, vol_bad, source) = if r.with_mesh == 0 {
+                (Value::Null, Value::Null, Value::Null, Value::Null, "none")
             } else {
-                (json!(r.area), json!(r.volume), "mesh")
+                (
+                    json!(r.area),
+                    json!(r.volume),
+                    json!(r.volume_reliable),
+                    json!(r.volume_unreliable),
+                    "mesh",
+                )
             };
             out.push(json!({
                 "entity": r.entity,
@@ -1743,6 +1764,9 @@ impl Analysis {
                 "storeys": storeys,
                 "area_m2": area,
                 "volume_m3": volume,
+                "volume_reliable_m3": vol_ok,
+                "volume_unreliable_m3": vol_bad,
+                "products_clip_unapplied": r.clip_unapplied,
                 "triangles": r.triangles,
                 "products_with_mesh": r.with_mesh,
                 "products_without_mesh": r.without_mesh,
@@ -1970,12 +1994,35 @@ impl Analysis {
             "products_meshed": self.counters.products_meshed,
             "products_deferred": self.counters.products_deferred,
             "triangles": self.counters.triangles,
+            "halfspace_clip_unapplied": self.counters.halfspace_clip_unapplied,
+            "halfspace_clip_manifold": self.counters.halfspace_clip_manifold,
             "mesh_ms": self.counters.mesh_ms,
             "entity_table_ms": self.counters.entity_table_ms,
             "parse_seconds": self.parse_seconds,
             "size_bytes": self.size_bytes,
         })
     }
+}
+
+/// guid → material names, first-seen order, deduped. Mirrors
+/// `scripts/generate_sample_sidecars.py::_materials_by_guid` (GH #185).
+fn roll_up_materials(t: &materials::MaterialTable) -> HashMap<String, Vec<String>> {
+    let mut out: HashMap<String, Vec<String>> = HashMap::new();
+    for i in 0..t.guid.len() {
+        if !matches!(
+            t.role[i],
+            "direct" | "list" | "layer" | "constituent" | "profile"
+        ) {
+            continue;
+        }
+        let bucket = out.entry(t.guid[i].clone()).or_default();
+        if let Some(name) = t.material_name[i].as_deref() {
+            if !name.is_empty() && !bucket.iter().any(|b| b == name) {
+                bucket.push(name.to_string());
+            }
+        }
+    }
+    out
 }
 
 /// `scripts/generate_sample_sidecars.py::_slug`.
@@ -2637,5 +2684,84 @@ mod tests {
             "wallstandardcase-basic-wall-interior-partition-9"
         );
         assert_eq!(slugify("---"), "type");
+    }
+
+    // ----- GH #185: every material role reaches the per-product list ---
+    //
+    // `materials_roles_185.ifc` binds one product per role the extractor
+    // emits: an IfcMaterial (`direct`), a layer set, a profile set, a
+    // constituent set (with a repeated constituent name) and an
+    // IfcMaterialList. The old rollup matched `single`/`set`, which the
+    // extractor never emits, so only the layer wall survived.
+    #[test]
+    fn graph_materials_carry_every_role() {
+        let mut a = fixture("materials_roles_185.ifc");
+        a.ensure_stats();
+        let g = a.graph_json();
+        let of = |name: &str| -> Value {
+            g["products"]
+                .as_array()
+                .expect("products array")
+                .iter()
+                .find(|p| p["name"] == json!(name))
+                .unwrap_or_else(|| panic!("{name} in graph.products"))["materials"]
+                .clone()
+        };
+        assert_eq!(of("Wall-Direct"), json!(["Concrete"]));
+        assert_eq!(
+            of("Wall-Layered"),
+            json!(["GypsumLayer", "InsulationLayer"])
+        );
+        assert_eq!(of("Beam-Profiled"), json!(["SteelProfile"]));
+        // Three constituents, two distinct names: deduped, first-seen.
+        assert_eq!(of("Wall-Constituent"), json!(["Shell", "Core"]));
+        assert_eq!(of("Column-List"), json!(["Concrete", "Gypsum"]));
+        // No set-name column exists on the public table, so the link is null.
+        assert!(g["products"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|p| p["layer_set"].is_null()));
+    }
+
+    // ----- GH #211: clip counters + reliable/unreliable qto split -------
+    //
+    // `clip_unresolvable_opening_194.ifc`: a host whose half-space clip
+    // cannot be applied. The counter is 1 and the host's volume lands in
+    // `volume_unreliable_m3`, not `volume_reliable_m3`.
+    #[test]
+    fn unapplied_clip_is_counted_and_split_out_of_qto() {
+        let mut a = fixture("clip_unresolvable_opening_194.ifc");
+        a.ensure_stats();
+        let stats = a.stats_json();
+        assert_eq!(stats["halfspace_clip_unapplied"], json!(1));
+        assert_eq!(stats["halfspace_clip_manifold"], json!(0));
+        let q = a.qto_json();
+        let rows = q["rows"].as_array().expect("qto rows");
+        let bad: Vec<&Value> = rows
+            .iter()
+            .filter(|r| r["products_clip_unapplied"].as_u64().unwrap_or(0) > 0)
+            .collect();
+        assert_eq!(bad.len(), 1, "exactly one class carries the unclipped host");
+        let r = bad[0];
+        let total = r["volume_m3"].as_f64().unwrap();
+        let unrel = r["volume_unreliable_m3"].as_f64().unwrap();
+        let rel = r["volume_reliable_m3"].as_f64().unwrap();
+        assert!(unrel > 0.0);
+        assert!((rel + unrel - total).abs() < 1e-9);
+    }
+
+    #[test]
+    fn clean_model_has_zero_unreliable_volume() {
+        let mut a = fixture("clip_single_pbhs_194.ifc");
+        a.ensure_stats();
+        assert_eq!(a.stats_json()["halfspace_clip_unapplied"], json!(0));
+        for r in a.qto_json()["rows"].as_array().unwrap() {
+            assert_eq!(r["products_clip_unapplied"], json!(0));
+            if !r["volume_m3"].is_null() {
+                assert_eq!(r["volume_unreliable_m3"], json!(0.0));
+                assert_eq!(r["volume_reliable_m3"], r["volume_m3"]);
+            }
+        }
     }
 }

@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ids xmlns="http://standards.buildingsmart.org/IDS" xmlns:xs="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://standards.buildingsmart.org/IDS http://standards.buildingsmart.org/IDS/1.0/ids.xsd">
+  <info><title>Duplicate same-named property sets</title></info>
+  <specifications>
+    <specification name="required present" ifcVersion="IFC4">
+      <applicability minOccurs="1" maxOccurs="unbounded"><entity><name><simpleValue>IFCWALL</simpleValue></name></entity></applicability>
+      <requirements><property dataType="IFCLABEL" cardinality="required"><propertySet><simpleValue>Pset_WallCommon</simpleValue></propertySet><baseName><simpleValue>FireRating</simpleValue></baseName></property></requirements>
+    </specification>
+    <specification name="required EI60" ifcVersion="IFC4">
+      <applicability minOccurs="1" maxOccurs="unbounded"><entity><name><simpleValue>IFCWALL</simpleValue></name></entity></applicability>
+      <requirements><property dataType="IFCLABEL" cardinality="required"><propertySet><simpleValue>Pset_WallCommon</simpleValue></propertySet><baseName><simpleValue>FireRating</simpleValue></baseName><value><xs:restriction base="xs:string"><xs:enumeration value="EI60"/></xs:restriction></value></property></requirements>
+    </specification>
+    <specification name="prohibited" ifcVersion="IFC4">
+      <applicability minOccurs="1" maxOccurs="unbounded"><entity><name><simpleValue>IFCWALL</simpleValue></name></entity></applicability>
+      <requirements><property dataType="IFCLABEL" cardinality="prohibited"><propertySet><simpleValue>Pset_WallCommon</simpleValue></propertySet><baseName><simpleValue>FireRating</simpleValue></baseName></property></requirements>
+    </specification>
+    <specification name="optional EI60" ifcVersion="IFC4">
+      <applicability minOccurs="1" maxOccurs="unbounded"><entity><name><simpleValue>IFCWALL</simpleValue></name></entity></applicability>
+      <requirements><property dataType="IFCLABEL" cardinality="optional"><propertySet><simpleValue>Pset_WallCommon</simpleValue></propertySet><baseName><simpleValue>FireRating</simpleValue></baseName><value><xs:restriction base="xs:string"><xs:enumeration value="EI60"/></xs:restriction></value></property></requirements>
+    </specification>
+  </specifications>
+</ids>

@@ -130,7 +130,20 @@ def _container_collections(raw):
     return out
 
 
-def _qto_aggregates(per_product):
+def _clip_unapplied_guids(model):
+    """Guids whose half-space clip could not be applied (GH #194 / #211).
+
+    Their mesh is the unclipped operand, so the volume is an upper bound.
+    `mesh_qto` labels them `volume_method == "mesh_unclipped"`. (A product
+    that ALSO fell to the prism fallback keeps that label and is missed
+    here; the wasm build flags it from the mesh itself.)
+    """
+    products_df, _surfaces = model.mesh_qto(cut_openings=False)
+    hit = products_df[products_df["volume_method"] == "mesh_unclipped"]
+    return set(hit["guid"])
+
+
+def _qto_aggregates(per_product, clip_unapplied=frozenset()):
     """Per-entity-class aggregates derived from products + mesh stats.
 
     Replaces the hand-rolled duplex.qto.json. Now sourced from real
@@ -150,6 +163,9 @@ def _qto_aggregates(per_product):
             "storeys": set(),
             "area_m2": 0.0,
             "volume_m3": 0.0,
+            "volume_reliable_m3": 0.0,
+            "volume_unreliable_m3": 0.0,
+            "products_clip_unapplied": 0,
             "triangles": 0,
             "products_with_mesh": 0,
             "products_without_mesh": 0,
@@ -162,6 +178,8 @@ def _qto_aggregates(per_product):
             row["products_without_mesh"] += 1
             continue
         row["products_with_mesh"] += 1
+        if p.get("guid") in clip_unapplied:
+            row["products_clip_unapplied"] += 1
         # drift measure columns are unit-suffixed (surface_area_m2 /
         # volume_abs_m3 / max_extent_m); the pre-rename names .get() to
         # None and silently zero every aggregate.
@@ -171,6 +189,13 @@ def _qto_aggregates(per_product):
             row["area_m2"] += sa
         if isinstance(vol, (int, float)) and math.isfinite(vol):
             row["volume_m3"] += vol
+            # GH #211: a product whose half-space clip was not applied
+            # carries an upper-bound volume — kept in volume_m3 (the
+            # total), split out here.
+            if p.get("guid") in clip_unapplied:
+                row["volume_unreliable_m3"] += vol
+            else:
+                row["volume_reliable_m3"] += vol
         tc = ms.get("triangle_count")
         if isinstance(tc, (int, float)) and math.isfinite(tc):
             row["triangles"] += int(tc)
@@ -183,11 +208,39 @@ def _qto_aggregates(per_product):
         if r["products_with_mesh"] == 0:
             r["area_m2"] = None
             r["volume_m3"] = None
+            r["volume_reliable_m3"] = None
+            r["volume_unreliable_m3"] = None
             r["source"] = "none"
         else:
             r["source"] = "mesh"
         out.append(r)
     out.sort(key=lambda r: (-r["count"], r["entity"]))
+    return out
+
+
+# The roles `extractors/materials.rs` emits. `unknown` (an unresolvable
+# association, no name) is deliberately not a member.
+_MATERIAL_ROLES = ("direct", "list", "layer", "constituent", "profile")
+
+
+def _materials_by_guid(records):
+    """Roll `model.materials` rows up into `{guid: [material names]}`.
+
+    Every role the extractor emits contributes its `material_name`
+    (deduped, first-seen order). `layer_set` has no source: the public
+    table carries no set-name column, so the per-product `layer_set`
+    stays null (GH #185). `crates/wasm/src/analysis.rs` mirrors this
+    loop; `crates/wasm/test/parity.mjs` holds them together.
+    """
+    out: dict[str, list] = {}
+    for m in records:
+        guid = m.get("guid")
+        if not guid or m.get("role") not in _MATERIAL_ROLES:
+            continue
+        name = m.get("material_name") or ""
+        bucket = out.setdefault(guid, [])
+        if name and name not in bucket:
+            bucket.append(name)
     return out
 
 
@@ -204,32 +257,14 @@ def _build_graph(model, spaces, containers, mesh_stats_by_guid, pset_attrs_by_gu
     """
     products = []
     psets_by_guid: dict[str, list] = {}
-    mats_by_guid: dict[str, list] = {}
     layer_set_by_guid: dict[str, str | None] = {}
     typed_by_guid: dict[str, bool] = {}
     type_name_by_guid: dict[str, str | None] = {}
     type_source_by_guid: dict[str, str] = {}
 
-    # Materials → per-product list + layer_set link
+    # Materials → per-product list (see `_materials_by_guid`).
     layer_set_defs: dict[str, dict] = {}
-    for m in _df_to_records(model.materials):
-        guid = m.get("guid")
-        if not guid:
-            continue
-        role = m.get("role")
-        name = m.get("material_name") or ""
-        if role == "layer":
-            mats_by_guid.setdefault(guid, [])
-            if name and name not in mats_by_guid[guid]:
-                mats_by_guid[guid].append(name)
-            # Layer-set name — for now we only have layer thicknesses;
-            # group by guid as a synthetic set per product if needed
-        elif role == "single" and name:
-            mats_by_guid.setdefault(guid, [])
-            if name not in mats_by_guid[guid]:
-                mats_by_guid[guid].append(name)
-        elif role == "set" and name:
-            layer_set_by_guid[guid] = name
+    mats_by_guid = _materials_by_guid(_df_to_records(model.materials))
 
     # Layer-set definitions — group materials by set name
     for m in _df_to_records(model.materials):
@@ -493,7 +528,7 @@ def main():
         json.dumps({
             "schema": model.header.schema,
             "products": len(per_product),
-            "rows": _qto_aggregates(per_product),
+            "rows": _qto_aggregates(per_product, _clip_unapplied_guids(model)),
         }, default=_json_default, indent=2)
     )
     # ---- long-format data layers (GH #183) --------------------------

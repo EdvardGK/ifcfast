@@ -9,6 +9,8 @@
 //   * tests/fixtures/clip_single_pbhs_194.ifc — one
 //     IfcPolygonalBoundedHalfSpace clip → 37.7596 m³ (unclipped 38.9135)
 //   * tests/fixtures/clip_chain3_194.ifc — three chained clips → 23.8721 m³
+//   * tests/fixtures/clip_unresolvable_opening_194.ifc — a clip that
+//     cannot be applied (GH #211): counter 1, volume flagged unreliable
 
 import fs from 'node:fs';
 import path from 'node:path';
@@ -57,5 +59,52 @@ for (const [name, want] of cases) {
     );
   }
 }
+// GH #211: the unresolvable clip. The host stays unclipped, so the browser
+// build must say so: the counter in statsJson, and the class's volume
+// split out of the reliable total in qtoJson.
+{
+  const name = 'clip_unresolvable_opening_194.ifc';
+  const bytes = fs.readFileSync(path.join(repo, 'tests/fixtures', name));
+  const m = IfcModel.fromBytes(bytes, name);
+  const stats = JSON.parse(m.statsJson());
+  const rows = JSON.parse(m.qtoJson()).rows;
+  const bad = rows.filter((r) => r.products_clip_unapplied > 0);
+  const r = bad[0];
+  const ok =
+    stats.halfspace_clip_unapplied === 1 &&
+    stats.halfspace_clip_manifold === 0 &&
+    bad.length === 1 &&
+    r.volume_unreliable_m3 > 0 &&
+    Math.abs(r.volume_reliable_m3 + r.volume_unreliable_m3 - r.volume_m3) < 1e-9;
+  if (ok) {
+    pass += 1;
+    console.log(
+      `PASS  ${name}: halfspace_clip_unapplied=1, ${r.entity} volume_unreliable_m3=${r.volume_unreliable_m3}`,
+    );
+  } else {
+    fail += 1;
+    console.log(
+      `FAIL  ${name}: stats ${JSON.stringify(stats)}; unreliable rows ${JSON.stringify(bad)}`,
+    );
+  }
+  // A clean model reports nothing unreliable.
+  const clean = IfcModel.fromBytes(
+    fs.readFileSync(path.join(repo, 'tests/fixtures/clip_single_pbhs_194.ifc')),
+    'clip_single_pbhs_194.ifc',
+  );
+  const cs = JSON.parse(clean.statsJson());
+  const cr = JSON.parse(clean.qtoJson()).rows;
+  const cok =
+    cs.halfspace_clip_unapplied === 0 &&
+    cr.every((x) => x.products_clip_unapplied === 0 && !(x.volume_unreliable_m3 > 0));
+  if (cok) {
+    pass += 1;
+    console.log('PASS  clip_single_pbhs_194.ifc: no unapplied clip, volume_unreliable_m3 = 0');
+  } else {
+    fail += 1;
+    console.log(`FAIL  clean model flagged: ${JSON.stringify(cs)}`);
+  }
+}
+
 console.log(`\n${pass}/${pass + fail} checks passed`);
 process.exit(fail === 0 ? 0 : 1);

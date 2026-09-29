@@ -38,7 +38,9 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const repo = path.resolve(here, '../../..');
 const pkg = path.resolve(here, '../pkg');
 const SAMPLES = path.join(repo, '.local-samples');
-const SITE = '/home/edkjo/workspace/inbox/ifcfast-site/public/sample';
+// IFCFAST_SAMPLE_DIR points the gate at freshly regenerated sidecars (a
+// scratch dir) instead of the site checkout.
+const SITE = process.env.IFCFAST_SAMPLE_DIR ?? '/home/edkjo/workspace/inbox/ifcfast-site/public/sample';
 
 if (!fs.existsSync(path.join(pkg, 'ifcfast_wasm.js'))) {
   console.error(`pkg/ not built — run ${path.relative(repo, path.join(here, '../build.sh'))}`);
