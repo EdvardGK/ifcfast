@@ -39,7 +39,28 @@ episodes where synthetic gates passed a real regression).
    ```
    Exit 1 = a class drifted past tolerance. Cache files under
    `scratch/g55/cache/` are keyed by model name only — DELETE the cache
-   for a model before sweeping a new build, or you'll diff stale data.
+   for a model before sweeping a new build (or pass `--refresh-fast`,
+   which recomputes the ifcfast side and reuses cached ifcopenshell
+   volumes), or you'll diff stale data.
+
+   **Run BOTH modes** (GH #194 — the cut-only sweep let an unclipped-wall
+   bug ship in the no-cut contract used by `mesh()` / `meshes()` /
+   substrate / `clash()` / wasm):
+   ```
+   python -m tests.oracle.class_sweep scratch/g55/G55_ARK.ifc --mode nocut \
+       --cache-dir scratch/g55/cache_nocut \
+       --baseline scratch/g55/baselines/G55_ARK_nocut.json
+   ```
+   - `--mode cut` (default): `mesh_qto(cut_openings=True)` vs
+     ifcopenshell defaults (openings subtracted). Baselines
+     `baselines/<MODEL>.json`.
+   - `--mode nocut`: `mesh_qto(cut_openings=False)` vs ifcopenshell with
+     `disable-opening-subtractions=True` (openings off, the element's own
+     half-space clips still applied). Baselines
+     `baselines/<MODEL>_nocut.json`; cache file `<stem>_sweep_nocut.json`
+     so the modes never share a cache.
+   - One ifcopenshell process at a time — sweep models and modes
+     sequentially (parallel oracle runs OOM this machine).
 5. **Code review** (agent): review the diff with focus on winding/frame
    conventions, Polygon2D producers that bypass `profile::extract`, and
    cache-schema implications.

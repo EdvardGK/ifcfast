@@ -14,9 +14,27 @@ Usage (from the repo root, venv active)::
         [--write-baseline FILE]      # save this sweep as a new baseline
         [--tolerance 0.005]          # flag classes whose ratio moved more
         [--refresh-fast]             # new build: recompute ifcfast, keep cached ios
+        [--mode cut|nocut]           # which kernel contract to gate (default cut)
 
 Baselines for client corpora (e.g. G55) live OUTSIDE the repo — they are
-client data. Convention: ``scratch/<corpus>/baselines/<MODEL>.json``.
+client data. Convention: ``scratch/<corpus>/baselines/<MODEL>.json`` for
+cut mode and ``scratch/<corpus>/baselines/<MODEL>_nocut.json`` for nocut.
+
+Modes (GH #194)
+---------------
+``--mode cut`` (default, the historical sweep): ifcfast
+``mesh_qto(cut_openings=True)`` vs ifcopenshell DEFAULT settings (openings
+subtracted). Cache file ``<stem>_sweep.json``.
+
+``--mode nocut``: ifcfast ``mesh_qto(cut_openings=False)`` — the contract
+behind ``mesh()`` / ``meshes()`` / substrate / ``clash()`` / wasm — vs the
+same ifcopenshell iterator with ``disable-opening-subtractions=True``
+(IfcRelVoidsElement openings NOT subtracted, but the element's own
+IfcBooleanClippingResult half-space clips still applied). Cache file
+``<stem>_sweep_nocut.json`` so the two modes can never serve each other's
+data from a shared ``--cache-dir`` (GH #144 lesson). The cut-only sweep
+never gated this contract, which is how the #194 unclipped-wall bug
+shipped.
 
 Kernel contract mirrors :mod:`tests.oracle._geom_adapter`: DEFAULT
 ifcopenshell settings (openings applied, local coords — volume is
@@ -41,12 +59,15 @@ from collections import defaultdict
 from pathlib import Path
 
 
-def fast_volumes(ifc_path: Path) -> dict[str, dict]:
+MODES = ("cut", "nocut")
+
+
+def fast_volumes(ifc_path: Path, mode: str = "cut") -> dict[str, dict]:
     """ifcfast side: {guid: {entity, volume, mesh_quality, volume_method}}."""
     import ifcfast
 
     m = ifcfast.open(str(ifc_path))
-    prod, _surf = m.mesh_qto(cut_openings=True)
+    prod, _surf = m.mesh_qto(cut_openings=(mode == "cut"))
     out: dict[str, dict] = {}
     for _, r in prod.iterrows():
         v = r["volume_m3"]
@@ -59,7 +80,7 @@ def fast_volumes(ifc_path: Path) -> dict[str, dict]:
     return out
 
 
-def ios_volumes(ifc_path: Path) -> dict[str, dict]:
+def ios_volumes(ifc_path: Path, mode: str = "cut") -> dict[str, dict]:
     """ifcopenshell side: {guid: {entity, volume}} — single iterator pass."""
     import ifcopenshell
     import ifcopenshell.geom
@@ -77,6 +98,10 @@ def ios_volumes(ifc_path: Path) -> dict[str, dict]:
     # products both kernels actually emit, not the cuts one side consumed.
     subtractive = {e.GlobalId for e in f.by_type("IfcFeatureElementSubtraction")}
     settings = ifcopenshell.geom.settings()  # DEFAULT — no use-world-coords
+    if mode == "nocut":
+        # Openings (IfcRelVoidsElement) off; half-space clips stay on — the
+        # reference for ifcfast's cut_openings=False contract (GH #194).
+        settings.set("disable-opening-subtractions", True)
     it = ifcopenshell.geom.iterator(settings, f)
     out: dict[str, dict] = {}
     if not it.initialize():
@@ -175,15 +200,27 @@ def main() -> int:
         help="recompute the ifcfast side against a NEW build but reuse the "
         "cached ifcopenshell volumes (the slow half) — the cache is rewritten",
     )
+    ap.add_argument(
+        "--mode",
+        choices=MODES,
+        default="cut",
+        help="cut: mesh_qto(cut_openings=True) vs ifcopenshell defaults; "
+        "nocut: mesh_qto(cut_openings=False) vs ifcopenshell with "
+        "disable-opening-subtractions (GH #194). Baseline convention: "
+        "scratch/g55/baselines/<MODEL>_nocut.json",
+    )
     args = ap.parse_args()
 
+    suffix = "" if args.mode == "cut" else f"_{args.mode}"
     cache = (
-        args.cache_dir / f"{args.ifc.stem}_sweep.json" if args.cache_dir else None
+        args.cache_dir / f"{args.ifc.stem}_sweep{suffix}.json"
+        if args.cache_dir
+        else None
     )
     if cache and cache.exists() and args.refresh_fast:
         data = json.load(cache.open())
         ios = data["ios"]
-        fast = fast_volumes(args.ifc)
+        fast = fast_volumes(args.ifc, args.mode)
         print(f"ifcfast products: {len(fast)} (refreshed; ios from cache {cache})", flush=True)
         json.dump({"fast": fast, "ios": ios}, cache.open("w"))
     elif cache and cache.exists():
@@ -191,9 +228,9 @@ def main() -> int:
         fast, ios = data["fast"], data["ios"]
         print(f"loaded cached {cache}")
     else:
-        fast = fast_volumes(args.ifc)
+        fast = fast_volumes(args.ifc, args.mode)
         print(f"ifcfast products: {len(fast)}", flush=True)
-        ios = ios_volumes(args.ifc)
+        ios = ios_volumes(args.ifc, args.mode)
         print(f"ios products: {len(ios)}", flush=True)
         if cache:
             cache.parent.mkdir(parents=True, exist_ok=True)
@@ -202,7 +239,7 @@ def main() -> int:
 
     shared = set(fast) & set(ios)
     print(
-        f"\n=== {args.ifc.name}: shared guids {len(shared)}, "
+        f"\n=== {args.ifc.name} [mode={args.mode}]: shared guids {len(shared)}, "
         f"fast-only {len(set(fast) - set(ios))}, ios-only {len(set(ios) - set(fast))} ==="
     )
     agg = per_class(fast, ios)
