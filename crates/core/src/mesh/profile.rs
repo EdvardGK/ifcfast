@@ -81,6 +81,15 @@ pub fn area_preserving_scale(n: usize) -> f32 {
 /// pipe authored as two semicircles is as volume-exact as a circle
 /// profile; the arc's endpoints move radially by `(k − 1)·r`, a
 /// sub-millimetre jog where an arc meets a straight segment.
+///
+/// The `t > 1e-6` guard on the per-chord angle `t = sweep / n` stays an
+/// angle on purpose (GH #191 reviewed it): unlike `arc_span`'s coincidence
+/// test it makes no geometric decision. The factor is dimensionless and a
+/// function of `t` alone (`1 + t²/12 + …`), independent of the radius, so
+/// the unit is right. Below the guard the exact factor differs from 1 by
+/// under 1e-13 — far below the f32 ulp of 1.0 (1.2e-7), which is reached
+/// only at `t ≈ 1.2e-3` — so returning exactly 1.0 there is the f32-correct
+/// value, and the guard only keeps `0 / sin 0` out of `t = 0`.
 pub fn arc_area_scale(sweep: f32, n: usize) -> f32 {
     let n = n.max(1) as f32;
     let t = sweep.abs() / n;
@@ -581,7 +590,11 @@ fn conic_arc(
         fields.get(3).copied().map(parse_field),
         Some(Field::Enum(b"T"))
     );
-    let (start, end) = arc_span(a1, a2, sense)?;
+    // Coincidence is judged on arc length (GH #191): the larger semi-axis
+    // bounds the arc length per radian from above, so "shorter than the
+    // tolerance" is never claimed for an arc that is not.
+    let coincident = COINCIDENT_TRIM_M / length_scale(table) as f64;
+    let (start, end) = arc_span(a1, a2, sense, a.abs().max(b.abs()), coincident)?;
     let sweep = (end - start).abs();
     // Segments per full turn from the larger semi-axis (GH #170), scaled
     // by the swept angle. Deliberately the same f32 rounding as before the
@@ -850,8 +863,36 @@ pub(crate) fn resolve_plane_angle_scale_opt(table: &EntityTable) -> Option<f32> 
     None
 }
 
+/// Arc length, in **metres**, at or below which two conic trims are
+/// "coincident" and the trimmed curve is read as a full revolution
+/// (GH #191). Converted to model units by the file's length scale.
+///
+/// Why a length, and why 1 µm:
+///
+/// * The question "do the two trims name the same point?" is about
+///   points, so its tolerance is a distance. An angular epsilon means a
+///   different distance on every circle: GH #190's 1e-6 rad was 6.5 m of
+///   arc on a 6.5e6 m Geometry Gym circle, and its 1e-9 rad successor
+///   still swallowed any authored arc under 6.5 mm there.
+/// * Lower bound — it must absorb the noise of genuinely coincident
+///   trims: the same `IfcCartesianPoint` referenced twice gives an exact
+///   zero; `(0, 2π)` parameter trims round to ~1e-15 rad (1.6e-8 m of arc
+///   even on a 1.6e7 m circle); trims quoted to 6 decimals in metres
+///   differ by < 5e-7 m.
+/// * Upper bound — it must sit below any arc a building model means:
+///   the smallest authored features are tenths of a millimetre, and the
+///   chord sampler's own sagitta tolerance is 0.5 mm. 1 µm leaves
+///   2–3 orders of margin on both sides.
+/// * Not `IfcGeometricRepresentationContext.Precision`: exporters write
+///   anything from 1e-8 to 0.01 there, with no consistent unit reading
+///   (Revit's 0.01 would be 1 cm in a metre file — it would promote a
+///   5 mm authored arc to a full turn), and the context is not in scope
+///   of a profile curve.
+pub(crate) const COINCIDENT_TRIM_M: f64 = 1.0e-6;
+
 /// Directed angular span `[start, end]` from `a1` to `a2`. `sense == true`
-/// sweeps CCW (increasing angle), `false` CW; a1 == a2 yields a full turn.
+/// sweeps CCW (increasing angle), `false` CW; trims closer than
+/// `coincident_len` of arc (on radius `radius`) yield a full turn.
 ///
 /// `None` for non-finite input (GH #160). This used to be a
 /// `while e += TAU` walk, which never terminates once `|a1|` exceeds
@@ -859,24 +900,23 @@ pub(crate) fn resolve_plane_angle_scale_opt(table: &EntityTable) -> Option<f32> 
 /// hangs outright on an infinite or NaN trim angle. The modular form
 /// below is O(1) and total.
 ///
-/// `EPS` is the "coincident trims → full revolution" threshold, and it is
-/// an *absolute angular* epsilon, which is the wrong unit for a sweep on a
-/// huge circle: GH #190's Geometry Gym beams trim circles of radius
-/// 6.5e6 m, where the old `EPS = 1e-6` rad is 6.5 m of arc — the entire
-/// real edge. Six such arcs in one file were promoted to full 41 000 km
-/// circles. 1e-9 rad keeps the behaviour (authored `(0, 2π)` and `(a, a)`
-/// still give a full turn) while sitting far below any real arc: f64 trim
-/// angles recovered from authored parameters, or from cartesian points
-/// quoted to 1e-8, carry only ~1e-14 rad of noise.
-fn arc_span(a1: f64, a2: f64, sense: bool) -> Option<(f64, f64)> {
+/// The "coincident trims → full revolution" test compares the swept
+/// **arc length** `delta · radius` against `coincident_len` (both in
+/// model units, see [`COINCIDENT_TRIM_M`]), not the angle (GH #191).
+/// GH #190 lowered an absolute 1e-6 rad epsilon to 1e-9 rad; that closed
+/// the corpus cases but was still the wrong unit — 6.5 mm of arc on a
+/// 6.5e6 m circle. `radius` is the larger semi-axis for an ellipse (an
+/// upper bound on the arc length per radian). An exact zero residue is a
+/// full turn whatever the radius.
+fn arc_span(a1: f64, a2: f64, sense: bool, radius: f64, coincident_len: f64) -> Option<(f64, f64)> {
     use std::f64::consts::TAU;
-    const EPS: f64 = 1e-9;
     if !a1.is_finite() || !a2.is_finite() {
         return None;
     }
     // Distance to walk from a1, in the swept direction, modulo a full
-    // turn. A residue at (or within EPS of) zero means the trims
-    // coincide → a full revolution, matching the old loop's behaviour.
+    // turn. A residue whose arc is at (or within `coincident_len` of) zero
+    // means the trims coincide → a full revolution, matching the old
+    // loop's behaviour.
     let mut delta = if sense {
         (a2 - a1).rem_euclid(TAU)
     } else {
@@ -885,7 +925,7 @@ fn arc_span(a1: f64, a2: f64, sense: bool) -> Option<(f64, f64)> {
     if !delta.is_finite() {
         return None;
     }
-    if delta <= EPS {
+    if delta == 0.0 || delta * radius.abs() <= coincident_len {
         delta = TAU;
     }
     if sense {
@@ -1351,25 +1391,127 @@ END-ISO-10303-21;
     #[test]
     fn arc_span_is_modular_and_total() {
         use std::f64::consts::{PI, TAU};
-        let (s, e) = arc_span(0.0, PI, true).unwrap();
+        const R: f64 = 1.0;
+        const TOL: f64 = COINCIDENT_TRIM_M;
+        let (s, e) = arc_span(0.0, PI, true, R, TOL).unwrap();
         assert!((s - 0.0).abs() < 1e-5 && (e - PI).abs() < 1e-5);
         // Coincident trims → a full turn, in both senses.
-        let (_, e) = arc_span(1.0, 1.0, true).unwrap();
+        let (_, e) = arc_span(1.0, 1.0, true, R, TOL).unwrap();
         assert!((e - (1.0 + TAU)).abs() < 1e-4);
-        let (_, e) = arc_span(1.0, 1.0, false).unwrap();
+        let (_, e) = arc_span(1.0, 1.0, false, R, TOL).unwrap();
         assert!((e - (1.0 - TAU)).abs() < 1e-4);
         // CCW to a *smaller* angle wraps forward by a full turn.
-        let (_, e) = arc_span(0.0, -PI, true).unwrap();
+        let (_, e) = arc_span(0.0, -PI, true, R, TOL).unwrap();
         assert!((e - PI).abs() < 1e-4, "got {e}");
         // CW to a *larger* angle wraps backward.
-        let (_, e) = arc_span(0.0, PI, false).unwrap();
+        let (_, e) = arc_span(0.0, PI, false, R, TOL).unwrap();
         assert!((e + PI).abs() < 1e-4, "got {e}");
         // Non-finite input is rejected, never looped on.
-        assert!(arc_span(f64::INFINITY, 0.0, true).is_none());
-        assert!(arc_span(0.0, f64::NAN, true).is_none());
+        assert!(arc_span(f64::INFINITY, 0.0, true, R, TOL).is_none());
+        assert!(arc_span(0.0, f64::NAN, true, R, TOL).is_none());
         // A huge angle terminates (the old `while e += TAU` never did:
         // TAU is below the f32 ULP at this magnitude).
-        assert!(arc_span(2.0e8, 2.0e8, true).is_some());
+        assert!(arc_span(2.0e8, 2.0e8, true, R, TOL).is_some());
+    }
+
+    /// GH #191: coincidence is an arc LENGTH. On the 6.5e6 m circles
+    /// Geometry Gym authors, a 5 mm arc sweeps 7.7e-10 rad — under the
+    /// old 1e-9 rad rule, which promoted it to a 41 000 km full turn.
+    #[test]
+    fn arc_span_coincidence_is_an_arc_length() {
+        use std::f64::consts::TAU;
+        const R: f64 = 6.5e6;
+        let tol = COINCIDENT_TRIM_M;
+        let sweep_of = |a1: f64, a2: f64, r: f64| {
+            let (s, e) = arc_span(a1, a2, true, r, tol).unwrap();
+            (e - s).abs()
+        };
+        // 5 mm of arc on the huge circle stays a 5 mm arc.
+        let five_mm = 0.005 / R;
+        assert!(
+            five_mm < 1e-9,
+            "fixture must sit under the old angular rule"
+        );
+        let got = sweep_of(1.0, 1.0 + five_mm, R);
+        assert!(
+            (got * R - 0.005).abs() < 1e-9,
+            "5 mm arc became {} m of arc",
+            got * R
+        );
+        // True zero sweep: full revolution, as always.
+        assert_eq!(sweep_of(1.0, 1.0, R), TAU);
+        // A sweep below the tolerance (0.5 µm of arc): full revolution.
+        assert_eq!(sweep_of(1.0, 1.0 + 0.5e-6 / R, R), TAU);
+        // The same rule on an ordinary 1 m circle: 2 µm stays an arc,
+        // 0.5 µm is coincident.
+        assert!((sweep_of(1.0, 1.0 + 2e-6, 1.0) - 2e-6).abs() < 1e-12);
+        assert_eq!(sweep_of(1.0, 1.0 + 0.5e-6, 1.0), TAU);
+    }
+
+    /// A trimmed-circle IFC whose trims are two cartesian points `half`
+    /// either side of the apex of an `r`-radius circle centred at
+    /// `(0, -r)` — a chord of `2·half` through the origin. `unit` is the
+    /// `IfcSIUnit` prefix (`$` = metres, `.MILLI.`).
+    fn huge_arc_ifc(unit: &str, r: f64, half: f64, same_point: bool) -> String {
+        let t2 = if same_point { "#20" } else { "#21" };
+        format!(
+            "ISO-10303-21;\nHEADER;\nFILE_DESCRIPTION(('ViewDefinition [ReferenceView]'),'2;1');\n\
+FILE_NAME('arc191.ifc','2026-09-29T00:00:00',('test'),('skiplum'),'ifcfast','ifcfast','');\n\
+FILE_SCHEMA(('IFC4'));\nENDSEC;\nDATA;\n\
+#1=IFCUNITASSIGNMENT((#2,#3));\n\
+#2=IFCSIUNIT(*,.LENGTHUNIT.,{unit},.METRE.);\n\
+#3=IFCSIUNIT(*,.PLANEANGLEUNIT.,$,.RADIAN.);\n\
+#10=IFCCARTESIANPOINT((0.,{c:.1}));\n\
+#11=IFCDIRECTION((1.,0.));\n\
+#12=IFCAXIS2PLACEMENT2D(#10,#11);\n\
+#13=IFCCIRCLE(#12,{r:.1});\n\
+#20=IFCCARTESIANPOINT(({half},0.));\n\
+#21=IFCCARTESIANPOINT(({neg},0.));\n\
+#30=IFCTRIMMEDCURVE(#13,(#20),({t2}),.T.,.CARTESIAN.);\n\
+ENDSEC;\nEND-ISO-10303-21;\n",
+            c = -r,
+            neg = -half,
+        )
+    }
+
+    fn extent(pts: &[Vec2]) -> f32 {
+        let (mut lo, mut hi) = (Vec2::splat(f32::INFINITY), Vec2::splat(f32::NEG_INFINITY));
+        for p in pts {
+            lo = lo.min(*p);
+            hi = hi.max(*p);
+        }
+        (hi - lo).max_element()
+    }
+
+    /// GH #191 end to end: a trimmed arc on a 6.5e6 m circle with a 5 mm
+    /// chord stays a 5 mm arc (before: a full 41 000 km circle), in a
+    /// metre file and in the same geometry authored in millimetres (the
+    /// tolerance follows the length unit). Coincident trims — the same
+    /// point referenced twice — still give the full circle.
+    #[test]
+    fn five_millimetre_arc_on_a_huge_circle_stays_an_arc() {
+        for (unit, k) in [("$", 1.0_f64), (".MILLI.", 1000.0)] {
+            let arc = huge_arc_ifc(unit, 6.5e6 * k, 0.0025 * k, false);
+            let table = EntityTable::build(arc.as_bytes());
+            let pts = curve_to_polyline(&table, 30).expect("arc resolves");
+            let span = extent(&pts) as f64 / k;
+            assert!(
+                (span - 0.005).abs() < 1e-4,
+                "{unit}: 5 mm arc spans {span} m ({} points)",
+                pts.len()
+            );
+            let chord = (pts[0] - pts[pts.len() - 1]).length() as f64 / k;
+            assert!((chord - 0.005).abs() < 1e-4, "{unit}: chord {chord} m");
+
+            let full = huge_arc_ifc(unit, 6.5e6 * k, 0.0025 * k, true);
+            let table = EntityTable::build(full.as_bytes());
+            let pts = curve_to_polyline(&table, 30).expect("full circle resolves");
+            let span = extent(&pts) as f64 / k;
+            assert!(
+                span > 1.2e7,
+                "{unit}: coincident trims must give the full circle, spans {span} m"
+            );
+        }
     }
 
     /// GH #190: a sub-microradian sweep is a real arc, not a coincident
@@ -1384,7 +1526,9 @@ END-ISO-10303-21;
     #[test]
     fn arc_span_keeps_a_sub_microradian_sweep() {
         use std::f64::consts::{PI, TAU};
-        let (s, e) = arc_span(9.7179201739999999e-7, 0.0, false).unwrap();
+        const R: f64 = 6514797.5921052601;
+        const TOL: f64 = COINCIDENT_TRIM_M;
+        let (s, e) = arc_span(9.7179201739999999e-7, 0.0, false, R, TOL).unwrap();
         let sweep = (e - s).abs();
         assert!(
             (sweep - 9.7179201739999999e-7).abs() < 1e-15,
@@ -1392,12 +1536,12 @@ END-ISO-10303-21;
         );
         // The full-revolution convention survives for genuinely
         // coincident trims, authored either way round.
-        let (s, e) = arc_span(0.0, TAU, true).unwrap();
+        let (s, e) = arc_span(0.0, TAU, true, R, TOL).unwrap();
         assert!(((e - s).abs() - TAU).abs() < 1e-12, "got {}", e - s);
-        let (s, e) = arc_span(1.0, 1.0, true).unwrap();
+        let (s, e) = arc_span(1.0, 1.0, true, R, TOL).unwrap();
         assert!(((e - s).abs() - TAU).abs() < 1e-12, "got {}", e - s);
         // And an ordinary half turn is untouched.
-        let (s, e) = arc_span(0.0, PI, true).unwrap();
+        let (s, e) = arc_span(0.0, PI, true, R, TOL).unwrap();
         assert!(((e - s).abs() - PI).abs() < 1e-12, "got {}", e - s);
     }
 }

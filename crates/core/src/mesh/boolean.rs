@@ -29,12 +29,12 @@
 //!                                   consumer knows this is a finite
 //!                                   stand-in for an unbounded volume.
 
-use glam::{Mat4, Vec2, Vec3};
+use glam::{DMat3, DMat4, DVec2, DVec3, Mat4, Vec2, Vec3};
 
 use crate::entity_table::EntityTable;
 use crate::lexer::{parse_field, split_top_level_args, Field};
 use crate::mesh::extrusion::{extrude_polygon, LocalMesh};
-use crate::mesh::placement::axis_placement_3d_from_id;
+use crate::mesh::placement::{axis_placement_3d_f64, axis_placement_3d_from_id};
 use crate::mesh::profile::Polygon2D;
 use crate::mesh::{BoundedHalfspacePayload, MeshFragment};
 
@@ -134,15 +134,58 @@ pub fn boolean_result(
     out
 }
 
+/// Distance from the origin, in **metres**, beyond which a half-space
+/// clip is evaluated on its f64 path (GH #210). Same threshold and the
+/// same reason as the model-wide global shift in [`crate::mesh::rebase`]:
+/// below 10 km an `f32` coordinate resolves ~1 mm or better, so the legacy
+/// `f32` placement read is kept there and near-origin output stays
+/// bit-identical. Beyond it the `f32` ulp grows to 0.5 m at 6.5e6 m, which
+/// is what quantised the plane of a UTM-baked brep's clip.
+const FAR_ORIGIN_M: f64 = 1.0e4;
+
+/// `true` when any component of `v` (model units) lies beyond
+/// [`FAR_ORIGIN_M`] once scaled to metres by `scale`.
+fn is_far(v: DVec3, scale: f64) -> bool {
+    v.abs().max_element() * scale > FAR_ORIGIN_M
+}
+
+/// A half-space cutting plane in f64 (GH #210): `point` on the plane and
+/// the unit `normal` pointing into the REMOVED side, both in the boolean's
+/// operand frame. Carried in f64 from the placement read to the frame
+/// pull-back in `clip_fragment`, which narrows to `f32` only once the
+/// plane is expressed in the fragment's near-origin local frame.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CutPlane {
+    pub point: DVec3,
+    pub normal: DVec3,
+}
+
+/// An `IfcPolygonalBoundedHalfSpace`, resolved for the clip (GH #194,
+/// f64 since GH #210).
+#[derive(Debug, Clone)]
+pub(crate) struct BoundedCut {
+    pub plane: CutPlane,
+    /// Boundary polygon in its `Position` frame. On the far path the ring
+    /// is rebased by its first vertex (subtracted in f64) so the `f32`
+    /// points stay small; the offset is folded into `boundary_xform`.
+    pub boundary: Polygon2D,
+    /// Maps `boundary` points (`z = 0`) into the operand frame.
+    pub boundary_xform: DMat4,
+    /// Any input of this cut lies beyond [`FAR_ORIGIN_M`]: compose the
+    /// boundary frame in f64 (`false` keeps the legacy `f32` compose, so
+    /// near-origin output is bit-identical).
+    pub far: bool,
+}
+
 /// A half-space second operand, resolved to what the clip needs (GH #194).
 #[derive(Debug, Clone)]
 pub(crate) enum HalfspaceCut {
     /// `IfcHalfSpaceSolid` / `IfcBoxedHalfSpace`: remove the side
     /// `normal` points into (the de-facto AgreementFlag convention, GH #39).
-    Plane { point: Vec3, normal: Vec3 },
+    Plane(CutPlane),
     /// `IfcPolygonalBoundedHalfSpace`: the plane intersected with the
     /// boundary polygon's column.
-    Bounded(BoundedHalfspacePayload),
+    Bounded(BoundedCut),
     /// A half-space entity we cannot evaluate (non-`IfcPlane` base
     /// surface, unreadable boundary curve). The host stays unclipped and
     /// is marked [`crate::mesh::CLIP_UNAPPLIED_TAG`] — never silently.
@@ -154,8 +197,8 @@ pub(crate) enum HalfspaceCut {
 pub(crate) fn resolve_halfspace_operand(table: &EntityTable, id: u64) -> Option<HalfspaceCut> {
     let (type_name, _) = table.get(id)?;
     if type_name.eq_ignore_ascii_case(b"IFCPOLYGONALBOUNDEDHALFSPACE") {
-        return Some(match polygonal_bounded_halfspace(table, id) {
-            Some((_, _, payload)) => HalfspaceCut::Bounded(payload),
+        return Some(match polygonal_bounded_cut(table, id) {
+            Some(cut) => HalfspaceCut::Bounded(cut),
             None => HalfspaceCut::Unresolvable,
         });
     }
@@ -163,7 +206,7 @@ pub(crate) fn resolve_halfspace_operand(table: &EntityTable, id: u64) -> Option<
         || type_name.eq_ignore_ascii_case(b"IFCBOXEDHALFSPACE")
     {
         return Some(match halfspace_plane(table, id) {
-            Some((point, normal)) => HalfspaceCut::Plane { point, normal },
+            Some(plane) => HalfspaceCut::Plane(plane),
             None => HalfspaceCut::Unresolvable,
         });
     }
@@ -200,7 +243,8 @@ fn clip_first_operand(
     let Some(fid) = first_id else {
         return out;
     };
-    let eps = crate::mesh::halfspace_clip::on_plane_eps(crate::mesh::profile::length_scale(table));
+    let scale = crate::mesh::profile::length_scale(table);
+    let eps = crate::mesh::halfspace_clip::on_plane_eps(scale);
     for frag in recurse(table, fid, shape_cache) {
         let MeshFragment::Mesh {
             mesh,
@@ -226,7 +270,7 @@ fn clip_first_operand(
             });
             continue;
         }
-        let (mesh, rep_step_id) = match clip_fragment(&mesh, instance_transform, cut, eps) {
+        let (mesh, rep_step_id) = match clip_fragment(&mesh, instance_transform, cut, eps, scale) {
             ClipOutcome::Unchanged => (mesh, rep_step_id),
             // The clipped shape is a function of THIS boolean node, not of
             // the leaf it came from: key it by the boolean's step id so the
@@ -268,14 +312,19 @@ fn clip_first_operand(
 /// boolean's operand frame; the fragment's vertices are local to
 /// `instance_transform * translate(rep_origin)` (identity + the far-origin
 /// rebase for facesets / breps), so the cut is mapped into that frame in
-/// f64 first.
+/// f64 first and narrowed to `f32` only there, where the numbers are small
+/// (GH #210 — the `mesh::rebase` pattern). `clip_by_plane` /
+/// `clip_plane_closed` / `clip_bounded` downstream therefore stay `f32`:
+/// every coordinate they see is near the local origin.
+///
+/// `scale` is metres per model length unit, for the far-origin gate.
 fn clip_fragment(
     mesh: &LocalMesh,
     instance_transform: Mat4,
     cut: &HalfspaceCut,
     eps: f32,
+    scale: f32,
 ) -> ClipOutcome {
-    use glam::{DMat4, DVec3};
     if mesh.indices.len() < 3 {
         return ClipOutcome::Unchanged;
     }
@@ -289,20 +338,49 @@ fn clip_fragment(
         return ClipOutcome::Unapplied;
     }
     let inv = fwd.inverse();
+    let scale = scale as f64;
+    // Far path (GH #210): the cut, or the fragment's own frame, sits beyond
+    // FAR_ORIGIN_M. Near-origin clips keep the exact legacy arithmetic.
+    let far = is_far(fwd.w_axis.truncate(), scale)
+        || match cut {
+            HalfspaceCut::Plane(pl) => is_far(pl.point, scale),
+            HalfspaceCut::Bounded(b) => b.far,
+            HalfspaceCut::Unresolvable => false,
+        };
+    // On the far path the plane's authored origin can lie anywhere on the
+    // plane — e.g. a horizontal clip anchored at the project origin while
+    // the brep is baked 6.5e6 m away — so its local image is still huge and
+    // narrowing it to f32 would re-quantise the plane. Slide it, in f64,
+    // to the point of the plane closest to the fragment's AABB centre: the
+    // same plane, expressed by a small number.
+    let centre = if far {
+        let (mut lo, mut hi) = (DVec3::splat(f64::INFINITY), DVec3::splat(f64::NEG_INFINITY));
+        for c in mesh.vertices.as_chunks::<3>().0 {
+            let v = DVec3::new(c[0] as f64, c[1] as f64, c[2] as f64);
+            lo = lo.min(v);
+            hi = hi.max(v);
+        }
+        Some((lo + hi) * 0.5)
+    } else {
+        None
+    };
     // Normals map with the inverse-transpose of the point map (`inv`),
     // i.e. the transpose of `fwd`'s linear part.
-    let to_local_point = |p: Vec3| inv.transform_point3(p.as_dvec3()).as_vec3();
-    let to_local_normal = |n: Vec3| {
-        glam::DMat3::from_mat4(fwd)
-            .transpose()
-            .mul_vec3(n.as_dvec3())
-            .normalize_or_zero()
-            .as_vec3()
+    let lin_t = DMat3::from_mat4(fwd).transpose();
+    let to_local = |pl: &CutPlane| -> (Vec3, Vec3) {
+        let n = lin_t.mul_vec3(pl.normal).normalize_or_zero();
+        let mut p = inv.transform_point3(pl.point);
+        if let Some(c) = centre {
+            if n.length_squared() > 0.5 {
+                p = c + n * (p - c).dot(n);
+            }
+        }
+        (p.as_vec3(), n.as_vec3())
     };
     match cut {
         HalfspaceCut::Unresolvable => ClipOutcome::Unapplied,
-        HalfspaceCut::Plane { point, normal } => {
-            let (p, n) = (to_local_point(*point), to_local_normal(*normal));
+        HalfspaceCut::Plane(plane) => {
+            let (p, n) = to_local(plane);
             if n.length_squared() < 0.5 {
                 return ClipOutcome::Unapplied;
             }
@@ -332,18 +410,23 @@ fn clip_fragment(
                 rep_origin: mesh.rep_origin,
             })
         }
-        HalfspaceCut::Bounded(payload) => {
+        HalfspaceCut::Bounded(bounded) => {
             use crate::mesh::bounded_clip::{clip_bounded, BoundedClip};
-            let p = to_local_point(payload.plane_point);
-            let n = to_local_normal(payload.plane_normal);
-            let xform = inv.as_mat4() * payload.boundary_xform;
+            let (p, n) = to_local(&bounded.plane);
+            // Far: compose in f64 and narrow the product, whose translation
+            // is local (small). Near: the legacy f32 compose, bit-identical.
+            let xform = if far {
+                (inv * bounded.boundary_xform).as_mat4()
+            } else {
+                inv.as_mat4() * bounded.boundary_xform.as_mat4()
+            };
             if n.length_squared() < 0.5 {
                 return ClipOutcome::Unapplied;
             }
             match clip_bounded(
                 &mesh.vertices,
                 &mesh.indices,
-                &payload.boundary,
+                &bounded.boundary,
                 xform,
                 p,
                 n,
@@ -356,7 +439,7 @@ fn clip_fragment(
                     rep_origin: mesh.rep_origin,
                 }),
                 BoundedClip::NonConvex | BoundedClip::Failed => {
-                    manifold_bounded_fallback(mesh, &payload.boundary, xform, p, n, eps)
+                    manifold_bounded_fallback(mesh, &bounded.boundary, xform, p, n, eps)
                 }
             }
         }
@@ -459,6 +542,49 @@ pub fn polygonal_bounded_halfspace(
     table: &EntityTable,
     id: u64,
 ) -> Option<(LocalMesh, bool, BoundedHalfspacePayload)> {
+    let parts = pbhs_parts(table, id)?;
+    let outer = bounded_curve_raw(table, parts.boundary_id)?
+        .finish(DVec2::ZERO, crate::mesh::profile::length_scale(table))?;
+    if outer.len() < 3 {
+        return None;
+    }
+    let polygon = Polygon2D {
+        outer,
+        holes: Vec::new(),
+    };
+    let (base_surface_position, boundary_position, frame) = pbhs_frames_f32(table, &parts);
+    let mesh = extrude_polygon(&polygon, Vec3::Z, HALFSPACE_SLAB_THICKNESS, frame);
+
+    // W6 / F6 payload. `plane_normal` matches the slab's top-cap normal
+    // (`frame`'s local +Z) — the direction `cut_openings` removes — so
+    // the bounded fast-path and the existing infinite-plane fallback read
+    // the same orientation. `plane_point` is the BaseSurface origin.
+    // `boundary` stays in its arg[2] frame; `boundary_xform` maps it to
+    // the (still solid-local) working frame the slab was built in. Both
+    // are re-baked into the product's world frame by `tessellate_one`.
+    let plane_normal = transform_vector(&frame, Vec3::Z).normalize_or_zero();
+    let plane_point = transform_point_local(&base_surface_position, Vec3::ZERO);
+    let payload = BoundedHalfspacePayload {
+        boundary: polygon,
+        boundary_xform: boundary_position,
+        plane_normal,
+        plane_point,
+    };
+    Some((mesh, parts.agreement, payload))
+}
+
+/// The raw references of an `IfcPolygonalBoundedHalfSpace`.
+struct PbhsParts {
+    agreement: bool,
+    /// `BaseSurface.Position` when the base surface is an `IfcPlane` with
+    /// a placement; `None` reads as identity (the pre-#210 behaviour).
+    base_position: Option<u64>,
+    /// `Position` (arg 2), the boundary polygon's frame.
+    boundary_position: Option<u64>,
+    boundary_id: u64,
+}
+
+fn pbhs_parts(table: &EntityTable, id: u64) -> Option<PbhsParts> {
     let (type_name, args) = table.get(id)?;
     if !type_name.eq_ignore_ascii_case(b"IFCPOLYGONALBOUNDEDHALFSPACE") {
         return None;
@@ -482,24 +608,23 @@ pub fn polygonal_bounded_halfspace(
     // BaseSurface.Axis = (-0.02, 0, -0.9998) (tilted), arg[2].Axis =
     // (0, 0, 1) — pre-fix the wall emptied; post-fix it's preserved.
     let agreement = parse_agreement_flag(fields.get(1).copied());
-    let base_surface_position = fields
-        .first()
-        .copied()
-        .and_then(|f| match parse_field(f) {
-            Field::Ref(sid) => {
-                let (s_type, s_args) = table.get(sid)?;
-                if !s_type.eq_ignore_ascii_case(b"IFCPLANE") {
-                    return None;
-                }
-                let s_fields = split_top_level_args(s_args);
-                match s_fields.first().copied().map(parse_field) {
-                    Some(Field::Ref(pid)) => Some(axis_placement_3d_from_id(table, pid)),
-                    _ => None,
-                }
+    // BaseSurface must be an `IfcPlane`; its Position is read by the
+    // caller (f32 for the slab / payload, f64 for the far clip). Anything
+    // else reads as an identity frame, as before GH #210.
+    let base_position = fields.first().copied().and_then(|f| match parse_field(f) {
+        Field::Ref(sid) => {
+            let (s_type, s_args) = table.get(sid)?;
+            if !s_type.eq_ignore_ascii_case(b"IFCPLANE") {
+                return None;
             }
-            _ => None,
-        })
-        .unwrap_or(Mat4::IDENTITY);
+            let s_fields = split_top_level_args(s_args);
+            match s_fields.first().copied().map(parse_field) {
+                Some(Field::Ref(pid)) => Some(pid),
+                _ => None,
+            }
+        }
+        _ => None,
+    });
     // arg[2] = Position (IfcAxis2Placement3D) — the LOCAL frame the
     // PolygonalBoundary's 2D points live in. Independent from
     // BaseSurface.Position. W6 needs it to place the boundary polygon in
@@ -511,88 +636,150 @@ pub fn polygonal_bounded_halfspace(
     // boundary frame must be resolved whether or not `prism-csg-fast` is
     // on. Previously this was gated and default builds carried an inert
     // identity xform, which silently dropped the boundary and over-cut.
-    let boundary_position = fields
-        .get(2)
-        .copied()
-        .and_then(|f| match parse_field(f) {
-            Field::Ref(pid) => Some(axis_placement_3d_from_id(table, pid)),
-            _ => None,
-        })
-        .unwrap_or(Mat4::IDENTITY);
+    let boundary_position = fields.get(2).copied().and_then(|f| match parse_field(f) {
+        Field::Ref(pid) => Some(pid),
+        _ => None,
+    });
     let boundary_id = match fields.get(3).copied().map(parse_field) {
         Some(Field::Ref(bid)) => bid,
         _ => return None,
     };
-    let outer = bounded_curve_points(table, boundary_id)?;
-    if outer.len() < 3 {
-        return None;
-    }
-    let polygon = Polygon2D {
-        outer,
-        holes: Vec::new(),
-    };
-    // Slab orientation follows the **de-facto** IFC convention — what
-    // ifcopenshell, Revit and web-ifc all do, which is the OPPOSITE of
-    // the literal reading of the IFC4 doc text for `AgreementFlag`. See
-    // ifcopenshell `src/ifcgeom/mapping/IfcHalfSpaceSolid.cpp:33`:
-    //
-    //     f->orientation.reset(!inst->AgreementFlag());
-    //
-    // and the OCCT kernel at `kernels/opencascade/solid.cpp:47`:
-    //
-    //     pnt = pln.Location().Translated(orientation ? +axis : -axis);
-    //     halfspace = BRepPrimAPI_MakeHalfSpace(face, pnt);
-    //
-    // where `BRepPrimAPI_MakeHalfSpace(face, refPnt)` builds the half-
-    // space CONTAINING `refPnt`. Net mapping:
-    //   * `.T.` (`agreement=true`)  → keep +position.Z side
-    //   * `.F.` (`agreement=false`) → keep -position.Z side
-    //
-    // We build a thin one-sided slab whose top-cap normal lives on the
-    // SUBTRACTED side (the side `halfspace_clip` is told to remove).
-    // `halfspace_clip::clip_by_plane` keeps the **negative** side of
-    // the normal it's given, so:
-    //   * `.T.` → slab built on -position.Z side (apply Y-180° rotation
-    //              so local +Z lands on world -position.Z) → clip
-    //              keeps +position.Z.
-    //   * `.F.` → slab built on +position.Z side (no rotation) → clip
-    //              keeps -position.Z.
-    //
-    // The Y-180° rotation has `det=+1`, so outward-facing windings are
-    // preserved through the matrix.
-    // The slab is built in **BaseSurface.Position**'s frame — its
-    // local +Z is the cutting plane's normal direction (which is what
-    // `cut_openings` needs). The polygon vertices were authored in the
-    // arg[2].Position frame, so when that frame diverges from
-    // BaseSurface.Position the slab's polygonal footprint will look
-    // sheared/rotated in world — a visualisation cost, but cut_openings
-    // only reads the first triangle's normal direction, so the cut is
-    // still correct. Faithful polygon-shape preservation under
-    // diverging frames would require projecting the polygon prism
-    // onto the BaseSurface plane (out of scope here).
-    let frame = if agreement {
+    Some(PbhsParts {
+        agreement,
+        base_position,
+        boundary_position,
+        boundary_id,
+    })
+}
+
+/// The legacy `f32` frames of a polygonal bounded half-space:
+/// `(BaseSurface.Position, boundary Position, slab frame)`.
+///
+/// Slab orientation follows the **de-facto** IFC convention — what
+/// ifcopenshell, Revit and web-ifc all do, which is the OPPOSITE of
+/// the literal reading of the IFC4 doc text for `AgreementFlag`. See
+/// ifcopenshell `src/ifcgeom/mapping/IfcHalfSpaceSolid.cpp:33`:
+///
+/// ```text
+/// f->orientation.reset(!inst->AgreementFlag());
+/// ```
+///
+/// and the OCCT kernel at `kernels/opencascade/solid.cpp:47`:
+///
+/// ```text
+/// pnt = pln.Location().Translated(orientation ? +axis : -axis);
+/// halfspace = BRepPrimAPI_MakeHalfSpace(face, pnt);
+/// ```
+///
+/// where `BRepPrimAPI_MakeHalfSpace(face, refPnt)` builds the half-
+/// space CONTAINING `refPnt`. Net mapping:
+///   * `.T.` (`agreement=true`)  → keep +position.Z side
+///   * `.F.` (`agreement=false`) → keep -position.Z side
+///
+/// We build a thin one-sided slab whose top-cap normal lives on the
+/// SUBTRACTED side (the side `halfspace_clip` is told to remove).
+/// `halfspace_clip::clip_by_plane` keeps the **negative** side of
+/// the normal it's given, so:
+///   * `.T.` → slab built on -position.Z side (apply Y-180° rotation
+///     so local +Z lands on world -position.Z) → clip keeps +position.Z.
+///   * `.F.` → slab built on +position.Z side (no rotation) → clip
+///     keeps -position.Z.
+///
+/// The Y-180° rotation has `det=+1`, so outward-facing windings are
+/// preserved through the matrix.
+/// The slab is built in **BaseSurface.Position**'s frame — its
+/// local +Z is the cutting plane's normal direction (which is what
+/// `cut_openings` needs). The polygon vertices were authored in the
+/// arg[2].Position frame, so when that frame diverges from
+/// BaseSurface.Position the slab's polygonal footprint will look
+/// sheared/rotated in world — a visualisation cost, but cut_openings
+/// only reads the first triangle's normal direction, so the cut is
+/// still correct.
+fn pbhs_frames_f32(table: &EntityTable, parts: &PbhsParts) -> (Mat4, Mat4, Mat4) {
+    let base_surface_position = parts
+        .base_position
+        .map(|pid| axis_placement_3d_from_id(table, pid))
+        .unwrap_or(Mat4::IDENTITY);
+    let boundary_position = parts
+        .boundary_position
+        .map(|pid| axis_placement_3d_from_id(table, pid))
+        .unwrap_or(Mat4::IDENTITY);
+    let frame = if parts.agreement {
         base_surface_position * Mat4::from_rotation_y(std::f32::consts::PI)
     } else {
         base_surface_position
     };
-    let mesh = extrude_polygon(&polygon, Vec3::Z, HALFSPACE_SLAB_THICKNESS, frame);
+    (base_surface_position, boundary_position, frame)
+}
 
-    // W6 / F6 payload. `plane_normal` matches the slab's top-cap normal
-    // (`frame`'s local +Z) — the direction `cut_openings` removes — so
-    // the bounded fast-path and the existing infinite-plane fallback read
-    // the same orientation. `plane_point` is the BaseSurface origin.
-    // `boundary` stays in its arg[2] frame; `boundary_xform` maps it to
-    // the (still solid-local) working frame the slab was built in. Both
-    // are re-baked into the product's world frame by `tessellate_one`.
-    let plane_normal = transform_vector(&frame, Vec3::Z).normalize_or_zero();
-    let plane_point = transform_point_local(&base_surface_position, Vec3::ZERO);
-    let payload = BoundedHalfspacePayload {
-        boundary: polygon,
-        boundary_xform: boundary_position,
-        plane_normal,
-        plane_point,
-    };
-    Some((mesh, agreement, payload))
+/// Resolve an `IfcPolygonalBoundedHalfSpace` for the clip (GH #194), in
+/// f64 (GH #210).
+///
+/// Near the origin (every placement location and boundary vertex within
+/// [`FAR_ORIGIN_M`]) the values are exactly the legacy `f32` ones widened,
+/// so output is bit-identical. Beyond it, `BaseSurface.Position`, the
+/// boundary `Position` and the boundary vertices are read in f64: the
+/// plane keeps its authored origin to the digit instead of the 0.5 m
+/// `f32` lattice at 6.5e6 m, and the ring is rebased by its first vertex
+/// (in f64) so its `f32` points are small, the offset riding on
+/// `boundary_xform`.
+fn polygonal_bounded_cut(table: &EntityTable, id: u64) -> Option<BoundedCut> {
+    let parts = pbhs_parts(table, id)?;
+    let scale32 = crate::mesh::profile::length_scale(table);
+    let scale = scale32 as f64;
+    let raw = bounded_curve_raw(table, parts.boundary_id)?;
+    let base64 = parts
+        .base_position
+        .map(|pid| axis_placement_3d_f64(table, pid));
+    let boundary64 = parts
+        .boundary_position
+        .map(|pid| axis_placement_3d_f64(table, pid));
+    let far = base64.is_some_and(|m| is_far(m.w_axis.truncate(), scale))
+        || boundary64.is_some_and(|m| is_far(m.w_axis.truncate(), scale))
+        || raw.max_abs() * scale > FAR_ORIGIN_M;
+
+    if !far {
+        let outer = raw.finish(DVec2::ZERO, scale32)?;
+        if outer.len() < 3 {
+            return None;
+        }
+        let (base, boundary, frame) = pbhs_frames_f32(table, &parts);
+        let normal = transform_vector(&frame, Vec3::Z).normalize_or_zero();
+        let point = transform_point_local(&base, Vec3::ZERO);
+        return Some(BoundedCut {
+            plane: CutPlane {
+                point: point.as_dvec3(),
+                normal: normal.as_dvec3(),
+            },
+            boundary: Polygon2D {
+                outer,
+                holes: Vec::new(),
+            },
+            boundary_xform: boundary.as_dmat4(),
+            far: false,
+        });
+    }
+
+    let offset = raw.first().unwrap_or(DVec2::ZERO);
+    let outer = raw.finish(offset, scale32)?;
+    if outer.len() < 3 {
+        return None;
+    }
+    let base = base64.unwrap_or(DMat4::IDENTITY);
+    let axis = base.z_axis.truncate().normalize_or_zero();
+    Some(BoundedCut {
+        plane: CutPlane {
+            point: base.w_axis.truncate(),
+            normal: if parts.agreement { -axis } else { axis },
+        },
+        boundary: Polygon2D {
+            outer,
+            holes: Vec::new(),
+        },
+        boundary_xform: boundary64.unwrap_or(DMat4::IDENTITY)
+            * DMat4::from_translation(DVec3::new(offset.x, offset.y, 0.0)),
+        far: true,
+    })
 }
 
 fn transform_vector(m: &Mat4, v: Vec3) -> Vec3 {
@@ -681,7 +868,13 @@ pub fn halfspace_solid(table: &EntityTable, id: u64) -> Option<(LocalMesh, bool)
 /// slab, whose centroid sits half a slab thickness off the plane.
 /// `None` when the base surface is not an `IfcPlane` (GH #194 counts that
 /// host as unclipped rather than guessing).
-pub fn halfspace_plane(table: &EntityTable, id: u64) -> Option<(Vec3, Vec3)> {
+///
+/// f64 since GH #210: within [`FAR_ORIGIN_M`] of the origin the plane is
+/// the legacy `f32` read widened (bit-identical output); beyond it
+/// `BaseSurface.Position` is read in f64, so a plane baked at
+/// x = 6 500 003.37 m keeps its 0.37 instead of snapping to the 0.5 m
+/// `f32` lattice.
+pub(crate) fn halfspace_plane(table: &EntityTable, id: u64) -> Option<CutPlane> {
     let (type_name, args) = table.get(id)?;
     if !type_name.eq_ignore_ascii_case(b"IFCHALFSPACESOLID")
         && !type_name.eq_ignore_ascii_case(b"IFCBOXEDHALFSPACE")
@@ -699,20 +892,38 @@ pub fn halfspace_plane(table: &EntityTable, id: u64) -> Option<(Vec3, Vec3)> {
         return None;
     }
     let s_fields = split_top_level_args(s_args);
-    let position = s_fields
+    let position_id = s_fields
         .first()
         .copied()
         .and_then(|f| match parse_field(f) {
-            Field::Ref(pid) => Some(axis_placement_3d_from_id(table, pid)),
+            Field::Ref(pid) => Some(pid),
             _ => None,
-        })
+        });
+    if let Some(pos64) = position_id.map(|pid| axis_placement_3d_f64(table, pid)) {
+        let scale = crate::mesh::profile::length_scale(table) as f64;
+        if is_far(pos64.w_axis.truncate(), scale) {
+            let axis = pos64.z_axis.truncate().normalize_or_zero();
+            if axis.length_squared() < 0.5 {
+                return None;
+            }
+            return Some(CutPlane {
+                point: pos64.w_axis.truncate(),
+                normal: if agreement { -axis } else { axis },
+            });
+        }
+    }
+    let position = position_id
+        .map(|pid| axis_placement_3d_from_id(table, pid))
         .unwrap_or(Mat4::IDENTITY);
     let axis = transform_vector(&position, Vec3::Z).normalize_or_zero();
     if axis.length_squared() < 0.5 {
         return None;
     }
     let normal = if agreement { -axis } else { axis };
-    Some((transform_point_local(&position, Vec3::ZERO), normal))
+    Some(CutPlane {
+        point: transform_point_local(&position, Vec3::ZERO).as_dvec3(),
+        normal: normal.as_dvec3(),
+    })
 }
 
 /// Annotate a fragment with its structural position inside the current
@@ -760,11 +971,85 @@ fn retag(frag: MeshFragment, new_role: &'static str) -> MeshFragment {
     }
 }
 
-/// Extract a 2D point list from an `IfcBoundedCurve` — supports
-/// `IfcPolyline` (CartesianPoint list) and `IfcIndexedPolyCurve`
-/// (point-list + segment indices). Returns the curve as a planar
-/// polygon in the curve's local XY frame, with Z dropped.
-fn bounded_curve_points(table: &EntityTable, id: u64) -> Option<Vec<Vec2>> {
+/// An `IfcBoundedCurve` boundary read in f64, before narrowing (GH #210).
+/// Supports `IfcPolyline` (CartesianPoint list) and `IfcIndexedPolyCurve`
+/// (point-list + segment indices).
+enum BoundedCurveRaw<'a> {
+    Polyline(Vec<DVec2>),
+    Indexed {
+        pts: Vec<DVec2>,
+        segments: Option<&'a [u8]>,
+    },
+}
+
+impl BoundedCurveRaw<'_> {
+    fn points(&self) -> &[DVec2] {
+        match self {
+            BoundedCurveRaw::Polyline(p) => p,
+            BoundedCurveRaw::Indexed { pts, .. } => pts,
+        }
+    }
+
+    /// Largest absolute coordinate, model units — the far-origin gate.
+    fn max_abs(&self) -> f64 {
+        self.points()
+            .iter()
+            .map(|p| p.abs().max_element())
+            .fold(0.0, f64::max)
+    }
+
+    fn first(&self) -> Option<DVec2> {
+        self.points().first().copied()
+    }
+
+    /// The boundary as a planar `f32` polygon in the curve's local XY
+    /// frame, **minus `offset`** (subtracted in f64 before the narrowing).
+    /// `offset = 0` is the pre-#210 read exactly (`(n - 0.0) as f32 ==
+    /// n as f32`). `IfcArcIndex` segments are evaluated on the rebased
+    /// points — an arc is translation-invariant.
+    fn finish(&self, offset: DVec2, unit_scale: f32) -> Option<Vec<Vec2>> {
+        let narrow =
+            |p: &[DVec2]| -> Vec<Vec2> { p.iter().map(|q| (*q - offset).as_vec2()).collect() };
+        match self {
+            BoundedCurveRaw::Polyline(pts) => {
+                let mut out = narrow(pts);
+                // IfcPolyline is explicit, often closed by repeating first
+                // point; drop a duplicate trailing vertex if present.
+                if out.len() >= 2 && (out[0] - out[out.len() - 1]).length_squared() < 1e-9 {
+                    out.pop();
+                }
+                if out.len() >= 3 {
+                    Some(out)
+                } else {
+                    None
+                }
+            }
+            BoundedCurveRaw::Indexed { pts, segments } => {
+                let raw_pts = narrow(pts);
+                // Evaluate IfcArcIndex / IfcLineIndex segments when present —
+                // otherwise booleans on curved profiles collapse to polygonal
+                // chords (GH #48).
+                if let Some(seg_body) = segments {
+                    if let Some(poly) =
+                        crate::mesh::indexed_curve::eval_segments_2d(&raw_pts, seg_body, unit_scale)
+                    {
+                        if poly.len() >= 3 {
+                            return Some(poly);
+                        }
+                    }
+                }
+                if raw_pts.len() >= 3 {
+                    Some(raw_pts)
+                } else {
+                    None
+                }
+            }
+        }
+    }
+}
+
+/// Read an `IfcBoundedCurve` boundary in f64 (see [`BoundedCurveRaw`]).
+fn bounded_curve_raw<'a>(table: &'a EntityTable, id: u64) -> Option<BoundedCurveRaw<'a>> {
     let (type_name, args) = table.get(id)?;
     if type_name.eq_ignore_ascii_case(b"IFCPOLYLINE") {
         let fields = split_top_level_args(args);
@@ -772,23 +1057,14 @@ fn bounded_curve_points(table: &EntityTable, id: u64) -> Option<Vec<Vec2>> {
             Field::List(b) => b,
             _ => return None,
         };
-        let mut out: Vec<Vec2> = Vec::new();
-        for f in split_top_level_args(body) {
-            if let Field::Ref(pid) = parse_field(f) {
-                if let Some(p) = cartesian_point_xy(table, pid) {
-                    out.push(p);
-                }
-            }
-        }
-        // IfcPolyline is explicit, often closed by repeating first point;
-        // drop a duplicate trailing vertex if present.
-        if out.len() >= 2 && (out[0] - out[out.len() - 1]).length_squared() < 1e-9 {
-            out.pop();
-        }
-        if out.len() >= 3 {
-            return Some(out);
-        }
-        return None;
+        let pts = split_top_level_args(body)
+            .into_iter()
+            .filter_map(|f| match parse_field(f) {
+                Field::Ref(pid) => cartesian_point_xy_f64(table, pid),
+                _ => None,
+            })
+            .collect();
+        return Some(BoundedCurveRaw::Polyline(pts));
     }
     if type_name.eq_ignore_ascii_case(b"IFCINDEXEDPOLYCURVE") {
         // IfcIndexedPolyCurve(Points: IfcCartesianPointList2D, Segments, SelfIntersect)
@@ -797,29 +1073,17 @@ fn bounded_curve_points(table: &EntityTable, id: u64) -> Option<Vec<Vec2>> {
             Field::Ref(pid) => pid,
             _ => return None,
         };
-        let raw_pts = cartesian_point_list_2d(table, pts_id)?;
-        // Evaluate IfcArcIndex / IfcLineIndex segments when present —
-        // otherwise booleans on curved profiles collapse to polygonal
-        // chords (GH #48).
-        if let Some(Field::List(seg_body)) = fields.get(1).copied().map(parse_field) {
-            if let Some(poly) = crate::mesh::indexed_curve::eval_segments_2d(
-                &raw_pts,
-                seg_body,
-                crate::mesh::profile::length_scale(table),
-            ) {
-                if poly.len() >= 3 {
-                    return Some(poly);
-                }
-            }
-        }
-        if raw_pts.len() >= 3 {
-            return Some(raw_pts);
-        }
+        let pts = cartesian_point_list_2d_f64(table, pts_id)?;
+        let segments = match fields.get(1).copied().map(parse_field) {
+            Some(Field::List(seg_body)) => Some(seg_body),
+            _ => None,
+        };
+        return Some(BoundedCurveRaw::Indexed { pts, segments });
     }
     None
 }
 
-fn cartesian_point_xy(table: &EntityTable, id: u64) -> Option<Vec2> {
+fn cartesian_point_xy_f64(table: &EntityTable, id: u64) -> Option<DVec2> {
     let (type_name, args) = table.get(id)?;
     if !type_name.eq_ignore_ascii_case(b"IFCCARTESIANPOINT") {
         return None;
@@ -829,20 +1093,20 @@ fn cartesian_point_xy(table: &EntityTable, id: u64) -> Option<Vec2> {
         Field::List(b) => b,
         _ => return None,
     };
-    let coords: Vec<f32> = split_top_level_args(body)
+    let coords: Vec<f64> = split_top_level_args(body)
         .into_iter()
         .filter_map(|f| match parse_field(f) {
-            Field::Number(n) => Some(n as f32),
+            Field::Number(n) => Some(n),
             _ => None,
         })
         .collect();
-    Some(Vec2::new(
+    Some(DVec2::new(
         *coords.first().unwrap_or(&0.0),
         *coords.get(1).unwrap_or(&0.0),
     ))
 }
 
-fn cartesian_point_list_2d(table: &EntityTable, id: u64) -> Option<Vec<Vec2>> {
+fn cartesian_point_list_2d_f64(table: &EntityTable, id: u64) -> Option<Vec<DVec2>> {
     let (type_name, args) = table.get(id)?;
     if !type_name.eq_ignore_ascii_case(b"IFCCARTESIANPOINTLIST2D") {
         return None;
@@ -853,18 +1117,18 @@ fn cartesian_point_list_2d(table: &EntityTable, id: u64) -> Option<Vec<Vec2>> {
         Field::List(b) => b,
         _ => return None,
     };
-    let mut out: Vec<Vec2> = Vec::new();
+    let mut out: Vec<DVec2> = Vec::new();
     for f in split_top_level_args(body) {
         if let Field::List(inner) = parse_field(f) {
-            let coords: Vec<f32> = split_top_level_args(inner)
+            let coords: Vec<f64> = split_top_level_args(inner)
                 .into_iter()
                 .filter_map(|g| match parse_field(g) {
-                    Field::Number(n) => Some(n as f32),
+                    Field::Number(n) => Some(n),
                     _ => None,
                 })
                 .collect();
             if coords.len() >= 2 {
-                out.push(Vec2::new(coords[0], coords[1]));
+                out.push(DVec2::new(coords[0], coords[1]));
             }
         }
     }
@@ -978,6 +1242,143 @@ END-ISO-10303-21;
             "payload plane_normal {:?} must also align with BaseSurface axis",
             payload.plane_normal
         );
+    }
+
+    fn fixture_table(name: &str) -> Vec<u8> {
+        std::fs::read(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../tests/fixtures")
+                .join(name),
+        )
+        .expect("fixture readable")
+    }
+
+    fn only_halfspace(table: &EntityTable) -> HalfspaceCut {
+        let id = (1..400)
+            .find(|&i| {
+                table.get(i).is_some_and(|(t, _)| {
+                    t.eq_ignore_ascii_case(b"IFCHALFSPACESOLID")
+                        || t.eq_ignore_ascii_case(b"IFCPOLYGONALBOUNDEDHALFSPACE")
+                })
+            })
+            .expect("fixture carries a half-space");
+        resolve_halfspace_operand(table, id).expect("resolves")
+    }
+
+    /// GH #210: a plane baked at UTM magnitude is read to the digit —
+    /// `f32` would put x = 6 500 003.37 on the 0.5 m lattice (…3.5).
+    #[test]
+    fn far_origin_plane_is_read_in_f64() {
+        let buf = fixture_table("far_origin_clip_plane_210.ifc");
+        let table = EntityTable::build(&buf);
+        let HalfspaceCut::Plane(p) = only_halfspace(&table) else {
+            panic!("expected a plane cut");
+        };
+        assert_eq!(p.point, DVec3::new(6_500_003.37, 1_200_000.0, 50.0));
+        assert_eq!(p.normal, DVec3::X, ".F. removes +Position.Z");
+
+        let buf = fixture_table("far_origin_clip_pbhs_210.ifc");
+        let table = EntityTable::build(&buf);
+        let HalfspaceCut::Bounded(b) = only_halfspace(&table) else {
+            panic!("expected a bounded cut");
+        };
+        assert!(b.far);
+        assert_eq!(b.plane.point, DVec3::new(6_500_003.37, 1_200_000.0, 50.0));
+        // The ring is rebased by its first vertex; the offset rides on the
+        // f64 boundary frame, so the boundary edge at local x = 0.13 (world
+        // y = 1 200 000.13) survives: f32 would snap it to …0.125.
+        let edge = b.boundary_xform.transform_point3(DVec3::new(
+            b.boundary.outer[1].x as f64,
+            b.boundary.outer[1].y as f64,
+            0.0,
+        ));
+        assert!((edge.y - 1_200_000.13).abs() < 1e-6, "{edge:?}");
+    }
+
+    /// GH #210: on the far path the plane's authored origin may lie far
+    /// from the host ALONG the plane (a clip anchored 1300 km away on the
+    /// same plane). `clip_fragment` slides it, in f64, to the plane point
+    /// nearest the host before narrowing; without that the local point is
+    /// 1.3e6 m out and its `f32` image shifts the plane (measured: 1.55 m³
+    /// kept instead of 1.5).
+    #[test]
+    fn far_plane_origin_is_slid_next_to_the_host() {
+        // Unit box [0,1]^2 × [0,3], rebased from (6.5e6, 1.2e6, 50).
+        let v: Vec<f32> = vec![
+            0., 0., 0., 1., 0., 0., 1., 1., 0., 0., 1., 0., 0., 0., 3., 1., 0., 3., 1., 1., 3., 0.,
+            1., 3.,
+        ];
+        let i: Vec<u32> = vec![
+            0, 2, 1, 0, 3, 2, 4, 5, 6, 4, 6, 7, 0, 1, 5, 0, 5, 4, 2, 3, 7, 2, 7, 6, 1, 2, 6, 1, 6,
+            5, 0, 4, 7, 0, 7, 3,
+        ];
+        let mesh = LocalMesh {
+            vertices: v,
+            indices: i,
+            rep_origin: [6_500_000.0, 1_200_000.0, 50.0],
+        };
+        // Oblique vertical plane through the box's centre column: any line
+        // through a square's centre bisects it, so exactly 1.5 m³ is kept.
+        // (An irrational-ish slope: with (1,1) or (1,2) the two f32
+        // rounding errors happen to cancel along the normal.)
+        let n = DVec3::new(1.0, 0.37, 0.0).normalize();
+        let along = DVec3::new(n.y, -n.x, 0.0);
+        let centre = DVec3::new(6_500_000.5, 1_200_000.5, 50.0);
+        let cut = HalfspaceCut::Plane(CutPlane {
+            point: centre + along * 1.3e6,
+            normal: n,
+        });
+        let ClipOutcome::Clipped(out) = clip_fragment(&mesh, Mat4::IDENTITY, &cut, 1e-3, 1.0)
+        else {
+            panic!("the diagonal plane cuts the box");
+        };
+        let p = |k: u32| {
+            let b = k as usize * 3;
+            DVec3::new(
+                out.vertices[b] as f64,
+                out.vertices[b + 1] as f64,
+                out.vertices[b + 2] as f64,
+            )
+        };
+        let vol: f64 = out
+            .indices
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .map(|t| p(t[0]).dot(p(t[1]).cross(p(t[2]))) / 6.0)
+            .sum();
+        assert!((vol - 1.5).abs() < 1e-5, "kept {vol} m³, want 1.5");
+    }
+
+    /// Near the origin the cut is the legacy `f32` read, widened — the
+    /// guarantee behind bit-identical near-origin output.
+    #[test]
+    fn near_origin_plane_is_the_legacy_f32_read() {
+        let buf = fixture_table("origin_clip_plane_210.ifc");
+        let table = EntityTable::build(&buf);
+        let HalfspaceCut::Plane(p) = only_halfspace(&table) else {
+            panic!("expected a plane cut");
+        };
+        assert_eq!(p.point, DVec3::new(3.37_f32 as f64, 0.0, 50.0));
+
+        let buf = fixture_table("origin_clip_pbhs_210.ifc");
+        let table = EntityTable::build(&buf);
+        let HalfspaceCut::Bounded(b) = only_halfspace(&table) else {
+            panic!("expected a bounded cut");
+        };
+        assert!(!b.far);
+        let id = (1..400)
+            .find(|&i| {
+                table
+                    .get(i)
+                    .is_some_and(|(t, _)| t.eq_ignore_ascii_case(b"IFCPOLYGONALBOUNDEDHALFSPACE"))
+            })
+            .unwrap();
+        let (_, _, legacy) = polygonal_bounded_halfspace(&table, id).unwrap();
+        assert_eq!(b.plane.point, legacy.plane_point.as_dvec3());
+        assert_eq!(b.plane.normal, legacy.plane_normal.as_dvec3());
+        assert_eq!(b.boundary_xform, legacy.boundary_xform.as_dmat4());
+        assert_eq!(b.boundary.outer, legacy.boundary.outer);
     }
 
     #[test]
