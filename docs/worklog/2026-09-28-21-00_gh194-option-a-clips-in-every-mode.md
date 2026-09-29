@@ -61,3 +61,10 @@ origin, #211 wasm counters.**
    (contract change + cache bump; bundle with anything landing before).
 2. Reporter to re-check Snowdon Towers (only on the edkjo box) on v0.6.2.
 3. #209–#212 follow-ons; #207 lazy IDS wasm; IDS slice 5; #187, #185, #182, #117, #191.
+
+## Release addendum (2026-09-29)
+
+CI green on `c03d113`; site synced to cache v37 (ifcfast-site `ee019a6`, parity 17/17,
+Duplex walls 6.458 → 5.789 ×2 and 3.382 → 2.856 m³, wasm 1.27 → 1.39 MB with the bounded
+clip). **v0.6.2 tagged** (release commit + GH release from CHANGELOG 0.6.2); PyPI publish
+via CI — verify with `pip download ifcfast==0.6.2` (CDN lag ~1 h seen before).
