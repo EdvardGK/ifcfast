@@ -219,42 +219,18 @@ impl ProductStats {
             "error"
         };
 
-        // Mesh-quality classifier (mirrors `MeshQto::mesh_quality`):
-        // see field docstring for the full taxonomy. Two-tier — cheap
-        // `|volume| > aabb` upper-bound check first, then edge-pairing
-        // manifold check for the under-detected cases. Computing it
-        // here keeps the drift DataFrame self-contained — analysts get
+        // Mesh-quality classifier — the same function `MeshQto` uses
+        // (GH #187), so the drift DataFrame and mesh_qto agree. Computing
+        // it here keeps the drift DataFrame self-contained: analysts get
         // the open-shell flag alongside the placement-drift columns
         // without a separate substrate-bundle pass.
-        // Coordinate-welding re-check (mirrors `MeshQto::mesh_quality`):
-        // brep step_id dedup + CSG/cut fragment-stitching leave duplicate
-        // coincident verts at shared edges with distinct indices, so the
-        // raw-index edge-pairing over-flags watertight meshes `open_shell`.
-        // When the cheap check says NOT closed, re-run it on
-        // coordinate-welded indices before committing. Already-closed
-        // meshes short-circuit and pay zero welding cost. The grid
-        // spacing is a FIXED PHYSICAL tolerance (~0.1 mm in world units),
-        // identical to `qto::compute`: 1e-4 m divided by unit_scale
-        // (metres-per-unit) gives the spacing in the model's own units,
-        // so the physical tolerance is 0.1 mm regardless of element size
-        // or whether the file is authored in mm, m, or feet. Tight enough
-        // to merge only f32-roundtrip-coincident duplicates, never to
-        // bridge a real sub-mm gap and mis-classify mesh_quality.
-        let mesh_quality = if aabb_volume <= 0.0 {
-            "degenerate"
-        } else if volume.abs() > aabb_volume * 1.001 {
-            "open_shell"
-        } else if crate::mesh::qto::is_closed_manifold(&mesh.indices) {
-            "closed"
-        } else {
-            let weld_eps = 1e-4_f32 / unit_scale.max(1e-12);
-            let welded = crate::mesh::qto::welded_indices(&mesh.vertices, &mesh.indices, weld_eps);
-            if crate::mesh::qto::is_closed_manifold(&welded) {
-                "closed"
-            } else {
-                "open_shell"
-            }
-        };
+        let mesh_quality = crate::mesh::qto::classify_mesh_quality(
+            &mesh.vertices,
+            &mesh.indices,
+            unit_scale,
+            volume,
+            aabb_volume,
+        );
 
         Self {
             guid: mesh.guid.clone(),

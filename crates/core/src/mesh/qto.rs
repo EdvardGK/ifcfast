@@ -82,26 +82,27 @@ pub struct MeshQto {
     /// Stored as a Parquet list so DuckDB UNNEST gives one row per
     /// face for "show me every surface on this product" queries.
     pub surfaces: Vec<PlanarSurface>,
-    /// Validity classifier for `volume_m3`:
+    /// Validity classifier for `volume_m3` ([`classify_mesh_quality`],
+    /// GH #187):
     ///
-    /// - `"closed"`:    `|volume_m3| <= aabb_volume_m3` (with a small
-    ///                  numerical tolerance). The divergence-theorem
-    ///                  computation produced a physically possible
-    ///                  value; consumers can trust it for sum queries.
-    /// - `"open_shell"`: `|volume_m3| > aabb_volume_m3`. The mesh is
-    ///                  not a closed manifold (open boundary, hole,
-    ///                  inverted normal). Divergence-theorem volumes
-    ///                  are mathematically undefined on open shells;
-    ///                  consumers should fall back to `aabb_volume_m3`
-    ///                  or filter the row out of volume sums.
-    /// - `"degenerate"`: `aabb_volume_m3 <= 0`. No real geometry —
-    ///                  empty mesh, 2D annotation, or a product whose
-    ///                  representation collapsed to a line / point.
-    ///                  Every quantity column is suspect.
-    ///
-    /// 9.4% of products on the audited Duplex file land in
-    /// `"open_shell"`; without this flag any downstream `SUM(volume_m3)`
-    /// silently sums garbage with valid figures.
+    /// - `"closed"`:    the triangle chain is boundary-free — every
+    ///                  undirected edge is walked equally often in each
+    ///                  direction (raw indices, or after a 0.1 mm weld) —
+    ///                  and `|volume_m3| <= aabb_volume_m3` (small float
+    ///                  tolerance). The divergence integral is well
+    ///                  defined. Self-touching solids (an edge with four
+    ///                  balanced incidences) are closed; strict 2-manifold
+    ///                  topology is NOT required.
+    /// - `"open_shell"`: some edge is unbalanced (open boundary, hole,
+    ///                  inconsistently wound face), or `|volume_m3|`
+    ///                  exceeds the AABB. The divergence volume is not
+    ///                  well defined; `volume_method` says whether the
+    ///                  mesh value was still trusted (`mesh_open`).
+    /// - `"degenerate"`: `aabb_volume_m3 <= 0` (empty mesh, 2D
+    ///                  annotation, collapsed rep), or a boundary-free
+    ///                  chain whose triangles all cancel in opposite-facing
+    ///                  pairs (a zero-thickness double-sided sheet) — no
+    ///                  enclosed region.
     pub mesh_quality: &'static str,
     /// Routing flag: `true` when `volume_best_m3` is the mesh-measured
     /// volume and is trustworthy — either a closed manifold, or a
@@ -450,54 +451,10 @@ pub fn compute(vertices: &[f32], indices: &[u32], unit_scale: f32) -> MeshQto {
     let volume_m3 = (volume_raw * volume_scale as f64) as f32;
     let aabb_volume_m3 = aabb_volume_raw * volume_scale;
 
-    // Mesh validity classifier — see field docs on `MeshQto.mesh_quality`.
-    //
-    // Two-tier classifier:
-    //   1. Cheap upper-bound check — `|volume| > aabb * 1.001` is
-    //      mathematically impossible for a closed manifold and catches
-    //      ~29% of Duplex products (windows, cabinets, IfcSpaces). The
-    //      1.001 multiplier absorbs ~0.1% f32 noise on the divergence
-    //      sum.
-    //   2. Edge-pairing manifold check — closed iff every undirected
-    //      edge is shared by exactly 2 triangles with opposite wind.
-    //      Catches the cases the cheap check misses: open shells whose
-    //      divergence-theorem volume happens to land inside the AABB
-    //      (e.g. a cube at origin with one face removed gives ~5/6 the
-    //      cube volume — wrong but bounded).
-    //   3. Coordinate-welding re-check (gated to the non-closed branch
-    //      only). brep dedup keys on IfcCartesianPoint step_id and the
-    //      CSG/cut paths stitch independently-tessellated fragments, so
-    //      a genuinely-watertight mesh can carry DUPLICATE coincident
-    //      vertices at shared edges with distinct indices — the raw-index
-    //      edge-pairing then over-flags it `open_shell`. When the cheap
-    //      edge-pairing says NOT closed, we re-run it on coordinate-welded
-    //      indices (snap to a tight ~0.1 mm grid, merge cells) before
-    //      committing to `open_shell`. ALREADY-CLOSED meshes never reach
-    //      this branch (short-circuit `&&`), so the closed hot path pays
-    //      zero welding cost.
-    let mesh_quality: &'static str = if aabb_volume_m3 <= 0.0 {
-        "degenerate"
-    } else if volume_m3.abs() > aabb_volume_m3 * 1.001 {
-        "open_shell"
-    } else if is_closed_manifold(indices) {
-        "closed"
-    } else {
-        // Non-closed under raw indices. Weld coincident fragment-dup
-        // verts on a tight, unit-scale-aware grid and re-check. The grid
-        // spacing is 0.1 mm expressed in the model's own units: 1e-4 m
-        // divided by unit_scale (metres-per-unit) gives 1e-4/unit_scale
-        // model units, so the physical tolerance is 0.1 mm regardless of
-        // whether the source file is authored in mm, m, or feet. Tight
-        // enough to merge only f32-roundtrip-coincident duplicates, never
-        // to bridge a real sub-mm gap and false-close an open shell.
-        let weld_eps = 1e-4_f32 / unit_scale.max(1e-12);
-        let welded = welded_indices(vertices, indices, weld_eps);
-        if is_closed_manifold(&welded) {
-            "closed"
-        } else {
-            "open_shell"
-        }
-    };
+    // Mesh validity classifier — see field docs on `MeshQto.mesh_quality`
+    // and [`classify_mesh_quality`] for the rule (GH #187).
+    let mesh_quality =
+        classify_mesh_quality(vertices, indices, unit_scale, volume_m3, aabb_volume_m3);
 
     // Volume-reliability + prism fallback (GH #60, #62). A closed
     // manifold's signed-tetra volume is trustworthy as-is. For anything
@@ -552,6 +509,15 @@ pub fn compute(vertices: &[f32], indices: &[u32], unit_scale: f32) -> MeshQto {
             // Footprint deliberately NOT computed — NaN signals "not
             // applicable / not computed" so consumers don't read it as 0.
             (volume_mesh_m3, "mesh", true, f32::NAN)
+        } else if mesh_quality == "degenerate" {
+            // No enclosed region: a zero-extent AABB, or a triangle chain
+            // that cancels completely (every face paired with an opposite
+            // copy of itself, GH #187). The solid's footprint is empty, so
+            // its prism bound is 0 — the value the zero-extent case always
+            // produced through the raster below; stated directly here so a
+            // cancelling chain (non-zero AABB) cannot pick up the raster of
+            // its faces as a phantom prism volume.
+            (0.0, "prism_fallback", false, 0.0)
         } else {
             // Tightest prism upper bound = min over the three axis
             // projections (GH #62). For each axis, the prism is the union
@@ -820,7 +786,202 @@ fn point_in_triangle(
     !(has_neg && has_pos)
 }
 
-/// Closed-manifold check via directed-edge pairing.
+/// The `mesh_quality` label for one mesh (GH #187). Shared by
+/// [`compute`] and the drift stats so both surfaces agree.
+///
+/// `volume` / `aabb_volume` are the signed divergence volume and the
+/// AABB volume in the same units (any — only their ratio is used).
+///
+/// The question the label answers is "is the signed-volume sum the
+/// element's volume?". The divergence theorem needs the oriented
+/// triangle chain's BOUNDARY to vanish — every undirected edge walked
+/// equally often in each direction ([`is_boundary_free`]) — not strict
+/// 2-manifold topology. A solid that touches itself along an edge (four
+/// incidences, two each way) is boundary-free; the old "exactly two
+/// incidences" rule ([`is_closed_manifold`]) flipped such solids between
+/// `closed` and `open_shell` depending on which valid triangulation a
+/// concave face happened to get.
+///
+/// Rule, in order:
+/// 1. `aabb_volume <= 0` → `"degenerate"`.
+/// 2. `|volume| > aabb_volume · 1.001` → `"open_shell"` (impossible for a
+///    simple solid).
+/// 3. Boundary-free on raw indices, else on 0.1 mm coordinate-welded
+///    indices ([`welded_indices`]; brep step-id dedup and CSG fragment
+///    stitching leave coincident duplicates that raw-index pairing can't
+///    see). Neither → `"open_shell"`.
+/// 4. Some triangle present more than once with the same orientation on
+///    the same three vertices ([`FaceNet::max_abs`] ≥ 2) → `"open_shell"`.
+///    The chain is balanced, but it counts that region more than once —
+///    and the oracle does not: G55_RIV's MagiCAD duct fittings list every
+///    `IfcPolygonalFaceSet` face three times; ifcopenshell reports 1×,
+///    the signed sum 3×. (A geometric winding-band test around
+///    over-incident edges was tried first and corpus-refuted: it also
+///    rejected interpenetrating multi-item railings and flow terminals
+///    whose volumes match ifcopenshell to 1e-6, because the oracle sums
+///    overlapping items exactly as we do — GH #131's lesson: a validity
+///    predicate must predict ORACLE divergence.)
+/// 5. Every triangle cancels against an opposite-facing copy of itself
+///    ([`FaceNet::all_cancel`]) — a zero-thickness double-sided sheet that
+///    encloses nothing → `"degenerate"`.
+/// 6. Otherwise `"closed"`.
+///
+/// Steps 4–5 build a per-face map only when some edge has more than two
+/// incidences (a duplicated face always creates one) or the volume is
+/// ~0, so a 2-manifold mesh pays exactly one edge-map pass.
+pub(crate) fn classify_mesh_quality(
+    vertices: &[f32],
+    indices: &[u32],
+    unit_scale: f32,
+    volume: f32,
+    aabb_volume: f32,
+) -> &'static str {
+    if aabb_volume <= 0.0 {
+        return "degenerate";
+    }
+    if volume.abs() > aabb_volume * 1.001 {
+        return "open_shell";
+    }
+    let welded;
+    let mut chain = EdgeChain::of(indices);
+    let ids: &[u32] = if chain.boundary_free {
+        indices
+    } else {
+        // Weld coincident fragment-dup verts on a tight, unit-scale-aware
+        // grid and re-check. 1e-4 m / unit_scale (metres-per-unit) is
+        // 0.1 mm in the model's own units whatever the authoring unit —
+        // tight enough to merge only f32-roundtrip-coincident duplicates,
+        // never to bridge a real sub-mm gap and false-close an open shell.
+        let weld_eps = 1e-4_f32 / unit_scale.max(1e-12);
+        welded = welded_indices(vertices, indices, weld_eps);
+        chain = EdgeChain::of(&welded);
+        if !chain.boundary_free {
+            return "open_shell";
+        }
+        &welded
+    };
+    let near_zero = volume.abs() <= aabb_volume * 1e-6;
+    if chain.over_incident || near_zero {
+        let faces = FaceNet::of(ids);
+        if faces.max_abs >= 2 {
+            return "open_shell";
+        }
+        if near_zero && faces.all_cancel {
+            return "degenerate";
+        }
+    }
+    "closed"
+}
+
+/// Edge-incidence summary of an oriented triangle chain.
+struct EdgeChain {
+    /// Every undirected edge is walked equally often in each direction.
+    boundary_free: bool,
+    /// Some edge has more than two incidences (self-touching, a fin, or
+    /// a duplicated face).
+    over_incident: bool,
+}
+
+impl EdgeChain {
+    fn of(indices: &[u32]) -> Self {
+        let mut edges: std::collections::HashMap<(u32, u32), (u32, i32)> =
+            std::collections::HashMap::with_capacity(indices.len() / 2);
+        if indices.len() >= 9 && indices.len().is_multiple_of(3) {
+            for tri in indices.as_chunks::<3>().0 {
+                let (a, b, c) = (tri[0], tri[1], tri[2]);
+                if a == b || b == c || c == a {
+                    continue;
+                }
+                for &(u, v) in &[(a, b), (b, c), (c, a)] {
+                    let (key, sign) = if u < v { ((u, v), 1) } else { ((v, u), -1) };
+                    let e = edges.entry(key).or_insert((0, 0));
+                    e.0 += 1;
+                    e.1 += sign;
+                }
+            }
+        }
+        EdgeChain {
+            boundary_free: !edges.is_empty() && edges.values().all(|&(_, s)| s == 0),
+            over_incident: edges.values().any(|&(n, _)| n > 2),
+        }
+    }
+}
+
+/// Does the oriented triangle chain have zero boundary — every
+/// undirected edge traversed the same number of times in each direction?
+/// (GH #187.) That is exactly the condition under which the signed-tetra
+/// divergence sum is independent of the reference point, i.e. the volume
+/// integral is well defined. Edge multiplicity is NOT constrained: a
+/// solid touching itself along an edge (4 incidences, balanced) passes.
+///
+/// Triangles with a repeated index have zero boundary (`u→v` + `v→u`) and
+/// are skipped. An empty chain (no non-degenerate triangle) is not
+/// boundary-free — there is nothing to integrate.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn is_boundary_free(indices: &[u32]) -> bool {
+    EdgeChain::of(indices).boundary_free
+}
+
+/// Net orientation count per face (triangle keyed by its vertex SET):
+/// `+1` per occurrence wound one way, `−1` per occurrence wound the other.
+struct FaceNet {
+    /// Largest `|net|` over all faces. ≥ 2 ⇒ a face is present more than
+    /// once with the same orientation (multiply covered).
+    max_abs: i32,
+    /// Every face's net is 0 (every triangle cancelled by an opposite
+    /// copy of itself); also true for a chain with no non-degenerate
+    /// triangle.
+    all_cancel: bool,
+}
+
+impl FaceNet {
+    fn of(indices: &[u32]) -> Self {
+        let mut net: std::collections::HashMap<[u32; 3], i32> =
+            std::collections::HashMap::with_capacity(indices.len() / 3);
+        for tri in indices.as_chunks::<3>().0 {
+            let (a, b, c) = (tri[0], tri[1], tri[2]);
+            if a == b || b == c || c == a {
+                continue;
+            }
+            // Canonical key = sorted triple; orientation = parity of the
+            // permutation that sorts it (rotations keep parity, a swap
+            // flips it).
+            let mut k = [a, b, c];
+            let mut parity = 1;
+            if k[0] > k[1] {
+                k.swap(0, 1);
+                parity = -parity;
+            }
+            if k[1] > k[2] {
+                k.swap(1, 2);
+                parity = -parity;
+            }
+            if k[0] > k[1] {
+                k.swap(0, 1);
+                parity = -parity;
+            }
+            *net.entry(k).or_insert(0) += parity;
+        }
+        FaceNet {
+            max_abs: net.values().map(|n| n.abs()).max().unwrap_or(0),
+            all_cancel: net.values().all(|&n| n == 0),
+        }
+    }
+}
+
+/// Does every non-degenerate triangle cancel against an opposite-facing
+/// copy of itself on the same three vertices? Such a chain is a set of
+/// zero-thickness double-sided sheets: boundary-free, but it encloses no
+/// region (GH #187's degenerate-cancellation guard).
+#[cfg(test)]
+pub(crate) fn chain_fully_cancels(indices: &[u32]) -> bool {
+    FaceNet::of(indices).all_cancel
+}
+
+/// Strict closed-2-manifold check via directed-edge pairing. NOT the
+/// `mesh_quality` rule since GH #187 (that is [`is_boundary_free`], via
+/// [`classify_mesh_quality`]); kept for callers that need true manifold
+/// topology (the bounded half-space clip's closed-in/closed-out check).
 ///
 /// A mesh is a closed manifold iff every undirected edge is shared by
 /// exactly two triangles whose winding agrees that the edge is
@@ -1383,6 +1544,182 @@ mod tests {
         assert!(!is_closed_manifold(&i));
     }
 
+    /// GH #187, the `3POXqHuM96DwZzM2c25HA4` pattern: a closed solid with
+    /// a zero-thickness region — two opposite-facing triangles on the same
+    /// three vertices — hinged on a real solid edge, so that edge carries
+    /// four incidences, two in each direction. Balanced ⇒ the volume
+    /// integral is well defined ⇒ `closed`, and the volume is the solid's.
+    #[test]
+    fn self_touching_balanced_edge_is_closed_with_exact_volume() {
+        let (mut v, mut i) = unit_cube_world();
+        // Fin vertex outside the cube, hinged on the cube's edge 0–1
+        // (bottom-front edge, y = z = -0.5).
+        v.extend_from_slice(&[0.0, -1.5, -0.5]);
+        let p = 8;
+        i.extend_from_slice(&[0, 1, p, 1, 0, p]);
+        assert!(!is_closed_manifold(&i), "setup: edge 0–1 has 4 incidences");
+        assert!(is_boundary_free(&i));
+        let q = compute(&v, &i, 1.0);
+        assert_eq!(q.mesh_quality, "closed");
+        assert_eq!(q.volume_method, "mesh");
+        assert!(q.volume_reliable);
+        assert!(
+            (q.volume_best_m3 - 1.0).abs() < 1e-6,
+            "fin pair adds no volume, got {}",
+            q.volume_best_m3
+        );
+    }
+
+    /// Two unit cubes sharing exactly one edge (vertex-shared), a solid
+    /// that touches itself along a line: 4 balanced incidences on the
+    /// shared edge. Closed, volume 2 — the analytic value.
+    #[test]
+    fn two_cubes_touching_along_an_edge_are_closed() {
+        let (v0, i0) = unit_cube_world();
+        let mut v = v0.clone();
+        // Second cube = first shifted by (+1, +1, 0): its edge x=-0.5+1,
+        // y=-0.5+1 coincides with the first cube's +X+Y edge (verts 2, 6).
+        for c in v0.as_chunks::<3>().0 {
+            v.extend_from_slice(&[c[0] + 1.0, c[1] + 1.0, c[2]]);
+        }
+        // Second-cube local verts 0 (-,-,-) and 4 (-,-,+) sit on first-cube
+        // verts 2 (+,+,-) and 6 (+,+,+): reuse those indices.
+        let remap = |k: u32| match k {
+            0 => 2,
+            4 => 6,
+            _ => k + 8,
+        };
+        let mut i = i0.clone();
+        i.extend(i0.iter().map(|&k| remap(k)));
+        assert!(!is_closed_manifold(&i));
+        let q = compute(&v, &i, 1.0);
+        assert_eq!(q.mesh_quality, "closed");
+        assert_eq!(q.volume_method, "mesh");
+        assert!(
+            (q.volume_best_m3 - 2.0).abs() < 1e-5,
+            "got {}",
+            q.volume_best_m3
+        );
+    }
+
+    /// The G55_RIV duct-fitting pattern: an `IfcPolygonalFaceSet` that
+    /// lists every face three times. Every edge is balanced (6 incidences,
+    /// 3 each way), so the integral is defined — but it is 3× the solid,
+    /// while ifcopenshell reports 1×. A tetrahedron keeps 3V inside the
+    /// AABB, so only the duplicated-face check can see it.
+    #[test]
+    fn multiply_covered_faces_are_open_shell() {
+        let v: Vec<f32> = vec![0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
+        let once: Vec<u32> = vec![0, 2, 1, 0, 1, 3, 0, 3, 2, 1, 2, 3];
+        let q1 = compute(&v, &once, 1.0);
+        assert_eq!(q1.mesh_quality, "closed");
+        assert!(
+            (q1.volume_m3 - 1.0 / 6.0).abs() < 1e-6,
+            "setup: outward tetra"
+        );
+        let mut i = once.clone();
+        i.extend_from_slice(&once);
+        i.extend_from_slice(&once);
+        assert!(is_boundary_free(&i), "setup: balanced");
+        let q = compute(&v, &i, 1.0);
+        assert!(
+            q.volume_m3.abs() < q.aabb_volume_m3,
+            "setup: 3V inside the AABB"
+        );
+        assert_eq!(q.mesh_quality, "open_shell");
+        assert_ne!(q.volume_method, "mesh");
+    }
+
+    /// Two overlapping solids sharing an edge (interpenetrating items, as
+    /// on G55_ARK railings) sum to more than their union, but ifcopenshell
+    /// sums the same items the same way — the label must not demote them
+    /// (GH #131 rule). Two unit cubes sharing their vertical corner edge
+    /// (verts 0, 4), the second rotated 45° about it: around that edge the
+    /// faces run + + − − (winding 2 in the overlap wedge), yet no face is
+    /// duplicated, so the row stays `closed` with the item sum.
+    #[test]
+    fn interpenetrating_items_without_duplicate_faces_stay_closed() {
+        let (v0, i0) = unit_cube_world();
+        let mut v = v0.clone();
+        let (s, c) = std::f32::consts::FRAC_PI_4.sin_cos();
+        for p in v0.as_chunks::<3>().0 {
+            let (rx, ry) = (p[0] + 0.5, p[1] + 0.5);
+            v.extend_from_slice(&[c * rx - s * ry - 0.5, s * rx + c * ry - 0.5, p[2]]);
+        }
+        let remap = |k: u32| if k == 0 || k == 4 { k } else { k + 8 };
+        let mut i = i0.clone();
+        i.extend(i0.iter().map(|&k| remap(k)));
+        assert!(
+            !is_closed_manifold(&i),
+            "setup: shared edge has 4 incidences"
+        );
+        let q = compute(&v, &i, 1.0);
+        assert!(
+            q.volume_m3.abs() < q.aabb_volume_m3,
+            "setup: inside the AABB"
+        );
+        assert_eq!(q.mesh_quality, "closed");
+        assert!(
+            (q.volume_best_m3 - 2.0).abs() < 1e-5,
+            "item sum, as the oracle"
+        );
+    }
+
+    /// An edge walked twice the same way (one face wound inside-out) is
+    /// unbalanced: the integral depends on the reference point, so the
+    /// shell is `open_shell` even though every edge has two incidences.
+    #[test]
+    fn unbalanced_edge_is_open_shell() {
+        let (v, mut i) = unit_cube_world();
+        // Flip the first bottom triangle.
+        i.swap(1, 2);
+        assert!(!is_boundary_free(&i));
+        let q = compute(&v, &i, 1.0);
+        assert!(
+            q.volume_m3.abs() <= q.aabb_volume_m3 * 1.001,
+            "setup: in-AABB volume"
+        );
+        assert_eq!(q.mesh_quality, "open_shell");
+    }
+
+    /// A chain that is ONLY opposite-facing pairs (a double-sided,
+    /// zero-thickness bent sheet — non-planar so the AABB is real) is
+    /// boundary-free but encloses nothing: `degenerate`, volume 0, and no
+    /// phantom prism volume from rastering its faces.
+    #[test]
+    fn fully_cancelling_pairs_are_degenerate() {
+        let (v, _) = unit_cube_world();
+        // Three faces of the cube meeting at vertex 0 (bottom, -Y, -X),
+        // each emitted with both windings.
+        let one_side: Vec<u32> = vec![0, 2, 1, 0, 3, 2, 0, 1, 5, 0, 5, 4, 0, 4, 7, 0, 7, 3];
+        let mut i = one_side.clone();
+        for t in one_side.as_chunks::<3>().0 {
+            i.extend_from_slice(&[t[0], t[2], t[1]]);
+        }
+        assert!(is_boundary_free(&i));
+        assert!(chain_fully_cancels(&i));
+        let q = compute(&v, &i, 1.0);
+        assert!(q.aabb_volume_m3 > 0.9, "setup: real AABB");
+        assert_eq!(q.mesh_quality, "degenerate");
+        assert!(!q.volume_reliable);
+        assert_eq!(q.volume_method, "prism_fallback");
+        assert_eq!(q.volume_best_m3, 0.0);
+        assert_eq!(q.volume_prism_bound_m3, 0.0);
+    }
+
+    /// A closed solid plus a cancelling pair elsewhere is NOT fully
+    /// cancelling — the cube is still there.
+    #[test]
+    fn partially_cancelling_chain_stays_closed() {
+        let (mut v, mut i) = unit_cube_world();
+        v.extend_from_slice(&[3.0, 3.0, 3.0, 4.0, 3.0, 3.0, 3.0, 4.0, 3.5]);
+        i.extend_from_slice(&[8, 9, 10, 8, 10, 9]);
+        assert!(!chain_fully_cancels(&i));
+        let q = compute(&v, &i, 1.0);
+        assert_eq!(q.mesh_quality, "closed");
+        assert!((q.volume_best_m3 - 1.0).abs() < 1e-5);
+    }
+
     #[test]
     fn volume_reliable_uses_mesh_value_for_closed_cube() {
         // Closed manifold → reliable; volume_best is the mesh volume,
@@ -1731,19 +2068,73 @@ mod tests {
         // the footprint × height prism reads ~9 m³.
         //
         // Simplest faithful mimic: an open tube (4 side walls, height 1 m,
-        // 3×3 footprint) whose two triangles are also given an inward
-        // duplicate of opposite winding so the divergence volume cancels
-        // to ~0. Prism = footprint(9 m²) × height(1 m) = 9 m³.
-        let (s, h) = (3.0_f32, 1.0_f32);
+        // 3×3 footprint) plus a reversed-winding copy inset by 0.2 mm, so
+        // the divergence volume nearly cancels (8·e·s·h/3 = 1.6e-3 m³, well
+        // under the 1e-3 · 9 m³ collapse threshold).
+        // Prism = footprint(9 m²) × height(1 m) = 9 m³.
+        //
+        // GH #187: the copy used to sit on the SAME vertices. That chain
+        // cancels exactly — every face against an opposite copy of itself
+        // — and is now classified `degenerate` with volume 0 (see
+        // `fully_cancelling_pairs_are_degenerate`). The inset (2 weld
+        // cells, so welding does not merge it) keeps this test on the
+        // open-shell collapse backstop it was written for.
+        let (s, h, e) = (3.0_f32, 1.0_f32, 2e-4_f32);
         let v: Vec<f32> = vec![
-            0.0, 0.0, 0.0, s, 0.0, 0.0, s, s, 0.0, 0.0, s, 0.0, // 0..3 bottom ring
-            0.0, 0.0, h, s, 0.0, h, s, s, h, 0.0, s, h, // 4..7 top ring
+            0.0,
+            0.0,
+            0.0,
+            s,
+            0.0,
+            0.0,
+            s,
+            s,
+            0.0,
+            0.0,
+            s,
+            0.0, // 0..3 bottom ring
+            0.0,
+            0.0,
+            h,
+            s,
+            0.0,
+            h,
+            s,
+            s,
+            h,
+            0.0,
+            s,
+            h, // 4..7 top ring
+            e,
+            e,
+            0.0,
+            s - e,
+            e,
+            0.0,
+            s - e,
+            s - e,
+            0.0,
+            e,
+            s - e,
+            0.0, // 8..11 inset bottom
+            e,
+            e,
+            h,
+            s - e,
+            e,
+            h,
+            s - e,
+            s - e,
+            h,
+            e,
+            s - e,
+            h, // 12..15 inset top
         ];
-        // Four side walls (open top + bottom). Then the SAME walls with
-        // reversed winding stacked on top → every directed contribution
-        // cancels in the divergence sum (volume → ~0), while the surface
-        // area DOUBLES (the shell survives, W4-style) and the footprint
-        // raster still sees the full 3×3 extent at full height.
+        // Four side walls (open top + bottom). Then the inset walls with
+        // reversed winding → the directed contributions nearly cancel in
+        // the divergence sum (volume → ~0), while the surface area
+        // DOUBLES (the shell survives, W4-style) and the footprint raster
+        // still sees the full 3×3 extent at full height.
         let walls: Vec<u32> = vec![
             0, 1, 5, 0, 5, 4, // -Y
             1, 2, 6, 1, 6, 5, // +X
@@ -1751,14 +2142,14 @@ mod tests {
             3, 0, 4, 3, 4, 7, // -X
         ];
         let mut i = walls.clone();
-        // Reversed-winding duplicate (swap 2nd/3rd of each triangle).
+        // Reversed-winding inset copy (swap 2nd/3rd of each triangle).
         for tri in walls.as_chunks::<3>().0 {
-            i.extend_from_slice(&[tri[0], tri[2], tri[1]]);
+            i.extend_from_slice(&[tri[0] + 8, tri[2] + 8, tri[1] + 8]);
         }
         let q = compute(&v, &i, 1.0);
         // Volume cancels to ~0.
         assert!(
-            q.volume_m3.abs() < 1e-3,
+            q.volume_m3.abs() < 2e-3,
             "setup: divergence volume must cancel to ~0, got {}",
             q.volume_m3
         );

@@ -828,7 +828,17 @@ def _resolve_step_escapes(s: str) -> str:
 #       that cannot be applied leaves the unclipped operand tagged
 #       `halfspace_unclipped` with `volume_reliable=False` /
 #       `volume_method="mesh_unclipped"`.
-_CACHE_SCHEMA_VERSION = 37
+#   38: GH #187 + #173 — `mesh_quality` keys on edge balance (boundary-
+#       free triangle chain, no same-orientation duplicate face), not on
+#       exactly-two incidences per edge: self-touching solids are
+#       `closed` regardless of triangulation, multiply-listed faceset
+#       faces are `open_shell`, fully self-cancelling chains are
+#       `degenerate`. Two-arc `IfcIndexedPolyCurve` profile loops drop
+#       their near-duplicate closing sample (relative dedup tolerance),
+#       so hollow pipe extrusions lose a zero-width seam quad (vertex /
+#       triangle counts change) and mesh watertight. Columns unchanged;
+#       `mesh_quality` / `volume_method` / `volume_m3` values move.
+_CACHE_SCHEMA_VERSION = 38
 
 _FIELD_RE = re.compile(r"\(\s*(.*?)\s*\)\s*;", re.DOTALL)
 

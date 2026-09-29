@@ -336,7 +336,19 @@ describing via `pq.read_schema(...)`):
 - QTO: `volume_m3`, `aabb_volume_m3`, `surface_area_m2`, orientation-
   bucketed area columns, `largest_surface_m2`, `smallest_surface_m2`,
   `surface_count`, `mesh_quality` (`"closed"` / `"open_shell"` /
-  `"degenerate"`).
+  `"degenerate"`). **`closed`** = the triangle chain is boundary-free
+  (every undirected edge walked equally often in each direction, on raw
+  indices or after a 0.1 mm weld), no face is present twice with the
+  same orientation, and `|volume| ≤ AABB` — i.e. the signed-volume sum
+  *is* the element's volume. Strict 2-manifold topology is not required:
+  a solid touching itself along an edge (four balanced incidences) is
+  `closed`. **`open_shell`** = some edge is unbalanced (open boundary,
+  inconsistently wound face), a face is duplicated with the same
+  orientation (a faceset listing each face three times sums to 3×), or
+  the volume exceeds the AABB. **`degenerate`** = zero-extent AABB, or a
+  chain whose every face cancels against an opposite copy of itself
+  (zero-thickness double-sided sheet; `volume_m3 = 0`,
+  `volume_prism_bound_m3 = 0`).
 - <a id="coverage-boundary"></a>**Coverage boundary (GH #122, #203).**
   Two layers, two different contracts:
   - **Tier-1 `products` table = reveal-all index.** One row for every
@@ -389,7 +401,7 @@ describing via `pq.read_schema(...)`):
   volume when trustworthy, else a min-over-three-axes prism fallback — so
   `SUM(volume_m3)` no longer mixes open-shell garbage into totals).
   `volume_reliable` (bool) is the routing flag — `true` when `volume_m3`
-  is the mesh value and it's trustworthy (closed manifold, **or** an open
+  is the mesh value and it's trustworthy (`mesh_quality == "closed"`, **or** an open
   shell whose volume is still within its tight upper bound, the min of the
   prism and the AABB); `false` when the mesh volume is out of bounds
   either way — provably too big (exceeded that bound) **or** collapsed to
@@ -404,7 +416,7 @@ describing via `pq.read_schema(...)`):
   signed-tetra volume matches the ifcopenshell kernel, so it is **trusted,
   not** replaced by the 40–66× prism — only a near-zero collapse
   (`< bound × 1e-3`) escalates. Send `false` rows to an authoritative
-  kernel. `volume_method` is `"mesh"` (closed manifold), `"mesh_open"`
+  kernel. `volume_method` is `"mesh"` (`closed`), `"mesh_open"`
   (trusted open shell — same trust as `mesh`, split out so you can filter
   on watertightness via `mesh_quality == "closed"`), `"prism_fallback"`,
   or `"mesh_unclipped"` (GH #194: a half-space clip of the element could
@@ -469,6 +481,18 @@ describing via `pq.read_schema(...)`):
   up to ~1 m off its neighbouring polyline vertices. Ordinary arcs keep
   the same chord count and area scale; only profiles with a trimmed
   conic re-extract, and only huge-radius ones move visibly.
+  **GH #187 + #173 (cache schema v38):** `mesh_quality` keys on edge
+  *balance*, not edge multiplicity (definition above). Self-touching
+  solids no longer flip between `closed` and `open_shell` with the
+  triangulation, and the two-`IfcArcIndex` hollow pipe profile (Revit /
+  MagiCAD `IfcArbitraryProfileDefWithVoids`) no longer keeps a
+  near-duplicate closing sample at the arc seam, so those extrusions are
+  watertight on raw indices. Rows move `open_shell` → `closed` and
+  `volume_method` `"mesh_open"` → `"mesh"` with the same volume (G55:
+  ARK 395, RIB 3, RIE 1 518, RIV 16 815 incl. all 10 704
+  `IfcPipeSegment`); a few `prism_fallback` rows become exact `"mesh"`
+  (G55_RIV: 3 duct segments, 0.92 → 1.003 of ifcopenshell). Pipe
+  volumes move by f32 summation order only (≤ 5e-7 relative).
 - Semantic payload: `materials`, `psets`, `quantities`,
   `classifications` (list-of-struct columns — `UNNEST` in DuckDB).
   Each `psets` and `quantities` struct carries `source`
@@ -923,7 +947,7 @@ exist but the nested entity's class or predefinedType does not match;
 `actual` = the classes climbed as a Python list, e.g.
 `['IFCELEMENTASSEMBLY.TRUSS']`, for aggregates / nests / no relation, else
 the related class or its predefinedType), `PROHIBITED_PRESENT`,
-`SPEC_NO_APPLICABLE`, `SPEC_PROHIBITED_APPLICABLE`.
+`SPEC_NO_APPLICABLE`, `SPEC_PROHIBITED_APPLICABLE`. When one element carries several `IfcPropertySet`s with the same name (Revit writes one per export rule), a Property requirement is evaluated against every one of them — required/optional: any satisfies; prohibited: must hold across all. Stock IfcTester sees only one of those sets (`docs/ids/ambiguities.md` A47, GH #193).
 
 `actual` on `PROP_DATATYPE_MISMATCH` is the value's type in CamelCase
 (`IfcText`, `IfcLengthMeasure`), as IfcTester prints it (GH #200).
@@ -1093,7 +1117,7 @@ JSON.parse(m.bySourceJson()); // GH #166 counters
 JSON.parse(m.validateIds(idsXml));   // IfcTester-shaped report (= rep.to_ifctester_json())
 m.validateIds(idsXml, "mark", true); // onUnsupported, filterIfcVersion
 m.free();
-```
+``` `graph.products[].materials` lists every material name bound to the product across all roles (direct, list, layer, constituent, profile), deduped, first-seen order; `layer_set` is always null (GH #185, #213) — read `materialsJson()` for the rows. `qtoJson` rows split `volume_m3` into `volume_reliable_m3` + `volume_unreliable_m3` (unreliable = the host's half-space clip was not applied, an upper bound; `products_clip_unapplied` counts them) and `statsJson` carries `halfspace_clip_unapplied` / `halfspace_clip_manifold` (GH #211). Sum only `volume_reliable_m3` for a trustworthy total.
 
 **`validateIds` is opt-in** (`IFCFAST_WASM_FEATURES=ids crates/wasm/build.sh`).
 It adds roxmltree, regex (Unicode tables) and the per-schema IDS tables

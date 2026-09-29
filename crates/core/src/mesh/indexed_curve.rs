@@ -99,8 +99,7 @@ pub fn eval_segments_2d(pts: &[Vec2], segments_raw: &[u8], unit_scale: f32) -> O
             return None;
         }
     }
-    if out.len() > 2 && (*out.first().unwrap() - *out.last().unwrap()).length_squared() < EPS_DEDUP
-    {
+    if out.len() > 2 && coincident_2d(*out.first().unwrap(), *out.last().unwrap()) {
         out.pop();
     }
     // Force CCW orientation — earcut + the extrusion pipeline assume
@@ -160,14 +159,35 @@ pub fn eval_segments_3d(pts: &[Vec3], segments_raw: &[u8], unit_scale: f32) -> O
             return None;
         }
     }
-    if out.len() > 2 && (*out.first().unwrap() - *out.last().unwrap()).length_squared() < EPS_DEDUP
-    {
+    if out.len() > 2 && coincident_3d(*out.first().unwrap(), *out.last().unwrap()) {
         out.pop();
     }
     Some(out)
 }
 
-const EPS_DEDUP: f32 = 1e-12;
+/// Relative coincidence tolerance for consecutive / closing samples
+/// (GH #173). Arc samples are `center + r·(cos θ, sin θ)` in f32, so the
+/// end of one arc and the start of the next — or the end of the last arc
+/// and the loop's first sample — land on the same authored point only to
+/// within a few ulps of the coordinate magnitude (measured on G55_RIV pipe
+/// profiles: ~1e-5 mm at r = 55 mm, i.e. ~2e-7 relative). The old
+/// absolute 1e-6-unit test missed that, so every two-arc hollow profile
+/// kept a near-duplicate closing point: a zero-width side-wall quad at
+/// the seam that the cap triangulation did not share, which left the
+/// extrusion's edges unbalanced on raw indices. 1e-6 relative (~8 ulps)
+/// with a 1e-6-unit absolute floor (the old tolerance) merges trig noise
+/// and nothing a tessellation could mean.
+const DEDUP_REL: f32 = 1e-6;
+
+fn coincident_2d(a: Vec2, b: Vec2) -> bool {
+    let scale = a.abs().max_element().max(b.abs().max_element()).max(1.0);
+    (a - b).length_squared() <= (DEDUP_REL * scale) * (DEDUP_REL * scale)
+}
+
+fn coincident_3d(a: Vec3, b: Vec3) -> bool {
+    let scale = a.abs().max_element().max(b.abs().max_element()).max(1.0);
+    (a - b).length_squared() <= (DEDUP_REL * scale) * (DEDUP_REL * scale)
+}
 
 fn parse_index_list(body_with_parens: &[u8]) -> Option<Vec<usize>> {
     let inner = match parse_field(body_with_parens) {
@@ -189,27 +209,17 @@ fn parse_index_list(body_with_parens: &[u8]) -> Option<Vec<usize>> {
 }
 
 fn append_dedup_2d(out: &mut Vec<Vec2>, samples: &[Vec2]) {
-    let start = if let (Some(&last), Some(&first)) = (out.last(), samples.first()) {
-        if (last - first).length_squared() < EPS_DEDUP {
-            1
-        } else {
-            0
-        }
-    } else {
-        0
+    let start = match (out.last(), samples.first()) {
+        (Some(&last), Some(&first)) if coincident_2d(last, first) => 1,
+        _ => 0,
     };
     out.extend_from_slice(&samples[start..]);
 }
 
 fn append_dedup_3d(out: &mut Vec<Vec3>, samples: &[Vec3]) {
-    let start = if let (Some(&last), Some(&first)) = (out.last(), samples.first()) {
-        if (last - first).length_squared() < EPS_DEDUP {
-            1
-        } else {
-            0
-        }
-    } else {
-        0
+    let start = match (out.last(), samples.first()) {
+        (Some(&last), Some(&first)) if coincident_3d(last, first) => 1,
+        _ => 0,
     };
     out.extend_from_slice(&samples[start..]);
 }

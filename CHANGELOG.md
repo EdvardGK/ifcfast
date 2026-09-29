@@ -7,6 +7,65 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **wasm `statsJson` exposes `halfspace_clip_unapplied` /
+  `halfspace_clip_manifold`; `qtoJson` rows and sidecar `qto.json` gain
+  `volume_reliable_m3`, `volume_unreliable_m3`, `products_clip_unapplied`**
+  (`volume_m3` stays the total) (GH #211).
+- **IDS: several same-named property sets on one element (GH #193, A47).**
+  A Property requirement is evaluated against every same-named set
+  (required/optional: any satisfies; prohibited: must hold across all);
+  stock IfcTester sees one set. Fixture + tests pin both behaviours.
+
+
+### Fixed
+
+- **Half-space clip planes stay f64 past 10 km (GH #210).** An
+  `IfcHalfSpaceSolid` or `IfcPolygonalBoundedHalfSpace` whose plane,
+  boundary `Position` or boundary vertices lie more than 10 km from the
+  origin is read in f64 and moved into the host's local frame before the
+  cast to f32. Before, the plane snapped to the f32 grid (0.5 m at
+  6.5e6 m): a UTM-baked brep wall read 2.100 m³ against ifcopenshell's
+  2.022. Output within 10 km of the origin is bit-identical.
+- **Trimmed conics decide "coincident trims → full revolution" on arc
+  length (1 µm in the file's unit) instead of an absolute 1e-9 rad
+  (GH #191).** A 5 mm arc on a 6.5e6 m circle stays an arc. On ordinary
+  radii a sweep under 1 µm of arc is now a full turn. G55 unchanged.
+- **wasm / sidecar `graph.json` per-product `materials` include every
+  role (GH #185)** — `direct`, `list`, `layer`, `constituent`, `profile`
+  (was: only layers; the rollup matched roles the extractor never emits).
+  Duplex: 91 → 99 products with materials. `layer_set` stays null (#213).
+- **`mesh_quality` keys on edge balance, not edge multiplicity (GH #187,
+  cache schema v38).** A mesh is `closed` when its triangle chain is
+  boundary-free — every undirected edge walked equally often in each
+  direction, on raw indices or after the 0.1 mm weld — no face occurs
+  twice with the same orientation, and `|volume| ≤ AABB`: exactly the
+  condition under which the signed-volume sum is the element's volume.
+  The old rule demanded exactly two incidences per edge, so a solid that
+  touches itself along an edge flipped between `closed` and `open_shell`
+  depending on which valid triangulation a concave face got (108 G55_ARK
+  elements relabelled by #177 with bit-identical volumes). A faceset that
+  lists every face several times (G55_RIV MagiCAD duct fittings: 3×,
+  ifcopenshell reports 1×) stays `open_shell` and keeps its prism
+  fallback; a chain whose every face cancels against an opposite copy of
+  itself is `degenerate` with volume 0. Shared by `mesh_qto()`, the
+  substrate and `drift`.
+- **Hollow pipe profiles made of two `IfcArcIndex` semicircles mesh
+  watertight (GH #173).** The last arc's final sample missed the loop's
+  first sample by f32 trig noise (~1e-5 mm at r = 55 mm) and survived the
+  absolute 1e-6 closing dedup, leaving a zero-width side quad at the seam
+  that the earcut caps did not share; every such extrusion was
+  `open_shell`. `IfcIndexedPolyCurve` sample dedup is now relative
+  (1e-6 × coordinate magnitude, 1e-6-unit floor). G55 corpus vs the
+  v37 build: labels `open_shell` → `closed` on ARK 395 / RIB 3 / RIE
+  1 518 / RIV 16 815 rows (all 10 704 RIV `IfcPipeSegment`), all with
+  unchanged volume except 3 RIV duct segments that leave
+  `prism_fallback` for an exact `mesh` value (0.92 → 1.003 of
+  ifcopenshell) and 2 136 RIV rows that move by f32 summation order
+  (≤ 5e-7 relative); no row moves away from ifcopenshell by more than
+  that noise.
+
 ## [0.6.2] - 2026-09-29
 
 ### Changed

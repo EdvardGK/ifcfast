@@ -402,4 +402,64 @@ mod tests {
             "two unit solids (one -Z) should sum to 2.0, got {total} — -Z solid cancelled (GH #138)"
         );
     }
+
+    /// GH #173: the G55_RIV pipe pattern verbatim (entities #93–#99 of
+    /// G55_RIV.ifc, mm file) — an `IfcArbitraryProfileDefWithVoids` whose
+    /// outer and inner curves are two-`IfcArcIndex` indexed polycurves.
+    /// Before the fix the last arc's final sample missed the loop's first
+    /// sample by f32 trig noise (~1e-5 mm), survived the absolute 1e-6
+    /// closing dedup, and left a zero-width side quad the earcut caps did
+    /// not share: raw edges unbalanced, every such pipe `open_shell`.
+    const ANNULUS_PIPE_IFC: &str = r#"ISO-10303-21;
+HEADER;
+FILE_DESCRIPTION(('ViewDefinition [ReferenceView]'),'2;1');
+FILE_NAME('pipe.ifc','2026-09-29T00:00:00',('test'),('skiplum'),'ifcfast','ifcfast','');
+FILE_SCHEMA(('IFC4'));
+ENDSEC;
+DATA;
+#1=IFCCARTESIANPOINT((0.,0.,0.));
+#2=IFCDIRECTION((1.,0.,0.));
+#3=IFCDIRECTION((0.,0.,1.));
+#4=IFCDIRECTION((0.,0.,1.));
+#5=IFCSIUNIT(*,.LENGTHUNIT.,.MILLI.,.METRE.);
+#6=IFCUNITASSIGNMENT((#5));
+#7=IFCPROJECT('0YvctVUKr0kugbFTf53O9L',$,'p',$,$,$,$,$,#6);
+#93=IFCCARTESIANPOINTLIST2D(((-55.,0.),(0.,55.),(55.,0.),(0.,-55.)));
+#94=IFCINDEXEDPOLYCURVE(#93,(IFCARCINDEX((1,2,3)),IFCARCINDEX((3,4,1))),$);
+#95=IFCCARTESIANPOINTLIST2D(((-53.,0.),(0.,53.),(53.,0.),(0.,-53.)));
+#96=IFCINDEXEDPOLYCURVE(#95,(IFCARCINDEX((1,2,3)),IFCARCINDEX((3,4,1))),$);
+#97=IFCARBITRARYPROFILEDEFWITHVOIDS(.AREA.,$,#94,(#96));
+#98=IFCAXIS2PLACEMENT3D(#1,#3,#2);
+#99=IFCEXTRUDEDAREASOLID(#97,#98,#4,13521.4);
+ENDSEC;
+END-ISO-10303-21;
+"#;
+
+    #[test]
+    fn annulus_pipe_extrusion_is_closed_with_analytic_volume() {
+        let table = EntityTable::build(ANNULUS_PIPE_IFC.as_bytes());
+        let mesh = extrude(&table, 99).expect("annulus pipe extrudes");
+        // Producer: no near-duplicate seam vertex — the raw index buffer
+        // is a strict closed 2-manifold (caps and walls share every seam
+        // vertex), not merely balanced after a weld.
+        assert!(
+            crate::mesh::qto::is_closed_manifold(&mesh.indices),
+            "raw pipe mesh must be a closed 2-manifold (GH #173 seam)"
+        );
+        let q = crate::mesh::qto::compute(&mesh.vertices, &mesh.indices, 0.001);
+        assert_eq!(q.mesh_quality, "closed");
+        assert_eq!(q.volume_method, "mesh");
+        assert!(q.volume_reliable);
+        // Area-preserving chord radius (`profile::arc_area_scale`): each
+        // sampled loop encloses exactly its circle's area, so the solid is
+        // π(R² − r²)·L with no chord-count correction.
+        let analytic_m3 =
+            std::f64::consts::PI * (55.0_f64.powi(2) - 53.0_f64.powi(2)) * 13521.4 * 1e-9;
+        let rel = (q.volume_best_m3 as f64 - analytic_m3).abs() / analytic_m3;
+        assert!(
+            rel < 1e-4,
+            "pipe volume {} vs analytic {analytic_m3} (rel {rel:.2e})",
+            q.volume_best_m3
+        );
+    }
 }
