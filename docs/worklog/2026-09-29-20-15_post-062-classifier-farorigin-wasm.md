@@ -58,3 +58,4 @@ Closed: #173, #185, #187, #191, #210, #211. Filed: #213 (materials set_name), if
 - v0.6.3 live on PyPI, GitHub release, ifcfast.com (site `bb30c7b`).
 - Every Next item is already tracked: ifcfast-site#6, #213, #209, #212, #207, #182, #117, IDS slice 5 on #192. No new issues filed at close.
 - knowledge.md not updated: this session's lessons are project-specific (memory `mesh-quality-classifier`, `omarchy-oom-multiagent`, `ids-external-validation-jonatan`).
+- **Jonatan activity check (Ed asked, 2026-09-30):** no new ifcfast issues/PRs; PR #24 untouched since 2026-05-31. His `ifcpipeline` runs a dedicated ifcfast worker (Dockerfile, tasks, API gateway, benchmarks vs ifccsv). On 2026-09-29 he upgraded that pipeline to ifcopenshell 0.9.0 and released `byggstyrning/ifctester-revit` v1.4.0 on IfcTester 0.9 → our 0.8.5 IDS oracle pin needs a rerun on 0.9 (#214).
