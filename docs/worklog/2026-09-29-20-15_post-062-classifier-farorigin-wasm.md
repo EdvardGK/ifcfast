@@ -1,7 +1,7 @@
 ## Agent signature
 - **Agent**: `claude-opus-5-5` (coordinator; session resumed from a Fable 5.1 run; opus agents for the classifier and far-origin streams, sonnet for wasm/materials/IDS and site syncs)
 - **Working tree**: `/home/edkjo/workspace/inbox/ifcfast`
-- **Branch**: `main` @ `789b084` → `b68d521` (`1689ee8` ship_gate.sh, `65d8c17` #185/#211/#193, `0fa7c2d` #210/#191, `8b79f0a` #187/#173 + docs, `b68d521` release v0.6.3)
+- **Branch**: `main` @ `789b084` → `a578c63` (`1689ee8` ship_gate.sh, `65d8c17` #185/#211/#193, `0fa7c2d` #210/#191, `8b79f0a` #187/#173 + docs, `b68d521` release v0.6.3)
 - **Session scope**: post-0.6.2 backlog — mesh_quality classifier, far-origin clip plane, arc tolerance, wasm materials/clip reliability, duplicate-pset IDS rule; release v0.6.3
 - **Touched paths**: scripts/ship_gate.sh (new), .claude/skills/oracle-gate/SKILL.md, crates/core/src/mesh/{qto,stats,indexed_curve,extrusion,boolean,profile}.rs, crates/core/tests/{far_origin_clip_210.rs,ids_eval.rs,fixtures/ids/**,fixtures/ids_own/**}, crates/wasm/{src/analysis.rs,src/lib.rs,test/parity.mjs,test/clip194.mjs}, scripts/generate_sample_sidecars.py, python/ifcfast/header.py, AGENTS.md (+data copy), CHANGELOG.md, docs/ids/ambiguities.md, tests/{test_materials_rollup_185,test_ids_duplicate_psets_193}.py, tests/fixtures/{materials_roles_185,*_210}.ifc, Cargo.toml, Cargo.lock, pyproject.toml
 - **Parallel sessions observed**: none on origin/main; external comment on #192 by jonatanjacobsson
@@ -43,7 +43,7 @@ Closed: #173, #185, #187, #191, #210, #211. Filed: #213 (materials set_name), if
 (receipts open_shell counts stale). Commented: #192, #193.
 
 ## Next
-1. Verify `pip download ifcfast==0.6.3` (watcher running at session end).
+1. ~~Verify PyPI~~ DONE: `ifcfast==0.6.3` resolved 2026-09-30 01:11 UTC (release workflow green on all lanes).
 2. ifcfast-site#6: regenerate receipts on 0.6.3.
 3. #213, #209, #212 (upstream report), #207, IDS slice 5 (needs Ed), #182, #117.
 4. Ed by hand: close PR #24 with the personal note (Jonatan's sweep is a good occasion), close PR #90.
@@ -53,3 +53,8 @@ Closed: #173, #185, #187, #191, #210, #211. Filed: #213 (materials set_name), if
   `<scratchpad>/wt` (detached HEAD); `git worktree remove` it when convenient (not done:
   no-delete rule). Isolated build target at `~/.cache/ifcfast-geomprec-210/` (~1 GB) — trashable.
 - A cold dev build filled the /tmp tmpfs quota; big scratch builds belong under ~/.cache.
+
+## Session close (2026-09-30)
+- v0.6.3 live on PyPI, GitHub release, ifcfast.com (site `bb30c7b`).
+- Every Next item is already tracked: ifcfast-site#6, #213, #209, #212, #207, #182, #117, IDS slice 5 on #192. No new issues filed at close.
+- knowledge.md not updated: this session's lessons are project-specific (memory `mesh-quality-classifier`, `omarchy-oom-multiagent`, `ids-external-validation-jonatan`).
