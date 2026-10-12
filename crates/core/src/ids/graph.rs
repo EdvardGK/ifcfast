@@ -563,11 +563,15 @@ impl ClassData {
                     .index
                     .refs
                     .get(&id)
-                    .and_then(|r| r.identification.as_deref());
+                    .and_then(|r| r.identification.as_deref())
+                    // The public table keeps `''` since GH #217; the IDS
+                    // facet keeps reading it as no value, as before.
+                    .filter(|s| !s.is_empty());
                 let root = self.root(id);
                 let system = root
                     .and_then(|s| self.index.systems.get(&s))
-                    .and_then(|s| s.name.as_deref());
+                    .and_then(|s| s.name.as_deref())
+                    .filter(|s| !s.is_empty());
                 ClassRef {
                     id,
                     value,

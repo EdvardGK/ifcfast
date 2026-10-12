@@ -417,6 +417,7 @@ _LAYER_DTYPES: dict[str, dict[str, str]] = {
         "guid": "object", "role": "object", "layer_index": "int64",
         "material_name": "object", "layer_thickness_mm": "object",
         "category": "object", "fraction": "object", "source": "object",
+        "item_name": "object", "set_name": "object",
     },
     "classifications": {
         "guid": "object", "system_name": "object", "edition": "object",

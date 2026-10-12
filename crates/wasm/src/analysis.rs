@@ -43,7 +43,7 @@ pub type Rollup = HashMap<String, (Option<f64>, Option<f64>, Option<f64>)>;
 /// Mirrors `python/ifcfast/header.py::_CACHE_SCHEMA_VERSION`. Bump in
 /// lockstep — it is hashed into `cache_key`, so a mismatch shows up as a
 /// changed key rather than stale data.
-const CACHE_SCHEMA_VERSION: u32 = 38;
+const CACHE_SCHEMA_VERSION: u32 = 39;
 const HASH_HEAD_BYTES: usize = 4 * 1024 * 1024;
 const HASH_TAIL_BYTES: usize = 4 * 1024 * 1024;
 /// `header.py::_HEADER_READ_BYTES` — the window FILE_SCHEMA is read from.
@@ -263,6 +263,9 @@ pub struct Analysis {
     /// guid → (materials in first-seen order, layer-set name)
     pub materials_by_guid: HashMap<String, Vec<String>>,
     pub layer_set_by_guid: HashMap<String, String>,
+    /// set name → `{layers: [{material, thickness_mm}], total_thickness_mm}`
+    /// (`graph.json` `material_layer_sets`, GH #213).
+    pub material_layer_sets: Map<String, Value>,
     /// guid → (IsExternal, LoadBearing, FireRating) as JSON values
     pub pset_attrs: PsetAttrs,
 
@@ -557,12 +560,10 @@ impl Analysis {
         // Every role the extractor emits (`direct`, `list`, `layer`,
         // `constituent`, `profile`) contributes its name — deduped,
         // first-seen order (GH #185). `unknown` (unresolvable
-        // association) has no name and is skipped. `layer_set_by_guid`
-        // stays empty: the public materials table carries no set-name
-        // column, so the per-product `layer_set` is null, as in the
-        // Python generator.
+        // association) has no name and is skipped. Layer sets come from
+        // the `set_name` column (GH #213), as in the Python generator.
         let materials_by_guid = roll_up_materials(&materials_t);
-        let layer_set_by_guid: HashMap<String, String> = HashMap::new();
+        let (layer_set_by_guid, material_layer_sets) = layer_sets(&materials_t);
 
         let mut pset_attrs: PsetAttrs = HashMap::new();
         for i in 0..psets_t.guid.len() {
@@ -642,6 +643,7 @@ impl Analysis {
             segment_rows: 0,
             materials_by_guid,
             layer_set_by_guid,
+            material_layer_sets,
             pset_attrs,
             drift: Vec::new(),
             drift_by_guid: HashMap::new(),
@@ -1268,6 +1270,8 @@ const COLS: &[(&str, &[&str])] = &[
             "category",
             "fraction",
             "source",
+            "item_name",
+            "set_name",
         ],
     ),
     (
@@ -1657,10 +1661,7 @@ impl Analysis {
             "voids": self.voids.iter()
                 .map(|(o, h)| json!({"opening_guid": o, "host_guid": h}))
                 .collect::<Vec<_>>(),
-            // The materials extractor exposes no `set_name` column, so
-            // the Python builder's `if not set_name: continue` drops every
-            // row and the map is always empty. Ported as-is.
-            "material_layer_sets": Value::Object(Map::new()),
+            "material_layer_sets": Value::Object(self.material_layer_sets.clone()),
         })
     }
 
@@ -1927,7 +1928,8 @@ impl Analysis {
     }
 
     /// `[{guid, role, layer_index, material_name, layer_thickness_mm,
-    /// category, fraction, source}]` — `model.materials` as row objects.
+    /// category, fraction, source, item_name, set_name}]` —
+    /// `model.materials` as row objects.
     ///
     /// `layer_index` is `-1` on every non-layered role (that is the
     /// extractor's encoding, not a missing value, so it stays a number).
@@ -1951,6 +1953,8 @@ impl Analysis {
             r.insert("category".into(), jstr(&t.category[i]));
             r.insert("fraction".into(), jnum(t.fraction[i].and_then(finite10)));
             r.insert("source".into(), Value::String(t.source[i].to_string()));
+            r.insert("item_name".into(), jstr(&t.item_name[i]));
+            r.insert("set_name".into(), jstr(&t.set_name[i]));
             rows.push(Value::Object(r));
         }
         Value::Array(rows)
@@ -2023,6 +2027,48 @@ fn roll_up_materials(t: &materials::MaterialTable) -> HashMap<String, Vec<String
         }
     }
     out
+}
+
+/// guid → its first layer row's `set_name`, and each layer set defined
+/// once by the first product carrying it (its layer rows in table order).
+/// Mirrors the layer-set block of
+/// `scripts/generate_sample_sidecars.py::_build_graph` (GH #213).
+fn layer_sets(t: &materials::MaterialTable) -> (HashMap<String, String>, Map<String, Value>) {
+    let mut by_guid: HashMap<String, String> = HashMap::new();
+    let mut owner: HashMap<&str, &str> = HashMap::new();
+    let mut defs: Vec<(String, Vec<Value>, f64)> = Vec::new();
+    for i in 0..t.guid.len() {
+        if t.role[i] != "layer" {
+            continue;
+        }
+        let guid = t.guid[i].as_str();
+        let Some(set_name) = t.set_name[i].as_deref().filter(|s| !s.is_empty()) else {
+            continue;
+        };
+        by_guid
+            .entry(guid.to_string())
+            .or_insert_with(|| set_name.to_string());
+        if *owner.entry(set_name).or_insert(guid) != guid {
+            continue;
+        }
+        let thickness = t.layer_thickness_mm[i].unwrap_or(0.0);
+        let layer = json!({
+            "material": t.material_name[i].clone().unwrap_or_default(),
+            "thickness_mm": thickness,
+        });
+        match defs.iter_mut().find(|(n, _, _)| n == set_name) {
+            Some((_, layers, total)) => {
+                layers.push(layer);
+                *total += thickness;
+            }
+            None => defs.push((set_name.to_string(), vec![layer], thickness)),
+        }
+    }
+    let mut out = Map::new();
+    for (name, layers, total) in defs {
+        out.insert(name, json!({"layers": layers, "total_thickness_mm": total}));
+    }
+    (by_guid, out)
 }
 
 /// `scripts/generate_sample_sidecars.py::_slug`.
@@ -2436,10 +2482,15 @@ mod tests {
                 "category",
                 "fraction",
                 "source",
+                "item_name",
+                "set_name",
             ],
         );
         let r = &rows[0];
         assert_eq!(r["material_name"], json!("Concrete"));
+        // A direct material has no set item and no set (GH #219 / #213).
+        assert_eq!(r["item_name"], Value::Null);
+        assert_eq!(r["set_name"], Value::Null);
         // Non-layered role: -1 is the extractor's encoding, a number.
         assert_eq!(r["layer_index"], json!(-1));
         // A single material has no thickness and no fraction — null, not 0.
@@ -2707,21 +2758,44 @@ mod tests {
                 .unwrap_or_else(|| panic!("{name} in graph.products"))["materials"]
                 .clone()
         };
+        // `material_name` is the IfcMaterial's Name for every role
+        // (GH #219), so the rollup names materials, not set items.
         assert_eq!(of("Wall-Direct"), json!(["Concrete"]));
-        assert_eq!(
-            of("Wall-Layered"),
-            json!(["GypsumLayer", "InsulationLayer"])
-        );
-        assert_eq!(of("Beam-Profiled"), json!(["SteelProfile"]));
-        // Three constituents, two distinct names: deduped, first-seen.
-        assert_eq!(of("Wall-Constituent"), json!(["Shell", "Core"]));
+        assert_eq!(of("Wall-Layered"), json!(["Gypsum", "Insulation"]));
+        assert_eq!(of("Beam-Profiled"), json!(["Steel"]));
+        // Three constituents over two materials: deduped, first-seen.
+        assert_eq!(of("Wall-Constituent"), json!(["Concrete", "Steel"]));
         assert_eq!(of("Column-List"), json!(["Concrete", "Gypsum"]));
-        // No set-name column exists on the public table, so the link is null.
-        assert!(g["products"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|p| p["layer_set"].is_null()));
+        // GH #213: the layered wall links its LayerSetName; nothing else
+        // has a layer set.
+        let layer_set = |name: &str| -> Value {
+            g["products"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|p| p["name"] == json!(name))
+                .unwrap()["layer_set"]
+                .clone()
+        };
+        assert_eq!(layer_set("Wall-Layered"), json!("WallBuildup"));
+        for other in [
+            "Wall-Direct",
+            "Beam-Profiled",
+            "Wall-Constituent",
+            "Column-List",
+        ] {
+            assert!(layer_set(other).is_null(), "{other}");
+        }
+        assert_eq!(
+            g["material_layer_sets"],
+            json!({"WallBuildup": {
+                "layers": [
+                    {"material": "Gypsum", "thickness_mm": 13.0},
+                    {"material": "Insulation", "thickness_mm": 100.0},
+                ],
+                "total_thickness_mm": 113.0,
+            }})
+        );
     }
 
     // ----- GH #211: clip counters + reliable/unreliable qto split -------

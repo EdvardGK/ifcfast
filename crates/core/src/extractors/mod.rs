@@ -23,6 +23,7 @@
 pub mod classifications;
 mod defined_type_names;
 pub mod materials;
+mod predefined_psets;
 pub mod property_graph;
 pub mod psets;
 pub mod quantities;

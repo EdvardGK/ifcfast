@@ -429,6 +429,11 @@ fn build_instance_schema() -> Schema {
         // Provenance: "instance" or "type" (IfcRelDefinesByType
         // inheritance, GH #165). Non-null.
         Field::new("source", DataType::Utf8, false),
+        // The set item's own Name (layer / constituent / profile), GH #219;
+        // `name` above is always the IfcMaterial's.
+        Field::new("item_name", DataType::Utf8, true),
+        // LayerSetName / ConstituentSet.Name / ProfileSet.Name, GH #213.
+        Field::new("set_name", DataType::Utf8, true),
     ]);
     let pset_fields = Fields::from(vec![
         Field::new("set_name", DataType::Utf8, false),
@@ -794,6 +799,14 @@ fn build_instance_batch(
                 m.field_builder::<StringBuilder>(6)
                     .unwrap()
                     .append_value(entry.source);
+                append_opt(
+                    m.field_builder::<StringBuilder>(7).unwrap(),
+                    entry.item_name.as_deref(),
+                );
+                append_opt(
+                    m.field_builder::<StringBuilder>(8).unwrap(),
+                    entry.set_name.as_deref(),
+                );
                 m.append(true);
             }
             materials.append(true);

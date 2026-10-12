@@ -171,6 +171,15 @@ impl<'a> EntityTable<'a> {
         &self.warnings
     }
 
+    /// The first `FILE_SCHEMA` entry of the HEADER, uppercased
+    /// (`"IFC2X3"`, `"IFC4"`, `"IFC4X3_ADD2"`); `""` when the header has
+    /// none (bare record-list fixtures). Same parse as the indexer's.
+    pub fn file_schema(&self) -> String {
+        crate::indexer::extract_header(self.buf)
+            .0
+            .to_ascii_uppercase()
+    }
+
     /// Id of the first `IfcUnitAssignment` in the DATA section, memoized so
     /// the O(n) scan runs at most once per table. Returns `None` when the
     /// file declares no unit assignment. Used by profile conic-trim unit

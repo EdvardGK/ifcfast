@@ -38,14 +38,22 @@
 //! side reads [`PropertyGraph::records_for`], which applies the same
 //! instance-wins type inheritance but hands back typed [`PropRecord`]s.
 //!
-//! What is not collected yet: `IfcPreDefinedPropertySet` subtypes
-//! (`IfcDoorLiningProperties`, …) and IFC2X3's attribute-style material
-//! property classes (`IfcGeneralMaterialProperties`, …). Their "properties"
-//! are entity attributes, read through `ids::attrs` when a spec needs them.
+//! Predefined property sets — `IfcPreDefinedPropertySet` subtypes
+//! (`IfcDoorLiningProperties`, `IfcDoorPanelProperties`, …) and their
+//! IFC2X3 counterparts directly under `IfcPropertySetDefinition` — are
+//! collected (with [`GraphScope::properties`]) into
+//! [`PropertyGraph::predefined`], NOT into [`PropertyGraph::sets`]: their
+//! "properties" are entity attributes, not `IfcProperty` members. Only the
+//! public psets table reads them (GH #216); the IDS property facet keeps
+//! reading those attributes through `ids::attrs`, so `records_for` is
+//! unchanged. IFC2X3's attribute-style material property classes
+//! (`IfcGeneralMaterialProperties`, …) are still not collected.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 
+pub use super::predefined_psets::PredefKind;
+use super::predefined_psets::{self, PredefAttr};
 use crate::entity_table::EntityTable;
 use crate::lexer::{parse_field, split_top_level_args, Field};
 
@@ -341,6 +349,30 @@ impl GraphScope {
     };
 }
 
+/// One `IfcPreDefinedPropertySet`-family instance (GH #216): what
+/// `ifcopenshell.util.element.get_psets` reads through its attribute walk.
+#[derive(Debug, Clone)]
+pub struct PredefSet<'a> {
+    pub step: u64,
+    /// `Name`; `""` when null (the [`SetDef::name`] convention).
+    pub name: String,
+    /// The explicit attributes from STEP index 4 on whose value is not
+    /// `$` / `*` (ifcopenshell skips `None` attributes), in schema order.
+    pub attrs: Vec<PredefAttrValue<'a>>,
+}
+
+/// One present attribute of a [`PredefSet`]: the schema facts from
+/// `predefined_psets.rs` plus the raw STEP value bytes.
+#[derive(Debug, Clone, Copy)]
+pub struct PredefAttrValue<'a> {
+    pub name: &'static str,
+    pub kind: PredefKind,
+    /// Declared type, ifcopenshell title-case; `None` for a SELECT or a
+    /// bare simple type.
+    pub declared: Option<&'static str>,
+    pub src: &'a [u8],
+}
+
 /// The typed property structure of one file. See the module docs.
 #[derive(Debug)]
 pub struct PropertyGraph<'a> {
@@ -363,6 +395,10 @@ pub struct PropertyGraph<'a> {
     /// `IfcExtendedMaterialProperties.Material`, IFC4
     /// `IfcProfileProperties.ProfileDefinition`.
     pub material_sets: Vec<(u64, u64)>,
+    /// Predefined property sets by STEP id (GH #216), collected with
+    /// [`GraphScope::properties`]. Reached through `defines` /
+    /// `type_sets` like any other definition; never in `sets`.
+    pub predefined: HashMap<u64, PredefSet<'a>>,
     /// `QuantityTable.unit_step_id` fallback: the project unit per
     /// quantity unit type, as [`crate::units::UnitTable::project_unit_step`]
     /// picks it — the first non-empty `IfcUnitAssignment` (the rule
@@ -428,13 +464,52 @@ impl<'a> PropertyGraph<'a> {
             object_type: HashMap::with_capacity(16_384),
             type_sets: HashMap::with_capacity(256),
             material_sets: Vec::new(),
+            predefined: HashMap::new(),
             quantity_default_units: HashMap::new(),
             by_object: OnceLock::new(),
         };
         // Quantity unit fallback input (see `quantity_default_units`).
         let mut units = crate::units::UnitCollector::default();
+        // Predefined-pset attribute layouts for this file's schema.
+        let predef = if scope.properties {
+            Some(predef_table(&table.file_schema()))
+        } else {
+            None
+        };
 
         for (step, t, args) in table.iter() {
+            if let Some(ptable) = predef {
+                if maybe_predefined(t) {
+                    if let Some(layout) = predef_lookup(ptable, t) {
+                        let f = split_top_level_args(args);
+                        let attrs = layout
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(i, (name, kind, declared))| {
+                                let src = crate::lexer::trim_ws(f.get(4 + i)?);
+                                if src.is_empty() || src == b"$" || src == b"*" {
+                                    return None;
+                                }
+                                Some(PredefAttrValue {
+                                    name,
+                                    kind: *kind,
+                                    declared: *declared,
+                                    src,
+                                })
+                            })
+                            .collect();
+                        g.predefined.insert(
+                            step,
+                            PredefSet {
+                                step,
+                                name: string_at(&f, 2).unwrap_or_default(),
+                                attrs,
+                            },
+                        );
+                        continue;
+                    }
+                }
+            }
             if scope.quantities && crate::units::is_unit_entity(t) {
                 let f = split_top_level_args(args);
                 units.feed(step, t, &f);
@@ -1054,6 +1129,48 @@ pub(crate) fn unhandled_quantity_measure(t: &[u8]) -> Option<&'static str> {
     } else {
         None
     }
+}
+
+/// The predefined-pset layouts for a `FILE_SCHEMA` value. IFC4X3 and
+/// IFC4 differ only in enum literal order for these entities, but each
+/// gets its own generated table; an unknown or absent schema reads as
+/// IFC4 (the indexer's default too).
+fn predef_table(schema: &str) -> &'static [(&'static str, &'static [PredefAttr])] {
+    if schema.starts_with("IFC2X3") {
+        predefined_psets::IFC2X3
+    } else if schema.starts_with("IFC4X3") {
+        predefined_psets::IFC4X3
+    } else {
+        predefined_psets::IFC4
+    }
+}
+
+/// Byte prefilter for [`predef_lookup`]: every predefined entity name ends
+/// in `PROPERTIES` except IFC2X3 `IfcServiceLifeFactor` / `IfcSoundValue`.
+fn maybe_predefined(t: &[u8]) -> bool {
+    let ends = |p: &[u8]| t.len() > p.len() && t[t.len() - p.len()..].eq_ignore_ascii_case(p);
+    ends(b"PROPERTIES")
+        || t.eq_ignore_ascii_case(b"IFCSERVICELIFEFACTOR")
+        || t.eq_ignore_ascii_case(b"IFCSOUNDVALUE")
+}
+
+fn predef_lookup(
+    table: &'static [(&'static str, &'static [PredefAttr])],
+    t: &[u8],
+) -> Option<&'static [PredefAttr]> {
+    table
+        .binary_search_by(|(k, _)| {
+            let k = k.as_bytes();
+            for (x, y) in k.iter().zip(t.iter()) {
+                match x.cmp(&y.to_ascii_uppercase()) {
+                    std::cmp::Ordering::Equal => continue,
+                    o => return o,
+                }
+            }
+            k.len().cmp(&t.len())
+        })
+        .ok()
+        .map(|i| table[i].1)
 }
 
 fn string_at(fields: &[&[u8]], idx: usize) -> Option<String> {

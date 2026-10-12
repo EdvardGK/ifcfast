@@ -271,11 +271,15 @@ normalise NaN→None on the comparison side, or use
 | column | type | description |
 |---|---|---|
 | `guid` | str | `IfcProduct.GlobalId` |
-| `role` | str | `direct` / `list` / `layer` / `unknown` |
-| `layer_index` | int | 0-based for layered materials, `-1` otherwise |
-| `material_name` | str \| None | material label |
+| `role` | str | `direct` / `list` / `layer` / `constituent` / `profile` / `unknown` |
+| `layer_index` | int | 0-based position in the set / list, `-1` otherwise |
+| `material_name` | str \| None | `IfcMaterial.Name`, every role |
 | `layer_thickness_mm` | float \| None | only set for `role="layer"` |
 | `category` | str \| None | IFC4 only |
+| `fraction` | float \| None | `IfcMaterialConstituent.Fraction` |
+| `source` | str | `instance` / `type` (inherited from the type) |
+| `item_name` | str \| None | the layer / constituent / profile's own `Name` |
+| `set_name` | str \| None | `LayerSetName` / constituent / profile set `Name` |
 
 ### classifications
 

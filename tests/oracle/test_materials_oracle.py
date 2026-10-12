@@ -16,31 +16,30 @@ Schema alignment (the load-bearing decision)
 ``m.materials`` is a flat row table; each row is one *constituent* of a
 product's material association:
 
-    guid | role            | layer_index | material_name | layer_thickness_mm | category
-    -----+-----------------+-------------+---------------+--------------------+---------
-    W1   | direct          | -1          | Concrete      | NaN                | Concrete
-    W2   | layer           | 0           | GypsumLayer   | 13.0               | Board
-    W2   | layer           | 1           | InsulationLayer | 100.0            | Thermal
-    B1   | profile         | 0           | SteelProfile  | NaN                | Metal
+    guid | role    | layer_index | material_name | item_name       | set_name   | layer_thickness_mm | category
+    -----+---------+-------------+---------------+-----------------+------------+--------------------+---------
+    W1   | direct  | -1          | Concrete      | None            | None       | NaN                | Concrete
+    W2   | layer   | 0           | Gypsum        | GypsumLayer     | <set name> | 13.0               | Board
+    W2   | layer   | 1           | Insulation    | InsulationLayer | <set name> | 100.0              | Thermal
+    B1   | profile | 0           | Steel         | SteelProfile    | <set name> | NaN                | Metal
 
 ``role``/``layer_index`` mirror the IFC traversal:
 
 * ``direct``  -> the ``IfcMaterial`` itself (``layer_index == -1``).
 * ``layer``   -> one ``IfcMaterialLayer`` of an ``IfcMaterialLayerSet``,
-  in declared order; ``material_name`` is the **layer's** ``Name``
-  (NOT the underlying ``IfcMaterial.Name``), ``category`` is the
-  underlying material's ``Category``, ``layer_thickness_mm`` is
-  ``LayerThickness`` scaled to millimetres.
+  in declared order; ``material_name`` is the underlying
+  ``layer.Material.Name`` (GH #219), ``item_name`` the **layer's** own
+  ``Name``, ``set_name`` the set's ``LayerSetName`` (GH #213),
+  ``category`` the underlying material's ``Category``,
+  ``layer_thickness_mm`` is ``LayerThickness`` scaled to millimetres.
 * ``profile`` -> one ``IfcMaterialProfile`` of an
-  ``IfcMaterialProfileSet``; ``material_name`` is the **profile's**
-  ``Name``, ``category`` the underlying material's ``Category``.
+  ``IfcMaterialProfileSet``; ``material_name`` is
+  ``profile.Material.Name``, ``item_name`` the **profile's** ``Name``,
+  ``set_name`` the profile set's ``Name``.
 
-So the faithful oracle is **not** ``get_materials`` (which flattens to
-the underlying ``IfcMaterial`` objects and would surface ``Gypsum`` /
-``Steel`` instead of ``GypsumLayer`` / ``SteelProfile``). It is a
-traversal of ``get_material`` that reproduces ifcfast's exact
-projection: for layers/profiles, the *wrapper* ``Name`` plus the
-underlying material's ``Category`` plus the (scaled) thickness.
+The oracle is a traversal of ``get_material`` that reproduces ifcfast's
+projection: both names (material and wrapper) plus the set name, the
+underlying material's ``Category`` and the (scaled) thickness.
 
 Both sides are projected onto a single
 ``{guid: {"material": {<constituent-key>: <value>}}}`` shape and
@@ -99,6 +98,16 @@ def _ours_grouped(fast) -> dict[str, dict[str, nz.NormalizedPayload]]:
                 "value": row.category,
             }
         )
+        if row.role != "direct":
+            for col in ("item_name", "set_name"):
+                rows.append(
+                    {
+                        "guid": guid,
+                        "group": GROUP,
+                        "name": f"{prefix}.{col}",
+                        "value": getattr(row, col),
+                    }
+                )
         thick = row.layer_thickness_mm
         if thick is not None and not (isinstance(thick, float) and math.isnan(thick)):
             rows.append(
@@ -142,8 +151,10 @@ def _truth_payload(material) -> list[tuple[str, Any]]:
     if material.is_a("IfcMaterialLayerSet"):
         for i, layer in enumerate(material.MaterialLayers or []):
             pre = f"layer[{i}]"
-            pairs.append((f"{pre}.name", layer.Name))
             mat = layer.Material
+            pairs.append((f"{pre}.name", mat.Name if mat else None))
+            pairs.append((f"{pre}.item_name", layer.Name))
+            pairs.append((f"{pre}.set_name", material.LayerSetName))
             pairs.append((f"{pre}.category", mat.Category if mat else None))
             thick = layer.LayerThickness
             if thick is not None:
@@ -153,8 +164,10 @@ def _truth_payload(material) -> list[tuple[str, Any]]:
     if material.is_a("IfcMaterialProfileSet"):
         for i, prof in enumerate(material.MaterialProfiles or []):
             pre = f"profile[{i}]"
-            pairs.append((f"{pre}.name", prof.Name))
             mat = prof.Material
+            pairs.append((f"{pre}.name", mat.Name if mat else None))
+            pairs.append((f"{pre}.item_name", prof.Name))
+            pairs.append((f"{pre}.set_name", material.Name))
             pairs.append((f"{pre}.category", mat.Category if mat else None))
         return pairs
 

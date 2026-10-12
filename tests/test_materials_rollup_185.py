@@ -33,10 +33,11 @@ def test_rollup_covers_every_role():
     got = gen._materials_by_guid(rows)
     assert got == {
         "7WALL1UIDgUIDgUIDgUID0": ["Concrete"],
-        "9WALL2UIDgUIDgUIDgUID0": ["GypsumLayer", "InsulationLayer"],
-        "BBEAM1UIDgUIDgUIDgUID0": ["SteelProfile"],
-        # three constituents, "Shell" twice: deduped, first-seen order
-        "DWALL4UIDgUIDgUIDgUID0": ["Shell", "Core"],
+        # material_name is the IfcMaterial's Name for every role (GH #219)
+        "9WALL2UIDgUIDgUIDgUID0": ["Gypsum", "Insulation"],
+        "BBEAM1UIDgUIDgUIDgUID0": ["Steel"],
+        # three constituents over two materials: deduped, first-seen order
+        "DWALL4UIDgUIDgUIDgUID0": ["Concrete", "Steel"],
         "FCOLM1UIDgUIDgUIDgUID0": ["Concrete", "Gypsum"],
     }
 
@@ -65,3 +66,26 @@ def test_qto_aggregates_split_clip_unapplied_volume():
     assert w["products_clip_unapplied"] == 1
     s = rows["IfcSlab"]
     assert s["volume_m3"] is None and s["volume_unreliable_m3"] is None
+
+
+def test_graph_layer_set_from_set_name_213():
+    """GH #213: `layer_set` / `material_layer_sets` come from the
+    materials table's `set_name`. Pinned to the same values as
+    `crates/wasm/src/analysis.rs::graph_materials_carry_every_role`."""
+    import ifcfast
+
+    gen = _generator()
+    m = ifcfast.open(str(FIXTURE), use_cache=False, write_cache=False)
+    g = gen._build_graph(m, [], {}, {}, {}, {})
+    by_name = {p["name"]: p["layer_set"] for p in g["products"]}
+    assert by_name["Wall-Layered"] == "WallBuildup"
+    assert all(v is None for k, v in by_name.items() if k != "Wall-Layered")
+    assert g["material_layer_sets"] == {
+        "WallBuildup": {
+            "layers": [
+                {"material": "Gypsum", "thickness_mm": 13.0},
+                {"material": "Insulation", "thickness_mm": 100.0},
+            ],
+            "total_thickness_mm": 113.0,
+        }
+    }

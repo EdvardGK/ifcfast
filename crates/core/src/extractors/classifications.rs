@@ -370,28 +370,31 @@ fn resolve_system<'a>(
 pub(crate) struct SystemRecord {
     pub(crate) source: Option<String>,
     pub(crate) edition: Option<String>,
-    /// `IfcClassification.Name`; `''` reads as `None`.
+    /// `IfcClassification.Name`; `''` stays `Some("")` (GH #217).
     pub(crate) name: Option<String>,
 }
 
 pub(crate) struct RefRecord {
     pub(crate) location: Option<String>,
-    /// IFC4 `Identification` / IFC2X3 `ItemReference`; `''` reads as `None`.
+    /// IFC4 `Identification` / IFC2X3 `ItemReference`; `''` stays
+    /// `Some("")` (GH #217).
     pub(crate) identification: Option<String>,
     pub(crate) name: Option<String>,
     /// `ReferencedSource` (an IfcClassification or a parent reference).
     pub(crate) parent_id: Option<u64>,
 }
 
-/// String-at-position, matching ifcopenshell's NULL semantics:
-/// both STEP `$` and an empty quoted string `''` map to None.
+/// String-at-position: STEP `$` (and any non-string) → `None`, a quoted
+/// string → `Some`, **including the empty string `''`**.
 ///
-/// Issue #9 surfaced this on SM_RIVr where 1,632 IfcClassificationReference
-/// records have `Identification = ''`. Our extractor was returning `Some("")`;
-/// ifcopenshell returns `None`. Both encodings mean "no value" semantically.
+/// Empty and absent are different facts (attribute set but empty vs not
+/// set), and ifcopenshell 0.8.x keeps them apart: `ref.ItemReference` on
+/// `IFCCLASSIFICATIONREFERENCE($,'','Lager',#5)` is `''`, not `None`
+/// (GH #217, HI90_ARK: 5 of 15 references). An earlier rule (issue #9)
+/// collapsed `''` to `None` here — the only extractor that did.
 fn string_at(fields: &[&[u8]], idx: usize) -> Option<String> {
     match parse_field(fields.get(idx)?) {
-        Field::String(s) if !s.is_empty() => Some(s),
+        Field::String(s) => Some(s),
         _ => None,
     }
 }
@@ -586,6 +589,35 @@ END-ISO-10303-21;
         assert_eq!(t.len(), 1);
         assert_eq!(t.identification[0].as_deref(), Some("X"));
         assert!(t.system_name[0].is_none());
+    }
+
+    /// GH #217: `''` and `$` are different facts and stay distinguishable
+    /// in every string column (ifcopenshell returns `''` for the former).
+    #[test]
+    fn empty_string_is_not_collapsed_to_null() {
+        let buf = make_buf(
+            r#"
+#30=IFCCLASSIFICATION('',$,$,'');
+#31=IFCCLASSIFICATIONREFERENCE('','','',#30);
+#32=IFCRELASSOCIATESCLASSIFICATION('2Cls000000000000000001',$,$,$,(#10),#31);
+#40=IFCCLASSIFICATION($,$,$,$);
+#41=IFCCLASSIFICATIONREFERENCE($,$,$,#40);
+#42=IFCRELASSOCIATESCLASSIFICATION('2Cls000000000000000002',$,$,$,(#10),#41);
+"#,
+        );
+        let t = run(&buf);
+        assert_eq!(t.len(), 2);
+        for col in [
+            &t.identification,
+            &t.name,
+            &t.location,
+            &t.system_name,
+            &t.source,
+        ] {
+            assert_eq!(col[0].as_deref(), Some(""), "'' must stay ''");
+            assert_eq!(col[1], None, "$ must stay null");
+        }
+        assert_eq!(t.edition[0], None);
     }
 
     #[test]

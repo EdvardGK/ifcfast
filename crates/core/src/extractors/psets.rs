@@ -10,6 +10,9 @@
 //! For the "all external load-bearing walls" class of query. Stays in
 //! column-major form so the PyO3 bridge marshalling stays cheap.
 //!
+//! Predefined property sets (`IfcDoorPanelProperties`, …) contribute one
+//! row per non-null attribute (GH #216).
+//!
 //! Single, enumerated, list, bounded, table and complex properties are
 //! flattened to one string per row; any other `IfcProperty*Value` class
 //! surfaces as an `unhandled:IFCXXX` marker row (GH #38).
@@ -21,12 +24,11 @@
 use std::collections::{HashMap, HashSet};
 
 use super::property_graph::{
-    split_type_wrapper, trim, GraphScope, PropClass, PropDef, PropertyGraph, PsetKind, TypedValue,
+    split_type_wrapper, trim, GraphScope, PredefKind, PredefSet, PropClass, PropDef, PropertyGraph,
+    PsetKind, TypedValue,
 };
 use crate::entity_table::EntityTable;
-#[cfg(test)]
-use crate::lexer::split_top_level_args;
-use crate::lexer::{parse_field, Field};
+use crate::lexer::{parse_field, split_top_level_args, Field};
 
 /// Long-format pset rows in column-major layout.
 ///
@@ -41,6 +43,14 @@ use crate::lexer::{parse_field, Field};
 /// A type object's own `HasPropertySets` are listed under the type's
 /// guid with `source="instance"` (declared on that object), after every
 /// product row (GH #196).
+///
+/// Predefined property sets (`IfcDoorLiningProperties`,
+/// `IfcDoorPanelProperties`, `IfcWindow*Properties`, … — IFC4
+/// `IfcPreDefinedPropertySet` subtypes and their IFC2X3 counterparts)
+/// are emitted like any other set wherever they are attached (relation,
+/// type `HasPropertySets`): `pset_name` = the entity's `Name`, one row per
+/// non-null attribute after the IfcRoot header (GH #216, ifcopenshell
+/// `get_psets` parity). See `predef_rows` for the value rules.
 #[derive(Debug, Default)]
 pub struct PsetTable {
     pub guid: Vec<String>,
@@ -119,6 +129,14 @@ pub fn build_from_graph(
             Some(g) => g.as_str(),
             None => continue, // rel pointed at a non-product (type, group, etc.)
         };
+        if let Some(p) = graph.predefined.get(set_step_id) {
+            let seen = seen_per_product.entry(guid).or_default();
+            for (prop, value, value_type) in predef_rows(p) {
+                seen.insert(format!("{}\t{prop}", p.name));
+                push_row(&mut out, guid, &p.name, prop, value, value_type, "instance");
+            }
+            continue;
+        }
         let set = match graph.sets.get(set_step_id) {
             Some(s) if s.kind == PsetKind::PropertySet => s,
             _ => continue,
@@ -167,6 +185,15 @@ pub fn build_from_graph(
             };
             let already_seen = seen_per_product.get(guid).unwrap_or(&empty);
             for set_id in type_set_ids {
+                if let Some(p) = graph.predefined.get(set_id) {
+                    for (prop, value, value_type) in predef_rows(p) {
+                        if already_seen.contains(&format!("{}\t{prop}", p.name)) {
+                            continue;
+                        }
+                        push_row(&mut out, guid, &p.name, prop, value, value_type, "type");
+                    }
+                    continue;
+                }
                 let set = match graph.sets.get(set_id) {
                     Some(s) if s.kind == PsetKind::PropertySet => s,
                     _ => continue,
@@ -197,24 +224,31 @@ pub fn build_from_graph(
     // after every product row, so the product half is unchanged. A set
     // the type already received through `IfcRelDefinesByProperties`
     // (emitted above) is not repeated.
-    for_each_type_own_set(
-        graph,
-        product_step_to_guid,
-        PsetKind::PropertySet,
-        |guid, set| {
-            graph.walk_set_leaves(set, &mut |path, def| {
-                let Some((value, value_type)) = &formatted[def.ord] else {
-                    return;
-                };
-                out.guid.push(guid.to_string());
-                out.pset_name.push(set.name.clone());
-                out.prop_name.push(prop_name(path, &def.name));
-                out.value.push(value.clone());
-                out.value_type.push(value_type.clone());
-                out.source.push("instance".to_string());
-            });
-        },
-    );
+    // Predefined property sets (GH #216) ride the same pass, in
+    // `HasPropertySets` order.
+    for_each_type_own_set_id(graph, product_step_to_guid, |guid, set_id| {
+        if let Some(p) = graph.predefined.get(&set_id) {
+            for (prop, value, value_type) in predef_rows(p) {
+                push_row(&mut out, guid, &p.name, prop, value, value_type, "instance");
+            }
+            return;
+        }
+        let set = match graph.sets.get(&set_id) {
+            Some(s) if s.kind == PsetKind::PropertySet => s,
+            _ => return,
+        };
+        graph.walk_set_leaves(set, &mut |path, def| {
+            let Some((value, value_type)) = &formatted[def.ord] else {
+                return;
+            };
+            out.guid.push(guid.to_string());
+            out.pset_name.push(set.name.clone());
+            out.prop_name.push(prop_name(path, &def.name));
+            out.value.push(value.clone());
+            out.value_type.push(value_type.clone());
+            out.source.push("instance".to_string());
+        });
+    });
 
     out
 }
@@ -231,6 +265,24 @@ pub(crate) fn for_each_type_own_set<'g, F>(
     mut visit: F,
 ) where
     F: FnMut(&'g str, &'g super::property_graph::SetDef),
+{
+    for_each_type_own_set_id(graph, step_to_guid, |guid, set_id| {
+        match graph.sets.get(&set_id) {
+            Some(s) if s.kind == kind => visit(guid, s),
+            _ => {}
+        }
+    });
+}
+
+/// [`for_each_type_own_set`] by definition id, unfiltered: the caller
+/// resolves the id (a [`super::property_graph::SetDef`] or a predefined
+/// set).
+fn for_each_type_own_set_id<'g, F>(
+    graph: &'g PropertyGraph,
+    step_to_guid: &'g HashMap<u64, String>,
+    mut visit: F,
+) where
+    F: FnMut(&'g str, u64),
 {
     if graph.type_sets.is_empty() {
         return;
@@ -259,12 +311,80 @@ pub(crate) fn for_each_type_own_set<'g, F>(
                 continue;
             }
             done.push(*set_id);
-            match graph.sets.get(set_id) {
-                Some(s) if s.kind == kind => visit(guid, s),
-                _ => {}
-            }
+            visit(guid, *set_id);
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_row(
+    out: &mut PsetTable,
+    guid: &str,
+    pset_name: &str,
+    prop: &str,
+    value: Option<String>,
+    value_type: Option<String>,
+    source: &str,
+) {
+    out.guid.push(guid.to_string());
+    out.pset_name.push(pset_name.to_string());
+    out.prop_name.push(prop.to_string());
+    out.value.push(value);
+    out.value_type.push(value_type);
+    out.source.push(source.to_string());
+}
+
+/// The rows of one predefined property set (GH #216), matching
+/// `ifcopenshell.util.element.get_property_definition`'s attribute walk:
+/// one row per explicit attribute after the IfcRoot header whose value is
+/// not `$`, `prop_name` = the attribute name. `value` follows the
+/// table's string rules (numbers via the IfcValue formatter, booleans
+/// `"True"` / `"False"`, enums as their literal, an entity reference as
+/// `"#id"`, a LIST / SET as its members joined with `", "`). `value_type`
+/// is the attribute's declared type (`IfcPositiveLengthMeasure`,
+/// `IfcDoorPanelOperationEnum`, `IfcShapeAspect`); for a SELECT it is the
+/// value's own wrapper, as on an `IfcPropertySingleValue` row; `None` for
+/// a bare simple type.
+fn predef_rows<'p>(
+    p: &'p PredefSet<'_>,
+) -> impl Iterator<Item = (&'static str, Option<String>, Option<String>)> + 'p {
+    p.attrs.iter().map(|a| {
+        let declared = a.declared.map(str::to_string);
+        let (value, value_type) = match a.kind {
+            PredefKind::Select => {
+                let (v, t) = parse_nominal_value(Some(a.src));
+                (v, t.or(declared))
+            }
+            PredefKind::Bool | PredefKind::Logical => {
+                let v = scalar_to_string(a.src).map(|s| match s.as_str() {
+                    "T" => "True".to_string(),
+                    "F" => "False".to_string(),
+                    "U" => "UNKNOWN".to_string(),
+                    _ => s,
+                });
+                (v, declared)
+            }
+            PredefKind::List => {
+                let v = match parse_field(trim(a.src)) {
+                    Field::List(body) => {
+                        let members: Vec<String> = split_top_level_args(body)
+                            .into_iter()
+                            .filter_map(scalar_to_string)
+                            .collect();
+                        if members.is_empty() {
+                            None
+                        } else {
+                            Some(members.join(", "))
+                        }
+                    }
+                    _ => scalar_to_string(a.src),
+                };
+                (v, declared)
+            }
+            _ => (scalar_to_string(a.src), declared),
+        };
+        (a.name, value, value_type)
+    })
 }
 
 /// `"{complex}.{complex}.{leaf}"`: each enclosing complex name followed by
@@ -1226,5 +1346,257 @@ END-ISO-10303-21;
         assert_eq!(t.len(), 1);
         assert_eq!(t.pset_name[0], "Pset_A");
         assert_eq!(t.prop_name[0], "LoadBearing");
+    }
+}
+
+/// GH #216: predefined property sets (`IfcDoorPanelProperties`, …) read
+/// like ifcopenshell `get_psets`: pset = entity Name, one row per non-null
+/// attribute after the IfcRoot header.
+#[cfg(test)]
+mod predefined_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn run(schema: &str, data: &str) -> PsetTable {
+        let buf = format!(
+            "ISO-10303-21;\nHEADER;\nFILE_DESCRIPTION((''),'2;1');\n\
+             FILE_SCHEMA(('{schema}'));\nENDSEC;\nDATA;\n{data}ENDSEC;\nEND-ISO-10303-21;\n"
+        );
+        let table = EntityTable::build(buf.as_bytes());
+        let mut products: HashMap<u64, String> = HashMap::new();
+        for (sid, t, args) in table.iter() {
+            if t.eq_ignore_ascii_case(b"IFCDOOR") || t.eq_ignore_ascii_case(b"IFCDOORSTYLE") {
+                if let Field::String(s) = parse_field(split_top_level_args(args)[0]) {
+                    products.insert(sid, s);
+                }
+            }
+        }
+        build(&table, &products)
+    }
+
+    fn rows(
+        t: &PsetTable,
+    ) -> Vec<(
+        String,
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        String,
+    )> {
+        (0..t.len())
+            .map(|i| {
+                (
+                    t.guid[i].clone(),
+                    t.pset_name[i].clone(),
+                    t.prop_name[i].clone(),
+                    t.value[i].clone(),
+                    t.value_type[i].clone(),
+                    t.source[i].clone(),
+                )
+            })
+            .collect()
+    }
+
+    fn s(x: &str) -> Option<String> {
+        Some(x.to_string())
+    }
+
+    /// The reporter's shape (Revit IFC4): panel + lining properties on a
+    /// door via IfcRelDefinesByProperties. `$` attributes produce no row;
+    /// enums are their literal; an entity ref is `#id`; value_type is the
+    /// declared type.
+    #[test]
+    fn ifc4_door_panel_and_lining_via_relation() {
+        let t = run(
+            "IFC4",
+            "#10=IFCDOOR('1Door00000000000000001',$,'D',$,$,$,$,$,900.,2100.,.DOOR.,.SINGLE_SWING_LEFT.,$);\n\
+             #20=IFCDOORPANELPROPERTIES('2Pan00000000000000001',$,'Panel A',$,50.,.SWINGING.,1.,.LEFT.,$);\n\
+             #21=IFCDOORLININGPROPERTIES('2Lin00000000000000001',$,'Lining A',$,120.,$,$,$,$,$,$,$,$,$,#99,0.,-5.5);\n\
+             #30=IFCRELDEFINESBYPROPERTIES('3Rel000000000000000001',$,$,$,(#10),#20);\n\
+             #31=IFCRELDEFINESBYPROPERTIES('3Rel000000000000000002',$,$,$,(#10),#21);\n",
+        );
+        let g = "1Door00000000000000001";
+        let pm = "IfcPositiveLengthMeasure";
+        assert_eq!(
+            rows(&t),
+            vec![
+                (
+                    g.into(),
+                    "Panel A".into(),
+                    "PanelDepth".into(),
+                    s("50"),
+                    s(pm),
+                    "instance".into()
+                ),
+                (
+                    g.into(),
+                    "Panel A".into(),
+                    "PanelOperation".into(),
+                    s("SWINGING"),
+                    s("IfcDoorPanelOperationEnum"),
+                    "instance".into()
+                ),
+                (
+                    g.into(),
+                    "Panel A".into(),
+                    "PanelWidth".into(),
+                    s("1"),
+                    s("IfcNormalisedRatioMeasure"),
+                    "instance".into()
+                ),
+                (
+                    g.into(),
+                    "Panel A".into(),
+                    "PanelPosition".into(),
+                    s("LEFT"),
+                    s("IfcDoorPanelPositionEnum"),
+                    "instance".into()
+                ),
+                (
+                    g.into(),
+                    "Lining A".into(),
+                    "LiningDepth".into(),
+                    s("120"),
+                    s(pm),
+                    "instance".into()
+                ),
+                (
+                    g.into(),
+                    "Lining A".into(),
+                    "ShapeAspectStyle".into(),
+                    s("#99"),
+                    s("IfcShapeAspect"),
+                    "instance".into()
+                ),
+                (
+                    g.into(),
+                    "Lining A".into(),
+                    "LiningToPanelOffsetX".into(),
+                    s("0"),
+                    s("IfcLengthMeasure"),
+                    "instance".into()
+                ),
+                (
+                    g.into(),
+                    "Lining A".into(),
+                    "LiningToPanelOffsetY".into(),
+                    s("-5.5"),
+                    s("IfcLengthMeasure"),
+                    "instance".into()
+                ),
+            ]
+        );
+    }
+
+    /// IFC2X3 Revit pattern: the lining properties hang off the
+    /// IfcDoorStyle's HasPropertySets. Occurrences inherit them
+    /// (`source="type"`), the instance shadows per property, and the
+    /// style lists them under its own guid. The IFC2X3 layout is used
+    /// (`LiningThickness` is `IfcPositiveLengthMeasure` there).
+    #[test]
+    fn ifc2x3_door_style_lining_is_inherited() {
+        let t = run(
+            "IFC2X3",
+            "#10=IFCDOOR('1Door00000000000000001',$,'D',$,$,$,$,$,900.,2100.);\n\
+             #11=IFCDOOR('1Door00000000000000002',$,'D',$,$,$,$,$,900.,2100.);\n\
+             #20=IFCDOORLININGPROPERTIES('2Lin00000000000000001',$,'Lining',$,120.,30.,$,$,$,$,$,$,$,$,$);\n\
+             #21=IFCDOORLININGPROPERTIES('2Lin00000000000000002',$,'Lining',$,99.,$,$,$,$,$,$,$,$,$,$);\n\
+             #40=IFCDOORSTYLE('3Sty00000000000000001',$,'S',$,$,(#20),$,$,.SINGLE_SWING_LEFT.,.WOOD.,.F.,.F.);\n\
+             #41=IFCRELDEFINESBYTYPE('4Rel000000000000000001',$,$,$,(#10,#11),#40);\n\
+             #42=IFCRELDEFINESBYPROPERTIES('3Rel000000000000000001',$,$,$,(#11),#21);\n",
+        );
+        let r = rows(&t);
+        let pick = |g: &str| -> Vec<(String, Option<String>, Option<String>, String)> {
+            r.iter()
+                .filter(|x| x.0 == g)
+                .map(|x| (x.2.clone(), x.3.clone(), x.4.clone(), x.5.clone()))
+                .collect()
+        };
+        assert_eq!(
+            pick("1Door00000000000000001"),
+            vec![
+                (
+                    "LiningDepth".into(),
+                    s("120"),
+                    s("IfcPositiveLengthMeasure"),
+                    "type".into()
+                ),
+                (
+                    "LiningThickness".into(),
+                    s("30"),
+                    s("IfcPositiveLengthMeasure"),
+                    "type".into()
+                ),
+            ]
+        );
+        assert_eq!(
+            pick("1Door00000000000000002"),
+            vec![
+                (
+                    "LiningDepth".into(),
+                    s("99"),
+                    s("IfcPositiveLengthMeasure"),
+                    "instance".into()
+                ),
+                (
+                    "LiningThickness".into(),
+                    s("30"),
+                    s("IfcPositiveLengthMeasure"),
+                    "type".into()
+                ),
+            ]
+        );
+        assert_eq!(pick("3Sty00000000000000001").len(), 2, "style's own set");
+        assert!(pick("3Sty00000000000000001")
+            .iter()
+            .all(|x| x.3 == "instance"));
+    }
+
+    /// IFC2X3-only classes: a bare boolean renders "True", a SELECT keeps
+    /// its wrapper type, a LIST joins its members.
+    #[test]
+    fn ifc2x3_bool_select_and_list_attributes() {
+        let t = run(
+            "IFC2X3",
+            "#10=IFCDOOR('1Door00000000000000001',$,'D',$,$,$,$,$,900.,2100.);\n\
+             #20=IFCSOUNDVALUE('2Snd00000000000000001',$,'SV',$,$,63.,IFCSOUNDPRESSUREMEASURE(40.));\n\
+             #21=IFCSOUNDPROPERTIES('2Snd00000000000000002',$,'Sound',$,.T.,.DBA.,(#20,#22));\n\
+             #22=IFCSOUNDVALUE('2Snd00000000000000003',$,'SV2',$,$,125.,$);\n\
+             #30=IFCRELDEFINESBYPROPERTIES('3Rel000000000000000001',$,$,$,(#10),(#20,#21));\n",
+        );
+        let r: Vec<(String, Option<String>, Option<String>)> =
+            rows(&t).into_iter().map(|x| (x.2, x.3, x.4)).collect();
+        assert_eq!(
+            r,
+            vec![
+                ("Frequency".into(), s("63"), s("IfcFrequencyMeasure")),
+                (
+                    "SoundLevelSingleValue".into(),
+                    s("40"),
+                    s("IfcSoundPressureMeasure")
+                ),
+                ("IsAttenuating".into(), s("True"), s("IfcBoolean")),
+                ("SoundScale".into(), s("DBA"), s("IfcSoundScaleEnum")),
+                ("SoundValues".into(), s("#20, #22"), s("IfcSoundValue")),
+            ]
+        );
+    }
+
+    /// The IDS view of the graph is unchanged: predefined sets are not
+    /// `SetDef`s, so `records_for` does not see them (IDS reads those
+    /// attributes through `ids::attrs`).
+    #[test]
+    fn predefined_sets_stay_out_of_records_for() {
+        let buf = "ISO-10303-21;\nHEADER;\nFILE_SCHEMA(('IFC4'));\nENDSEC;\nDATA;\n\
+             #10=IFCDOOR('1Door00000000000000001',$,'D',$,$,$,$,$,900.,2100.,.DOOR.,$,$);\n\
+             #20=IFCDOORPANELPROPERTIES('2Pan00000000000000001',$,'Panel A',$,50.,.SWINGING.,1.,.LEFT.,$);\n\
+             #30=IFCRELDEFINESBYPROPERTIES('3Rel000000000000000001',$,$,$,(#10),#20);\n\
+             ENDSEC;\nEND-ISO-10303-21;\n";
+        let table = EntityTable::build(buf.as_bytes());
+        let g = PropertyGraph::build(&table);
+        assert_eq!(g.predefined.len(), 1);
+        assert!(g.sets.is_empty());
+        assert!(g.records_for(10).is_empty());
     }
 }

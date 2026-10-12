@@ -346,8 +346,11 @@ def materials(
     """Material-assignment rows, filtered.
 
     Long-format rows: ``guid`` / ``role`` / ``layer_index`` /
-    ``material_name`` / ``layer_thickness_mm`` / ``category`` /
-    ``fraction``. Returns up to ``limit`` rows.
+    ``material_name`` (the ``IfcMaterial.Name``, every role) /
+    ``layer_thickness_mm`` / ``category`` / ``fraction`` / ``source`` /
+    ``item_name`` (the layer / constituent / profile's own Name) /
+    ``set_name`` (the layer / constituent / profile set's name).
+    Returns up to ``limit`` rows.
     """
     df = _resolve(path).materials
     if guid is not None:

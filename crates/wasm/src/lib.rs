@@ -154,7 +154,8 @@ impl IfcModel {
     }
 
     /// `[{guid, role, layer_index, material_name, layer_thickness_mm,
-    /// category, fraction, source}]` — `model.materials` (GH #183).
+    /// category, fraction, source, item_name, set_name}]` —
+    /// `model.materials` (GH #183; `item_name` / `set_name` GH #219 / #213).
     ///
     /// The long-format layer table. `graphJson()`'s per-product
     /// `materials` array is a name rollup of these rows; this is the

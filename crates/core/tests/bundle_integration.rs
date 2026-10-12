@@ -389,3 +389,40 @@ fn fingerprint_columns_carry_centroid_and_counts() {
     assert_eq!(sv, 0, "space must report zero vertices");
     assert_eq!(st, 0, "space must report zero triangles");
 }
+
+/// GH #219 / #213: the substrate `materials` struct carries `name` =
+/// the IfcMaterial's Name, plus `item_name` (the constituent's own Name)
+/// and `set_name` (the constituent set's Name).
+#[test]
+fn materials_struct_carries_item_and_set_name() {
+    let buf = MIXED_FIXTURE.replace(
+        "ENDSEC;\nEND-ISO-10303-21;",
+        "#80=IFCMATERIAL('KNM-Vegg',$,$);\n\
+         #81=IFCMATERIALCONSTITUENT('KNM-Vegg (2)',$,#80,0.5,$);\n\
+         #82=IFCMATERIALCONSTITUENTSET('Innervegg',$,(#81),$);\n\
+         #83=IFCRELASSOCIATESMATERIAL('DRel000000000000000001',$,$,$,(#50),#82);\n\
+         ENDSEC;\nEND-ISO-10303-21;",
+    );
+    let (_bundle, out_dir) = bundle_to_parquet(buf.as_bytes());
+    let batches = read_parquet(&out_dir.join("instances.parquet"));
+    let mut found = false;
+    for batch in &batches {
+        let guid_col = batch.column_by_name("guid").unwrap().as_string::<i32>();
+        let mats = batch.column_by_name("materials").unwrap().as_list::<i32>();
+        for i in 0..batch.num_rows() {
+            if guid_col.value(i) != "7Wall00000000000000001" {
+                continue;
+            }
+            let row = mats.value(i);
+            let s = row.as_struct();
+            let col = |n: &str| s.column_by_name(n).unwrap().as_string::<i32>().clone();
+            assert_eq!(s.len(), 1);
+            assert_eq!(col("role").value(0), "constituent");
+            assert_eq!(col("name").value(0), "KNM-Vegg");
+            assert_eq!(col("item_name").value(0), "KNM-Vegg (2)");
+            assert_eq!(col("set_name").value(0), "Innervegg");
+            found = true;
+        }
+    }
+    assert!(found, "wall instance row missing");
+}

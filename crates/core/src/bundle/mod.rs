@@ -83,6 +83,12 @@ pub struct MaterialEntry {
     /// Provenance: "instance" (bound directly to the product) or
     /// "type" (inherited via IfcRelDefinesByType). GH #165.
     pub source: &'static str,
+    /// The set item's own Name (layer / constituent / profile), GH #219.
+    /// See [`crate::extractors::materials::MaterialTable::item_name`].
+    pub item_name: Option<Arc<str>>,
+    /// The containing set's name, GH #213. See
+    /// [`crate::extractors::materials::MaterialTable::set_name`].
+    pub set_name: Option<Arc<str>>,
 }
 
 /// One quantity (length/area/volume/count) on a product.
@@ -415,32 +421,29 @@ impl Bundle {
         }
 
         let mut materials_by_guid: HashMap<String, Vec<MaterialEntry>> = HashMap::new();
-        let mat_iter = mat_table
-            .guid
+        let mut mat_names = mat_table
+            .material_name
             .into_iter()
-            .zip(mat_table.role)
-            .zip(mat_table.layer_index)
-            .zip(mat_table.material_name)
-            .zip(mat_table.layer_thickness_mm)
             .zip(mat_table.category)
-            .zip(mat_table.fraction)
-            .zip(mat_table.source);
-        for (
-            ((((((guid, role), layer_index), material_name), thickness_mm), category), fraction),
-            source,
-        ) in mat_iter
-        {
+            .zip(mat_table.item_name)
+            .zip(mat_table.set_name);
+        for (i, guid) in mat_table.guid.into_iter().enumerate() {
+            let (((material_name, category), item_name), set_name) = mat_names
+                .next()
+                .expect("materials columns have equal length");
             materials_by_guid
                 .entry(guid)
                 .or_default()
                 .push(MaterialEntry {
-                    role,
-                    layer_index,
+                    role: mat_table.role[i],
+                    layer_index: mat_table.layer_index[i],
                     name: intern_opt(&mut str_cache, material_name),
-                    thickness_mm,
+                    thickness_mm: mat_table.layer_thickness_mm[i],
                     category: intern_opt(&mut str_cache, category),
-                    fraction,
-                    source,
+                    fraction: mat_table.fraction[i],
+                    source: mat_table.source[i],
+                    item_name: intern_opt(&mut str_cache, item_name),
+                    set_name: intern_opt(&mut str_cache, set_name),
                 });
         }
 

@@ -838,7 +838,17 @@ def _resolve_step_escapes(s: str) -> str:
 #       so hollow pipe extrusions lose a zero-width seam quad (vertex /
 #       triangle counts change) and mesh watertight. Columns unchanged;
 #       `mesh_quality` / `volume_method` / `volume_m3` values move.
-_CACHE_SCHEMA_VERSION = 38
+#   39: extraction batch, no geometry change. GH #219 — `materials.
+#       material_name` is the referenced `IfcMaterial.Name` for every role
+#       (was the layer / constituent / profile's own Name when set); that
+#       item Name moves to the new `item_name` column. GH #213 — new
+#       `set_name` column (LayerSetName / ConstituentSet.Name /
+#       ProfileSet.Name); the substrate `materials` struct gains both
+#       fields. GH #217 — classification string columns keep `''` (was
+#       collapsed to null). GH #216 — predefined property sets
+#       (`IfcDoorPanelProperties`, `IfcDoorLiningProperties`, …) are read
+#       into `psets` (new rows).
+_CACHE_SCHEMA_VERSION = 39
 
 _FIELD_RE = re.compile(r"\(\s*(.*?)\s*\)\s*;", re.DOTALL)
 

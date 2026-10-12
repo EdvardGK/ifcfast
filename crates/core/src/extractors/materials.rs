@@ -7,7 +7,17 @@
 //!
 //! Output schema:
 //!     (guid, role, layer_index, material_name, layer_thickness_mm, category,
-//!      fraction, source)
+//!      fraction, source, item_name, set_name)
+//!
+//! `material_name` is ALWAYS the referenced `IfcMaterial.Name`, for every
+//! role (ifcopenshell `layer.Material.Name` / `constituent.Material.Name` /
+//! `profile.Material.Name`; GH #219). The set item's own `Name`
+//! (`IfcMaterialLayer.Name` (IFC4), `IfcMaterialConstituent.Name`,
+//! `IfcMaterialProfile.Name`) is `item_name`, and the containing set's
+//! name (`IfcMaterialLayerSet.LayerSetName`, `IfcMaterialConstituentSet.Name`,
+//! `IfcMaterialProfileSet.Name`) is `set_name` (GH #213). Both are null
+//! where the schema / role has no such attribute (`direct`, `list`,
+//! IFC2X3 layers). `''` and `$` stay distinct in every string column.
 //!
 //! `role`:
 //!   `"direct"`       — `IfcMaterial` directly assigned
@@ -31,6 +41,7 @@ pub struct MaterialTable {
     pub guid: Vec<String>,
     pub role: Vec<&'static str>,
     pub layer_index: Vec<i32>, // -1 for non-layered roles
+    /// `IfcMaterial.Name` of the referenced material, every role (GH #219).
     pub material_name: Vec<Option<String>>,
     pub layer_thickness_mm: Vec<Option<f64>>,
     pub category: Vec<Option<String>>,
@@ -50,6 +61,17 @@ pub struct MaterialTable {
     /// instance-wins-on-collision rule: a product with ANY directly
     /// associated material inherits nothing from its type (GH #165).
     pub source: Vec<&'static str>,
+    /// The set item's own `Name`: IFC4 `IfcMaterialLayer.Name`,
+    /// `IfcMaterialConstituent.Name`, `IfcMaterialProfile.Name`. `None` on
+    /// `direct` / `list` / `unknown` rows and IFC2X3 layers (no such
+    /// attribute), or when the item's Name is `$` (GH #219).
+    pub item_name: Vec<Option<String>>,
+    /// The containing set's name: `IfcMaterialLayerSet.LayerSetName`
+    /// (also through `IfcMaterialLayerSetUsage`),
+    /// `IfcMaterialConstituentSet.Name`, `IfcMaterialProfileSet.Name`
+    /// (also through `IfcMaterialProfileSetUsage`). `None` on `direct` /
+    /// `list` / `unknown` rows or when the set's name is `$` (GH #213).
+    pub set_name: Vec<Option<String>>,
 }
 
 impl MaterialTable {
@@ -100,8 +122,8 @@ pub(crate) fn collect(table: &EntityTable) -> MaterialScan {
     // the material binding.
     let mut profile_sets: HashMap<u64, Vec<u64>> = HashMap::with_capacity(256);
     let mut profiles: HashMap<u64, ConstituentRecord> = HashMap::with_capacity(1024);
-    // LayerSetName / ConstituentSet.Name / ProfileSet.Name, by set step id.
-    // Not in the public table (the IDS material facet matches on them).
+    // LayerSetName / ConstituentSet.Name / ProfileSet.Name, by set step id:
+    // the public table's `set_name` (GH #213) and the IDS material facet.
     let mut set_names: HashMap<u64, Option<String>> = HashMap::with_capacity(512);
 
     // Collect rel-pairs: (related_object_step_ids, relating_material_ref)
@@ -137,7 +159,7 @@ pub(crate) fn collect(table: &EntityTable) -> MaterialScan {
             // IFC stores LayerThickness in the project's linear unit;
             // `emit` normalises it to mm (see `LayerRecord::thickness_raw`).
             let thickness_raw = number_at(&fields, 1);
-            // IFC4 layer-name overrides Material.Name when present.
+            // IFC4 IfcMaterialLayer.Name → `item_name` (GH #219).
             let name_override = string_at(&fields, 3);
             let category_override = string_at(&fields, 5);
             layers.insert(
@@ -398,8 +420,7 @@ pub(crate) struct MaterialIndex {
     pub(crate) profile_sets: HashMap<u64, Vec<u64>>,
     pub(crate) profiles: HashMap<u64, ConstituentRecord>,
     /// LayerSetName / IfcMaterialConstituentSet.Name /
-    /// IfcMaterialProfileSet.Name by set step id (IDS only).
-    #[cfg_attr(not(feature = "ids"), allow(dead_code))]
+    /// IfcMaterialProfileSet.Name by set step id (public `set_name`, IDS).
     pub(crate) set_names: HashMap<u64, Option<String>>,
 }
 
@@ -427,6 +448,8 @@ impl MaterialIndex {
                 mat.category.clone(),
                 None,
                 source,
+                None,
+                None,
             );
             return;
         }
@@ -443,19 +466,19 @@ impl MaterialIndex {
                         mat.category.clone(),
                         None,
                         source,
+                        None,
+                        None,
                     );
                 }
             }
             return;
         }
         if let Some(constituent_ids) = self.constituent_sets.get(&relating_id) {
+            let set_name = self.set_name(relating_id);
             for (i, cid) in constituent_ids.iter().enumerate() {
                 if let Some(c) = self.constituents.get(cid) {
                     let mat = c.material_ref.and_then(|mid| self.materials.get(&mid));
-                    let name = c
-                        .name_override
-                        .clone()
-                        .or_else(|| mat.and_then(|m| m.name.clone()));
+                    let name = mat.and_then(|m| m.name.clone());
                     let category = c
                         .category_override
                         .clone()
@@ -470,6 +493,8 @@ impl MaterialIndex {
                         category,
                         c.fraction,
                         source,
+                        c.name_override.clone(),
+                        set_name.clone(),
                     );
                 }
             }
@@ -484,19 +509,27 @@ impl MaterialIndex {
             .copied()
             .unwrap_or(relating_id);
         if let Some(profile_ids) = self.profile_sets.get(&pset_id) {
+            let set_name = self.set_name(pset_id);
             for (i, pid) in profile_ids.iter().enumerate() {
                 if let Some(p) = self.profiles.get(pid) {
                     let mat = p.material_ref.and_then(|mid| self.materials.get(&mid));
-                    let name = p
-                        .name_override
-                        .clone()
-                        .or_else(|| mat.and_then(|m| m.name.clone()));
+                    let name = mat.and_then(|m| m.name.clone());
                     let category = p
                         .category_override
                         .clone()
                         .or_else(|| mat.and_then(|m| m.category.clone()));
                     push_row(
-                        out, guid, "profile", i as i32, name, None, category, None, source,
+                        out,
+                        guid,
+                        "profile",
+                        i as i32,
+                        name,
+                        None,
+                        category,
+                        None,
+                        source,
+                        p.name_override.clone(),
+                        set_name.clone(),
                     );
                 }
             }
@@ -509,13 +542,11 @@ impl MaterialIndex {
             .copied()
             .unwrap_or(relating_id);
         if let Some(layer_ids) = self.layer_sets.get(&lset_id) {
+            let set_name = self.set_name(lset_id);
             for (i, lid) in layer_ids.iter().enumerate() {
                 if let Some(layer) = self.layers.get(lid) {
                     let mat = layer.material_ref.and_then(|mid| self.materials.get(&mid));
-                    let name = layer
-                        .name_override
-                        .clone()
-                        .or_else(|| mat.and_then(|m| m.name.clone()));
+                    let name = mat.and_then(|m| m.name.clone());
                     let category = layer
                         .category_override
                         .clone()
@@ -530,6 +561,8 @@ impl MaterialIndex {
                         category,
                         None,
                         source,
+                        layer.name_override.clone(),
+                        set_name.clone(),
                     );
                 }
             }
@@ -537,7 +570,14 @@ impl MaterialIndex {
         }
         // Unknown relating type — record the GUID with a placeholder so
         // the row count reflects reality.
-        push_row(out, guid, "unknown", -1, None, None, None, None, source);
+        push_row(
+            out, guid, "unknown", -1, None, None, None, None, source, None, None,
+        );
+    }
+
+    /// The set's own name by set step id (`None` when `$` or unknown).
+    fn set_name(&self, set_id: u64) -> Option<String> {
+        self.set_names.get(&set_id).cloned().flatten()
     }
 }
 
@@ -567,6 +607,8 @@ fn push_row(
     category: Option<String>,
     fraction: Option<f64>,
     source: &'static str,
+    item_name: Option<String>,
+    set_name: Option<String>,
 ) {
     out.guid.push(guid.to_string());
     out.role.push(role);
@@ -576,6 +618,8 @@ fn push_row(
     out.category.push(category);
     out.fraction.push(fraction);
     out.source.push(source);
+    out.item_name.push(item_name);
+    out.set_name.push(set_name);
 }
 
 pub(crate) struct MaterialRecord {
@@ -788,16 +832,16 @@ END-ISO-10303-21;
             assert_eq!(t.guid[i], "1Beam00000000000000001");
             assert_eq!(t.role[i], "constituent");
         }
-        // The name override on the constituent (e.g. "Concrete body")
-        // takes precedence over the referenced material name, mirroring
-        // the IfcMaterialLayer behaviour.
-        let names: std::collections::HashSet<&str> = t
-            .material_name
+        // GH #219: `material_name` is the referenced IfcMaterial's Name;
+        // the constituent's own Name is `item_name`, the set's `set_name`.
+        assert_eq!(t.material_name[0].as_deref(), Some("Concrete C30/37"));
+        assert_eq!(t.material_name[1].as_deref(), Some("Rebar B500B"));
+        assert_eq!(t.item_name[0].as_deref(), Some("Concrete body"));
+        assert_eq!(t.item_name[1].as_deref(), Some("Rebar mass"));
+        assert!(t
+            .set_name
             .iter()
-            .filter_map(|n| n.as_deref())
-            .collect();
-        assert!(names.contains("Concrete body"));
-        assert!(names.contains("Rebar mass"));
+            .all(|n| n.as_deref() == Some("RC Beam C30/37 mix")));
         // Categories also override.
         let cats: std::collections::HashSet<&str> =
             t.category.iter().filter_map(|c| c.as_deref()).collect();
@@ -849,6 +893,8 @@ END-ISO-10303-21;
         assert_eq!(t.len(), 1);
         assert_eq!(t.material_name[0].as_deref(), Some("Steel S355"));
         assert_eq!(t.category[0].as_deref(), Some("Structural"));
+        assert_eq!(t.item_name[0], None, "constituent Name is $");
+        assert_eq!(t.set_name[0].as_deref(), Some("Single-material set"));
     }
 
     #[test]
@@ -883,9 +929,11 @@ END-ISO-10303-21;
         assert_eq!(t.len(), 1, "expected 1 profile row, got {}", t.len());
         assert_eq!(t.role[0], "profile");
         assert_eq!(t.guid[0], "1Beam00000000000000001");
-        // Constituent's `Name` ("Web+Flanges") overrides the material's
-        // name, same precedence rule as layers / constituents.
-        assert_eq!(t.material_name[0].as_deref(), Some("Web+Flanges"));
+        // GH #219: the profile's own Name is `item_name`; `material_name`
+        // is the IfcMaterial's. `set_name` resolves through the usage.
+        assert_eq!(t.material_name[0].as_deref(), Some("Steel S355"));
+        assert_eq!(t.item_name[0].as_deref(), Some("Web+Flanges"));
+        assert_eq!(t.set_name[0].as_deref(), Some("HEA200-S355"));
         assert_eq!(t.category[0].as_deref(), Some("Section"));
     }
 
@@ -923,6 +971,72 @@ END-ISO-10303-21;
         // referenced IfcMaterial's Name + Category.
         assert_eq!(t.material_name[0].as_deref(), Some("Concrete C40/50"));
         assert_eq!(t.category[0].as_deref(), Some("Structural"));
+        assert_eq!(t.item_name[0], None);
+        assert_eq!(t.set_name[0].as_deref(), Some("Round Column"));
+    }
+
+    /// GH #219 / #213 on layers, both schemas' shapes: IFC4 layer Name →
+    /// `item_name` (never `material_name`), LayerSetName → `set_name`
+    /// through the usage; `''` stays `''`, `$` stays null; direct and
+    /// list rows carry neither.
+    #[test]
+    fn layer_item_and_set_names_are_separate_columns() {
+        let buf = r#"ISO-10303-21;
+HEADER;
+FILE_DESCRIPTION(('ViewDefinition [ReferenceView]'),'2;1');
+FILE_NAME('layers.ifc','2026-10-12T00:00:00',('test'),('test'),'ifcfast','ifcfast','');
+FILE_SCHEMA(('IFC4'));
+ENDSEC;
+DATA;
+#10=IFCWALL('1Wall00000000000000001',$,'W',$,$,$,$,'t',.STANDARD.);
+#11=IFCWALL('1Wall00000000000000002',$,'W',$,$,$,$,'t',.STANDARD.);
+#12=IFCWALL('1Wall00000000000000003',$,'W',$,$,$,$,'t',.STANDARD.);
+#20=IFCMATERIAL('Gips',$,$);
+#21=IFCMATERIAL('',$,$);
+#22=IFCMATERIALLAYER(#20,13.,$,'Gips (2)',$,$,$);
+#23=IFCMATERIALLAYER(#21,100.,$,'',$,$,$);
+#24=IFCMATERIALLAYER(#20,13.,$,$,$,$,$);
+#25=IFCMATERIALLAYERSET((#22,#23,#24),'Vegg 126',$);
+#26=IFCMATERIALLAYERSETUSAGE(#25,.AXIS2.,.POSITIVE.,0.,$);
+#30=IFCRELASSOCIATESMATERIAL('2Rel00000000000000001',$,$,$,(#10),#26);
+#31=IFCRELASSOCIATESMATERIAL('2Rel00000000000000002',$,$,$,(#11),#20);
+#32=IFCMATERIALLIST((#20,#21));
+#33=IFCRELASSOCIATESMATERIAL('2Rel00000000000000003',$,$,$,(#12),#32);
+ENDSEC;
+END-ISO-10303-21;
+"#;
+        let t = run_full_table(buf);
+        assert_eq!(t.len(), 6);
+        // Layer rows (#10).
+        assert_eq!(t.role[0..3], ["layer", "layer", "layer"]);
+        assert_eq!(t.material_name[0].as_deref(), Some("Gips"));
+        assert_eq!(t.material_name[1].as_deref(), Some(""));
+        assert_eq!(t.material_name[2].as_deref(), Some("Gips"));
+        assert_eq!(t.item_name[0].as_deref(), Some("Gips (2)"));
+        assert_eq!(t.item_name[1].as_deref(), Some(""));
+        assert_eq!(t.item_name[2], None);
+        for i in 0..3 {
+            assert_eq!(t.set_name[i].as_deref(), Some("Vegg 126"));
+        }
+        // Direct (#11) and list (#12): neither column applies.
+        assert_eq!(t.role[3], "direct");
+        assert_eq!(t.role[4], "list");
+        for i in 3..6 {
+            assert_eq!(t.item_name[i], None);
+            assert_eq!(t.set_name[i], None);
+        }
+        assert_eq!(t.material_name[5].as_deref(), Some(""));
+    }
+
+    /// IFC2X3 layers have no Name attribute: `item_name` is null and
+    /// `material_name` the material's.
+    #[test]
+    fn ifc2x3_layer_has_no_item_name() {
+        let buf = build_buf(".MILLI.", 200.0);
+        let t = run_full_table(&buf);
+        assert_eq!(t.material_name[0].as_deref(), Some("Concrete"));
+        assert_eq!(t.item_name[0], None);
+        assert_eq!(t.set_name[0].as_deref(), Some("WallSet"));
     }
 }
 

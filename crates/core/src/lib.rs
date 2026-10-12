@@ -726,6 +726,8 @@ mod python {
             )?;
             out.set_item("category", PyList::new(py, &mats.category)?)?;
             out.set_item("source", PyList::new(py, &mats.source)?)?;
+            out.set_item("item_name", PyList::new(py, &mats.item_name)?)?;
+            out.set_item("set_name", PyList::new(py, &mats.set_name)?)?;
             out.set_item("open_ms", open_ms)?;
             out.set_item("entity_table_ms", table_ms)?;
             out.set_item("warnings", table.warnings())?;
@@ -857,6 +859,8 @@ mod python {
                 d.set_item("category", PyList::new(py, &materials.category)?)?;
                 d.set_item("fraction", PyList::new(py, &materials.fraction)?)?;
                 d.set_item("source", PyList::new(py, &materials.source)?)?;
+                d.set_item("item_name", PyList::new(py, &materials.item_name)?)?;
+                d.set_item("set_name", PyList::new(py, &materials.set_name)?)?;
                 out.set_item("materials", d)?;
             }
             {

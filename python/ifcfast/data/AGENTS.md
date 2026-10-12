@@ -507,6 +507,9 @@ describing via `pq.read_schema(...)`):
   ~0.5 m off through that path (the `bbox_*` / `centroid_xyz` columns
   were always right; only the transform × local reconstruction was
   not).
+  Since cache schema v39 the `materials` struct also carries
+  `item_name` and `set_name` (GH #219 / #213), and its `name` is the
+  `IfcMaterial.Name` on every role.
   Since cache schema v30 (GH #165) the same inheritance pass covers
   `materials` (struct field `source`, `"instance"` / `"type"`) and
   `classifications` (struct field `assignment_source` — `source` on
@@ -547,7 +550,12 @@ build mirrors it at `CACHE_SCHEMA_VERSION` in `crates/wasm/src/analysis.rs`;
 the two are hashed into the same `cache_key` and bump in lockstep.
 Cache schema **v36** (GH #192 slice 3) added the `nests`, `groups` and
 `fills` edge tables (`nests.parquet` / `groups.parquet` / `fills.parquet`
-in the index cache); no existing table changed.
+in the index cache); no existing table changed. Cache schema **v39** is
+an extraction-only batch (no geometry moves): `materials` gains
+`item_name` + `set_name` and `material_name` changes meaning on set
+rows (GH #219 / #213), classification strings keep `''` (GH #217), and
+`psets` gains the predefined property sets (GH #216) — see
+*Conventions you can rely on*.
 
 **Cache freshness is verified, not assumed.** The cache key cannot see
 a same-size edit confined to the middle of a >8 MB file (its hash only
@@ -1108,7 +1116,7 @@ JSON.parse(m.typesJson());    // type manifest (no per-type mini-glbs in v1)
 // normalisation and same row order as the Python DataFrames.
 JSON.parse(m.psetsJson());           // [{guid, pset_name, prop_name, value, value_type, source}]
 JSON.parse(m.quantitiesJson());      // [{guid, qto_name, quantity_name, value, quantity_type, unit_step_id, source}]
-JSON.parse(m.materialsJson());       // [{guid, role, layer_index, material_name, layer_thickness_mm, category, fraction, source}]
+JSON.parse(m.materialsJson());       // [{guid, role, layer_index, material_name, layer_thickness_mm, category, fraction, source, item_name, set_name}]
 JSON.parse(m.classificationsJson()); // [{guid, system_name, edition, identification, name, location, source, assignment_source}]
 const glb = m.toGlb(true, true);   // Uint8Array — same writer as m.to_gltf()
 JSON.parse(m.shiftJson());    // [sx, sy, sz] metres — add back for absolute coords
@@ -1117,7 +1125,7 @@ JSON.parse(m.bySourceJson()); // GH #166 counters
 JSON.parse(m.validateIds(idsXml));   // IfcTester-shaped report (= rep.to_ifctester_json())
 m.validateIds(idsXml, "mark", true); // onUnsupported, filterIfcVersion
 m.free();
-``` `graph.products[].materials` lists every material name bound to the product across all roles (direct, list, layer, constituent, profile), deduped, first-seen order; `layer_set` is always null (GH #185, #213) — read `materialsJson()` for the rows. `qtoJson` rows split `volume_m3` into `volume_reliable_m3` + `volume_unreliable_m3` (unreliable = the host's half-space clip was not applied, an upper bound; `products_clip_unapplied` counts them) and `statsJson` carries `halfspace_clip_unapplied` / `halfspace_clip_manifold` (GH #211). Sum only `volume_reliable_m3` for a trustworthy total.
+``` `graph.products[].materials` lists every `IfcMaterial` name bound to the product across all roles (direct, list, layer, constituent, profile), deduped, first-seen order (GH #185; the material's Name, not the layer / constituent / profile Name, since GH #219). `layer_set` is the `set_name` of the product's first `layer` row, null when it has none; `graph.material_layer_sets` maps each set name to `{layers: [{material, thickness_mm}], total_thickness_mm}`, defined once by the first product carrying it (GH #213) — read `materialsJson()` for every row. `qtoJson` rows split `volume_m3` into `volume_reliable_m3` + `volume_unreliable_m3` (unreliable = the host's half-space clip was not applied, an upper bound; `products_clip_unapplied` counts them) and `statsJson` carries `halfspace_clip_unapplied` / `halfspace_clip_manifold` (GH #211). Sum only `volume_reliable_m3` for a trustworthy total.
 
 **`validateIds` is opt-in** (`IFCFAST_WASM_FEATURES=ids crates/wasm/build.sh`).
 It adds roxmltree, regex (Unicode tables) and the per-schema IDS tables
@@ -1159,7 +1167,8 @@ three numbers in `asset.extras.ifcfast.global_shift`.
 
 The four data-layer accessors are serialise-only: the extractors run
 inside `fromBytes`, so unlike `graphJson()` / `qtoJson()` none of them
-triggers a mesh pass. Missing values are `null`, never `""`.
+triggers a mesh pass. Missing values (`$`) are `null`; an authored
+empty string (`''`) is `""` — the two are never conflated (GH #217).
 **`psets.value` and `quantities.value` are strings** — the STEP
 literal verbatim, with the IFC type in the sibling `value_type` /
 `quantity_type` column; the wheel does not coerce them either, so
@@ -1456,6 +1465,74 @@ Gated by `crates/wasm/test/limits.mjs`.
   arguments; only genuine panics map to `IfcfastError`.) From the CLI
   it is caught like any other recoverable failure: `ifcfast: <message>`
   on stderr and exit code 1, never a traceback (GH #162).
+- **`m.materials.material_name` is always the `IfcMaterial.Name`**
+  (cache schema v39, GH #219). On every role — `direct`, `list`,
+  `layer`, `constituent`, `profile` — it is the Name of the referenced
+  `IfcMaterial`, the value ifcopenshell gives as
+  `layer.Material.Name` / `constituent.Material.Name` /
+  `profile.Material.Name`. Before v39 a set item's own Name (Revit
+  writes `IfcMaterialConstituent('KNM-Vegg (2)',$,#mat,…)` for the
+  second use of a material) replaced it. Two more columns, both
+  nullable strings:
+
+  | column | holds | null when |
+  |---|---|---|
+  | `item_name` | the set item's own `Name`: IFC4 `IfcMaterialLayer.Name`, `IfcMaterialConstituent.Name`, `IfcMaterialProfile.Name` | `direct` / `list` / `unknown` rows, IFC2X3 layers (no such attribute), Name `$` |
+  | `set_name` | the containing set's name: `IfcMaterialLayerSet.LayerSetName`, `IfcMaterialConstituentSet.Name`, `IfcMaterialProfileSet.Name` (resolved through `*SetUsage`) | `direct` / `list` / `unknown` rows, set name `$` |
+
+  Grouping by set: `m.materials.groupby(["guid", "set_name"])`. Want
+  the pre-v39 "item name, else material name" label?
+  `df.item_name.fillna(df.material_name)`. `category` is unchanged (the
+  item's own Category when set, else the material's). The substrate
+  `materials` struct carries the same two fields (`item_name`,
+  `set_name`; `name` there is `material_name`). Columns are
+  `guid, role, layer_index, material_name, layer_thickness_mm,
+  category, fraction, source, item_name, set_name`.
+- **`''` and `$` stay distinct in every string column** (cache schema
+  v39, GH #217). An attribute authored as the empty string comes back
+  as `""`; an absent one (`$`) as null — "set but empty" vs "not set"
+  is a QA fact, and it is what ifcopenshell returns. Until v39
+  `m.classifications` collapsed `''` to null (Archicad writes
+  `ItemReference = ''` on uncoded references; HI90_ARK: 5 of 15
+  references, 72 product rows); the other layers already kept it.
+  Filter "has a code" with `df.identification.fillna("") != ""`. The
+  IDS classification facet still treats `''` as no value.
+  Known exception (GH #221): `psets.pset_name` / `prop_name` and
+  `quantities.qto_name` / `quantity_name` are non-null columns, so a
+  `$` set / property Name reads as `""` there.
+- **Predefined property sets are psets** (cache schema v39, GH #216).
+  `IfcDoorLiningProperties`, `IfcDoorPanelProperties`,
+  `IfcWindowLiningProperties`, `IfcWindowPanelProperties`,
+  `IfcPermeableCoveringProperties`, `IfcReinforcementDefinitionProperties`
+  (IFC4 `IfcPreDefinedPropertySet` subtypes) and, on IFC2X3, the same
+  classes plus `IfcEnergyProperties`, `IfcElectricalBaseProperties`,
+  `IfcFluidFlowProperties`, `IfcServiceLifeFactor`,
+  `IfcSoundProperties`, `IfcSoundValue`,
+  `IfcSpaceThermalLoadProperties` — the list is generated from the
+  schemas (`scripts/gen_predefined_psets.py`) — appear in `m.psets`
+  wherever they are attached: `IfcRelDefinesByProperties`, or a type's
+  `HasPropertySets` (inherited, `source = "type"`; the IFC2X3 Revit
+  pattern hangs door lining / panel sets on `IfcDoorStyle`). Same shape
+  as ifcopenshell `get_psets`:
+  - `pset_name` = the entity's `Name` (Revit: the type name, e.g.
+    `Tofløyet:Glassdør 27x25M:6150804:1`), not the class name;
+  - one row per explicit attribute after GlobalId / OwnerHistory /
+    Name / Description whose value is not `$` — `prop_name` is the
+    attribute name (`PanelDepth`, `PanelOperation`, `LiningThickness`);
+  - `value` follows the table's string rules: numbers as on
+    `IfcPropertySingleValue` rows, booleans `"True"` / `"False"`, enums
+    as the literal (`SWINGING`), an entity reference as `"#id"`
+    (`ShapeAspectStyle`), a list as members joined with `", "`;
+  - `value_type` is the attribute's declared type
+    (`IfcPositiveLengthMeasure`, `IfcDoorPanelOperationEnum`,
+    `IfcShapeAspect`); for a SELECT attribute it is the value's own
+    wrapper (`IfcSoundPressureMeasure`).
+
+  No marker column — ifcopenshell has none either, and `source` keeps
+  its instance / type meaning. To isolate them, filter on the attribute
+  names above or look the set up by class in the IFC. KNM_ARK (Revit IFC4):
+  56 sampled products with predefined sets, 146/146 predefined property
+  values equal to `get_psets`.
 - **`psets.value_type` is the schema's CamelCase spelling**
   (`IfcPressureMeasure`, `IfcPositiveLengthMeasure`), matching
   ifcopenshell `NominalValue.is_a()`, since cache schema v35 (GH

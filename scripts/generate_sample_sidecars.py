@@ -227,10 +227,9 @@ def _materials_by_guid(records):
     """Roll `model.materials` rows up into `{guid: [material names]}`.
 
     Every role the extractor emits contributes its `material_name`
-    (deduped, first-seen order). `layer_set` has no source: the public
-    table carries no set-name column, so the per-product `layer_set`
-    stays null (GH #185). `crates/wasm/src/analysis.rs` mirrors this
-    loop; `crates/wasm/test/parity.mjs` holds them together.
+    (deduped, first-seen order; the IfcMaterial's Name for every role
+    since GH #219). `crates/wasm/src/analysis.rs` mirrors this loop;
+    `crates/wasm/test/parity.mjs` holds them together.
     """
     out: dict[str, list] = {}
     for m in records:
@@ -266,12 +265,23 @@ def _build_graph(model, spaces, containers, mesh_stats_by_guid, pset_attrs_by_gu
     layer_set_defs: dict[str, dict] = {}
     mats_by_guid = _materials_by_guid(_df_to_records(model.materials))
 
-    # Layer-set definitions — group materials by set name
+    # Layer sets (GH #213), from the `set_name` column of `role == "layer"`
+    # rows: a product's `layer_set` is the set_name of its first layer
+    # row, and each set is defined once, by the first product that
+    # carries it (its layer rows in table order — `layer_index` order).
+    # `thickness_mm` is `layer_thickness_mm` as is: the extractor already
+    # normalises it to millimetres. Mirrored by
+    # `crates/wasm/src/analysis.rs::layer_sets`.
+    set_owner: dict[str, str] = {}
     for m in _df_to_records(model.materials):
         if m.get("role") != "layer":
             continue
-        set_name = m.get("set_name") if "set_name" in m else None
-        if not set_name:
+        guid = m.get("guid")
+        set_name = m.get("set_name")
+        if not guid or not set_name:
+            continue
+        layer_set_by_guid.setdefault(guid, set_name)
+        if set_owner.setdefault(set_name, guid) != guid:
             continue
         ls = layer_set_defs.setdefault(set_name, {
             "layers": [],
@@ -279,9 +289,7 @@ def _build_graph(model, spaces, containers, mesh_stats_by_guid, pset_attrs_by_gu
         })
         ly = {
             "material": m.get("material_name") or "",
-            "thickness_mm": float(m.get("layer_thickness_mm") or 0.0) * 1000.0
-            if (m.get("layer_thickness_mm") or 0.0) < 1.0
-            else float(m.get("layer_thickness_mm") or 0.0),
+            "thickness_mm": float(m.get("layer_thickness_mm") or 0.0),
         }
         ls["layers"].append(ly)
         ls["total_thickness_mm"] += ly["thickness_mm"]
