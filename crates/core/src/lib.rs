@@ -498,6 +498,11 @@ mod python {
             groups.set_item("group_guid", PyList::new(py, &idx.groups_group_guid)?)?;
             groups.set_item("group_entity", PyList::new(py, &idx.groups_group_entity)?)?;
             groups.set_item("member_guid", PyList::new(py, &idx.groups_member_guid)?)?;
+            groups.set_item("group_name", PyList::new(py, &idx.groups_group_name)?)?;
+            groups.set_item(
+                "group_predefined_type",
+                PyList::new(py, &idx.groups_group_predefined_type)?,
+            )?;
             dict.set_item("groups", groups)?;
 
             // IfcRelDefinesByType: (product_step_id, type_step_id) pairs, plus

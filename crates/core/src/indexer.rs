@@ -403,6 +403,14 @@ pub struct IndexedFile {
     pub groups_group_guid: Vec<String>,
     pub groups_group_entity: Vec<String>,
     pub groups_member_guid: Vec<String>,
+    /// The group's `Name` (GH #215); `None` when `$`.
+    pub groups_group_name: Vec<Option<String>>,
+    /// The group's `PredefinedType` enum, verbatim (`USERDEFINED` kept),
+    /// for the classes that have one (`IfcDistributionSystem`,
+    /// `IfcBuildingSystem`, `IfcStructuralLoadGroup`, …; positions from
+    /// the generated `schema_products` tables); `None` otherwise or when
+    /// `$` (GH #215).
+    pub groups_group_predefined_type: Vec<Option<String>>,
 
     /// IfcRelDefinesByType: parallel arrays of
     /// `(product_step_id[i], type_step_id[i])`. RelatedObjects is a list,
@@ -942,7 +950,7 @@ pub fn index(buf: &[u8]) -> IndexedFile {
         }
     }
 
-    resolve_nests_and_groups(&mut out, &raw_nests, &raw_groups, &rooted);
+    resolve_nests_and_groups(&mut out, &raw_nests, &raw_groups, &rooted, is_ifc2x3);
 
     // All IfcRelContainedInSpatialStructure edges pass through —
     // structures can be Site, Building, Storey, or Space. The Python
@@ -996,6 +1004,7 @@ fn resolve_nests_and_groups(
     raw_nests: &[(u64, u64, u32)],
     raw_groups: &[(u64, u64)],
     rooted: &[(u64, &[u8], &[u8])],
+    is_ifc2x3: bool,
 ) {
     if raw_nests.is_empty() && raw_groups.is_empty() {
         return;
@@ -1009,21 +1018,24 @@ fn resolve_nests_and_groups(
         need.insert(*g);
         need.insert(*m);
     }
-    // step id -> (guid, type token). First record wins on a duplicated id.
-    let mut by_id: HashMap<u64, (String, &[u8])> = HashMap::with_capacity(need.len());
+    // step id -> (guid, type token, args). First record wins on a
+    // duplicated id.
+    let mut by_id: HashMap<u64, (String, &[u8], &[u8])> = HashMap::with_capacity(need.len());
     for (id, t, args) in rooted {
         if !need.contains(id) || by_id.contains_key(id) {
             continue;
         }
         let fields = split_top_level_args(args);
         if let Some(guid) = string_at(&fields, 0) {
-            by_id.insert(*id, (guid, t));
+            by_id.insert(*id, (guid, t, args));
         }
     }
+    // Group Name / PredefinedType, once per group (GH #215).
+    let mut group_attrs: HashMap<u64, (Option<String>, Option<String>)> = HashMap::new();
     let mut dropped = 0usize;
     for &(p, c, pos) in raw_nests {
         match (by_id.get(&p), by_id.get(&c)) {
-            (Some((pg, _)), Some((cg, _))) => {
+            (Some((pg, _, _)), Some((cg, _, _))) => {
                 out.nests_parent.push(p);
                 out.nests_child.push(c);
                 out.nests_position.push(pos);
@@ -1035,13 +1047,19 @@ fn resolve_nests_and_groups(
     }
     for &(g, m) in raw_groups {
         match (by_id.get(&g), by_id.get(&m)) {
-            (Some((gg, gt)), Some((mg, _))) => {
+            (Some((gg, gt, gargs)), Some((mg, _, _))) => {
+                let (name, predefined) = group_attrs
+                    .entry(g)
+                    .or_insert_with(|| group_name_and_predefined(gt, gargs, is_ifc2x3))
+                    .clone();
                 out.groups_group.push(g);
                 out.groups_member.push(m);
                 out.groups_group_guid.push(gg.clone());
                 out.groups_group_entity
                     .push(type_name_uppercase_with_proper_case(gt));
                 out.groups_member_guid.push(mg.clone());
+                out.groups_group_name.push(name);
+                out.groups_group_predefined_type.push(predefined);
             }
             _ => dropped += 1,
         }
@@ -1055,6 +1073,31 @@ fn resolve_nests_and_groups(
         eprintln!("ifcfast: {msg}");
         out.warnings.push(msg);
     }
+}
+
+/// A group's `Name` (position 2, IfcRoot) and its `PredefinedType` enum
+/// when the class declares one in the file's schema (GH #215).
+fn group_name_and_predefined(
+    type_token: &[u8],
+    args: &[u8],
+    is_ifc2x3: bool,
+) -> (Option<String>, Option<String>) {
+    let fields = split_top_level_args(args);
+    let name = string_at(&fields, 2);
+    let up = type_token.to_ascii_uppercase();
+    let table = if is_ifc2x3 {
+        crate::schema_products::GROUP_PREDEFINED_POSITION_IFC2X3
+    } else {
+        crate::schema_products::GROUP_PREDEFINED_POSITION_IFC4
+    };
+    let predefined = table
+        .iter()
+        .find(|(c, _)| *c == up.as_slice())
+        .and_then(|&(_, pos)| match parse_field(fields.get(pos)?) {
+            Field::Enum(e) => std::str::from_utf8(e).ok().map(str::to_string),
+            _ => None,
+        });
+    (name, predefined)
 }
 
 fn extract_product(
@@ -1905,6 +1948,15 @@ ENDSEC;\nEND-ISO-10303-21;\n"
             vec!["IfcDistributionSystem", "IfcDistributionSystem", "IfcZone"]
         );
         assert_eq!(idx.groups_member_guid[1], "0Test00000000000000012");
+        // GH #215: group Name + PredefinedType (IfcZone has none).
+        assert_eq!(
+            idx.groups_group_name,
+            vec![Some("s".into()), Some("s".into()), Some("z".into())]
+        );
+        assert_eq!(
+            idx.groups_group_predefined_type,
+            vec![Some("WATERSUPPLY".into()), Some("WATERSUPPLY".into()), None]
+        );
         assert_eq!(idx.fills_opening, vec![30]);
         assert_eq!(idx.fills_element, vec![31]);
         assert_eq!(idx.voids_opening, vec![30]);
@@ -1913,6 +1965,34 @@ ENDSEC;\nEND-ISO-10303-21;\n"
             idx.warnings.iter().any(|w| w.contains("1 IfcRelNests")),
             "{:?}",
             idx.warnings
+        );
+    }
+
+    /// GH #215: `PredefinedType` positions are schema-aware. IFC2X3
+    /// `IfcInventory` carries `InventoryType` where IFC4 has
+    /// `PredefinedType`, so it must stay `None`; IFC2X3
+    /// `IfcStructuralLoadGroup` has `PredefinedType` at 5; `$` is `None`.
+    #[test]
+    fn group_predefined_type_is_schema_aware() {
+        let src = "ISO-10303-21;\nHEADER;\nFILE_DESCRIPTION((''),'2;1');\n\
+FILE_NAME('t.ifc','2026-10-13T00:00:00',(''),(''),'ifcfast','ifcfast','');\n\
+FILE_SCHEMA(('IFC2X3'));\nENDSEC;\nDATA;\n\
+#1=IFCRELASSIGNSTOGROUP('0Test00000000000000001',$,$,$,(#10),$,#20);\n\
+#2=IFCRELASSIGNSTOGROUP('0Test00000000000000002',$,$,$,(#10),$,#21);\n\
+#3=IFCRELASSIGNSTOGROUP('0Test00000000000000003',$,$,$,(#10),$,#22);\n\
+#10=IFCBUILDINGELEMENTPROXY('0Test00000000000000010',$,'p',$,$,$,$,$,$);\n\
+#20=IFCINVENTORY('0Test00000000000000020',$,'inv',$,$,.ASSETINVENTORY.,$,(),$,$,$);\n\
+#21=IFCSTRUCTURALLOADGROUP('0Test00000000000000021',$,'lg',$,$,.LOAD_GROUP.,.PERMANENT_G.,.DEAD_LOAD_G.,1.,$);\n\
+#22=IFCSTRUCTURALLOADGROUP('0Test00000000000000022',$,$,$,$,$,.PERMANENT_G.,.DEAD_LOAD_G.,1.,$);\n\
+ENDSEC;\nEND-ISO-10303-21;\n";
+        let idx = index(src.as_bytes());
+        assert_eq!(
+            idx.groups_group_name,
+            vec![Some("inv".into()), Some("lg".into()), None]
+        );
+        assert_eq!(
+            idx.groups_group_predefined_type,
+            vec![None, Some("LOAD_GROUP".into()), None]
         );
     }
 

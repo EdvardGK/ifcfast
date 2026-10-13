@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ids xmlns:xs="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://standards.buildingsmart.org/IDS http://standards.buildingsmart.org/IDS/1.0/ids.xsd" xmlns="http://standards.buildingsmart.org/IDS">
+  <info><title>app_airterminal_on_proxy</title></info>
+  <specifications>
+    <specification name="app_airterminal_on_proxy" ifcVersion="IFC2X3">
+      <applicability minOccurs="0" maxOccurs="unbounded"><entity><name><simpleValue>IFCAIRTERMINAL</simpleValue></name></entity></applicability>
+      <requirements><attribute><name><simpleValue>Name</simpleValue></name><value><simpleValue>NOPE</simpleValue></value></attribute></requirements>
+    </specification>
+  </specifications>
+</ids>

@@ -16,7 +16,10 @@ FIXTURE = (
 )
 
 NESTS_COLS = ["parent_guid", "child_guid", "position", "parent_step_id", "child_step_id"]
-GROUPS_COLS = ["group_guid", "group_entity", "member_guid", "group_step_id", "member_step_id"]
+GROUPS_COLS = [
+    "group_guid", "group_entity", "member_guid", "group_step_id", "member_step_id",
+    "group_name", "group_predefined_type",  # GH #215
+]
 FILLS_COLS = ["opening_guid", "element_guid"]
 
 
@@ -29,10 +32,12 @@ def _check_tables(m):
     assert list(m.groups.columns) == GROUPS_COLS
     assert list(m.fills.columns) == FILLS_COLS
     assert m.nests.values.tolist() == [[g(8), g(9), 0, 8, 9]]
-    assert m.groups.values.tolist() == [
-        [g(10), "IfcDistributionSystem", g(6), 10, 6],
-        [g(10), "IfcDistributionSystem", g(9), 10, 9],
-        [g(12), "IfcZone", g(11), 12, 11],  # IfcRelAssignsToGroupByFactor
+    # None (cold parse) and NaN (cache hit) are the same missing value.
+    rows = [[None if v != v else v for v in r] for r in m.groups.values.tolist()]
+    assert rows == [
+        [g(10), "IfcDistributionSystem", g(6), 10, 6, "SYS", "ELECTRICAL"],
+        [g(10), "IfcDistributionSystem", g(9), 10, 9, "SYS", "ELECTRICAL"],
+        [g(12), "IfcZone", g(11), 12, 11, "Z", None],  # IfcRelAssignsToGroupByFactor
     ]
     assert m.fills.values.tolist() == [[g(5), g(6)]]
     # fills joins voids on the opening: door -> opening -> wall

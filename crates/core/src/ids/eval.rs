@@ -260,6 +260,21 @@ impl Outcome {
 /// IfcTester `Entity.__call__` (`facet.py:230-258`).
 pub(crate) fn eval_entity(ctx: &Ctx, e: &CEntity, rec: &Record) -> Result<Outcome, IdsError> {
     if !e.name.matches_class(rec.class) {
+        // A restriction with IFC2X3 mapped members (A6, GH #224): pass when
+        // the occurrence's type object is exactly one of their classes.
+        let set_types = e.name.mapped_types();
+        if !set_types.is_empty() {
+            if let Some(ty) = ctx.type_record(rec)? {
+                if set_types.binary_search(&ty.class).is_ok() {
+                    return eval_predefined(ctx, e, rec);
+                }
+            }
+            return Ok(Outcome::fail(
+                reason::ENTITY_MISMATCH,
+                Some(rec.class.to_string()),
+                Some("instance"),
+            ));
+        }
         let mapped = match e.name.plain() {
             Some(n) if ctx.schema == Schema::Ifc2x3 && !n.ends_with("TYPE") => {
                 ctx.type_record(rec)?
@@ -293,6 +308,11 @@ pub(crate) fn eval_entity(ctx: &Ctx, e: &CEntity, rec: &Record) -> Result<Outcom
             }
         }
     }
+    eval_predefined(ctx, e, rec)
+}
+
+/// The `predefinedType` half of [`eval_entity`], once the name matched.
+fn eval_predefined(ctx: &Ctx, e: &CEntity, rec: &Record) -> Result<Outcome, IdsError> {
     let Some(p) = &e.predefined else {
         return Ok(Outcome::pass());
     };

@@ -219,7 +219,15 @@ pub fn audit_requirement_entities(
             Err(IdsError::Unsupported { .. }) => continue,
             Err(other) => return Err((i, other.to_string())),
         };
-        if !cv.matches(&Actual::Str(app_name.to_string())) {
+        // IFC2X3 mapping table (A6, GH #224): a requirement name listed
+        // with the applicability entity as its occurrence entity (e.g.
+        // IFCAIRTERMINAL under IFCFLOWTERMINAL) can match an IFC2X3 file,
+        // whether it is given alone or inside a restriction.
+        let via_table = || {
+            super::ifc2x3_mapping::table_names_for_occurrence(app_name)
+                .any(|n| cv.matches(&Actual::Str(n.to_string())))
+        };
+        if !cv.matches(&Actual::Str(app_name.to_string())) && !via_table() {
             return Err((
                 i,
                 format!(
@@ -387,6 +395,26 @@ mod tests {
         );
         let app_type = vec![ent(Val::Simple("IFCWALLTYPE".into()))];
         assert!(audit_requirement_entities(&app_type, &[req(ent(Val::Restriction(pat)))]).is_ok());
+        // IFC2X3 mapping table (A6): IFCAIRTERMINAL's occurrence entity is
+        // IFCFLOWTERMINAL, alone or in an enumeration; not under IFCWALL.
+        let flow = vec![ent(Val::Simple("IFCFLOWTERMINAL".into()))];
+        let air = Restriction {
+            enumeration: Some(vec!["IFCAIRTERMINAL".into()]),
+            ..Restriction::default()
+        };
+        assert!(
+            audit_requirement_entities(&flow, &[req(ent(Val::Restriction(air.clone())))]).is_ok()
+        );
+        assert!(audit_requirement_entities(
+            &flow,
+            &[req(ent(Val::Simple("IFCAIRTERMINAL".into())))]
+        )
+        .is_ok());
+        assert!(audit_requirement_entities(&app, &[req(ent(Val::Restriction(air)))]).is_err());
+        let door = vec![ent(Val::Simple("IFCBUILDINGELEMENTPROXY".into()))];
+        assert!(
+            audit_requirement_entities(&door, &[req(ent(Val::Simple("IFCDOOR".into())))]).is_err()
+        );
         // Applicability without a simple entity: nothing to check.
         assert!(audit_requirement_entities(&[], &other).is_ok());
     }

@@ -120,6 +120,32 @@ impl IfcModel {
         self.inner.qto_json().to_string()
     }
 
+    /// `[{group_guid, group_entity, member_guid, group_step_id,
+    /// member_step_id, group_name, group_predefined_type}]` —
+    /// `model.groups`: `IfcRelAssignsToGroup` (+ `…ByFactor`) membership,
+    /// one row per (relation, member), file order (GH #215). This is what
+    /// an IDS `partOf relation="IFCRELASSIGNSTOGROUP"` reads: the group's
+    /// class (`IfcDistributionSystem`, `IfcZone`, …), its `Name` and its
+    /// `PredefinedType` enum verbatim (`null` for classes without one).
+    #[wasm_bindgen(js_name = groupsJson)]
+    pub fn groups_json(&self) -> String {
+        self.inner.groups_json().to_string()
+    }
+
+    /// `[{parent_guid, child_guid, position, parent_step_id,
+    /// child_step_id}]` — `model.nests` (`IfcRelNests`, GH #215).
+    #[wasm_bindgen(js_name = nestsJson)]
+    pub fn nests_json(&self) -> String {
+        self.inner.nests_json().to_string()
+    }
+
+    /// `[{opening_guid, element_guid}]` — `model.fills`
+    /// (`IfcRelFillsElement`, GH #215).
+    #[wasm_bindgen(js_name = fillsJson)]
+    pub fn fills_json(&self) -> String {
+        self.inner.fills_json().to_string()
+    }
+
     /// `[{guid, pset_name, prop_name, value, value_type, source}]` —
     /// every property row, long format, exactly `model.psets` (GH #183).
     ///

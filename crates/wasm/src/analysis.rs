@@ -190,6 +190,18 @@ pub enum MeshState {
     Batched,
 }
 
+/// One `model.groups` row: `(group_guid, group_entity, member_guid,
+/// group_step_id, member_step_id, group_name, group_predefined_type)`.
+pub type GroupRow = (
+    String,
+    String,
+    String,
+    u64,
+    u64,
+    Option<String>,
+    Option<String>,
+);
+
 /// Everything the four JSON surfaces are derived from. Identity and the
 /// tier-1 join are built by [`Analysis::run`]; the geometry-derived
 /// fields (`drift`, `counters`, `segment_rows`, `meshes`) are filled by
@@ -238,8 +250,9 @@ pub struct Analysis {
     pub nests: Vec<(String, String, u32, u64, u64)>,
     /// `IfcRelAssignsToGroup` rows, guid-resolved by `indexer::index`.
     /// Column order mirrors `model.py::_GROUPS_COLUMNS`:
-    /// `(group_guid, group_entity, member_guid, group_step_id, member_step_id)`.
-    pub groups: Vec<(String, String, String, u64, u64)>,
+    /// `(group_guid, group_entity, member_guid, group_step_id, member_step_id,
+    /// group_name, group_predefined_type)` (the last two GH #215).
+    pub groups: Vec<GroupRow>,
     /// `IfcRelFillsElement` rows. Both sides are products, so this
     /// resolves through `product_step_to_guid` the same way `voids`
     /// does — `model.py`'s comment on the matching join says so
@@ -519,8 +532,7 @@ impl Analysis {
                 idx.nests_child[i],
             ));
         }
-        let mut groups: Vec<(String, String, String, u64, u64)> =
-            Vec::with_capacity(idx.groups_group_guid.len());
+        let mut groups: Vec<GroupRow> = Vec::with_capacity(idx.groups_group_guid.len());
         for i in 0..idx.groups_group_guid.len() {
             groups.push((
                 idx.groups_group_guid[i].clone(),
@@ -528,6 +540,8 @@ impl Analysis {
                 idx.groups_member_guid[i].clone(),
                 idx.groups_group[i],
                 idx.groups_member[i],
+                idx.groups_group_name[i].clone(),
+                idx.groups_group_predefined_type[i].clone(),
             ));
         }
         let mut fills: Vec<(String, String)> = Vec::new();
@@ -1233,6 +1247,8 @@ const COLS: &[(&str, &[&str])] = &[
             "member_guid",
             "group_step_id",
             "member_step_id",
+            "group_name",
+            "group_predefined_type",
         ],
     ),
     ("fills", &["opening_guid", "element_guid"]),
@@ -1875,6 +1891,54 @@ impl Analysis {
 
     /// `[{guid, pset_name, prop_name, value, value_type, source}]` —
     /// `model.psets` as row objects.
+    /// `model.nests` rows (GH #215).
+    pub fn nests_json(&self) -> Value {
+        Value::Array(
+            self.nests
+                .iter()
+                .map(|(p, c, pos, ps, cs)| {
+                    json!({
+                        "parent_guid": p,
+                        "child_guid": c,
+                        "position": pos,
+                        "parent_step_id": ps,
+                        "child_step_id": cs,
+                    })
+                })
+                .collect(),
+        )
+    }
+
+    /// `model.groups` rows (GH #215).
+    pub fn groups_json(&self) -> Value {
+        Value::Array(
+            self.groups
+                .iter()
+                .map(|(gg, ge, mg, gs, ms, name, pt)| {
+                    json!({
+                        "group_guid": gg,
+                        "group_entity": ge,
+                        "member_guid": mg,
+                        "group_step_id": gs,
+                        "member_step_id": ms,
+                        "group_name": jstr(name),
+                        "group_predefined_type": jstr(pt),
+                    })
+                })
+                .collect(),
+        )
+    }
+
+    /// `model.fills` rows (GH #215).
+    pub fn fills_json(&self) -> Value {
+        Value::Array(
+            self.fills
+                .iter()
+                .map(|(o, e)| json!({"opening_guid": o, "element_guid": e}))
+                .collect(),
+        )
+    }
+
     pub fn psets_json(&self) -> Value {
         let t = &self.psets_t;
         let mut rows = Vec::with_capacity(t.guid.len());
@@ -2540,9 +2604,9 @@ mod tests {
 
     // ----- GH #208 (GH #192 slice 3): nests / groups / fills --------
     //
-    // These three tier-1 tables have no dedicated `*_json` accessor on
-    // `IfcModel` (unlike psets/quantities/materials/classifications),
-    // so the coverage that matters is `summaryJson().tables` — the
+    // These three tier-1 tables gained `groupsJson` / `nestsJson` /
+    // `fillsJson` row accessors in GH #215; the coverage that matters
+    // for the sidecars is still `summaryJson().tables` — the
     // exact thing `crates/wasm/test/parity.mjs` diffs against the
     // Python-generated sidecar — plus the raw field counts underneath
     // it. Row counts are cross-checked against the Python wheel:
@@ -2596,7 +2660,9 @@ mod tests {
                 "group_entity",
                 "member_guid",
                 "group_step_id",
-                "member_step_id"
+                "member_step_id",
+                "group_name",
+                "group_predefined_type"
             ]),
             "groups: column list matches model.py::_GROUPS_COLUMNS"
         );
@@ -2608,6 +2674,14 @@ mod tests {
 
         // Values, not just shape — GH #192 slice 3's join.
         assert_eq!(a.groups[2].1, "IfcZone");
+        // GH #215: the row accessors mirror the tables.
+        let g = a.groups_json();
+        assert_eq!(g.as_array().map(Vec::len), Some(3));
+        for k in ["group_name", "group_predefined_type", "member_step_id"] {
+            assert!(g[0].get(k).is_some(), "groupsJson row lacks {k}");
+        }
+        assert_eq!(a.nests_json().as_array().map(Vec::len), Some(1));
+        assert_eq!(a.fills_json().as_array().map(Vec::len), Some(1));
         let (opening_guid, element_guid) = &a.fills[0];
         assert_ne!(opening_guid, element_guid);
     }

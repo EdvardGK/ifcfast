@@ -175,6 +175,34 @@ def tag_positions(products: list[str]) -> dict[str, int]:
     return out
 
 
+def group_predefined_positions() -> tuple[dict[str, int], dict[str, int]]:
+    """STEP position of ``PredefinedType`` per ``IfcGroup`` subtype that
+    declares one, as (IFC2X3, IFC4 + IFC4X3) maps (GH #215). IFC2X3 is
+    kept apart because a class can carry the attribute in IFC4 only
+    (``IfcInventory``: IFC2X3 has ``InventoryType`` there). Fails loudly
+    if IFC4 and IFC4X3 disagree on a class both have."""
+    def one(schema: str) -> dict[str, int]:
+        out: dict[str, int] = {}
+        for e in _entities(schema):
+            if not _descends_from(e, "IfcGroup"):
+                continue
+            names = [a.name() for a in e.all_attributes()]
+            if "PredefinedType" in names:
+                out[e.name()] = names.index("PredefinedType")
+        return out
+
+    ifc4 = one("IFC4")
+    ifc4x3 = one("IFC4X3")
+    both = entity_names_for("IFC4") & entity_names_for("IFC4X3")
+    for cls in (set(ifc4) | set(ifc4x3)) & both:
+        if ifc4.get(cls) != ifc4x3.get(cls):
+            raise SystemExit(
+                f"{cls}.PredefinedType differs between IFC4 and IFC4X3; "
+                "the indexer keys IFC4/IFC4X3 on class alone"
+            )
+    return one("IFC2X3"), {**ifc4, **ifc4x3}
+
+
 def canonical_names() -> dict[str, str]:
     """STEP token (uppercase) → ifcopenshell spelling, for every entity in
     every supported schema. Fails loudly on a spelling conflict."""
@@ -253,6 +281,22 @@ def render_rust() -> str:
     )
     o.append("    ];")
     o.append("")
+    g2x3, g4 = group_predefined_positions()
+    for const, table, doc in (
+        ("GROUP_PREDEFINED_POSITION_IFC2X3", g2x3, "IFC2X3"),
+        ("GROUP_PREDEFINED_POSITION_IFC4", g4, "IFC4 / IFC4X3"),
+    ):
+        o.append(f"    /// STEP position of `PredefinedType` per `IfcGroup` subtype ({doc},")
+        o.append("    /// GH #215). A class absent here has no `PredefinedType`.")
+        o.append(f"    pub(crate) const {const}: &[(&[u8], usize)] = &[")
+        o.extend(
+            _chunked_strings(
+                [f'(b"{c.upper()}", {table[c]})' for c in sorted(table, key=str.upper)],
+                "        ",
+            )
+        )
+        o.append("    ];")
+        o.append("")
     o.append("    /// STEP token → ifcopenshell spelling for every entity in every schema.")
     o.append("    pub(crate) const ENTITY_NAMES: &[(&[u8], &str)] = &[")
     o.extend(
@@ -263,7 +307,14 @@ def render_rust() -> str:
     o.append("    ];")
     o.append("}")
     o.append("")
-    o.append("pub(crate) use gen::{ENTITY_NAMES, PRODUCT_TYPES, TAG_POSITION};")
+    # rustfmt's layout of this line (the drift test byte-compares).
+    o.append("pub(crate) use gen::{")
+    o.append(
+        "    ENTITY_NAMES, GROUP_PREDEFINED_POSITION_IFC2X3, GROUP_PREDEFINED_POSITION_IFC4, "
+        "PRODUCT_TYPES,"
+    )
+    o.append("    TAG_POSITION,")
+    o.append("};")
     o.append("")
     return "\n".join(o)
 
