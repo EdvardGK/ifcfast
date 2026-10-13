@@ -29,6 +29,24 @@ Per model it compares, against ifcopenshell as the oracle:
   entity → ``"#id"``, tuple → ``", "``-joined, numbers numerically).
   Complex properties (nested dicts) are flattened ``"Outer.Inner"`` like
   ifcfast does. Predefined-set rows (GH #216) are counted separately.
+* **quantities** — every IfcProduct carrying an IfcElementQuantity (own
+  or via its type; all of them, every k-th above 20 000) vs
+  ``m.quantities``: value per ``(qto_name, quantity_name)`` (numeric) and
+  ``source`` (``instance`` shadows ``type`` per quantity). The harness'
+  own walk is cross-checked against ``get_psets(qtos_only=True)``.
+* **attributes** — every ``products_df`` row vs its entity (by step_id):
+  entity, Name, ObjectType, Tag, PredefinedType, type guid/name/source
+  (documented three-tier: RelDefinesByType > truthy ObjectType > none),
+  ``''`` vs None distinct; plus coverage of every IfcProduct except
+  IfcSite / IfcBuilding / IfcBuildingStorey.
+* **storeys** — ``m.storeys`` vs IfcBuildingStorey: name, raw
+  ``elevation``, ``elevation_m`` (× ``calculate_unit_scale``),
+  ``building_guid`` (IfcRelAggregates parent).
+* **containment** — ``storey_guid`` vs the GH #88 walk (spatial
+  container, else IfcRelAggregates parent, up to a storey; voids / nests
+  are NOT climbed — ``get_container`` disagreements on those are
+  reported as information only) and ``parent_guid`` vs the
+  IfcRelAggregates parent.
 
 Run (ONE ifcopenshell-loading process at a time — RAM)::
 
@@ -343,6 +361,383 @@ def ifcopenshell_get_type(el):
     return get_type(el)
 
 
+def _attr(el, name):
+    """``getattr`` that tolerates a short STEP record (fewer arguments
+    than the schema declares — ifcopenshell raises ``Index N is out of
+    range``); an absent trailing argument reads as None, which is what
+    ifcfast's indexer reports for it."""
+    try:
+        return getattr(el, name, None)
+    except RuntimeError:
+        return None
+
+
+def _defs_of(el) -> list:
+    """Every IfcPropertySetDefinition bound to ``el`` by
+    IfcRelDefinesByProperties, set-valued RelatingPropertyDefinition
+    (IFC4 IfcPropertySetDefinitionSet / inline tuple) expanded."""
+    out = []
+    for rel in getattr(el, "IsDefinedBy", None) or []:
+        if rel.is_a("IfcRelDefinesByProperties"):
+            d = rel.RelatingPropertyDefinition
+            if isinstance(d, tuple):
+                out.extend(d)
+            elif d.is_a("IfcPropertySetDefinitionSet"):
+                out.extend(d.wrappedValue)
+            else:
+                out.append(d)
+    return out
+
+
+# --------------------------------------------------------------------------
+# quantities
+# --------------------------------------------------------------------------
+
+
+def _qto_flat(qto) -> dict:
+    from ifcopenshell.util.element import get_property_definition
+
+    return _flatten(get_property_definition(qto))
+
+
+def quantities(ios, fast, max_products: int = 20000) -> dict[str, Any]:
+    """Every IfcProduct carrying an IfcElementQuantity (own or via its
+    type) vs ``m.quantities``: value per ``(qto_name, quantity_name)``
+    and ``source`` (``instance`` shadows ``type`` per quantity, like
+    ``get_psets``' ``update`` merge)."""
+    from ifcopenshell.util.element import get_psets
+
+    # truth: guid -> {(qto, q): (value, source)}
+    truth_by_guid: dict[str, dict] = {}
+    getpsets_disagree = 0
+    getpsets_examples = []
+    for el in ios.by_type("IfcProduct"):
+        inst = [d for d in _defs_of(el) if d.is_a("IfcElementQuantity")]
+        t = ifcopenshell_get_type(el)
+        typ = [d for d in (t.HasPropertySets or []) if d.is_a("IfcElementQuantity")] if t else []
+        if not inst and not typ:
+            continue
+        tr: dict = {}
+        for src, defs in (("type", typ), ("instance", inst)):
+            for d in defs:
+                qn = d.Name if d.Name is not None else ""
+                for k, v in _qto_flat(d).items():
+                    tr[(qn, k)] = (_render(v), src)
+        # cross-check the harness' own walk against get_psets (oracle API)
+        gp = {}
+        for qn, props in get_psets(el, qtos_only=True).items():
+            for k, v in _flatten(props).items():
+                gp[(qn if qn is not None else "", k)] = _render(v)
+        if gp != {k: v for k, (v, _) in tr.items()}:
+            getpsets_disagree += 1
+            if len(getpsets_examples) < 3:
+                getpsets_examples.append(el.GlobalId)
+        truth_by_guid[el.GlobalId] = tr
+
+    guids = sorted(truth_by_guid)
+    step = 1
+    if len(guids) > max_products:
+        step = math.ceil(len(guids) / max_products)
+        guids = guids[::step]
+    chosen = set(guids)
+
+    df = fast.quantities
+    product_guids = set(fast.products_df.guid)
+    ours: dict[str, dict] = defaultdict(dict)
+    dup_rows = 0
+    for r in df.itertuples():
+        if r.guid not in chosen and not (step == 1 and r.guid in product_guids):
+            continue
+        key = (r.qto_name, r.quantity_name)
+        if key in ours[r.guid]:
+            dup_rows += 1
+        ours[r.guid][key] = (_nn(r.value), r.source)
+
+    compared = matched = missing = extra = value_mm = source_mm = 0
+    source_counts: Counter = Counter()
+    examples = []
+    for g in sorted(chosen | set(ours)):
+        tr = truth_by_guid.get(g, {})
+        mine = ours.get(g, {})
+        for key, (tv, tsrc) in tr.items():
+            compared += 1
+            source_counts[tsrc] += 1
+            if key not in mine:
+                missing += 1
+                if len(examples) < 8:
+                    examples.append(f"missing {g} {key} truth={tv!r} ({tsrc})")
+                continue
+            ov, osrc = mine[key]
+            ok = True
+            if not _values_equal(ov, tv):
+                value_mm += 1
+                ok = False
+                if len(examples) < 8:
+                    examples.append(f"value {g} {key} ours={ov!r} truth={tv!r}")
+            if osrc != tsrc:
+                source_mm += 1
+                ok = False
+                if len(examples) < 8:
+                    examples.append(f"source {g} {key} ours={osrc!r} truth={tsrc!r}")
+            matched += ok
+        for key in mine:
+            if key not in tr:
+                extra += 1
+                if len(examples) < 8:
+                    examples.append(f"extra {g} {key} ours={mine[key]!r}")
+    return {
+        "products_with_quantities": len(truth_by_guid),
+        "products_compared": len(chosen),
+        "sampling_step": step,
+        "quantities_compared": compared,
+        "truth_by_source": dict(source_counts),
+        "matched": matched,
+        "missing_in_ifcfast": missing,
+        "extra_in_ifcfast": extra,
+        "value_mismatch": value_mm,
+        "source_mismatch": source_mm,
+        "ifcfast_duplicate_key_rows": dup_rows,
+        "harness_walk_vs_get_psets_disagree": getpsets_disagree,
+        "harness_walk_vs_get_psets_examples": getpsets_examples,
+        "examples": examples,
+    }
+
+
+# --------------------------------------------------------------------------
+# attributes (products_df vs entity attributes) + coverage
+# --------------------------------------------------------------------------
+
+_ATTR_FIELDS = ("guid", "entity", "name", "object_type", "tag",
+                "predefined_type", "type_guid", "type_name", "type_source")
+_SPATIAL_OWN_TABLE = ("IfcSite", "IfcBuilding", "IfcBuildingStorey")
+
+
+def attributes(ios, fast) -> dict[str, Any]:
+    """Every products_df row vs its STEP entity (looked up by step_id).
+
+    ``type_name`` follows the documented three-tier resolution
+    (model.py / AGENTS.md): IfcRelDefinesByType type's Name, else a
+    truthy ``ObjectType`` (``type_source='objecttype'``), else None.
+    IFC2X3 IfcSpace / IfcRoof trailing enums are not PredefinedType
+    (GH #159) — counted under ``ifc2x3_trailing_enum_not_predefined``."""
+    df = fast.products_df
+    compared: Counter = Counter()
+    mismatched: Counter = Counter()
+    examples: dict[str, list] = defaultdict(list)
+    ifc2x3_special = 0
+    rows_seen: set[int] = set()
+
+    def chk(field, g, ours, truth):
+        compared[field] += 1
+        if ours != truth:
+            mismatched[field] += 1
+            if len(examples[field]) < 5:
+                examples[field].append(f"{g}: ours={ours!r} truth={truth!r}")
+
+    for r in df.itertuples():
+        sid = int(r.step_id)
+        rows_seen.add(sid)
+        el = ios.by_id(sid)
+        g = r.guid
+        chk("guid", g, g, el.GlobalId)
+        chk("entity", g, r.entity, el.is_a())
+        chk("name", g, _nn(r.name), el.Name)
+        chk("object_type", g, _nn(r.object_type), _attr(el, "ObjectType"))
+        chk("tag", g, _nn(r.tag), _attr(el, "Tag"))
+        pt = _attr(el, "PredefinedType")
+        if (ios.schema == "IFC2X3" and el.is_a() in ("IfcSpace", "IfcRoof")):
+            ifc2x3_special += 1
+        chk("predefined_type", g, _nn(r.predefined_type), pt)
+        t = ifcopenshell_get_type(el)
+        ot = _attr(el, "ObjectType")
+        if t is not None:
+            tg, tn, ts = t.GlobalId, t.Name, "ifctype"
+        elif ot:
+            tg, tn, ts = None, ot, "objecttype"
+        else:
+            tg, tn, ts = None, None, "none"
+        chk("type_guid", g, _nn(r.type_guid), tg)
+        chk("type_name", g, _nn(r.type_name), tn)
+        chk("type_source", g, r.type_source, ts)
+
+    # coverage
+    truth_ids = {
+        el.id(): el.is_a()
+        for el in ios.by_type("IfcProduct")
+        if not any(el.is_a(c) for c in _SPATIAL_OWN_TABLE)
+    }
+    missing_by_class = Counter(c for i, c in truth_ids.items() if i not in rows_seen)
+    extra_by_class = Counter(
+        ios.by_id(i).is_a() for i in rows_seen if i not in truth_ids
+    )
+    dup_rows = len(df) - len(rows_seen)
+    return {
+        "rows": len(df),
+        "duplicate_step_id_rows": dup_rows,
+        "compared": dict(compared),
+        "mismatched": dict(mismatched),
+        "ifc2x3_trailing_enum_not_predefined": ifc2x3_special,
+        "coverage_truth_products": len(truth_ids),
+        "coverage_missing_in_ifcfast_by_class": dict(missing_by_class),
+        "coverage_extra_in_ifcfast_by_class": dict(extra_by_class),
+        "examples": dict(examples),
+    }
+
+
+# --------------------------------------------------------------------------
+# storeys
+# --------------------------------------------------------------------------
+
+
+def _num_eq(a, b) -> bool:
+    if a is None or b is None:
+        return a is None and b is None
+    return math.isclose(float(a), float(b), rel_tol=1e-9, abs_tol=1e-9)
+
+
+def storeys(ios, fast) -> dict[str, Any]:
+    import ifcopenshell.util.unit
+
+    scale = ifcopenshell.util.unit.calculate_unit_scale(ios)
+    ours = {s.guid: s for s in fast.storeys}
+    truth = {s.GlobalId: s for s in ios.by_type("IfcBuildingStorey")}
+    compared: Counter = Counter()
+    mismatched: Counter = Counter()
+    examples: dict[str, list] = defaultdict(list)
+
+    def chk(field, g, o, t, eq=lambda a, b: a == b):
+        compared[field] += 1
+        if not eq(o, t):
+            mismatched[field] += 1
+            if len(examples[field]) < 5:
+                examples[field].append(f"{g}: ours={o!r} truth={t!r}")
+
+    for g in sorted(set(ours) & set(truth)):
+        o, s = ours[g], truth[g]
+        chk("name", g, o.name, s.Name)
+        chk("elevation", g, o.elevation, s.Elevation, _num_eq)
+        tm = s.Elevation * scale if s.Elevation is not None else None
+        chk("elevation_m", g, o.elevation_m, tm, _num_eq)
+        b = None
+        for rel in s.Decomposes or []:
+            if rel.is_a("IfcRelAggregates") and rel.RelatingObject.is_a("IfcBuilding"):
+                b = rel.RelatingObject.GlobalId
+        chk("building_guid", g, o.building_guid, b)
+    return {
+        "unit_scale_ifcopenshell": scale,
+        "unit_scale_ifcfast": fast.unit_scale,
+        "storeys_truth": len(truth),
+        "storeys_ifcfast": len(fast.storeys),
+        "missing_in_ifcfast": sorted(set(truth) - set(ours)),
+        "extra_in_ifcfast": sorted(set(ours) - set(truth)),
+        "compared": dict(compared),
+        "mismatched": dict(mismatched),
+        "examples": dict(examples),
+    }
+
+
+# --------------------------------------------------------------------------
+# containment (storey_guid transitive, parent_guid = IfcRelAggregates parent)
+# --------------------------------------------------------------------------
+
+
+def _agg_parent(el):
+    """IfcRelAggregates parent only (IFC2X3 ``Decomposes`` also carries
+    IfcRelNests, which ifcfast keeps in ``m.nests``, not here)."""
+    for rel in getattr(el, "Decomposes", None) or []:
+        if rel.is_a("IfcRelAggregates"):
+            return rel.RelatingObject
+    return None
+
+
+def _truth_storey(el, budget: int = 16):
+    """Storey the product resolves to: direct spatial container, walked
+    up through IfcRelAggregates until an IfcBuildingStorey; a product
+    with no containment inherits from its aggregate parent (GH #88).
+
+    Returns (storey_or_None, how) with how in direct / via_container /
+    via_aggregate / none."""
+    cur = el
+    how = None
+    seen = set()
+    for _ in range(budget):
+        if cur.id() in seen:
+            return None, "cycle"
+        seen.add(cur.id())
+        cis = getattr(cur, "ContainedInStructure", None) or []
+        if cis:
+            c = cis[0].RelatingStructure
+            if c.is_a("IfcBuildingStorey"):
+                return c, how or "direct"
+            how = how or "via_container"
+            cur = c
+            continue
+        p = _agg_parent(cur)
+        if p is None:
+            return None, "none"
+        if p.is_a("IfcBuildingStorey"):
+            return p, how or "via_aggregate"
+        how = how or "via_aggregate"
+        cur = p
+    return None, "budget"
+
+
+def containment(ios, fast) -> dict[str, Any]:
+    from ifcopenshell.util.element import get_container
+
+    compared = Counter()
+    mismatched = Counter()
+    examples: dict[str, list] = defaultdict(list)
+    how_counts: Counter = Counter()
+    transitive_mismatch = 0
+    multi_container = 0
+    ios_get_container_disagree = 0
+    ios_gc_examples = []
+
+    def chk(field, g, o, t):
+        compared[field] += 1
+        if o != t:
+            mismatched[field] += 1
+            if len(examples[field]) < 5:
+                examples[field].append(f"{g}: ours={o!r} truth={t!r}")
+            return False
+        return True
+
+    for r in fast.products_df.itertuples():
+        el = ios.by_id(int(r.step_id))
+        if len(getattr(el, "ContainedInStructure", None) or []) > 1:
+            multi_container += 1
+        st, how = _truth_storey(el)
+        how_counts[how] += 1
+        tg = st.GlobalId if st is not None else None
+        ok = chk("storey_guid", r.guid, _nn(r.storey_guid), tg)
+        if not ok and how == "via_aggregate":
+            transitive_mismatch += 1
+        if st is not None:
+            chk("storey_name", r.guid, _nn(r.storey_name), st.Name)
+        # informational: ifcopenshell's own resolver
+        gc = get_container(el, ifc_class="IfcBuildingStorey")
+        if (gc.GlobalId if gc is not None else None) != tg:
+            ios_get_container_disagree += 1
+            if len(ios_gc_examples) < 5:
+                ios_gc_examples.append(
+                    f"{r.guid}: get_container={gc.GlobalId if gc else None} walk={tg}")
+        p = _agg_parent(el)
+        pt = p.GlobalId if p is not None and (
+            p.is_a("IfcProduct") or p.is_a("IfcProject")) else None
+        chk("parent_guid", r.guid, _nn(r.parent_guid), pt)
+    return {
+        "compared": dict(compared),
+        "mismatched": dict(mismatched),
+        "truth_resolution": dict(how_counts),
+        "storey_mismatch_on_transitive_only": transitive_mismatch,
+        "products_with_multiple_containers": multi_container,
+        "ifcopenshell_get_container_vs_walk_disagree": ios_get_container_disagree,
+        "ifcopenshell_get_container_examples": ios_gc_examples,
+        "examples": dict(examples),
+    }
+
+
 # --------------------------------------------------------------------------
 
 
@@ -358,16 +753,48 @@ def run_model(path: Path, sample: int) -> dict[str, Any]:
         "classifications": classifications(ios, fast),
         "materials": materials(ios, fast),
         "psets": psets(ios, fast, sample),
+        "quantities": quantities(ios, fast),
+        "attributes": attributes(ios, fast),
+        "storeys": storeys(ios, fast),
+        "containment": containment(ios, fast),
     }
 
 
 def is_clean(rep: dict[str, Any]) -> bool:
+    q, a, s, c = (rep[k] for k in ("quantities", "attributes", "storeys", "containment"))
     return (
         rep["classifications"]["mismatched_products"] == 0
         and rep["materials"]["mismatched_products"] == 0
         and rep["psets"]["missing_in_ifcfast"] == 0
         and rep["psets"]["extra_in_ifcfast"] == 0
         and rep["psets"]["value_mismatch"] == 0
+        and q["missing_in_ifcfast"] == 0
+        and q["extra_in_ifcfast"] == 0
+        and q["value_mismatch"] == 0
+        and q["source_mismatch"] == 0
+        and not any(a["mismatched"].values())
+        and not a["coverage_missing_in_ifcfast_by_class"]
+        and not a["coverage_extra_in_ifcfast_by_class"]
+        and not any(s["mismatched"].values())
+        and not s["missing_in_ifcfast"]
+        and not s["extra_in_ifcfast"]
+        and not any(c["mismatched"].values())
+    )
+
+
+def _summary_line(rep: dict[str, Any]) -> str:
+    """model | surface compared/mismatched, one line per model."""
+    q, a, s, c = (rep[k] for k in ("quantities", "attributes", "storeys", "containment"))
+    qm = q["missing_in_ifcfast"] + q["extra_in_ifcfast"] + q["value_mismatch"] + q["source_mismatch"]
+    am = sum(a["mismatched"].values()) + sum(a["coverage_missing_in_ifcfast_by_class"].values()) \
+        + sum(a["coverage_extra_in_ifcfast_by_class"].values())
+    sm = sum(s["mismatched"].values()) + len(s["missing_in_ifcfast"]) + len(s["extra_in_ifcfast"])
+    return (
+        f"{rep['model']}: quantities {q['quantities_compared']}/{qm} "
+        f"attributes {sum(a['compared'].values())}/{am} "
+        f"storeys {sum(s['compared'].values())}/{sm} "
+        f"containment {sum(c['compared'].values())}/{sum(c['mismatched'].values())} "
+        "(compared/mismatched)"
     )
 
 
@@ -384,6 +811,8 @@ def main(argv: list[str] | None = None) -> int:
         reports.append(rep)
         ok &= is_clean(rep)
         print(json.dumps(rep, indent=1, default=str))
+    for rep in reports:
+        print(_summary_line(rep))
     if a.report:
         a.report.write_text(json.dumps(reports, indent=1, default=str))
     return 0 if ok else 1

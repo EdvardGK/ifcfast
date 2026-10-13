@@ -15,6 +15,8 @@ Usage (from the repo root, venv active)::
         [--tolerance 0.005]          # flag classes whose ratio moved more
         [--refresh-fast]             # new build: recompute ifcfast, keep cached ios
         [--mode cut|nocut]           # which kernel contract to gate (default cut)
+        [--dump-elements FILE]       # per-element rows incl. flags (GH #220 audit)
+        [--element-tol 0.01]         # |err| threshold flagged in the dump summary
 
 Baselines for client corpora (e.g. G55) live OUTSIDE the repo — they are
 client data. Convention: ``scratch/<corpus>/baselines/<MODEL>.json`` for
@@ -69,6 +71,7 @@ def fast_volumes(ifc_path: Path, mode: str = "cut") -> dict[str, dict]:
     m = ifcfast.open(str(ifc_path))
     prod, _surf = m.mesh_qto(cut_openings=(mode == "cut"))
     out: dict[str, dict] = {}
+    has_rel = "volume_reliable" in prod.columns
     for _, r in prod.iterrows():
         v = r["volume_m3"]
         out[r["guid"]] = {
@@ -76,6 +79,9 @@ def fast_volumes(ifc_path: Path, mode: str = "cut") -> dict[str, dict]:
             "volume": None if v is None else float(v),
             "mesh_quality": r["mesh_quality"],
             "volume_method": r["volume_method"],
+            # routing flag (GH #60 / #121 / #220) — recorded so a per-element
+            # dump can score the tripwire against the oracle
+            "volume_reliable": bool(r["volume_reliable"]) if has_rel else None,
         }
     return out
 
@@ -159,6 +165,59 @@ def per_class(fast: dict, ios: dict) -> dict[str, dict]:
     return dict(agg)
 
 
+def element_rows(fast: dict, ios: dict) -> list[dict]:
+    """Per shared element: both volumes, relative error, ifcfast's flags.
+
+    ``err`` is ``fast / ios - 1`` (``None`` when the oracle volume is ~0 or
+    ifcfast has no volume). Sorted by ``|err|`` descending so the head of the
+    list is the divergence worklist; ``volume_reliable`` rides along so the
+    tripwire's false-negative / false-positive rates can be read off.
+    """
+    rows = []
+    for g in set(fast) & set(ios):
+        fv, iv = fast[g]["volume"], ios[g]["volume"]
+        err = None if fv is None or iv is None or iv < 1e-9 else fv / iv - 1.0
+        rows.append({
+            "guid": g, "entity": ios[g]["entity"], "fast": fv, "ios": iv, "err": err,
+            "mesh_quality": fast[g].get("mesh_quality"),
+            "volume_method": fast[g].get("volume_method"),
+            "volume_reliable": fast[g].get("volume_reliable"),
+            # GH #230: set by bbox_parity --export-sweep-cache when the ios mesh's
+            # signed volume depends on the origin (open / incoherent shell); None
+            # when the cache has no such evidence
+            "oracle_indeterminate": ios[g].get("indeterminate"),
+        })
+    rows.sort(key=lambda r: -(abs(r["err"]) if r["err"] is not None else float("inf")))
+    return rows
+
+
+def print_element_summary(rows: list[dict], tol: float) -> None:
+    """Tripwire scorecard: |err| > tol split by volume_reliable."""
+    n = len(rows)
+    bad = [r for r in rows if r["err"] is not None and abs(r["err"]) > tol]
+    ind = [r for r in bad if r["oracle_indeterminate"]]
+    if ind:
+        print(f"\n{len(ind)} of the over-tolerance rows have an origin-dependent oracle volume "
+              f"(GH #230) — not kernel divergence; excluded below")
+        bad = [r for r in bad if not r["oracle_indeterminate"]]
+    none_err = sum(1 for r in rows if r["err"] is None)
+    rel_bad = sum(1 for r in bad if r["volume_reliable"] is True)
+    unrel = [r for r in rows if r["volume_reliable"] is False]
+    unrel_ok = sum(1 for r in unrel if r["err"] is not None and abs(r["err"]) <= tol)
+    print(f"\nelements: {n} shared, {len(bad)} with |err| > {tol:.3%} "
+          f"({rel_bad} of them volume_reliable=True = silent), {none_err} without a ratio")
+    print(f"volume_reliable=False: {len(unrel)} rows, {unrel_ok} of them within tolerance "
+          f"(flagged but at parity)")
+    by_cls: dict[str, int] = defaultdict(int)
+    for r in bad:
+        by_cls[r["entity"]] += 1
+    if by_cls:
+        print("over-tolerance by class:", dict(sorted(by_cls.items(), key=lambda kv: -kv[1])))
+    for r in bad[:15]:
+        print(f"  {r['err']:+9.2%} {r['guid']} {r['entity']:<24} fast={r['fast']:.4f} ios={r['ios']:.4f} "
+              f"{r['mesh_quality']}/{r['volume_method']} reliable={r['volume_reliable']}")
+
+
 def print_table(agg: dict[str, dict], baseline: dict[str, dict] | None, tolerance: float) -> list[str]:
     """Print the sweep table; return the list of drifted class names."""
     drifted: list[str] = []
@@ -200,6 +259,13 @@ def main() -> int:
         help="recompute the ifcfast side against a NEW build but reuse the "
         "cached ifcopenshell volumes (the slow half) — the cache is rewritten",
     )
+    ap.add_argument("--dump-elements", type=Path, default=None,
+                    help="write per-element rows (volumes, err, mesh_quality, "
+                         "volume_method, volume_reliable) as JSON and print the "
+                         "tripwire scorecard")
+    ap.add_argument("--element-tol", type=float, default=0.01,
+                    help="|fast/ios - 1| above which an element counts as divergent "
+                         "in the --dump-elements summary (default 1 %%)")
     ap.add_argument(
         "--mode",
         choices=MODES,
@@ -245,6 +311,14 @@ def main() -> int:
     agg = per_class(fast, ios)
     baseline = json.load(args.baseline.open()) if args.baseline else None
     drifted = print_table(agg, baseline, args.tolerance)
+
+    if args.dump_elements:
+        rows = element_rows(fast, ios)
+        print_element_summary(rows, args.element_tol)
+        args.dump_elements.parent.mkdir(parents=True, exist_ok=True)
+        json.dump({"model": args.ifc.name, "mode": args.mode, "rows": rows},
+                  args.dump_elements.open("w"))
+        print(f"elements written: {args.dump_elements}")
 
     if args.write_baseline:
         args.write_baseline.parent.mkdir(parents=True, exist_ok=True)
