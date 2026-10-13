@@ -14,7 +14,10 @@ flock /tmp/ifcfast-oracle.lock .venv/bin/python <anything that imports ifcopensh
 scripts/worktree/remove_worktree.sh <name>            # keeps branch wt/<name>
 ```
 
-Rules: `/tmp/ifcfast-build.lock` around EVERY cargo/maturin/wasm build
+Rules: ONE heavy job at a time machine-wide — `flock /tmp/ifcfast-heavy.lock nice -n 10 <cmd>`
+around every build, oracle run, corpus scan or load of a model > 20 MB, and start it
+only when `free -g` shows ≥ 6 GB available (Ed, 2026-10-13: "one file at a time, and
+only add to it when safe"). Additionally `/tmp/ifcfast-build.lock` around EVERY cargo/maturin/wasm build
 (`scripts/ship_gate.sh` holds the same lock); `/tmp/ifcfast-oracle.lock`
 around every ifcopenshell-loading process; never `maturin develop
 --release` in a worktree (the release `.so` in the main tree's `.venv` is
