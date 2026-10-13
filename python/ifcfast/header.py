@@ -869,7 +869,18 @@ def _resolve_step_escapes(s: str) -> str:
 #       product is not a valid region. Such rows get `volume_reliable =
 #       False` and, over a mesh-derived method, `volume_method =
 #       "mesh_profile_invalid"`. Geometry unchanged.
-_CACHE_SCHEMA_VERSION = 42
+#   43: GH #225 — geometry change: parameterised section profiles carry
+#       their corner radii. I / asymmetric I / L / U / T / Z / C sections,
+#       rounded rectangles and rectangle-hollow sections get their fillet,
+#       edge and bend radii as tangent arcs sampled like the GH #218
+#       profile arcs (sagitta chord count, area-exact), and tapered
+#       flanges / legs honour their slope. Rolled-section beams / columns
+#       / members gain vertices and their `volume_m3` moves (IPE / HEA /
+#       HEB +3–5 %); `IfcCShapeProfileDef`, `IfcAsymmetricIShapeProfileDef`
+#       and `IfcRectangleHollowProfileDef` products, which did not mesh,
+#       now do. Sharp (null / zero radius) sections are byte-identical.
+#       Columns unchanged.
+_CACHE_SCHEMA_VERSION = 43
 
 _FIELD_RE = re.compile(r"\(\s*(.*?)\s*\)\s*;", re.DOTALL)
 

@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-Cache schema v41.
+Cache schema v43.
 
 ### Added
 
@@ -46,6 +46,27 @@ Cache schema v41.
   measurable mesh-pass cost (G55_ARK / KNM_ARK A/B within noise).
 
 ### Fixed
+
+- **Section profiles carry their fillets, edge radii and slopes (GH #225,
+  cache schema v43).** `IfcIShapeProfileDef` and its L / U / T / Z
+  siblings were meshed as their sharp-cornered polygons, so every rolled
+  section under-reported its area by the missing root fillets — IPE /
+  HEA / HEB beams −3…−5 % with `mesh_quality = "closed"` and
+  `volume_reliable = True` (HI90_RIB: all 20 IShape beams, G55_RIB: all
+  10). Each corner radius (`FilletRadius`, `FlangeEdgeRadius`,
+  `EdgeRadius`, `WebEdgeRadius`, `InternalFilletRadius`,
+  `Inner`/`OuterFilletRadius`, `RoundingRadius`) is now a tangent arc
+  sampled like the GH #218 profile arcs (0.5 mm sagitta chord count,
+  tangent points verbatim, sector-area interior radius), so the section
+  area is the analytic one. Tapered flanges / legs (`FlangeSlope`,
+  `LegSlope`, `WebSlope`), previously ignored, are honoured with
+  IfcOpenShell 0.8's reference points. `IfcRoundedRectangleProfileDef`
+  is no longer a plain rectangle (it over-reported), and
+  `IfcCShapeProfileDef`, `IfcAsymmetricIShapeProfileDef` and
+  `IfcRectangleHollowProfileDef` — which did not mesh at all — now do.
+  A missing or zero radius is a sharp corner, byte-identical to before.
+  The L / U / T / Z frame (corner origin instead of the bounding-box
+  centre) is unchanged and tracked in GH #237.
 
 - **IDS: IFC2X3 entity names inside an `xs:enumeration` / pattern map
   through the occurrence/type table (GH #224, ambiguity A6).** Each

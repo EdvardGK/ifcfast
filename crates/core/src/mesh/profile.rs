@@ -206,8 +206,9 @@ pub fn extract(table: &EntityTable, id: u64) -> Option<Polygon2D> {
         // (Position, XDim, YDim) at arg[2..5]
         rectangle(&fields)?
     } else if type_name.eq_ignore_ascii_case(b"IFCROUNDEDRECTANGLEPROFILEDEF") {
-        // Same as rectangle but with RoundingRadius — approximate as plain rect for now.
-        rectangle(&fields)?
+        rounded_rectangle(table, &fields)?
+    } else if type_name.eq_ignore_ascii_case(b"IFCRECTANGLEHOLLOWPROFILEDEF") {
+        rectangle_hollow(table, &fields)?
     } else if type_name.eq_ignore_ascii_case(b"IFCCIRCLEPROFILEDEF") {
         circle(table, &fields)?
     } else if type_name.eq_ignore_ascii_case(b"IFCCIRCLEHOLLOWPROFILEDEF") {
@@ -215,15 +216,19 @@ pub fn extract(table: &EntityTable, id: u64) -> Option<Polygon2D> {
     } else if type_name.eq_ignore_ascii_case(b"IFCELLIPSEPROFILEDEF") {
         ellipse(table, &fields)?
     } else if type_name.eq_ignore_ascii_case(b"IFCISHAPEPROFILEDEF") {
-        i_shape(&fields)?
+        i_shape(table, &fields)?
+    } else if type_name.eq_ignore_ascii_case(b"IFCASYMMETRICISHAPEPROFILEDEF") {
+        asymmetric_i_shape(table, &fields)?
     } else if type_name.eq_ignore_ascii_case(b"IFCLSHAPEPROFILEDEF") {
-        l_shape(&fields)?
+        l_shape(table, &fields)?
     } else if type_name.eq_ignore_ascii_case(b"IFCUSHAPEPROFILEDEF") {
-        u_shape(&fields)?
+        u_shape(table, &fields)?
     } else if type_name.eq_ignore_ascii_case(b"IFCTSHAPEPROFILEDEF") {
-        t_shape(&fields)?
+        t_shape(table, &fields)?
     } else if type_name.eq_ignore_ascii_case(b"IFCZSHAPEPROFILEDEF") {
-        z_shape(&fields)?
+        z_shape(table, &fields)?
+    } else if type_name.eq_ignore_ascii_case(b"IFCCSHAPEPROFILEDEF") {
+        c_shape(table, &fields)?
     } else if type_name.eq_ignore_ascii_case(b"IFCARBITRARYCLOSEDPROFILEDEF") {
         // arg[2] = OuterCurve
         arbitrary_closed(table, &fields)?
@@ -346,118 +351,494 @@ fn ellipse(table: &EntityTable, fields: &[&[u8]]) -> Option<Polygon2D> {
     })
 }
 
-fn i_shape(fields: &[&[u8]]) -> Option<Polygon2D> {
+// ----------------------------------------------------------------------
+// Rolled / cold-formed section profiles (GH #225)
+// ----------------------------------------------------------------------
+//
+// Every section is first written as its sharp-cornered polygon — the
+// exact f32 vertices it had before GH #225, in the same order — with a
+// radius per corner. [`round_corners`] then replaces each corner whose
+// radius is positive by the circular arc tangent to both of its edges,
+// sampled like every other profile arc (GH #218): the sagitta chord count
+// of [`arc_samples_per_turn`] over the arc's sweep through
+// [`arc_chord_count`], authored tangent points as the end samples and the
+// sector-area radius [`arc_area_scale_pinned`] on the interior samples, so
+// the polygon area equals the analytic section area (sharp area ∓ the
+// fillet corrections) for any chord count. A missing (`$`) or zero radius
+// is a sharp corner and leaves the polygon bit-identical to the old
+// output.
+//
+// Slopes (tapered flanges / legs) follow IfcOpenShell 0.8's reference
+// points, the de-facto reading of a spec that does not say where a
+// tapered thickness is measured: I-shape flange thickness at the flange
+// tip, U-shape and L-shape at the middle of the flange / leg extent, T
+// flange at a quarter of the flange width from the web axis and T web at
+// mid-depth. A slope is an IfcPlaneAngleMeasure in the file's
+// PLANEANGLEUNIT; one whose |tan| ≥ 1 (a 45°+ "taper" — in practice an
+// angle authored in the wrong unit) is ignored.
+
+/// A corner radius from an optional `IfcNonNegativeLengthMeasure` field:
+/// `$`, zero, negative or non-finite → `0.0` (sharp).
+fn corner_radius(fields: &[&[u8]], idx: usize) -> f64 {
+    match number_at(fields, idx) {
+        Some(r) if r.is_finite() && r > 0.0 => r,
+        _ => 0.0,
+    }
+}
+
+/// `tan` of an optional slope field (`IfcPlaneAngleMeasure`, file angle
+/// unit); `0.0` when absent, zero, or not a plausible taper (see the
+/// section comment). The unit walk only runs for a non-zero slope.
+fn slope_tan(table: &EntityTable, fields: &[&[u8]], idx: usize) -> f64 {
+    let s = match number_at(fields, idx) {
+        Some(s) if s.is_finite() && s != 0.0 => s,
+        _ => return 0.0,
+    };
+    let k = (s * resolve_plane_angle_scale(table) as f64).tan();
+    if k.is_finite() && k.abs() < 1.0 {
+        k
+    } else {
+        0.0
+    }
+}
+
+/// Replace every corner `(vertex, radius)` with `radius > 0` by its
+/// tangent arc (see the section comment). Corners at which the polygon
+/// does not turn (or folds back) stay sharp. When the tangent points of
+/// the two corners of one edge would overlap (a radius larger than the
+/// section allows), both radii are scaled down so the arcs meet; a
+/// tangent point that then coincides with its neighbour is emitted once.
+/// With no positive radius the input vertices are returned unchanged.
+fn round_corners(corners: &[(Vec2, f64)], unit_scale: f32) -> Vec<Vec2> {
+    if !corners.iter().any(|c| c.1 > 0.0) {
+        return corners.iter().map(|c| c.0).collect();
+    }
+    let n = corners.len();
+    let p: Vec<DVec2> = corners.iter().map(|c| c.0.as_dvec2()).collect();
+    let dir = |i: usize, j: usize| (p[j] - p[i]).normalize_or_zero();
+    // Half the angle between the corner's two edges, and the distance from
+    // the corner to each tangent point.
+    let mut half = vec![0.0_f64; n];
+    let mut tangent = vec![0.0_f64; n];
+    for i in 0..n {
+        let r = corners[i].1;
+        if r <= 0.0 {
+            continue;
+        }
+        let u = dir(i, (i + n - 1) % n);
+        let v = dir(i, (i + 1) % n);
+        let a = 0.5 * u.dot(v).clamp(-1.0, 1.0).acos();
+        if a > 1e-9 && a < std::f64::consts::FRAC_PI_2 - 1e-9 {
+            half[i] = a;
+            tangent[i] = r / a.tan();
+        }
+    }
+    let mut fit = vec![1.0_f64; n];
+    for i in 0..n {
+        let j = (i + 1) % n;
+        let need = tangent[i] + tangent[j];
+        let len = (p[j] - p[i]).length();
+        if need > len && need > 0.0 {
+            let f = len / need;
+            fit[i] = fit[i].min(f);
+            fit[j] = fit[j].min(f);
+        }
+    }
+    let mut out: Vec<Vec2> = Vec::with_capacity(n * 4);
+    for i in 0..n {
+        if tangent[i] <= 0.0 {
+            out.push(corners[i].0);
+            continue;
+        }
+        let r = corners[i].1 * fit[i];
+        let t = tangent[i] * fit[i];
+        let u = dir(i, (i + n - 1) % n);
+        let v = dir(i, (i + 1) % n);
+        let t1 = p[i] + u * t;
+        let t2 = p[i] + v * t;
+        let c = p[i] + (u + v).normalize() * (r / half[i].sin());
+        let a1 = (t1.y - c.y).atan2(t1.x - c.x);
+        let a2 = (t2.y - c.y).atan2(t2.x - c.x);
+        let mut d = a2 - a1;
+        if d > std::f64::consts::PI {
+            d -= std::f64::consts::TAU;
+        } else if d < -std::f64::consts::PI {
+            d += std::f64::consts::TAU;
+        }
+        let sweep = d.abs() as f32;
+        let chords = arc_chord_count(
+            arc_samples_per_turn(r as f32, unit_scale) * sweep / std::f32::consts::TAU,
+        );
+        let k = arc_area_scale_pinned(sweep, chords) as f64;
+        out.push(t1.as_vec2());
+        for s in 1..chords {
+            let a = a1 + d * (s as f64 / chords as f64);
+            out.push((c + DVec2::new(a.cos(), a.sin()) * (k * r)).as_vec2());
+        }
+        out.push(t2.as_vec2());
+    }
+    // Arcs that meet (clamped radii, or a rounded rectangle whose radius is
+    // half its side) share a tangent point.
+    let mut span = 0.0_f32;
+    for q in &out {
+        span = span.max(q.x.abs()).max(q.y.abs());
+    }
+    let eps = span * 1e-6;
+    out.dedup_by(|b, a| a.distance(*b) <= eps);
+    while out.len() > 1 && out[0].distance(out[out.len() - 1]) <= eps {
+        out.pop();
+    }
+    out
+}
+
+fn i_shape(table: &EntityTable, fields: &[&[u8]]) -> Option<Polygon2D> {
     // (ProfileType, ProfileName, Position, OverallWidth, OverallDepth,
     //  WebThickness, FlangeThickness, FilletRadius, FlangeEdgeRadius, FlangeSlope)
+    // The last two are IFC4; in IFC2X3 the fields are absent.
     let bf = number_at(fields, 3)? as f32; // OverallWidth
     let d = number_at(fields, 4)? as f32; // OverallDepth
     let tw = number_at(fields, 5)? as f32; // WebThickness
     let tf = number_at(fields, 6)? as f32; // FlangeThickness
-    let half_bf = bf * 0.5;
-    let half_d = d * 0.5;
-    let half_tw = tw * 0.5;
-    let y_inner = half_d - tf;
+    let rf = corner_radius(fields, 7);
+    let re = corner_radius(fields, 8);
+    let k = slope_tan(table, fields, 9);
     Some(Polygon2D {
-        outer: vec![
-            Vec2::new(-half_bf, -half_d),
-            Vec2::new(half_bf, -half_d),
-            Vec2::new(half_bf, -y_inner),
-            Vec2::new(half_tw, -y_inner),
-            Vec2::new(half_tw, y_inner),
-            Vec2::new(half_bf, y_inner),
-            Vec2::new(half_bf, half_d),
-            Vec2::new(-half_bf, half_d),
-            Vec2::new(-half_bf, y_inner),
-            Vec2::new(-half_tw, y_inner),
-            Vec2::new(-half_tw, -y_inner),
-            Vec2::new(-half_bf, -y_inner),
-        ],
+        outer: round_corners(
+            &i_corners(bf, bf, d, tw, tf, tf, (rf, rf), (re, re), (k, k)),
+            length_scale(table),
+        ),
         holes: Vec::new(),
     })
 }
 
-fn l_shape(fields: &[&[u8]]) -> Option<Polygon2D> {
-    // (ProfileType, ProfileName, Position, Depth, Width, Thickness, ...)
+fn asymmetric_i_shape(table: &EntityTable, fields: &[&[u8]]) -> Option<Polygon2D> {
+    // (…, Position, BottomFlangeWidth, OverallDepth, WebThickness,
+    //  BottomFlangeThickness, BottomFlangeFilletRadius, TopFlangeWidth,
+    //  TopFlangeThickness, TopFlangeFilletRadius,
+    //  IFC4: BottomFlangeEdgeRadius, BottomFlangeSlope, TopFlangeEdgeRadius,
+    //  TopFlangeSlope | IFC2X3: CentreOfGravityInY)
+    // The two schemas agree up to field 10; IFC4 has 15 fields, IFC2X3 12.
+    let bb = number_at(fields, 3)? as f32;
+    let d = number_at(fields, 4)? as f32;
+    let tw = number_at(fields, 5)? as f32;
+    let tb = number_at(fields, 6)? as f32;
+    let rb = corner_radius(fields, 7);
+    let bt = number_at(fields, 8)? as f32;
+    // TopFlangeThickness is optional; absent means the bottom one.
+    let tt = number_at(fields, 9).map_or(tb, |t| t as f32);
+    let rt = corner_radius(fields, 10);
+    let ifc4 = fields.len() >= 15;
+    let (reb, ret) = if ifc4 {
+        (corner_radius(fields, 11), corner_radius(fields, 13))
+    } else {
+        (0.0, 0.0)
+    };
+    let (kb, kt) = if ifc4 {
+        (slope_tan(table, fields, 12), slope_tan(table, fields, 14))
+    } else {
+        (0.0, 0.0)
+    };
+    Some(Polygon2D {
+        outer: round_corners(
+            &i_corners(bb, bt, d, tw, tb, tt, (rb, rt), (reb, ret), (kb, kt)),
+            length_scale(table),
+        ),
+        holes: Vec::new(),
+    })
+}
+
+/// The 12 corners of an I-section centred on its bounding box, CCW from
+/// the bottom-left: bottom flange width `bb` / thickness `tb`, top flange
+/// `bt` / `tt`, root fillets `fillet = (bottom, top)`, flange-edge radii
+/// `edge`, and flange slopes `slope` as tangents (thickness at the tip,
+/// the inner face rising toward the web). With `bb == bt`, `tb == tt`
+/// and zero slopes the vertices are exactly the pre-GH #225 `i_shape`.
+#[allow(clippy::too_many_arguments)]
+fn i_corners(
+    bb: f32,
+    bt: f32,
+    d: f32,
+    tw: f32,
+    tb: f32,
+    tt: f32,
+    fillet: (f64, f64),
+    edge: (f64, f64),
+    slope: (f64, f64),
+) -> [(Vec2, f64); 12] {
+    let half_bb = bb * 0.5;
+    let half_bt = bt * 0.5;
+    let half_d = d * 0.5;
+    let half_tw = tw * 0.5;
+    let yb = half_d - tb; // |y| of the bottom flange's inner face at the tip
+    let yt = half_d - tt;
+    let yb_root = yb - ((half_bb - half_tw) as f64 * slope.0) as f32;
+    let yt_root = yt - ((half_bt - half_tw) as f64 * slope.1) as f32;
+    let (rb, rt) = fillet;
+    let (eb, et) = edge;
+    [
+        (Vec2::new(-half_bb, -half_d), 0.0),
+        (Vec2::new(half_bb, -half_d), 0.0),
+        (Vec2::new(half_bb, -yb), eb),
+        (Vec2::new(half_tw, -yb_root), rb),
+        (Vec2::new(half_tw, yt_root), rt),
+        (Vec2::new(half_bt, yt), et),
+        (Vec2::new(half_bt, half_d), 0.0),
+        (Vec2::new(-half_bt, half_d), 0.0),
+        (Vec2::new(-half_bt, yt), et),
+        (Vec2::new(-half_tw, yt_root), rt),
+        (Vec2::new(-half_tw, -yb_root), rb),
+        (Vec2::new(-half_bb, -yb), eb),
+    ]
+}
+
+/// Intersection of the lines `a + s·da` and `b + t·db` (f64); `None` when
+/// (near-)parallel.
+fn line_intersection(a: DVec2, da: DVec2, b: DVec2, db: DVec2) -> Option<DVec2> {
+    let den = da.perp_dot(db);
+    if den.abs() < 1e-12 * da.length() * db.length() {
+        return None;
+    }
+    Some(a + da * ((b - a).perp_dot(db) / den))
+}
+
+fn l_shape(table: &EntityTable, fields: &[&[u8]]) -> Option<Polygon2D> {
+    // (ProfileType, ProfileName, Position, Depth, Width, Thickness,
+    //  FilletRadius, EdgeRadius, LegSlope[, CentreOfGravityInX/Y in IFC2X3])
+    // Frame (unchanged by GH #225): outer corner at the origin, Width
+    // along +x, Depth along +y.
     let d = number_at(fields, 3)? as f32;
     let w = number_at(fields, 4).unwrap_or_else(|| number_at(fields, 3).unwrap_or(0.0)) as f32;
     let t = number_at(fields, 5)? as f32;
+    let r1 = corner_radius(fields, 6);
+    let r2 = corner_radius(fields, 7);
+    let k = slope_tan(table, fields, 8);
+    // Leg slope: each leg's inner face is tilted by `k`, the thickness `t`
+    // holding at the middle of the profile's extent (w/2, d/2) and thinning
+    // toward the toe.
+    let (tip_x, root, tip_y) = if k == 0.0 {
+        (Vec2::new(w, t), Vec2::new(t, t), Vec2::new(t, d))
+    } else {
+        let (w64, d64, t64) = (w as f64, d as f64, t as f64);
+        let h_mid = DVec2::new(w64 * 0.5, t64);
+        let h_dir = DVec2::new(1.0, -k);
+        let v_mid = DVec2::new(t64, d64 * 0.5);
+        let v_dir = DVec2::new(-k, 1.0);
+        let root = line_intersection(h_mid, h_dir, v_mid, v_dir)?;
+        (
+            Vec2::new(w, (t64 - k * w64 * 0.5) as f32),
+            root.as_vec2(),
+            Vec2::new((t64 - k * d64 * 0.5) as f32, d),
+        )
+    };
+    let corners = [
+        (Vec2::new(0.0, 0.0), 0.0),
+        (Vec2::new(w, 0.0), 0.0),
+        (tip_x, r2),
+        (root, r1),
+        (tip_y, r2),
+        (Vec2::new(0.0, d), 0.0),
+    ];
     Some(Polygon2D {
-        outer: vec![
-            Vec2::new(0.0, 0.0),
-            Vec2::new(w, 0.0),
-            Vec2::new(w, t),
-            Vec2::new(t, t),
-            Vec2::new(t, d),
-            Vec2::new(0.0, d),
-        ],
+        outer: round_corners(&corners, length_scale(table)),
         holes: Vec::new(),
     })
 }
 
-fn u_shape(fields: &[&[u8]]) -> Option<Polygon2D> {
-    // (Depth, FlangeWidth, WebThickness, FlangeThickness)
+fn u_shape(table: &EntityTable, fields: &[&[u8]]) -> Option<Polygon2D> {
+    // (…, Position, Depth, FlangeWidth, WebThickness, FlangeThickness,
+    //  FilletRadius, EdgeRadius, FlangeSlope[, CentreOfGravityInX in IFC2X3])
+    // Frame (unchanged by GH #225): web's outer face on x = 0, flanges
+    // toward +x, bottom at y = 0.
     let d = number_at(fields, 3)? as f32;
     let bf = number_at(fields, 4)? as f32;
     let tw = number_at(fields, 5)? as f32;
     let tf = number_at(fields, 6)? as f32;
+    let r1 = corner_radius(fields, 7);
+    let r2 = corner_radius(fields, 8);
+    let k = slope_tan(table, fields, 9);
+    // Flange slope: thickness `tf` at half the flange width, the inner
+    // face thinning toward the toe.
+    let (tip, root) = if k == 0.0 {
+        (tf, tf)
+    } else {
+        let half = bf as f64 * 0.5;
+        (
+            (tf as f64 - k * half) as f32,
+            (tf as f64 + k * (half - tw as f64)) as f32,
+        )
+    };
+    let corners = [
+        (Vec2::new(0.0, 0.0), 0.0),
+        (Vec2::new(bf, 0.0), 0.0),
+        (Vec2::new(bf, tip), r2),
+        (Vec2::new(tw, root), r1),
+        (Vec2::new(tw, d - root), r1),
+        (Vec2::new(bf, d - tip), r2),
+        (Vec2::new(bf, d), 0.0),
+        (Vec2::new(0.0, d), 0.0),
+    ];
     Some(Polygon2D {
-        outer: vec![
-            Vec2::new(0.0, 0.0),
-            Vec2::new(bf, 0.0),
-            Vec2::new(bf, tf),
-            Vec2::new(tw, tf),
-            Vec2::new(tw, d - tf),
-            Vec2::new(bf, d - tf),
-            Vec2::new(bf, d),
-            Vec2::new(0.0, d),
-        ],
+        outer: round_corners(&corners, length_scale(table)),
         holes: Vec::new(),
     })
 }
 
-fn t_shape(fields: &[&[u8]]) -> Option<Polygon2D> {
-    // (Depth, FlangeWidth, WebThickness, FlangeThickness)
-    // T centered on origin, flange at top.
+fn t_shape(table: &EntityTable, fields: &[&[u8]]) -> Option<Polygon2D> {
+    // (…, Position, Depth, FlangeWidth, WebThickness, FlangeThickness,
+    //  FilletRadius, FlangeEdgeRadius, WebEdgeRadius, WebSlope, FlangeSlope
+    //  [, CentreOfGravityInY in IFC2X3])
+    // Frame (unchanged by GH #225): web toe at y = 0, flange top at y = d,
+    // centred in x.
     let d = number_at(fields, 3)? as f32;
     let bf = number_at(fields, 4)? as f32;
     let tw = number_at(fields, 5)? as f32;
     let tf = number_at(fields, 6)? as f32;
+    let r1 = corner_radius(fields, 7);
+    let r2 = corner_radius(fields, 8);
+    let r3 = corner_radius(fields, 9);
+    let kw = slope_tan(table, fields, 10);
+    let kf = slope_tan(table, fields, 11);
     let half_bf = bf * 0.5;
     let half_tw = tw * 0.5;
+    // Web slope: half-thickness `tw/2` at mid-depth, widening toward the
+    // flange. Flange slope: thickness `tf` at a quarter of the flange
+    // width from the web axis, thinning toward the toe.
+    let (toe_x, root, tip_y) = if kw == 0.0 && kf == 0.0 {
+        (half_tw, Vec2::new(half_tw, d - tf), d - tf)
+    } else {
+        let (d64, bf64, tw64, tf64) = (d as f64, bf as f64, tw as f64, tf as f64);
+        let web = DVec2::new(tw64 * 0.5, d64 * 0.5);
+        let web_dir = DVec2::new(kw, 1.0);
+        let flange = DVec2::new(bf64 * 0.25, d64 - tf64);
+        let flange_dir = DVec2::new(1.0, kf);
+        let root = line_intersection(web, web_dir, flange, flange_dir)?;
+        (
+            (tw64 * 0.5 - kw * d64 * 0.5) as f32,
+            root.as_vec2(),
+            (d64 - tf64 + kf * bf64 * 0.25) as f32,
+        )
+    };
+    let corners = [
+        (Vec2::new(-toe_x, 0.0), r3),
+        (Vec2::new(toe_x, 0.0), r3),
+        (root, r1),
+        (Vec2::new(half_bf, tip_y), r2),
+        (Vec2::new(half_bf, d), 0.0),
+        (Vec2::new(-half_bf, d), 0.0),
+        (Vec2::new(-half_bf, tip_y), r2),
+        (Vec2::new(-root.x, root.y), r1),
+    ];
     Some(Polygon2D {
-        outer: vec![
-            Vec2::new(-half_tw, 0.0),
-            Vec2::new(half_tw, 0.0),
-            Vec2::new(half_tw, d - tf),
-            Vec2::new(half_bf, d - tf),
-            Vec2::new(half_bf, d),
-            Vec2::new(-half_bf, d),
-            Vec2::new(-half_bf, d - tf),
-            Vec2::new(-half_tw, d - tf),
-        ],
+        outer: round_corners(&corners, length_scale(table)),
         holes: Vec::new(),
     })
 }
 
-fn z_shape(fields: &[&[u8]]) -> Option<Polygon2D> {
-    // (Depth, FlangeWidth, WebThickness, FlangeThickness)
+fn z_shape(table: &EntityTable, fields: &[&[u8]]) -> Option<Polygon2D> {
+    // (…, Position, Depth, FlangeWidth, WebThickness, FlangeThickness,
+    //  FilletRadius, EdgeRadius)
+    // Frame and FlangeWidth reading unchanged by GH #225 (flange of length
+    // `bf` beyond each web face).
     let d = number_at(fields, 3)? as f32;
     let bf = number_at(fields, 4)? as f32;
     let tw = number_at(fields, 5)? as f32;
     let tf = number_at(fields, 6)? as f32;
+    let r1 = corner_radius(fields, 7);
+    let r2 = corner_radius(fields, 8);
     let half_tw = tw * 0.5;
+    let corners = [
+        (Vec2::new(-half_tw - bf, 0.0), 0.0),
+        (Vec2::new(half_tw, 0.0), 0.0),
+        (Vec2::new(half_tw, d - tf), r1),
+        (Vec2::new(half_tw + bf, d - tf), r2),
+        (Vec2::new(half_tw + bf, d), 0.0),
+        (Vec2::new(-half_tw, d), 0.0),
+        (Vec2::new(-half_tw, tf), r1),
+        (Vec2::new(-half_tw - bf, tf), r2),
+    ];
     Some(Polygon2D {
-        outer: vec![
-            Vec2::new(-half_tw - bf, 0.0),
-            Vec2::new(half_tw, 0.0),
-            Vec2::new(half_tw, d - tf),
-            Vec2::new(half_tw + bf, d - tf),
-            Vec2::new(half_tw + bf, d),
-            Vec2::new(-half_tw, d),
-            Vec2::new(-half_tw, tf),
-            Vec2::new(-half_tw - bf, tf),
-        ],
+        outer: round_corners(&corners, length_scale(table)),
         holes: Vec::new(),
+    })
+}
+
+fn c_shape(table: &EntityTable, fields: &[&[u8]]) -> Option<Polygon2D> {
+    // (…, Position, Depth, Width, WallThickness, Girth, InternalFilletRadius
+    //  [, CentreOfGravityInX in IFC2X3])
+    // Centred on the bounding box (IFC2x3+), web at −x, lips at +x — the
+    // same layout as IfcOpenShell. The outer bends carry radius
+    // `InternalFilletRadius + WallThickness` (constant wall thickness).
+    let d = number_at(fields, 3)? as f32;
+    let w = number_at(fields, 4)? as f32;
+    let t = number_at(fields, 5)? as f32;
+    let g = number_at(fields, 6)? as f32;
+    let ri = corner_radius(fields, 7);
+    let ro = if ri > 0.0 { ri + t as f64 } else { 0.0 };
+    let x = w * 0.5;
+    let y = d * 0.5;
+    let corners = [
+        (Vec2::new(-x, -y), ro),
+        (Vec2::new(x, -y), ro),
+        (Vec2::new(x, -y + g), 0.0),
+        (Vec2::new(x - t, -y + g), 0.0),
+        (Vec2::new(x - t, -y + t), ri),
+        (Vec2::new(-x + t, -y + t), ri),
+        (Vec2::new(-x + t, y - t), ri),
+        (Vec2::new(x - t, y - t), ri),
+        (Vec2::new(x - t, y - g), 0.0),
+        (Vec2::new(x, y - g), 0.0),
+        (Vec2::new(x, y), ro),
+        (Vec2::new(-x, y), ro),
+    ];
+    Some(Polygon2D {
+        outer: round_corners(&corners, length_scale(table)),
+        holes: Vec::new(),
+    })
+}
+
+/// The four corners of an `x_dim × y_dim` rectangle centred on the origin,
+/// CCW from the bottom-left (the pre-GH #225 `rectangle` vertices), each
+/// with radius `r`.
+fn rect_corners(x_dim: f64, y_dim: f64, r: f64) -> [(Vec2, f64); 4] {
+    let hw = (x_dim * 0.5) as f32;
+    let hd = (y_dim * 0.5) as f32;
+    [
+        (Vec2::new(-hw, -hd), r),
+        (Vec2::new(hw, -hd), r),
+        (Vec2::new(hw, hd), r),
+        (Vec2::new(-hw, hd), r),
+    ]
+}
+
+fn rounded_rectangle(table: &EntityTable, fields: &[&[u8]]) -> Option<Polygon2D> {
+    // (ProfileType, ProfileName, Position, XDim, YDim, RoundingRadius)
+    let x_dim = number_at(fields, 3)?;
+    let y_dim = number_at(fields, 4)?;
+    let r = corner_radius(fields, 5);
+    Some(Polygon2D {
+        outer: round_corners(&rect_corners(x_dim, y_dim, r), length_scale(table)),
+        holes: Vec::new(),
+    })
+}
+
+fn rectangle_hollow(table: &EntityTable, fields: &[&[u8]]) -> Option<Polygon2D> {
+    // (…, Position, XDim, YDim, WallThickness, InnerFilletRadius,
+    //  OuterFilletRadius)
+    let x_dim = number_at(fields, 3)?;
+    let y_dim = number_at(fields, 4)?;
+    let t = number_at(fields, 5)?;
+    if !(t > 0.0 && 2.0 * t < x_dim.min(y_dim)) {
+        return None;
+    }
+    let ri = corner_radius(fields, 6);
+    let ro = corner_radius(fields, 7);
+    let scale = length_scale(table);
+    let outer = round_corners(&rect_corners(x_dim, y_dim, ro), scale);
+    let mut hole = round_corners(&rect_corners(x_dim - 2.0 * t, y_dim - 2.0 * t, ri), scale);
+    hole.reverse(); // CW for hole
+    Some(Polygon2D {
+        outer,
+        holes: vec![hole],
     })
 }
 
@@ -2357,5 +2738,564 @@ mod legacy_length_scale {
             _ => return None,
         };
         Some(10f32.powi(exp))
+    }
+}
+
+/// GH #225: rolled / cold-formed sections carry their fillets. Truth is
+/// the analytic section area — sharp-cornered area ± one fillet correction
+/// per rounded corner — derived here independently of `round_corners`.
+#[cfg(test)]
+mod section_fillet_tests {
+    use super::*;
+    use std::f64::consts::PI;
+
+    /// 1 − π/4: the area between a right-angle corner and its fillet, per r².
+    const Q: f64 = 1.0 - PI / 4.0;
+
+    /// Area between two edges meeting at angle `theta` and the arc of
+    /// radius `r` tangent to both: kite `r²·cot(θ/2)` minus sector
+    /// `r²·(π − θ)/2`. A convex corner loses it, a concave corner gains it.
+    fn fillet(r: f64, theta: f64) -> f64 {
+        r * r * (1.0 / (theta / 2.0).tan() - (PI - theta) / 2.0)
+    }
+
+    fn loop_area(pts: &[Vec2]) -> f64 {
+        signed_area_2(pts).abs() * 0.5
+    }
+
+    fn section_area(p: &Polygon2D) -> f64 {
+        loop_area(&p.outer) - p.holes.iter().map(|h| loop_area(h)).sum::<f64>()
+    }
+
+    /// A one-profile file: millimetres + radians unless `units` overrides.
+    fn src_with(schema: &str, units: &str, profile: &str) -> String {
+        format!(
+            "ISO-10303-21;\nHEADER;\nFILE_DESCRIPTION(('ViewDefinition [ReferenceView]'),'2;1');\n\
+FILE_NAME('s.ifc','2026-10-13T00:00:00',('test'),('skiplum'),'ifcfast','ifcfast','');\n\
+FILE_SCHEMA(('{schema}'));\nENDSEC;\nDATA;\n{units}\n#90={profile};\nENDSEC;\nEND-ISO-10303-21;\n"
+        )
+    }
+
+    const MM_RAD: &str = "#1=IFCUNITASSIGNMENT((#2,#3));\n\
+#2=IFCSIUNIT(*,.LENGTHUNIT.,.MILLI.,.METRE.);\n\
+#3=IFCSIUNIT(*,.PLANEANGLEUNIT.,$,.RADIAN.);";
+
+    fn area_of(schema: &str, profile: &str) -> (f64, Polygon2D) {
+        let table_src = src_with(schema, MM_RAD, profile);
+        let table = EntityTable::build(table_src.as_bytes());
+        let poly = extract(&table, 90).unwrap_or_else(|| panic!("{profile} resolves"));
+        (section_area(&poly), poly)
+    }
+
+    fn assert_area(label: &str, got: f64, want: f64) {
+        let rel = (got - want).abs() / want;
+        assert!(
+            rel < 1e-4,
+            "{label}: polygon {got:.4} vs analytic {want:.4} (rel {rel:.2e})"
+        );
+    }
+
+    fn no_repeated_vertices(pts: &[Vec2]) {
+        for i in 0..pts.len() {
+            let j = (i + 1) % pts.len();
+            assert!(pts[i] != pts[j], "repeated vertex {i}: {:?}", pts[i]);
+        }
+    }
+
+    #[test]
+    fn i_sections_ipe200_hea200_heb260_match_the_table_area() {
+        // IFC2X3 (8 fields): the four root fillets were the whole −4 % of
+        // GH #225.
+        for (name, b, h, tw, tf, r) in [
+            ("IPE200", 100.0, 200.0, 5.6, 8.5, 12.0),
+            ("HEA200", 200.0, 190.0, 6.5, 10.0, 18.0),
+            ("HEA120", 120.0, 114.0, 5.0, 8.0, 12.0),
+            ("HEB260", 260.0, 260.0, 10.0, 17.5, 24.0),
+        ] {
+            let (got, poly) = area_of(
+                "IFC2X3",
+                &format!("IFCISHAPEPROFILEDEF(.AREA.,'{name}',$,{b:?},{h:?},{tw:?},{tf:?},{r:?})"),
+            );
+            let want = 2.0 * b * tf + (h - 2.0 * tf) * tw + 4.0 * Q * r * r;
+            assert_area(name, got, want);
+            no_repeated_vertices(&poly.outer);
+        }
+        // IPE200 = 28.48 cm² in the steel tables.
+        let (got, _) = area_of(
+            "IFC2X3",
+            "IFCISHAPEPROFILEDEF(.AREA.,$,$,100.,200.,5.6,8.5,12.)",
+        );
+        assert!((got / 100.0 - 28.48).abs() < 0.01, "{got}");
+    }
+
+    #[test]
+    fn i_section_ifc4_flange_edge_radius_and_slope() {
+        // Parallel flanges with a flange-edge radius.
+        let (b, h, tw, tf, r1, r2) = (100.0, 200.0, 5.6, 8.5, 12.0, 3.0);
+        let (got, _) = area_of(
+            "IFC4",
+            &format!("IFCISHAPEPROFILEDEF(.AREA.,$,$,{b:?},{h:?},{tw:?},{tf:?},{r1:?},{r2:?},0.)"),
+        );
+        let want = 2.0 * b * tf + (h - 2.0 * tf) * tw + 4.0 * Q * (r1 * r1 - r2 * r2);
+        assert_area("IPE200 + edge radius", got, want);
+
+        // IPN200, 14 % taper: thickness tf at the toe, the inner face
+        // rising by dy toward the web; every web/flange corner and every
+        // toe corner then meets at π/2 + atan k.
+        let (b, h, tw, tf, r1, r2) = (90.0, 200.0, 7.5, 11.3, 7.5, 4.5);
+        let k: f64 = 0.14;
+        let slope = k.atan();
+        let (got, _) = area_of(
+            "IFC4",
+            &format!(
+                "IFCISHAPEPROFILEDEF(.AREA.,$,$,{b:?},{h:?},{tw:?},{tf:?},{r1:?},{r2:?},{slope:?})"
+            ),
+        );
+        let reach = (b - tw) / 2.0;
+        let sharp = 2.0 * b * tf + (h - 2.0 * tf) * tw + 4.0 * reach * (reach * k) / 2.0;
+        let theta = PI / 2.0 + slope;
+        let want = sharp + 4.0 * fillet(r1, theta) - 4.0 * fillet(r2, theta);
+        assert_area("IPN200 tapered", got, want);
+    }
+
+    #[test]
+    fn slope_reads_the_declared_plane_angle_unit() {
+        let deg = "#1=IFCUNITASSIGNMENT((#2,#3));\n\
+#2=IFCSIUNIT(*,.LENGTHUNIT.,.MILLI.,.METRE.);\n\
+#3=IFCCONVERSIONBASEDUNIT(#4,.PLANEANGLEUNIT.,'DEGREE',#5);\n\
+#4=IFCDIMENSIONALEXPONENTS(0,0,0,0,0,0,0);\n\
+#5=IFCMEASUREWITHUNIT(IFCPLANEANGLEMEASURE(0.0174532925199433),#6);\n\
+#6=IFCSIUNIT(*,.PLANEANGLEUNIT.,$,.RADIAN.);";
+        let k: f64 = 0.14;
+        let in_deg_src = src_with(
+            "IFC4",
+            deg,
+            &format!(
+                "IFCISHAPEPROFILEDEF(.AREA.,$,$,90.,200.,7.5,11.3,0.,0.,{:?})",
+                k.atan().to_degrees()
+            ),
+        );
+        let in_deg = EntityTable::build(in_deg_src.as_bytes());
+        let in_rad_src = src_with(
+            "IFC4",
+            MM_RAD,
+            &format!(
+                "IFCISHAPEPROFILEDEF(.AREA.,$,$,90.,200.,7.5,11.3,0.,0.,{:?})",
+                k.atan()
+            ),
+        );
+        let in_rad = EntityTable::build(in_rad_src.as_bytes());
+        let a = section_area(&extract(&in_deg, 90).unwrap());
+        let b = section_area(&extract(&in_rad, 90).unwrap());
+        assert!((a - b).abs() / b < 1e-6, "{a} vs {b}");
+    }
+
+    #[test]
+    fn asymmetric_i_section_ifc4_and_ifc2x3() {
+        let (bb, h, tw, tb, rb, bt, tt, rt) = (200.0, 300.0, 8.0, 15.0, 12.0, 150.0, 10.0, 10.0);
+        let want = bb * tb + bt * tt + (h - tb - tt) * tw + 2.0 * Q * (rb * rb + rt * rt);
+        let (got, _) = area_of(
+            "IFC4",
+            &format!(
+                "IFCASYMMETRICISHAPEPROFILEDEF(.AREA.,$,$,{bb:?},{h:?},{tw:?},{tb:?},{rb:?},{bt:?},{tt:?},{rt:?},0.,0.,0.,0.)"
+            ),
+        );
+        assert_area("asymmetric I IFC4", got, want);
+        // IFC2X3: trailing CentreOfGravityInY (here 40) must not be read
+        // as a flange-edge radius.
+        let (got, _) = area_of(
+            "IFC2X3",
+            &format!(
+                "IFCASYMMETRICISHAPEPROFILEDEF(.AREA.,$,$,{bb:?},{h:?},{tw:?},{tb:?},{rb:?},{bt:?},{tt:?},{rt:?},40.)"
+            ),
+        );
+        assert_area("asymmetric I IFC2X3", got, want);
+        // Optional TopFlangeThickness absent → the bottom one.
+        let (got, _) = area_of(
+            "IFC2X3",
+            &format!("IFCASYMMETRICISHAPEPROFILEDEF(.AREA.,$,$,{bb:?},{h:?},{tw:?},{tb:?},$,{bt:?},$,$,$)"),
+        );
+        assert_area(
+            "asymmetric I default top",
+            got,
+            bb * tb + bt * tb + (h - 2.0 * tb) * tw,
+        );
+    }
+
+    #[test]
+    fn u_section_upn200_tapered_and_parallel() {
+        // UPN200: 8 % taper, thickness tf at half the flange width.
+        let (h, b, tw, tf, r1, r2) = (200.0, 75.0, 8.5, 11.5, 11.5, 6.0);
+        let k: f64 = 0.08;
+        let slope = k.atan();
+        let (got, _) = area_of(
+            "IFC2X3",
+            &format!(
+                "IFCUSHAPEPROFILEDEF(.AREA.,'UPN200',$,{h:?},{b:?},{tw:?},{tf:?},{r1:?},{r2:?},{slope:?},$)"
+            ),
+        );
+        // Web strip + two flanges whose inner face is y = tf − k(x − b/2).
+        let m = |x: f64| (x - b / 2.0) * (x - b / 2.0) / 2.0;
+        let sharp = h * tw + 2.0 * ((b - tw) * tf - k * (m(b) - m(tw)));
+        let theta = PI / 2.0 + slope;
+        let want = sharp + 2.0 * fillet(r1, theta) - 2.0 * fillet(r2, theta);
+        assert_area("UPN200", got, want);
+        // ≈ 32.2 cm² in the steel tables.
+        assert!((got / 100.0 - 32.2).abs() < 0.2, "{got}");
+
+        let (got, _) = area_of(
+            "IFC4",
+            &format!("IFCUSHAPEPROFILEDEF(.AREA.,$,$,{h:?},{b:?},{tw:?},{tf:?},{r1:?},{r2:?},$)"),
+        );
+        let want = h * tw + 2.0 * (b - tw) * tf + 2.0 * Q * (r1 * r1 - r2 * r2);
+        assert_area("U200 parallel", got, want);
+    }
+
+    #[test]
+    fn l_section_l100x10_and_tapered_leg() {
+        let (d, w, t, r1, r2) = (100.0, 100.0, 10.0, 12.0, 6.0);
+        let (got, _) = area_of(
+            "IFC4",
+            &format!("IFCLSHAPEPROFILEDEF(.AREA.,'L100x10',$,{d:?},{w:?},{t:?},{r1:?},{r2:?},$)"),
+        );
+        let want = (d + w - t) * t + Q * (r1 * r1 - 2.0 * r2 * r2);
+        assert_area("L100x10", got, want);
+        // ≈ 19.2 cm² in the steel tables.
+        assert!((got / 100.0 - 19.2).abs() < 0.1, "{got}");
+
+        // Tapered unequal leg, 150 × 90 × 10, 3 %: thickness t at the
+        // middle of each leg's extent. Sharp polygon and corner angles from
+        // the two inner face lines.
+        let (d, w, t) = (150.0, 90.0, 10.0);
+        let k: f64 = 0.03;
+        let (got, _) = area_of(
+            "IFC2X3",
+            &format!(
+                "IFCLSHAPEPROFILEDEF(.AREA.,$,$,{d:?},{w:?},{t:?},{r1:?},{r2:?},{:?},$,$)",
+                k.atan()
+            ),
+        );
+        // y = t − k(x − w/2) and x = t − k(y − d/2) meet at the root.
+        let rx = (t - k * (t + k * w / 2.0 - d / 2.0)) / (1.0 - k * k);
+        let ry = t - k * (rx - w / 2.0);
+        let sharp = [
+            (0.0, 0.0),
+            (w, 0.0),
+            (w, t - k * w / 2.0),
+            (rx, ry),
+            (t - k * d / 2.0, d),
+            (0.0, d),
+        ];
+        let sharp_area = 0.5
+            * (0..6)
+                .map(|i| {
+                    let (a, b) = (sharp[i], sharp[(i + 1) % 6]);
+                    a.0 * b.1 - b.0 * a.1
+                })
+                .sum::<f64>();
+        let tip = PI / 2.0 + k.atan(); // toe corners
+        let root = PI / 2.0 + 2.0 * k.atan(); // between the two faces
+        let want = sharp_area + fillet(r1, root) - 2.0 * fillet(r2, tip);
+        assert_area("L150x90x10 tapered", got, want);
+    }
+
+    #[test]
+    fn t_section_parallel_and_tapered() {
+        let (d, b, tw, tf, r1, r2, r3) = (100.0, 100.0, 11.0, 11.0, 11.0, 5.5, 3.0);
+        let (got, _) = area_of(
+            "IFC4",
+            &format!(
+                "IFCTSHAPEPROFILEDEF(.AREA.,'T100',$,{d:?},{b:?},{tw:?},{tf:?},{r1:?},{r2:?},{r3:?},$,$)"
+            ),
+        );
+        let want = b * tf + (d - tf) * tw + 2.0 * Q * (r1 * r1 - r2 * r2 - r3 * r3);
+        assert_area("T100", got, want);
+
+        // 2 % web and flange taper (IFC2X3 field order: WebSlope, FlangeSlope).
+        let (kw, kf): (f64, f64) = (0.02, 0.02);
+        let (got, _) = area_of(
+            "IFC2X3",
+            &format!(
+                "IFCTSHAPEPROFILEDEF(.AREA.,$,$,{d:?},{b:?},{tw:?},{tf:?},{r1:?},{r2:?},{r3:?},{:?},{:?},$)",
+                kw.atan(),
+                kf.atan()
+            ),
+        );
+        // Web face x = tw/2 + kw(y − d/2); flange underside y = d − tf + kf(x − b/4).
+        let rx = (tw / 2.0 + kw * (d - tf - kf * b / 4.0 - d / 2.0)) / (1.0 - kw * kf);
+        let ry = d - tf + kf * (rx - b / 4.0);
+        let toe = tw / 2.0 - kw * d / 2.0;
+        let tip = d - tf + kf * b / 4.0;
+        let half = [(toe, 0.0), (rx, ry), (b / 2.0, tip), (b / 2.0, d)];
+        // Symmetric: twice the area right of the axis (trapezoid sums).
+        let mut right = 0.0;
+        let pts = [(0.0, 0.0), half[0], half[1], half[2], half[3], (0.0, d)];
+        for i in 0..pts.len() {
+            let (a, c) = (pts[i], pts[(i + 1) % pts.len()]);
+            right += a.0 * c.1 - c.0 * a.1;
+        }
+        let sharp_area = right; // 2 × (½ Σ)
+        let toe_angle = PI / 2.0 + kw.atan(); // web face vs. toe edge
+        let root_angle = PI / 2.0 + kw.atan() + kf.atan();
+        let tip_angle = PI / 2.0 + kf.atan();
+        let want = sharp_area + 2.0 * fillet(r1, root_angle)
+            - 2.0 * fillet(r2, tip_angle)
+            - 2.0 * fillet(r3, toe_angle);
+        assert_area("T100 tapered", got, want);
+    }
+
+    #[test]
+    fn z_section() {
+        let (d, b, tw, tf, r1, r2) = (200.0, 80.0, 8.0, 8.0, 8.0, 4.0);
+        let (got, _) = area_of(
+            "IFC4",
+            &format!("IFCZSHAPEPROFILEDEF(.AREA.,$,$,{d:?},{b:?},{tw:?},{tf:?},{r1:?},{r2:?})"),
+        );
+        let want = d * tw + 2.0 * b * tf + 2.0 * Q * (r1 * r1 - r2 * r2);
+        assert_area("Z200", got, want);
+    }
+
+    #[test]
+    fn c_section_is_new_and_bends_with_constant_wall() {
+        // Cold-formed C200×75×20×2.5, inner bend radius 2.5 → outer 5.0.
+        let (d, w, t, g, r) = (200.0, 75.0, 2.5, 20.0, 2.5);
+        let ro = r + t;
+        let sharp = 2.0 * w * t + (d - 2.0 * t) * t + 2.0 * (g - t) * t;
+        let (got, poly) = area_of(
+            "IFC4",
+            &format!("IFCCSHAPEPROFILEDEF(.AREA.,$,$,{d:?},{w:?},{t:?},{g:?},{r:?})"),
+        );
+        assert_area("C200x75x20x2.5", got, sharp + 4.0 * Q * (r * r - ro * ro));
+        no_repeated_vertices(&poly.outer);
+        // Centred on the bounding box.
+        let (mut lo, mut hi) = (Vec2::splat(f32::MAX), Vec2::splat(f32::MIN));
+        for p in &poly.outer {
+            lo = lo.min(*p);
+            hi = hi.max(*p);
+        }
+        assert!((lo + hi).length() < 1e-3, "{lo:?} {hi:?}");
+        // Sharp (IFC2X3, CentreOfGravityInX present).
+        let (got, poly) = area_of(
+            "IFC2X3",
+            &format!("IFCCSHAPEPROFILEDEF(.AREA.,$,$,{d:?},{w:?},{t:?},{g:?},$,-10.)"),
+        );
+        assert_area("C sharp", got, sharp);
+        assert_eq!(poly.outer.len(), 12);
+    }
+
+    #[test]
+    fn rectangle_hollow_rhs100x50x4_and_rounded_rectangle() {
+        let (x, y, t, ri, ro) = (100.0, 50.0, 4.0, 4.0, 8.0);
+        let (got, poly) = area_of(
+            "IFC4",
+            &format!("IFCRECTANGLEHOLLOWPROFILEDEF(.AREA.,'RHS100x50x4',$,{x:?},{y:?},{t:?},{ri:?},{ro:?})"),
+        );
+        let want =
+            (x * y - 4.0 * Q * ro * ro) - ((x - 2.0 * t) * (y - 2.0 * t) - 4.0 * Q * ri * ri);
+        assert_area("RHS100x50x4", got, want);
+        assert_eq!(poly.holes.len(), 1);
+        // Sharp RHS.
+        let (got, _) = area_of(
+            "IFC2X3",
+            &format!("IFCRECTANGLEHOLLOWPROFILEDEF(.AREA.,$,$,{x:?},{y:?},{t:?},$,$)"),
+        );
+        assert_area("RHS sharp", got, x * y - (x - 2.0 * t) * (y - 2.0 * t));
+
+        let (got, _) = area_of(
+            "IFC4",
+            "IFCROUNDEDRECTANGLEPROFILEDEF(.AREA.,$,$,300.,200.,20.)",
+        );
+        assert_area("rounded rectangle", got, 300.0 * 200.0 - 4.0 * Q * 400.0);
+        // Radius = half the short side: a stadium; the tangent points of
+        // neighbouring arcs coincide and are emitted once.
+        let (got, poly) = area_of(
+            "IFC4",
+            "IFCROUNDEDRECTANGLEPROFILEDEF(.AREA.,$,$,300.,200.,100.)",
+        );
+        assert_area("stadium", got, 100.0 * 200.0 + PI * 100.0 * 100.0);
+        no_repeated_vertices(&poly.outer);
+        // Over-large radius: clamped to the stadium, never a self-overlap.
+        let (got, poly) = area_of(
+            "IFC4",
+            "IFCROUNDEDRECTANGLEPROFILEDEF(.AREA.,$,$,300.,200.,150.)",
+        );
+        assert_area("clamped", got, 100.0 * 200.0 + PI * 100.0 * 100.0);
+        no_repeated_vertices(&poly.outer);
+    }
+
+    #[test]
+    fn fillet_chords_follow_the_gh218_sagitta_rule() {
+        // IPE200 root fillet r = 12 mm: a quarter turn at the uncapped
+        // per-turn count, same count whether the file is in mm or m.
+        let per_turn = arc_samples_per_turn(12.0, 0.001);
+        let n = arc_chord_count(per_turn * std::f32::consts::FRAC_PI_2 / std::f32::consts::TAU);
+        let (_, poly) = area_of(
+            "IFC2X3",
+            "IFCISHAPEPROFILEDEF(.AREA.,$,$,100.,200.,5.6,8.5,12.)",
+        );
+        assert_eq!(poly.outer.len(), 8 + 4 * (n + 1));
+        let metres = "#1=IFCUNITASSIGNMENT((#2));\n#2=IFCSIUNIT(*,.LENGTHUNIT.,$,.METRE.);";
+        let t_src = src_with(
+            "IFC2X3",
+            metres,
+            "IFCISHAPEPROFILEDEF(.AREA.,$,$,0.1,0.2,0.0056,0.0085,0.012)",
+        );
+        let t = EntityTable::build(t_src.as_bytes());
+        assert_eq!(extract(&t, 90).unwrap().outer.len(), poly.outer.len());
+        // A 0.5 mm sagitta on a 12 mm radius → more than the 2-chord floor.
+        assert!(n >= 3, "{n}");
+    }
+
+    // ------------------------------------------------------------------
+    // Sharp corners: bit-identical to the pre-GH #225 output.
+    // ------------------------------------------------------------------
+
+    /// Verbatim copies of the pre-GH #225 builders (commit 659412e).
+    mod legacy {
+        use super::super::number_at;
+        use glam::Vec2;
+
+        pub fn i_shape(fields: &[&[u8]]) -> Vec<Vec2> {
+            let bf = number_at(fields, 3).unwrap() as f32;
+            let d = number_at(fields, 4).unwrap() as f32;
+            let tw = number_at(fields, 5).unwrap() as f32;
+            let tf = number_at(fields, 6).unwrap() as f32;
+            let half_bf = bf * 0.5;
+            let half_d = d * 0.5;
+            let half_tw = tw * 0.5;
+            let y_inner = half_d - tf;
+            vec![
+                Vec2::new(-half_bf, -half_d),
+                Vec2::new(half_bf, -half_d),
+                Vec2::new(half_bf, -y_inner),
+                Vec2::new(half_tw, -y_inner),
+                Vec2::new(half_tw, y_inner),
+                Vec2::new(half_bf, y_inner),
+                Vec2::new(half_bf, half_d),
+                Vec2::new(-half_bf, half_d),
+                Vec2::new(-half_bf, y_inner),
+                Vec2::new(-half_tw, y_inner),
+                Vec2::new(-half_tw, -y_inner),
+                Vec2::new(-half_bf, -y_inner),
+            ]
+        }
+
+        pub fn l_shape(fields: &[&[u8]]) -> Vec<Vec2> {
+            let d = number_at(fields, 3).unwrap() as f32;
+            let w =
+                number_at(fields, 4).unwrap_or_else(|| number_at(fields, 3).unwrap_or(0.0)) as f32;
+            let t = number_at(fields, 5).unwrap() as f32;
+            vec![
+                Vec2::new(0.0, 0.0),
+                Vec2::new(w, 0.0),
+                Vec2::new(w, t),
+                Vec2::new(t, t),
+                Vec2::new(t, d),
+                Vec2::new(0.0, d),
+            ]
+        }
+
+        pub fn u_shape(fields: &[&[u8]]) -> Vec<Vec2> {
+            let d = number_at(fields, 3).unwrap() as f32;
+            let bf = number_at(fields, 4).unwrap() as f32;
+            let tw = number_at(fields, 5).unwrap() as f32;
+            let tf = number_at(fields, 6).unwrap() as f32;
+            vec![
+                Vec2::new(0.0, 0.0),
+                Vec2::new(bf, 0.0),
+                Vec2::new(bf, tf),
+                Vec2::new(tw, tf),
+                Vec2::new(tw, d - tf),
+                Vec2::new(bf, d - tf),
+                Vec2::new(bf, d),
+                Vec2::new(0.0, d),
+            ]
+        }
+
+        pub fn t_shape(fields: &[&[u8]]) -> Vec<Vec2> {
+            let d = number_at(fields, 3).unwrap() as f32;
+            let bf = number_at(fields, 4).unwrap() as f32;
+            let tw = number_at(fields, 5).unwrap() as f32;
+            let tf = number_at(fields, 6).unwrap() as f32;
+            let half_bf = bf * 0.5;
+            let half_tw = tw * 0.5;
+            vec![
+                Vec2::new(-half_tw, 0.0),
+                Vec2::new(half_tw, 0.0),
+                Vec2::new(half_tw, d - tf),
+                Vec2::new(half_bf, d - tf),
+                Vec2::new(half_bf, d),
+                Vec2::new(-half_bf, d),
+                Vec2::new(-half_bf, d - tf),
+                Vec2::new(-half_tw, d - tf),
+            ]
+        }
+
+        pub fn z_shape(fields: &[&[u8]]) -> Vec<Vec2> {
+            let d = number_at(fields, 3).unwrap() as f32;
+            let bf = number_at(fields, 4).unwrap() as f32;
+            let tw = number_at(fields, 5).unwrap() as f32;
+            let tf = number_at(fields, 6).unwrap() as f32;
+            let half_tw = tw * 0.5;
+            vec![
+                Vec2::new(-half_tw - bf, 0.0),
+                Vec2::new(half_tw, 0.0),
+                Vec2::new(half_tw, d - tf),
+                Vec2::new(half_tw + bf, d - tf),
+                Vec2::new(half_tw + bf, d),
+                Vec2::new(-half_tw, d),
+                Vec2::new(-half_tw, tf),
+                Vec2::new(-half_tw - bf, tf),
+            ]
+        }
+
+        pub fn rectangle(fields: &[&[u8]]) -> Vec<Vec2> {
+            let x_dim = number_at(fields, 3).unwrap();
+            let y_dim = number_at(fields, 4).unwrap();
+            let hw = (x_dim * 0.5) as f32;
+            let hd = (y_dim * 0.5) as f32;
+            vec![
+                Vec2::new(-hw, -hd),
+                Vec2::new(hw, -hd),
+                Vec2::new(hw, hd),
+                Vec2::new(-hw, hd),
+            ]
+        }
+    }
+
+    fn bits(pts: &[Vec2]) -> Vec<(u32, u32)> {
+        pts.iter().map(|p| (p.x.to_bits(), p.y.to_bits())).collect()
+    }
+
+    #[test]
+    fn sharp_sections_are_bit_identical_to_the_pre_gh225_output() {
+        type New = fn(&EntityTable, &[&[u8]]) -> Option<Polygon2D>;
+        type Old = fn(&[&[u8]]) -> Vec<Vec2>;
+        // Awkward decimals (Archicad-style 1e-12 noise) so any change in the
+        // f32 arithmetic order shows up in the bits.
+        let cases: &[(&str, &str, New, Old)] = &[
+            ("IFC2X3", "IFCISHAPEPROFILEDEF(.AREA.,'HEA120',$,120.00000000000738,114.00000000000007,5.0000000000161888,7.999999999998181,$)", i_shape, legacy::i_shape),
+            ("IFC2X3", "IFCISHAPEPROFILEDEF(.AREA.,$,$,100.3,200.7,5.6,8.5,0.)", i_shape, legacy::i_shape),
+            ("IFC4", "IFCISHAPEPROFILEDEF(.AREA.,$,$,100.3,200.7,5.6,8.5,0.,0.,0.)", i_shape, legacy::i_shape),
+            ("IFC4", "IFCISHAPEPROFILEDEF(.AREA.,$,$,100.3,200.7,5.6,8.5,$,$,$)", i_shape, legacy::i_shape),
+            ("IFC4", "IFCLSHAPEPROFILEDEF(.AREA.,$,$,100.1,75.3,10.7,$,$,$)", l_shape, legacy::l_shape),
+            ("IFC2X3", "IFCLSHAPEPROFILEDEF(.AREA.,$,$,100.1,$,10.7,0.,0.,0.,$,$)", l_shape, legacy::l_shape),
+            ("IFC4", "IFCUSHAPEPROFILEDEF(.AREA.,$,$,200.3,75.1,8.5,11.5,$,$,$)", u_shape, legacy::u_shape),
+            ("IFC2X3", "IFCUSHAPEPROFILEDEF(.AREA.,$,$,200.3,75.1,8.5,11.5,0.,0.,0.,$)", u_shape, legacy::u_shape),
+            ("IFC4", "IFCTSHAPEPROFILEDEF(.AREA.,$,$,100.3,100.1,11.3,10.9,$,$,$,$,$)", t_shape, legacy::t_shape),
+            ("IFC2X3", "IFCTSHAPEPROFILEDEF(.AREA.,$,$,100.3,100.1,11.3,10.9,0.,0.,0.,0.,0.,$)", t_shape, legacy::t_shape),
+            ("IFC4", "IFCZSHAPEPROFILEDEF(.AREA.,$,$,200.3,80.1,8.3,7.9,$,$)", z_shape, legacy::z_shape),
+            ("IFC4", "IFCZSHAPEPROFILEDEF(.AREA.,$,$,200.3,80.1,8.3,7.9,0.,0.)", z_shape, legacy::z_shape),
+            ("IFC4", "IFCROUNDEDRECTANGLEPROFILEDEF(.AREA.,$,$,300.3,200.1,0.)", rounded_rectangle, legacy::rectangle),
+        ];
+        for (schema, profile, new, old) in cases {
+            let table_src = src_with(schema, MM_RAD, profile);
+            let table = EntityTable::build(table_src.as_bytes());
+            let (_, args) = table.get(90).unwrap();
+            let fields = split_top_level_args(args);
+            let got = new(&table, &fields).unwrap();
+            assert!(got.holes.is_empty());
+            assert_eq!(bits(&got.outer), bits(&old(&fields)), "{profile}");
+        }
     }
 }
