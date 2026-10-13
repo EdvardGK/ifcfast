@@ -20,6 +20,16 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+// Largest spread within either radius group (split at 200.16 mm, between the
+// authored 200.0 and the interior-sample 200.33 of GH #218).
+function groupedSpread(radii) {
+  let worst = 0;
+  for (const g of [radii.filter((r) => r < 200.16), radii.filter((r) => r >= 200.16)]) {
+    if (g.length) worst = Math.max(worst, Math.max(...g) - Math.min(...g));
+  }
+  return worst;
+}
+
 const here = path.dirname(fileURLToPath(import.meta.url));
 const repo = path.resolve(here, '../../..');
 const pkg = path.resolve(here, '../pkg');
@@ -103,20 +113,23 @@ for (const b of farBatches) {
   for (const row of b.meta) {
     const axis = FAR_AXIS[row.guid];
     if (!axis) { farErr ||= `unexpected guid ${row.guid}`; continue; }
-    let rMin = Infinity;
-    let rMax = -Infinity;
     let outer = 0;
+    const radii = [];
     for (let v = row.v0; v < row.v0 + row.vn; v++) {
       const x = b.positions[v * 3] + farShift[0];
       const y = b.positions[v * 3 + 1] + farShift[1];
       const r = Math.hypot(x - axis[0], y - axis[1]) * 1000;
-      if (r > 199.5) { outer++; rMin = Math.min(rMin, r); rMax = Math.max(rMax, r); }
+      if (r > 199.5) { outer++; radii.push(r); }
     }
     if (outer < 32) farErr ||= `${row.guid}: only ${outer} outer-loop vertices`;
-    const spread = rMax - rMin;
+    // GH #218: arc endpoints sit on the authored R = 200 mm, interior
+    // samples on R·k (≈ 200.33 mm, the area-preserving radius), so the
+    // outer loop has two radius groups. Precision is the spread WITHIN
+    // each group, not across them.
+    const spread = groupedSpread(radii);
     worstSpread = Math.max(worstSpread, spread);
     if (!(spread < 0.05)) {
-      farErr ||= `${row.guid}: outer radius spread ${spread.toFixed(4)} mm (mean ~${rMax.toFixed(4)})`;
+      farErr ||= `${row.guid}: outer radius spread ${spread.toFixed(4)} mm within a radius group`;
     }
     farSeen++;
   }
@@ -154,16 +167,16 @@ if (unplacedMeta[0]?.row.guid !== '0UnplacedFirstProd00__') {
 for (const { row, positions } of unplacedMeta) {
   const axis = FAR_AXIS[row.guid];
   if (!axis) continue;
-  let rMin = Infinity;
-  let rMax = -Infinity;
+  const radii2 = [];
   for (let v = row.v0; v < row.v0 + row.vn; v++) {
     const r = Math.hypot(
       positions[v * 3] + unplacedShift[0] - axis[0],
       positions[v * 3 + 1] + unplacedShift[1] - axis[1],
     ) * 1000;
-    if (r > 199.5) { rMin = Math.min(rMin, r); rMax = Math.max(rMax, r); }
+    if (r > 199.5) radii2.push(r);
   }
-  if (!(rMax - rMin < 0.05)) unplacedErr ||= `${row.guid}: spread ${(rMax - rMin).toFixed(4)} mm`;
+  const spread2 = groupedSpread(radii2);
+  if (!(spread2 < 0.05)) unplacedErr ||= `${row.guid}: spread ${spread2.toFixed(4)} mm within a radius group`;
 }
 check('far-origin: ducts stay round behind the unplaced product', !unplacedErr, unplacedErr);
 unplaced.free();

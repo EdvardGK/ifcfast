@@ -2051,7 +2051,10 @@ fn layer_sets(t: &materials::MaterialTable) -> (HashMap<String, String>, Map<Str
         if *owner.entry(set_name).or_insert(guid) != guid {
             continue;
         }
-        let thickness = t.layer_thickness_mm[i].unwrap_or(0.0);
+        // round10 like `materials_json` / the Python generator's
+        // `_df_to_records` (df.to_json rounds to 10 digits), and sum the
+        // rounded values so `total_thickness_mm` matches the sidecar.
+        let thickness = round10(t.layer_thickness_mm[i].unwrap_or(0.0));
         let layer = json!({
             "material": t.material_name[i].clone().unwrap_or_default(),
             "thickness_mm": thickness,
