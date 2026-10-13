@@ -213,8 +213,14 @@ pub struct InstanceRecord {
     /// or the rep is degenerate. Pipelines escalate the `false` rows to
     /// an authoritative kernel. See `MeshQto::volume_reliable`.
     pub volume_reliable: bool,
-    /// `"mesh"` or `"prism_fallback"` — which definition `volume_m3` carries.
+    /// Which definition `volume_m3` carries — see `MeshQto::volume_method`
+    /// (`"mesh"`, `"mesh_open"`, `"prism_fallback"`, `"mesh_unclipped"`,
+    /// `"mesh_profile_invalid"`).
     pub volume_method: &'static str,
+    /// GH #220: invalid swept-profile reason (`"self_intersecting"` /
+    /// `"degenerate"` / `"hole_outside"`), `None` when valid. See
+    /// `MeshQto::profile_invalid`.
+    pub profile_invalid: Option<&'static str>,
     pub aabb_volume_m3: f32,
     pub surface_area_m2: f32,
     pub area_top_m2: f32,
@@ -284,10 +290,9 @@ pub fn pair_split(
     // cache-warm vertex buffer feeds both. Sub-ms on typical
     // products, ~30ms on the biggest individual meshes.
     let mut qto: MeshQto = qto::compute(&mesh.vertices, &mesh.indices, unit_scale);
-    // GH #194: an unapplied half-space clip leaves the unclipped operand.
-    if crate::mesh::has_unapplied_clip(&mesh) {
-        qto::mark_clip_unapplied(&mut qto);
-    }
+    // GH #194 (unapplied half-space clip) and GH #220 (invalid
+    // swept profile) route the row out of trusted volume sums.
+    qto::apply_product_flags(&mut qto, &mesh);
 
     // Build the representation record. For single-fragment products
     // the rep carries the LOCAL (untransformed) mesh from
@@ -430,6 +435,7 @@ pub fn pair_split(
         volume_prism_bound_m3: qto.volume_prism_bound_m3,
         volume_reliable: qto.volume_reliable,
         volume_method: qto.volume_method,
+        profile_invalid: qto.profile_invalid,
         aabb_volume_m3: qto.aabb_volume_m3,
         surface_area_m2: qto.surface_area_m2,
         area_top_m2: qto.area_top_m2,

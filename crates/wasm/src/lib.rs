@@ -113,7 +113,9 @@ impl IfcModel {
     /// `volume_reliable_m3` + `volume_unreliable_m3` split it, the latter
     /// being products whose half-space clip could not be applied (their
     /// volume is the unclipped operand's, an upper bound; GH #194/#211),
-    /// counted in `products_clip_unapplied`.
+    /// counted in `products_clip_unapplied`, or whose swept profile
+    /// polygon is not a valid region (GH #220), counted in
+    /// `products_profile_invalid`.
     #[wasm_bindgen(js_name = qtoJson)]
     pub fn qto_json(&mut self) -> String {
         self.inner.ensure_stats();
@@ -264,7 +266,9 @@ impl IfcModel {
 
     /// Engine counters for the UI: products seen / meshed / deferred,
     /// triangles, mesh milliseconds, and the two half-space clip counters
-    /// (`halfspace_clip_unapplied`, `halfspace_clip_manifold`; GH #211).
+    /// (`halfspace_clip_unapplied`, `halfspace_clip_manifold`; GH #211),
+    /// and `profile_invalid` (products with an invalid swept profile
+    /// polygon; GH #220).
     #[wasm_bindgen(js_name = statsJson)]
     pub fn stats_json(&mut self) -> String {
         self.inner.ensure_stats();

@@ -282,6 +282,8 @@ mod python {
             "halfspace_clip_manifold",
             stats.halfspace_clip_manifold as u64,
         )?;
+        // GH #220: products with an invalid swept profile polygon.
+        out.set_item("profile_invalid", stats.profile_invalid as u64)?;
         Ok(())
     }
 
@@ -977,6 +979,8 @@ mod python {
                 volume_reliable: Vec<bool>,
                 volume_method: Vec<&'static str>,
                 mesh_quality: Vec<&'static str>,
+                // GH #220: invalid swept-profile reason, None when valid.
+                profile_invalid: Vec<Option<&'static str>>,
                 aabb_volume_m3: Vec<f32>,
                 surface_area_m2: Vec<f32>,
                 area_top_m2: Vec<f32>,
@@ -1008,11 +1012,9 @@ mod python {
                 /// flush.
                 fn record(&mut self, mesh: ProductMesh) {
                     let mut q = qto::compute(&mesh.vertices, &mesh.indices, self.unit_scale);
-                    // GH #194: an unapplied half-space clip leaves the
-                    // unclipped operand — never a trusted volume.
-                    if crate::mesh::has_unapplied_clip(&mesh) {
-                        qto::mark_clip_unapplied(&mut q);
-                    }
+                    // GH #194 (unapplied half-space clip) and GH #220 (invalid
+                    // swept profile) route the row out of trusted volume sums.
+                    qto::apply_product_flags(&mut q, &mesh);
                     self.guid.push(mesh.guid.clone());
                     self.entity.push(mesh.entity.clone());
                     self.volume_m3.push(q.volume_best_m3);
@@ -1021,6 +1023,7 @@ mod python {
                     self.volume_reliable.push(q.volume_reliable);
                     self.volume_method.push(q.volume_method);
                     self.mesh_quality.push(q.mesh_quality);
+                    self.profile_invalid.push(q.profile_invalid);
                     self.aabb_volume_m3.push(q.aabb_volume_m3);
                     self.surface_area_m2.push(q.surface_area_m2);
                     self.area_top_m2.push(q.area_top_m2);
@@ -1110,6 +1113,7 @@ mod python {
                 volume_reliable: Vec::with_capacity(idx.product_step_id.len()),
                 volume_method: Vec::with_capacity(idx.product_step_id.len()),
                 mesh_quality: Vec::with_capacity(idx.product_step_id.len()),
+                profile_invalid: Vec::with_capacity(idx.product_step_id.len()),
                 aabb_volume_m3: Vec::with_capacity(idx.product_step_id.len()),
                 surface_area_m2: Vec::with_capacity(idx.product_step_id.len()),
                 area_top_m2: Vec::with_capacity(idx.product_step_id.len()),
@@ -1167,6 +1171,10 @@ mod python {
             out.set_item("volume_reliable", PyList::new(py, sink.volume_reliable)?)?;
             out.set_item("volume_method", PyList::new(py, sink.volume_method)?)?;
             out.set_item("mesh_quality", PyList::new(py, sink.mesh_quality)?)?;
+            out.set_item(
+                "profile_invalid",
+                PyList::new(py, sink.profile_invalid)?,
+            )?;
             out.set_item("aabb_volume_m3", PyList::new(py, sink.aabb_volume_m3)?)?;
             out.set_item("surface_area_m2", PyList::new(py, sink.surface_area_m2)?)?;
             out.set_item("area_top_m2", PyList::new(py, sink.area_top_m2)?)?;

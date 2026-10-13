@@ -624,6 +624,7 @@ mod drift_floor_tests {
             surface_color: None,
             bounded_halfspaces: Vec::new(),
             clip_unapplied: false,
+            profile_invalid: None,
         }
     }
 

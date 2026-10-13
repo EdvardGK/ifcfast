@@ -857,7 +857,13 @@ def _resolve_step_escapes(s: str) -> str:
 #       arcs gain vertices / triangles, bboxes and `volume_m3` move (KNM
 #       bboxes up to 146 mm). Full circle profiles unchanged. Columns
 #       unchanged.
-_CACHE_SCHEMA_VERSION = 40
+#   41: GH #220 — new nullable `profile_invalid` column on
+#       `instances.parquet` and `mesh_qto()` ("self_intersecting" /
+#       "degenerate" / "hole_outside"): a swept profile polygon of the
+#       product is not a valid region. Such rows get `volume_reliable =
+#       False` and, over a mesh-derived method, `volume_method =
+#       "mesh_profile_invalid"`. Geometry unchanged.
+_CACHE_SCHEMA_VERSION = 41
 
 _FIELD_RE = re.compile(r"\(\s*(.*?)\s*\)\s*;", re.DOTALL)
 

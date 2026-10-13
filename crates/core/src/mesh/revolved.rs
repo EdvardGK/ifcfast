@@ -116,6 +116,8 @@ pub fn revolved_area_solid(table: &EntityTable, id: u64) -> Option<LocalMesh> {
     }
 
     let mut mesh = LocalMesh::new();
+    // GH #220: an invalid profile ring sweeps an invalid solid too.
+    mesh.profile_invalid = crate::mesh::profile_check::check(&polygon);
 
     // Build rings: a ring is one rotated copy of the profile boundary
     // (outer + holes concatenated, in the same order each ring).

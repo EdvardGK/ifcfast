@@ -35,6 +35,11 @@ pub struct LocalMesh {
     pub vertices: Vec<f32>, // [x, y, z, ...]
     pub indices: Vec<u32>,  // triangle indices into vertices
     pub rep_origin: [f64; 3],
+    /// GH #220: the swept profile polygon this mesh was built from is not
+    /// a valid region ([`crate::mesh::profile_check::check`]). The mesh is
+    /// kept as-is (reveal-all); the product's QTO row is routed out of
+    /// trusted volume sums. `None` for every non-profile kernel.
+    pub profile_invalid: Option<crate::mesh::profile_check::ProfileDefect>,
 }
 
 impl LocalMesh {
@@ -43,6 +48,7 @@ impl LocalMesh {
             vertices: Vec::new(),
             indices: Vec::new(),
             rep_origin: [0.0; 3],
+            profile_invalid: None,
         }
     }
 
@@ -142,7 +148,9 @@ pub fn extrude_params(table: &EntityTable, id: u64) -> Option<ExtrudeParams> {
 /// Build a mesh for an `IfcExtrudedAreaSolid` entity (by step_id).
 pub fn extrude(table: &EntityTable, id: u64) -> Option<LocalMesh> {
     let p = extrude_params(table, id)?;
-    Some(extrude_polygon(&p.profile, p.dir, p.depth, p.local_xform))
+    let mut mesh = extrude_polygon(&p.profile, p.dir, p.depth, p.local_xform);
+    mesh.profile_invalid = crate::mesh::profile_check::check(&p.profile);
+    Some(mesh)
 }
 
 /// Build mesh from an already-resolved 2D polygon + extrusion params.

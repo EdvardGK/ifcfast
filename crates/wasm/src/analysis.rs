@@ -152,6 +152,9 @@ pub struct DriftRow {
     /// The product's half-space clip was not applied (GH #194, #211):
     /// its volume is the unclipped operand's, an upper bound.
     pub clip_unapplied: bool,
+    /// A swept profile polygon of the product is not a valid region
+    /// (GH #220): the volume is mesh-measured but unreliable.
+    pub profile_invalid: bool,
 }
 
 #[derive(Default)]
@@ -166,6 +169,8 @@ pub struct MeshCounters {
     /// Products clipped via the Manifold fallback (never in this build —
     /// the wasm crate has no `csg` — but the counter is the wheel's).
     pub halfspace_clip_manifold: usize,
+    /// Products with an invalid swept profile polygon (GH #220).
+    pub profile_invalid: usize,
     pub mesh_ms: f64,
     pub entity_table_ms: f64,
     pub by_source: Vec<(String, usize)>,
@@ -862,6 +867,7 @@ fn drift_row(m: &ProductMesh, unit_scale: f64, unit_scale_f32: f32) -> DriftRow 
         max_extent_m: round10_opt(s.max_extent as f64 * us_len),
         triangle_count: s.triangle_count,
         clip_unapplied: mesh::has_unapplied_clip(m),
+        profile_invalid: m.profile_invalid.is_some(),
     }
 }
 
@@ -879,6 +885,7 @@ fn counters_from(mesh_stats: &mesh::MeshStats) -> MeshCounters {
         triangles: mesh_stats.triangles,
         halfspace_clip_unapplied: mesh_stats.halfspace_clip_unapplied,
         halfspace_clip_manifold: mesh_stats.halfspace_clip_manifold,
+        profile_invalid: mesh_stats.profile_invalid,
         mesh_ms: mesh_stats.elapsed_ms,
         entity_table_ms: mesh_stats.entity_table_build_ms,
         by_source,
@@ -1677,6 +1684,7 @@ impl Analysis {
             volume_reliable: f64,
             volume_unreliable: f64,
             clip_unapplied: usize,
+            profile_invalid: usize,
             triangles: u64,
             with_mesh: usize,
             without_mesh: usize,
@@ -1701,6 +1709,7 @@ impl Analysis {
                     volume_reliable: 0.0,
                     volume_unreliable: 0.0,
                     clip_unapplied: 0,
+                    profile_invalid: 0,
                     triangles: 0,
                     with_mesh: 0,
                     without_mesh: 0,
@@ -1725,9 +1734,12 @@ impl Analysis {
                     if d.clip_unapplied {
                         row.clip_unapplied += 1;
                     }
+                    if d.profile_invalid {
+                        row.profile_invalid += 1;
+                    }
                     if let Some(v) = d.volume_abs_m3 {
                         row.volume += v;
-                        if d.clip_unapplied {
+                        if d.clip_unapplied || d.profile_invalid {
                             row.volume_unreliable += v;
                         } else {
                             row.volume_reliable += v;
@@ -1768,6 +1780,7 @@ impl Analysis {
                 "volume_reliable_m3": vol_ok,
                 "volume_unreliable_m3": vol_bad,
                 "products_clip_unapplied": r.clip_unapplied,
+                "products_profile_invalid": r.profile_invalid,
                 "triangles": r.triangles,
                 "products_with_mesh": r.with_mesh,
                 "products_without_mesh": r.without_mesh,
@@ -2000,6 +2013,7 @@ impl Analysis {
             "triangles": self.counters.triangles,
             "halfspace_clip_unapplied": self.counters.halfspace_clip_unapplied,
             "halfspace_clip_manifold": self.counters.halfspace_clip_manifold,
+            "profile_invalid": self.counters.profile_invalid,
             "mesh_ms": self.counters.mesh_ms,
             "entity_table_ms": self.counters.entity_table_ms,
             "parse_seconds": self.parse_seconds,

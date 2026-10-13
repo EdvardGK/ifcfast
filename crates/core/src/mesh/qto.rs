@@ -140,6 +140,11 @@ pub struct MeshQto {
     ///   the element volume. Set by [`mark_clip_unapplied`] (only over a
     ///   mesh-derived method — a `"prism_fallback"` row keeps its name and
     ///   is just marked unreliable); always `volume_reliable == false`.
+    /// - `"mesh_profile_invalid"`: a swept profile polygon of the product
+    ///   is not a valid region (GH #220 — see `profile_invalid`), so the
+    ///   mesh volume, although within the element bounds, need not match
+    ///   a kernel. Set by [`mark_profile_invalid`] over a mesh-derived
+    ///   method only; always `volume_reliable == false`.
     pub volume_method: &'static str,
     /// The best single volume estimate: the mesh volume when reliable,
     /// else the prism fallback (`volume_prism_bound_m3`). This is what
@@ -157,6 +162,13 @@ pub struct MeshQto {
     /// rows, where it is neither needed nor computed (keeps the watertight
     /// hot path raster-free).
     pub volume_prism_bound_m3: f32,
+    /// GH #220: why a swept profile polygon of this product is not a
+    /// valid region — `"self_intersecting"`, `"degenerate"` or
+    /// `"hole_outside"` ([`crate::mesh::profile_check::ProfileDefect`]);
+    /// `None` when every profile is valid (or the product has none). Set
+    /// by [`mark_profile_invalid`]; whenever it is `Some`,
+    /// `volume_reliable` is `false`.
+    pub profile_invalid: Option<&'static str>,
 }
 
 // 20° threshold against ±Z: `cos(20°) ≈ 0.940`.
@@ -193,6 +205,37 @@ pub fn mark_clip_unapplied(q: &mut MeshQto) {
     q.volume_reliable = false;
     if matches!(q.volume_method, "mesh" | "mesh_open") {
         q.volume_method = "mesh_unclipped";
+    }
+}
+
+/// Downgrade a QTO row whose product carries an invalid swept profile
+/// (GH #220, [`crate::mesh::ProductMesh::profile_invalid`]): earcut over a
+/// self-intersecting / collapsed / hole-outside polygon covers a region
+/// the author did not mean, and the extruded volume can still sit inside
+/// every element-level bound (KNM_ARK pre-#218: +14 % / +21 % with
+/// `volume_reliable = True`). The mesh and `volume_best_m3` are left as
+/// computed; the row is routed out of trusted sums and the reason is
+/// recorded. A mesh-derived method (`"mesh"` / `"mesh_open"`) is
+/// relabelled `"mesh_profile_invalid"`; `"prism_fallback"` and
+/// `"mesh_unclipped"` keep their names (they already say which number is
+/// carried and are already unreliable).
+pub fn mark_profile_invalid(q: &mut MeshQto, defect: crate::mesh::profile_check::ProfileDefect) {
+    q.volume_reliable = false;
+    q.profile_invalid = Some(defect.as_str());
+    if matches!(q.volume_method, "mesh" | "mesh_open") {
+        q.volume_method = "mesh_profile_invalid";
+    }
+}
+
+/// Apply every product-level reliability downgrade carried on the mesh
+/// (GH #194 unapplied clip, GH #220 invalid profile) to its QTO row. The
+/// single place QTO writers call after [`compute`].
+pub fn apply_product_flags(q: &mut MeshQto, mesh: &crate::mesh::ProductMesh) {
+    if crate::mesh::has_unapplied_clip(mesh) {
+        mark_clip_unapplied(q);
+    }
+    if let Some(d) = mesh.profile_invalid {
+        mark_profile_invalid(q, d);
     }
 }
 
@@ -661,6 +704,7 @@ pub fn compute(vertices: &[f32], indices: &[u32], unit_scale: f32) -> MeshQto {
         volume_best_m3,
         volume_prism_bound_m3,
         surfaces,
+        profile_invalid: None,
     }
 }
 
