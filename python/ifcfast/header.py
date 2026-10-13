@@ -880,7 +880,18 @@ def _resolve_step_escapes(s: str) -> str:
 #       and `IfcRectangleHollowProfileDef` products, which did not mesh,
 #       now do. Sharp (null / zero radius) sections are byte-identical.
 #       Columns unchanged.
-_CACHE_SCHEMA_VERSION = 43
+#   44: GH #232 / #233 — geometry change, cut path only
+#       (`cut_openings=True`). An IfcOpeningElement with several Body
+#       items is subtracted as one cutter per item (their union), not as
+#       one concatenated self-overlapping mesh (Archicad walls ±34 %).
+#       After every CSG difference, zero-thickness residue components are
+#       dropped, and a coplanar double-sided sheet left attached to the
+#       kept solid triggers one retry with the cutter faces flush with a
+#       host face pushed outward by 2e-5 · host bbox diagonal (other faces
+#       stay). A host its openings fully consume is
+#       no longer emitted. `volume_m3`, bboxes and triangle counts move
+#       on affected hosts only. Columns unchanged.
+_CACHE_SCHEMA_VERSION = 44
 
 _FIELD_RE = re.compile(r"\(\s*(.*?)\s*\)\s*;", re.DOTALL)
 
