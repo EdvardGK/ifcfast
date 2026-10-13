@@ -419,10 +419,11 @@ describing via `pq.read_schema(...)`):
   kernel. `volume_method` is `"mesh"` (`closed`), `"mesh_open"`
   (trusted open shell — same trust as `mesh`, split out so you can filter
   on watertightness via `mesh_quality == "closed"`), `"prism_fallback"`,
-  or `"mesh_unclipped"` (GH #194: a half-space clip of the element could
+  `"mesh_unclipped"` (GH #194: a half-space clip of the element could
   not be applied, so the mesh is the unclipped operand and the volume
-  an upper bound) — the last two are the `volume_reliable == false`
-  methods; `volume_mesh_m3` is the
+  an upper bound), or `"mesh_profile_invalid"` (GH #220: a swept profile
+  polygon is not a valid region — see `profile_invalid` below) — the
+  last three are the `volume_reliable == false` methods; `volume_mesh_m3` is the
   raw mesh volume regardless of reliability; `volume_prism_bound_m3` is
   the prism bound — the min over the three axis projections of
   `footprint × perpendicular-extent`, tight for beams/columns/slabs alike
@@ -508,6 +509,32 @@ describing via `pq.read_schema(...)`):
   ifcopenshell 55 → 0 (max 146 → 0.36 mm), +6 % triangles; G55_ARK
   +0.16 % triangles. Only products with large-radius arcs re-extract
   visibly; the 0.3 mm residual is the interior samples' area radius.
+  **GH #220 (cache schema v42): `profile_invalid`** (nullable string,
+  on `instances.parquet` and `mesh_qto()`) — a typed flag naming why a
+  swept profile polygon of the product (`IfcExtrudedAreaSolid` /
+  `IfcRevolvedAreaSolid` `SweptArea`, after curve sampling) is not a
+  valid region: `"self_intersecting"` (two edges properly cross —
+  earcut then covers a region the author did not mean),
+  `"degenerate"` (< 3 distinct vertices, or mean width `2·area /
+  perimeter` below 1e-6 of the profile's extent — collapsed to a line)
+  or `"hole_outside"` (a void loop outside the outer loop). Null when
+  every profile is valid or the product has none. **Non-null ⇒
+  `volume_reliable == False`**; a mesh-derived `volume_method`
+  (`"mesh"` / `"mesh_open"`) becomes `"mesh_profile_invalid"`,
+  `"prism_fallback"` / `"mesh_unclipped"` keep their names. The mesh
+  and `volume_m3` are unchanged (reveal-all) — route the row to a
+  kernel. Why: such a mesh can sit inside every element-level bound
+  (prism, AABB) while over-counting — KNM_ARK pre-#218: two walls with
+  1 mm crescent slivers whose sampled outline self-intersected came
+  back `mesh_open` / reliable at +14 % / +21 % vs ifcopenshell. An
+  item-level `profile AABB × depth` bound cannot catch this class (an
+  earcut cap never leaves its polygon's AABB; the KNM sliver item was
+  0.5 % of its own bound), so the check is on the polygon itself.
+  Expect it to be rare: 5 of 84 k products on 15 corpus models, all
+  real divergences (HI90_RIE sockets, a 0.2 mm ring whose sampled hole
+  crosses its outer loop, +13.4 % vs ifcopenshell).
+  Mesh-stats surfaces count the products as
+  **`products_profile_invalid`**.
 - Semantic payload: `materials`, `psets`, `quantities`,
   `classifications` (list-of-struct columns — `UNNEST` in DuckDB).
   Each `psets` and `quantities` struct carries `source`
@@ -1153,7 +1180,7 @@ JSON.parse(m.bySourceJson()); // GH #166 counters
 JSON.parse(m.validateIds(idsXml));   // IfcTester-shaped report (= rep.to_ifctester_json())
 m.validateIds(idsXml, "mark", true); // onUnsupported, filterIfcVersion
 m.free();
-``` `graph.products[].materials` lists every `IfcMaterial` name bound to the product across all roles (direct, list, layer, constituent, profile), deduped, first-seen order (GH #185; the material's Name, not the layer / constituent / profile Name, since GH #219). `layer_set` is the `set_name` of the product's first `layer` row, null when it has none; `graph.material_layer_sets` maps each set name to `{layers: [{material, thickness_mm}], total_thickness_mm}`, defined once by the first product carrying it (GH #213) — read `materialsJson()` for every row. `qtoJson` rows split `volume_m3` into `volume_reliable_m3` + `volume_unreliable_m3` (unreliable = the host's half-space clip was not applied, an upper bound; `products_clip_unapplied` counts them) and `statsJson` carries `halfspace_clip_unapplied` / `halfspace_clip_manifold` (GH #211). Sum only `volume_reliable_m3` for a trustworthy total.
+``` `graph.products[].materials` lists every `IfcMaterial` name bound to the product across all roles (direct, list, layer, constituent, profile), deduped, first-seen order (GH #185; the material's Name, not the layer / constituent / profile Name, since GH #219). `layer_set` is the `set_name` of the product's first `layer` row, null when it has none; `graph.material_layer_sets` maps each set name to `{layers: [{material, thickness_mm}], total_thickness_mm}`, defined once by the first product carrying it (GH #213) — read `materialsJson()` for every row. `qtoJson` rows split `volume_m3` into `volume_reliable_m3` + `volume_unreliable_m3` (unreliable = the host's half-space clip was not applied, an upper bound, `products_clip_unapplied` counts them; or a swept profile polygon is not a valid region, `products_profile_invalid` counts them, GH #220) and `statsJson` carries `halfspace_clip_unapplied` / `halfspace_clip_manifold` (GH #211) / `products_profile_invalid` (GH #220). Sum only `volume_reliable_m3` for a trustworthy total.
 
 **`validateIds` is opt-in** (`IFCFAST_WASM_FEATURES=ids crates/wasm/build.sh`).
 It adds roxmltree, regex (Unicode tables) and the per-schema IDS tables
@@ -1756,7 +1783,8 @@ mainstream exporter writes — so the native `extract_meshes` dict's
 `Model.meshes()` surfaces the mesh-pass counters as
 **`MeshList.stats`** (`products_seen` / `products_meshed` /
 `products_deferred` / `by_source` / `halfspace_clip_unapplied` /
-`halfspace_clip_manifold`, GH #166 / #194) but not the cut counters —
+`halfspace_clip_manifold`, GH #166 / #194, `products_profile_invalid`,
+GH #220) but not the cut counters —
 for those `m.to_gltf()` is still the surface (see "Cut diagnostics"
 below).
 

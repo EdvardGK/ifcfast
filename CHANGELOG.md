@@ -24,6 +24,27 @@ Cache schema v41.
   relation="IFCRELASSIGNSTOGROUP"` (system / zone / group membership).
   The native IDS engine already evaluated it.
 
+- **`profile_invalid` — typed flag for invalid swept profile polygons
+  (GH #220).** New nullable column on `instances.parquet` and
+  `mesh_qto()`: `"self_intersecting"` / `"degenerate"` /
+  `"hole_outside"` when a profile polygon of the product (extrusion or
+  revolution `SweptArea`, after curve sampling) is not a valid region,
+  null otherwise. Such rows get `volume_reliable = False`; a mesh-derived
+  method becomes `volume_method = "mesh_profile_invalid"`. Geometry and
+  `volume_m3` are unchanged (reveal-all). Mesh-stats surfaces gain
+  `products_profile_invalid`; wasm `qtoJson` routes these volumes to
+  `volume_unreliable_m3` and counts `products_profile_invalid`, and
+  `statsJson` carries `products_profile_invalid`. The detector is an
+  x-sorted segment sweep (proper crossings only, relative tolerance), run
+  once per profile. It closes the tripwire gap from KNM_ARK before #218,
+  where 1 mm crescent slivers whose sampled outline self-intersected
+  over-counted by +14 % / +21 % with `volume_reliable = True`. On 15
+  corpus models (G55 ×4, KNM ×5, HI90 ×6; 84 k products) it flags 5
+  products, all true positives: HI90_RIE recessed sockets whose 0.2 mm
+  annulus item is sampled with its hole crossing the outer loop —
+  +13.4 % vs ifcopenshell, previously `volume_reliable = True`. No
+  measurable mesh-pass cost (G55_ARK / KNM_ARK A/B within noise).
+
 ### Fixed
 
 - **IDS: IFC2X3 entity names inside an `xs:enumeration` / pattern map

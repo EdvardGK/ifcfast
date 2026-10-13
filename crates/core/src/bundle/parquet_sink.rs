@@ -572,6 +572,10 @@ fn build_instance_schema() -> Schema {
         Field::new("volume_prism_bound_m3", DataType::Float32, false),
         Field::new("volume_reliable", DataType::Boolean, false),
         Field::new("volume_method", DataType::Utf8, false),
+        // GH #220: why a swept profile polygon is not a valid region
+        // ("self_intersecting" / "degenerate" / "hole_outside"); null when
+        // every profile is valid. Non-null ⇒ `volume_reliable = false`.
+        Field::new("profile_invalid", DataType::Utf8, true),
         // List<Struct> of every distinct planar surface, sorted by
         // area descending. DuckDB UNNEST(surfaces) turns it into a
         // row-per-face stream.
@@ -735,6 +739,7 @@ fn build_instance_batch(
     let mut volume_prism_bound_m3 = Float32Builder::with_capacity(n);
     let mut volume_reliable = BooleanBuilder::with_capacity(n);
     let mut volume_method = StringBuilder::with_capacity(n, n * 8);
+    let mut profile_invalid = StringBuilder::with_capacity(n, 0);
     let mut source_model = StringBuilder::with_capacity(n, n * source_model_value.len().max(1));
 
     for r in records {
@@ -917,6 +922,7 @@ fn build_instance_batch(
         volume_prism_bound_m3.append_value(r.volume_prism_bound_m3);
         volume_reliable.append_value(r.volume_reliable);
         volume_method.append_value(r.volume_method);
+        profile_invalid.append_option(r.profile_invalid);
         source_model.append_value(source_model_value);
 
         // Per-surface list — one row per distinct planar face.
@@ -982,6 +988,7 @@ fn build_instance_batch(
         Arc::new(volume_prism_bound_m3.finish()),
         Arc::new(volume_reliable.finish()),
         Arc::new(volume_method.finish()),
+        Arc::new(profile_invalid.finish()),
         Arc::new(surfaces.finish()),
         Arc::new(source_model.finish()),
     ];

@@ -1639,6 +1639,7 @@ mod tests {
             surface_color: None,
             bounded_halfspaces: Vec::new(),
             clip_unapplied: false,
+            profile_invalid: None,
         }
     }
 
@@ -1679,6 +1680,7 @@ mod tests {
             surface_color: None,
             bounded_halfspaces: Vec::new(),
             clip_unapplied: false,
+            profile_invalid: None,
         };
         let before_verts = mesh.vertices.clone();
         assert_eq!(apply(&mut mesh, 1.0), Outcome::Passthrough);

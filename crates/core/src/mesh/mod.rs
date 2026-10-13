@@ -42,6 +42,7 @@ pub mod polygon_bool;
 #[cfg(feature = "prism-csg-fast")]
 pub mod prism_csg;
 pub mod profile;
+pub mod profile_check;
 pub mod qto;
 pub mod rebase;
 pub mod revolved;
@@ -396,6 +397,13 @@ pub struct ProductMesh {
     /// `"cut_openings"` segment and clears `parts`. The
     /// [`CLIP_UNAPPLIED_TAG`] segment token is informational only.
     pub clip_unapplied: bool,
+    /// GH #220: the first defect found in a swept profile polygon of any
+    /// fragment of this product (self-intersecting, degenerate, hole
+    /// outside the outer loop — [`profile_check::check`]). The mesh is
+    /// unchanged (reveal-all); the QTO row is marked unreliable via
+    /// [`qto::mark_profile_invalid`]. Survives the `cut_openings` rewrite
+    /// like [`Self::clip_unapplied`].
+    pub profile_invalid: Option<profile_check::ProfileDefect>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -420,6 +428,10 @@ pub struct MeshStats {
     /// Manifold fallback instead of the pure-Rust route (always 0 in
     /// builds without `csg`). See [`CLIP_MANIFOLD_TAG`].
     pub halfspace_clip_manifold: usize,
+    /// Products with at least one swept profile polygon that is not a
+    /// valid region (GH #220, [`ProductMesh::profile_invalid`]) — their
+    /// `volume_reliable` is `false`.
+    pub products_profile_invalid: usize,
     /// Model-wide global shift in MODEL UNITS, decided once per pass
     /// before the first emission — see [`ProductSink::on_global_shift`].
     /// `[0, 0, 0]` for a near-origin model, and also for a model whose
@@ -1015,6 +1027,8 @@ fn tessellate_one(
     // GH #194: carried as data, not only as a segment token — the cut
     // pass rewrites `segments`, the flag survives it.
     let mut clip_unapplied = false;
+    // GH #220: first profile defect across all fragments.
+    let mut profile_invalid: Option<profile_check::ProfileDefect> = None;
 
     for item_id in items {
         let fragments = mesh_item(table, item_id, shape_cache);
@@ -1030,6 +1044,9 @@ fn tessellate_one(
                 } => {
                     if roles.contains(&CLIP_UNAPPLIED_TAG) {
                         clip_unapplied = true;
+                    }
+                    if profile_invalid.is_none() {
+                        profile_invalid = local.profile_invalid;
                     }
                     let seg_index_start = combined_i.len() as u32;
                     let base = (combined_v.len() / 3) as u32;
@@ -1270,6 +1287,7 @@ fn tessellate_one(
             surface_color: product_surface_color,
             bounded_halfspaces,
             clip_unapplied,
+            profile_invalid,
         },
         triangle_count,
         segment_tags,
@@ -1374,6 +1392,9 @@ fn apply_outcome<S: ProductSink>(outcome: ProductOutcome, sink: &mut S, stats: &
             if product.clip_unapplied {
                 stats.halfspace_clip_unapplied += 1;
             }
+            if product.profile_invalid.is_some() {
+                stats.products_profile_invalid += 1;
+            }
             if has_tag(CLIP_MANIFOLD_TAG) {
                 stats.halfspace_clip_manifold += 1;
             }
@@ -1454,6 +1475,7 @@ fn emit_geometryless<S: ProductSink>(
             surface_color: None,
             bounded_halfspaces: Vec::new(),
             clip_unapplied: false,
+            profile_invalid: None,
         });
     }
 }
@@ -1676,6 +1698,7 @@ fn clone_local(m: &LocalMesh) -> LocalMesh {
         vertices: m.vertices.clone(),
         indices: m.indices.clone(),
         rep_origin: m.rep_origin,
+        profile_invalid: m.profile_invalid,
     }
 }
 
@@ -1965,6 +1988,7 @@ mod strip_cutter_tests {
             surface_color: None,
             bounded_halfspaces: Vec::new(),
             clip_unapplied: false,
+            profile_invalid: None,
         }
     }
 

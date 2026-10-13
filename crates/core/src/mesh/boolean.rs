@@ -408,6 +408,7 @@ fn clip_fragment(
                 vertices: v,
                 indices: i,
                 rep_origin: mesh.rep_origin,
+                profile_invalid: mesh.profile_invalid,
             })
         }
         HalfspaceCut::Bounded(bounded) => {
@@ -437,6 +438,7 @@ fn clip_fragment(
                     vertices,
                     indices,
                     rep_origin: mesh.rep_origin,
+                    profile_invalid: mesh.profile_invalid,
                 }),
                 BoundedClip::NonConvex | BoundedClip::Failed => {
                     manifold_bounded_fallback(mesh, &bounded.boundary, xform, p, n, eps)
@@ -473,6 +475,7 @@ fn manifold_bounded_fallback(
             vertices: v,
             indices: i,
             rep_origin: mesh.rep_origin,
+            profile_invalid: mesh.profile_invalid,
         }),
         Err(_) => ClipOutcome::Unapplied,
     }
@@ -1316,6 +1319,7 @@ END-ISO-10303-21;
             vertices: v,
             indices: i,
             rep_origin: [6_500_000.0, 1_200_000.0, 50.0],
+            profile_invalid: None,
         };
         // Oblique vertical plane through the box's centre column: any line
         // through a square's centre bisects it, so exactly 1.5 m³ is kept.

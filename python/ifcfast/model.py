@@ -95,6 +95,7 @@ def _mesh_stats(d) -> dict:
         "triangles",
         "halfspace_clip_unapplied",
         "halfspace_clip_manifold",
+        "products_profile_invalid",
     ):
         if k in d:
             out[k] = int(d[k])
@@ -121,7 +122,9 @@ class MeshList(list):
     #: (their mesh is the unclipped operand, tagged
     #: ``"halfspace_unclipped"`` in its segment chain) and
     #: ``halfspace_clip_manifold`` those clipped via the Manifold fallback
-    #: (GH #194).
+    #: (GH #194). ``products_profile_invalid`` counts products with a swept profile
+    #: polygon that is not a valid region (GH #220; their QTO row carries
+    #: ``volume_reliable == False`` and the reason in ``profile_invalid``).
     stats: dict = {}
 
 
@@ -809,13 +812,21 @@ class Model:
           can filter on watertightness), ``"prism_fallback"``, or
           ``"mesh_unclipped"`` (GH #194: a half-space clip of the element
           could not be applied — the mesh is the unclipped operand and the
-          volume an upper bound); the last two are the
+          volume an upper bound), or ``"mesh_profile_invalid"`` (GH #220:
+          a swept profile polygon is not a valid region, see
+          ``profile_invalid``); the last three are the
           ``volume_reliable == False`` methods; ``volume_mesh_m3`` is the
           raw mesh value regardless of reliability; ``volume_prism_bound_m3``
           is the prism bound, computed for every non-closed row (``NaN`` on
           closed rows — the watertight hot path stays raster-free);
           ``mesh_quality`` is ``"closed"`` / ``"open_shell"`` /
-          ``"degenerate"``.
+          ``"degenerate"``. ``profile_invalid`` (GH #220) is ``None`` when
+          every swept profile of the product is a valid region, else why
+          one is not: ``"self_intersecting"`` (edges cross — earcut
+          covers a region the author did not mean), ``"degenerate"``
+          (collapsed to a line) or ``"hole_outside"``; a non-null value
+          always comes with ``volume_reliable == False`` (the mesh is
+          unchanged).
         * ``surfaces_df`` — long-format, one row per distinct planar
           surface per product (sorted by area within a product).
           Columns: ``guid``, ``surface_index``, ``area_m2``, ``nx``,
@@ -847,6 +858,7 @@ class Model:
             "volume_reliable": d["volume_reliable"],
             "volume_method": d["volume_method"],
             "mesh_quality": d["mesh_quality"],
+            "profile_invalid": d["profile_invalid"],
             "aabb_volume_m3": d["aabb_volume_m3"],
             "surface_area_m2": d["surface_area_m2"],
             "area_top_m2": d["area_top_m2"],

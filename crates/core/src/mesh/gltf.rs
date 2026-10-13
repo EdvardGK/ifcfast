@@ -1576,6 +1576,7 @@ mod material_naming_tests {
             surface_color: None,
             bounded_halfspaces: Vec::new(),
             clip_unapplied: false,
+            profile_invalid: None,
         }
     }
 
@@ -1755,6 +1756,7 @@ mod far_origin_instancing_tests {
             surface_color: None,
             bounded_halfspaces: Vec::new(),
             clip_unapplied: false,
+            profile_invalid: None,
         }
     }
 
@@ -1923,6 +1925,7 @@ mod quantization_extension_tests {
             surface_color: None,
             bounded_halfspaces: Vec::new(),
             clip_unapplied: false,
+            profile_invalid: None,
         }
     }
 

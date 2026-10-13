@@ -143,7 +143,18 @@ def _clip_unapplied_guids(model):
     return set(hit["guid"])
 
 
-def _qto_aggregates(per_product, clip_unapplied=frozenset()):
+def _profile_invalid_guids(model):
+    """Guids with a swept profile polygon that is not a valid region (GH #220).
+
+    `mesh_qto` carries the reason in `profile_invalid` (null when valid);
+    the wasm build reads the same flag off the product mesh.
+    """
+    products_df, _surfaces = model.mesh_qto(cut_openings=False)
+    hit = products_df[products_df["profile_invalid"].notna()]
+    return set(hit["guid"])
+
+
+def _qto_aggregates(per_product, clip_unapplied=frozenset(), profile_invalid=frozenset()):
     """Per-entity-class aggregates derived from products + mesh stats.
 
     Replaces the hand-rolled duplex.qto.json. Now sourced from real
@@ -166,6 +177,7 @@ def _qto_aggregates(per_product, clip_unapplied=frozenset()):
             "volume_reliable_m3": 0.0,
             "volume_unreliable_m3": 0.0,
             "products_clip_unapplied": 0,
+            "products_profile_invalid": 0,
             "triangles": 0,
             "products_with_mesh": 0,
             "products_without_mesh": 0,
@@ -180,6 +192,8 @@ def _qto_aggregates(per_product, clip_unapplied=frozenset()):
         row["products_with_mesh"] += 1
         if p.get("guid") in clip_unapplied:
             row["products_clip_unapplied"] += 1
+        if p.get("guid") in profile_invalid:
+            row["products_profile_invalid"] += 1
         # drift measure columns are unit-suffixed (surface_area_m2 /
         # volume_abs_m3 / max_extent_m); the pre-rename names .get() to
         # None and silently zero every aggregate.
@@ -191,8 +205,9 @@ def _qto_aggregates(per_product, clip_unapplied=frozenset()):
             row["volume_m3"] += vol
             # GH #211: a product whose half-space clip was not applied
             # carries an upper-bound volume — kept in volume_m3 (the
-            # total), split out here.
-            if p.get("guid") in clip_unapplied:
+            # total), split out here. GH #220: likewise a product with an
+            # invalid swept profile polygon.
+            if p.get("guid") in clip_unapplied or p.get("guid") in profile_invalid:
                 row["volume_unreliable_m3"] += vol
             else:
                 row["volume_reliable_m3"] += vol
@@ -536,7 +551,9 @@ def main():
         json.dumps({
             "schema": model.header.schema,
             "products": len(per_product),
-            "rows": _qto_aggregates(per_product, _clip_unapplied_guids(model)),
+            "rows": _qto_aggregates(
+                per_product, _clip_unapplied_guids(model), _profile_invalid_guids(model)
+            ),
         }, default=_json_default, indent=2)
     )
     # ---- long-format data layers (GH #183) --------------------------
