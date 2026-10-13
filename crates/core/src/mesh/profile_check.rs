@@ -184,11 +184,6 @@ fn point_in_loop(p: (f64, f64), l: &[(f64, f64)], tol: f64) -> Option<bool> {
 /// order: < 3 distinct vertices (degenerate) → crossing edges
 /// (self-intersecting) → collapsed loop (degenerate) → hole outside.
 pub fn check(p: &Polygon2D) -> Option<ProfileDefect> {
-    // TEMP (GH #220 timing A/B, not for merge)
-    static SKIP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if *SKIP.get_or_init(|| std::env::var_os("IFCFAST_SKIP_PROFILE_CHECK").is_some()) {
-        return None;
-    }
     let outer = clean_loop(&p.outer);
     if outer.len() < 3 {
         return Some(ProfileDefect::Degenerate);
@@ -314,7 +309,14 @@ mod tests {
     fn valid_concave_is_valid() {
         // L / U shapes and a deep notch: concave but simple.
         let l = poly(
-            &[(0., 0.), (10., 0.), (10., 2.), (2., 2.), (2., 10.), (0., 10.)],
+            &[
+                (0., 0.),
+                (10., 0.),
+                (10., 2.),
+                (2., 2.),
+                (2., 10.),
+                (0., 10.),
+            ],
             &[],
         );
         assert_eq!(check(&l), None);
@@ -328,7 +330,14 @@ mod tests {
     #[test]
     fn closing_duplicate_and_repeats_are_ignored() {
         let p = poly(
-            &[(0., 0.), (10., 0.), (10., 0.), (10., 5.), (0., 5.), (0., 0.)],
+            &[
+                (0., 0.),
+                (10., 0.),
+                (10., 0.),
+                (10., 5.),
+                (0., 5.),
+                (0., 0.),
+            ],
             &[],
         );
         assert_eq!(check(&p), None);
@@ -337,10 +346,7 @@ mod tests {
     #[test]
     fn touching_vertex_is_not_a_crossing() {
         // Keyhole-style: a vertex touches another edge but nothing crosses.
-        let p = poly(
-            &[(0., 0.), (10., 0.), (10., 10.), (5., 0.), (0., 10.)],
-            &[],
-        );
+        let p = poly(&[(0., 0.), (10., 0.), (10., 10.), (5., 0.), (0., 10.)], &[]);
         assert_eq!(check(&p), None);
     }
 
@@ -375,20 +381,38 @@ mod tests {
     #[test]
     fn thin_but_real_sliver_is_valid() {
         // 1 mm × 28 m band (KNM scale, mm units): thin, not degenerate.
-        let p = poly(
-            &[(0., 0.), (28_000., 0.), (28_000., 1.), (0., 1.)],
-            &[],
-        );
+        let p = poly(&[(0., 0.), (28_000., 0.), (28_000., 1.), (0., 1.)], &[]);
         assert_eq!(check(&p), None);
     }
 
     #[test]
     fn thin_crossing_sliver_is_flagged() {
         // The #220 shape class: a ~1 mm band whose long edges cross.
-        let p = poly(
-            &[(0., 0.), (28_000., 1.), (28_000., 0.), (0., 1.)],
-            &[],
-        );
+        let p = poly(&[(0., 0.), (28_000., 1.), (28_000., 0.), (0., 1.)], &[]);
         assert_eq!(check(&p), Some(ProfileDefect::SelfIntersecting));
+    }
+
+    fn ngon(r: f32, n: usize, phase: f32) -> Vec<(f32, f32)> {
+        (0..n)
+            .map(|i| {
+                let t = phase + i as f32 * std::f32::consts::TAU / n as f32;
+                (r * t.cos(), r * t.sin())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn thin_annulus_samples_out_of_phase_cross() {
+        // HI90_RIE socket (GH #220 corpus hit): a 0.2 mm ring, outer and
+        // hole sampled independently. Aligned samples are a valid ring;
+        // out-of-phase samples put hole vertices outside the outer chords.
+        let outer = ngon(20.0, 8, 0.0);
+        let aligned = ngon(19.8, 8, 0.0);
+        assert_eq!(check(&poly(&outer, &[&aligned])), None);
+        let shifted = ngon(19.8, 8, std::f32::consts::PI / 8.0);
+        assert_eq!(
+            check(&poly(&outer, &[&shifted])),
+            Some(ProfileDefect::SelfIntersecting)
+        );
     }
 }
