@@ -760,26 +760,41 @@ def run_model(path: Path, sample: int) -> dict[str, Any]:
     }
 
 
-def is_clean(rep: dict[str, Any]) -> bool:
+def surface_status(rep: dict[str, Any]) -> dict[str, bool]:
+    """Per-surface clean flag; ``is_clean`` is the conjunction. The corpus
+    gate reads this so a known divergence can be registered per surface in
+    ``tests/oracle/extraction_xfail.toml`` without masking the others."""
     q, a, s, c = (rep[k] for k in ("quantities", "attributes", "storeys", "containment"))
-    return (
-        rep["classifications"]["mismatched_products"] == 0
-        and rep["materials"]["mismatched_products"] == 0
-        and rep["psets"]["missing_in_ifcfast"] == 0
-        and rep["psets"]["extra_in_ifcfast"] == 0
-        and rep["psets"]["value_mismatch"] == 0
-        and q["missing_in_ifcfast"] == 0
-        and q["extra_in_ifcfast"] == 0
-        and q["value_mismatch"] == 0
-        and q["source_mismatch"] == 0
-        and not any(a["mismatched"].values())
-        and not a["coverage_missing_in_ifcfast_by_class"]
-        and not a["coverage_extra_in_ifcfast_by_class"]
-        and not any(s["mismatched"].values())
-        and not s["missing_in_ifcfast"]
-        and not s["extra_in_ifcfast"]
-        and not any(c["mismatched"].values())
-    )
+    return {
+        "classifications": rep["classifications"]["mismatched_products"] == 0,
+        "materials": rep["materials"]["mismatched_products"] == 0,
+        "psets": (
+            rep["psets"]["missing_in_ifcfast"] == 0
+            and rep["psets"]["extra_in_ifcfast"] == 0
+            and rep["psets"]["value_mismatch"] == 0
+        ),
+        "quantities": (
+            q["missing_in_ifcfast"] == 0
+            and q["extra_in_ifcfast"] == 0
+            and q["value_mismatch"] == 0
+            and q["source_mismatch"] == 0
+        ),
+        "attributes": (
+            not any(a["mismatched"].values())
+            and not a["coverage_missing_in_ifcfast_by_class"]
+            and not a["coverage_extra_in_ifcfast_by_class"]
+        ),
+        "storeys": (
+            not any(s["mismatched"].values())
+            and not s["missing_in_ifcfast"]
+            and not s["extra_in_ifcfast"]
+        ),
+        "containment": not any(c["mismatched"].values()),
+    }
+
+
+def is_clean(rep: dict[str, Any]) -> bool:
+    return all(surface_status(rep).values())
 
 
 def _summary_line(rep: dict[str, Any]) -> str:

@@ -1,0 +1,10 @@
+# Known extraction divergences vs ifcopenshell on the real corpus, per
+# (model file name, surface). Strict: when the surface comes back clean the
+# corpus gate FAILS until the entry is removed. Surfaces: classifications,
+# materials, psets, quantities, attributes, storeys, containment.
+
+[[xfail]]
+model = "G55_ARK.ifc"
+surface = "containment"
+issue = "GH #236"
+note = "IfcRelContainedInSpatialStructure edges whose container is an IfcSpace are dropped; 625 products with storey_guid=None, 1250/39514 containment rows mismatched (discovery sweep 2026-10-13)"

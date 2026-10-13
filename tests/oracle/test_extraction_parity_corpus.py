@@ -14,11 +14,27 @@ from __future__ import annotations
 
 import json
 import os
+import tomllib
 from pathlib import Path
 
 import pytest
 
 from . import extraction_parity as ep
+
+_XFAIL = Path(__file__).with_name("extraction_xfail.toml")
+
+
+def _xfail_surfaces(model: str) -> dict[str, str]:
+    """surface → issue for registered divergences on this model (strict: a
+    registered surface that comes back clean FAILS — remove the entry)."""
+    if not _XFAIL.exists():
+        return {}
+    reg = tomllib.loads(_XFAIL.read_text())
+    return {
+        e["surface"]: e["issue"]
+        for e in reg.get("xfail", [])
+        if e["model"] == model
+    }
 
 
 def _corpus_paths() -> list[Path]:
@@ -42,6 +58,9 @@ def test_extraction_matches_ifcopenshell(path):
         + rep["psets"]["properties_compared"]
     )
     assert compared > 0, f"{path.name}: nothing compared"
-    assert ep.is_clean(rep), json.dumps(
-        {k: rep[k] for k in ("classifications", "materials", "psets")}, default=str
-    )
+    status = ep.surface_status(rep)
+    xfail = _xfail_surfaces(path.name)
+    stale = [f"{s} ({xfail[s]})" for s in xfail if status.get(s, True)]
+    assert not stale, f"{path.name}: registered divergence now clean — remove from extraction_xfail.toml: {stale}"
+    dirty = {s: rep[s] for s, ok in status.items() if not ok and s not in xfail}
+    assert not dirty, json.dumps(dirty, default=str)
