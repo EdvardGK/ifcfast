@@ -17,14 +17,17 @@
 //! 4-point lists + 2 `IfcArcIndex` semicircles) collapse to square
 //! prisms — see GH #48.
 //!
-//! Sampling density is `profile::circle_samples` per full circle (8..=32
-//! from the arc radius, GH #170), scaled by arc angle — a metre-radius
-//! semicircle gets 16 chord segments.
+//! Sampling density is `profile::arc_samples_per_turn` — the 0.5 mm
+//! sagitta rule of GH #170 without the 32-per-turn cap (GH #218) — scaled
+//! by arc angle, 2..=`MAX_ARC_CHORDS` chords per arc: a metre-radius
+//! semicircle gets 50 chords, a 16.5° arc at R = 98 m gets 45. The arc's
+//! endpoints are emitted verbatim (they are the neighbouring segments'
+//! points too).
 
-use glam::{Vec2, Vec3};
+use glam::{DVec2, Vec2, Vec3};
 
 use crate::lexer::{parse_field, split_top_level_args, Field};
-use crate::mesh::profile::{arc_area_scale, chord_count, circle_samples};
+use crate::mesh::profile::{arc_area_scale_pinned, arc_chord_count, arc_samples_per_turn};
 
 /// Parse a typed inline value such as `IFCARCINDEX((1,2,3))` — returns
 /// `(name, body)` where `body` is the bytes between the outer `(` and
@@ -224,38 +227,36 @@ fn append_dedup_3d(out: &mut Vec<Vec3>, samples: &[Vec3]) {
     out.extend_from_slice(&samples[start..]);
 }
 
-/// Unique circle through three 2D points. `None` for collinear inputs.
-fn circumcircle_2d(p1: Vec2, p2: Vec2, p3: Vec2) -> Option<(Vec2, f32)> {
-    let (ax, ay) = (p1.x, p1.y);
-    let (bx, by) = (p2.x, p2.y);
-    let (cx, cy) = (p3.x, p3.y);
-    let d = 2.0 * (ax * (by - cy) + bx * (cy - ay) + cx * (ay - by));
+/// Unique circle through three 2D points, in f64 relative to `p1` (GH
+/// #218): Revit profile coordinates reach 3.6e5 mm, where the f32
+/// `x² + y²` terms of the textbook formula carry an ulp of ~8 000 mm² and
+/// put a 9 m arc's centre millimetres off (5.3 mm bbox error on a KNM
+/// opening). `None` for collinear inputs.
+fn circumcircle_2d(p1: DVec2, p2: DVec2, p3: DVec2) -> Option<(DVec2, f64)> {
+    let (b, c) = (p2 - p1, p3 - p1);
+    let d = 2.0 * b.perp_dot(c);
     if d.abs() < 1e-12 {
         return None;
     }
-    let a2 = ax * ax + ay * ay;
-    let b2 = bx * bx + by * by;
-    let c2 = cx * cx + cy * cy;
-    let ux = (a2 * (by - cy) + b2 * (cy - ay) + c2 * (ay - by)) / d;
-    let uy = (a2 * (cx - bx) + b2 * (ax - cx) + c2 * (bx - ax)) / d;
-    let center = Vec2::new(ux, uy);
-    let r = (p1 - center).length();
+    let (b2, c2) = (b.length_squared(), c.length_squared());
+    let u = DVec2::new(c.y * b2 - b.y * c2, b.x * c2 - c.x * b2) / d;
+    let r = u.length();
     if !r.is_finite() || r <= 0.0 {
         return None;
     }
-    Some((center, r))
+    Some((p1 + u, r))
 }
 
 /// Sample the unique arc from `p1` to `p3` passing through `mid` —
-/// inclusive of both endpoints. Sampling density is
-/// [`circle_samples`] per full turn for the arc's radius (`unit_scale`
-/// = metres per file unit), with a minimum of two chord segments per arc.
+/// inclusive of both endpoints, which are `p1` / `p3` verbatim. Sampling
+/// density is [`arc_samples_per_turn`] for the arc's radius (`unit_scale`
+/// = metres per file unit), 2..=`MAX_ARC_CHORDS` chords per arc.
 fn arc_samples_2d(p1: Vec2, mid: Vec2, p3: Vec2, unit_scale: f32) -> Option<Vec<Vec2>> {
     arc_samples_2d_impl(p1, mid, p3, unit_scale, true)
 }
 
-/// `preserve_area`: scale the chord radius by [`arc_area_scale`] so the
-/// polygonal sector equals the circular one — right for the arcs of a
+/// `preserve_area`: scale the interior samples' radius by
+/// [`arc_area_scale_pinned`] so the polygonal sector equals the circular one — right for the arcs of a
 /// closed 2D profile (the QTO volume stays analytic for any chord
 /// count), wrong for a 3D directrix where the path itself must stay on
 /// the arc.
@@ -266,10 +267,14 @@ fn arc_samples_2d_impl(
     unit_scale: f32,
     preserve_area: bool,
 ) -> Option<Vec<Vec2>> {
-    let (center, radius) = circumcircle_2d(p1, mid, p3)?;
-    let theta1 = (p1 - center).y.atan2((p1 - center).x);
-    let theta_m = (mid - center).y.atan2((mid - center).x);
-    let theta3 = (p3 - center).y.atan2((p3 - center).x);
+    // f64 geometry, f32 only for the chord-count / area-scale rounding path
+    // and the emitted points.
+    let (center, radius) = circumcircle_2d(p1.as_dvec2(), mid.as_dvec2(), p3.as_dvec2())?;
+    let angle = |p: Vec2| {
+        let v = p.as_dvec2() - center;
+        v.y.atan2(v.x)
+    };
+    let (theta1, theta_m, theta3) = (angle(p1), angle(mid), angle(p3));
 
     let ccw_to_mid = wrap_pos(theta_m - theta1);
     let ccw_to_end = wrap_pos(theta3 - theta1);
@@ -284,20 +289,28 @@ fn arc_samples_2d_impl(
     if delta <= 0.0 {
         return Some(vec![p1, p3]);
     }
-    let step = std::f32::consts::TAU / circle_samples(radius, unit_scale) as f32;
-    let n = chord_count(delta / step).max(2);
-    let radius = if preserve_area {
-        radius * arc_area_scale(delta, n)
+    // Sagitta-honouring chord count, uncapped for arcs (GH #218): the old
+    // 32-per-turn cap gave a 16.5° arc at R = 98 m two chords (253 mm
+    // sagitta). The ratio is rounded in f32 through `chord_count`'s guard.
+    let delta32 = delta as f32;
+    let step = std::f32::consts::TAU / arc_samples_per_turn(radius as f32, unit_scale);
+    let n = arc_chord_count(delta32 / step);
+    // Interior samples only carry the sector-area radius; the endpoints are
+    // the authored points (shared with the neighbouring segments), emitted
+    // verbatim — scaling them jogged them (k − 1)·R outward (GH #218).
+    let interior_radius = if preserve_area {
+        radius * arc_area_scale_pinned(delta32, n) as f64
     } else {
         radius
     };
     let mut out = Vec::with_capacity(n + 1);
-    for i in 0..=n {
-        let t = i as f32 / n as f32;
-        let signed = if ccw { delta * t } else { -delta * t };
-        let a = theta1 + signed;
-        out.push(center + Vec2::new(a.cos() * radius, a.sin() * radius));
+    out.push(p1);
+    for i in 1..n {
+        let t = i as f64 / n as f64;
+        let a = theta1 + if ccw { delta * t } else { -delta * t };
+        out.push((center + DVec2::new(a.cos(), a.sin()) * interior_radius).as_vec2());
     }
+    out.push(p3);
     Some(out)
 }
 
@@ -325,13 +338,8 @@ fn arc_samples_3d(p1: Vec3, mid: Vec3, p3: Vec3, unit_scale: f32) -> Option<Vec<
     )
 }
 
-fn wrap_pos(a: f32) -> f32 {
-    let two_pi = std::f32::consts::TAU;
-    let mut x = a % two_pi;
-    if x < 0.0 {
-        x += two_pi;
-    }
-    x
+fn wrap_pos(a: f64) -> f64 {
+    a.rem_euclid(std::f64::consts::TAU)
 }
 
 #[cfg(test)]
@@ -361,52 +369,43 @@ mod tests {
     #[test]
     fn circumcircle_unit_circle() {
         let (c, r) = circumcircle_2d(
-            Vec2::new(1.0, 0.0),
-            Vec2::new(0.0, 1.0),
-            Vec2::new(-1.0, 0.0),
+            DVec2::new(1.0, 0.0),
+            DVec2::new(0.0, 1.0),
+            DVec2::new(-1.0, 0.0),
         )
         .unwrap();
-        assert!((c - Vec2::ZERO).length() < 1e-5);
-        assert!((r - 1.0).abs() < 1e-5);
+        assert!((c - DVec2::ZERO).length() < 1e-12);
+        assert!((r - 1.0).abs() < 1e-12);
     }
 
     #[test]
     fn circumcircle_collinear() {
         assert!(circumcircle_2d(
-            Vec2::new(0.0, 0.0),
-            Vec2::new(1.0, 0.0),
-            Vec2::new(2.0, 0.0),
+            DVec2::new(0.0, 0.0),
+            DVec2::new(1.0, 0.0),
+            DVec2::new(2.0, 0.0),
         )
         .is_none());
     }
 
     #[test]
     fn arc_semicircle_upper_half() {
-        // p1=(1,0), mid=(0,1), p3=(-1,0). Upper semicircle CCW. Should
-        // emit at least 16 chord segments (half of the 32 a 1 m radius gets).
-        let pts = arc_samples_2d(
-            Vec2::new(1.0, 0.0),
-            Vec2::new(0.0, 1.0),
-            Vec2::new(-1.0, 0.0),
-            1.0,
-        )
-        .unwrap();
-        assert!(pts.len() >= 17);
-        // All samples on the sector-area-preserving circle (GH #170):
-        // radius k = arc_area_scale(π, n) — 1.0032 for 16 chords.
-        let k = arc_area_scale(std::f32::consts::PI, pts.len() - 1);
-        assert!(k > 1.0 && k < 1.01, "k = {k}");
-        for p in &pts {
-            assert!((p.length() - k).abs() < 1e-4, "{p:?} vs r={k}");
+        // p1=(1,0), mid=(0,1), p3=(-1,0). Upper semicircle CCW, 1 m radius:
+        // the 0.5 mm sagitta needs ~99 chords per turn → 50 here.
+        let (p1, p3) = (Vec2::new(1.0, 0.0), Vec2::new(-1.0, 0.0));
+        let pts = arc_samples_2d(p1, Vec2::new(0.0, 1.0), p3, 1.0).unwrap();
+        assert_eq!(pts.len(), 51);
+        // Endpoints are the authored points, bit-for-bit (GH #218).
+        assert_eq!(pts.first().copied(), Some(p1));
+        assert_eq!(pts.last().copied(), Some(p3));
+        // Interior samples on the sector-area-preserving circle (GH #170):
+        // radius k = arc_area_scale_pinned(π, n).
+        let k = crate::mesh::profile::arc_area_scale_pinned(std::f32::consts::PI, 50);
+        assert!(k > 1.0 && k < 1.001, "k = {k}");
+        for p in &pts[1..pts.len() - 1] {
+            assert!((p.length() - k).abs() < 1e-5, "{p:?} vs r={k}");
+            assert!(p.y > 0.0);
         }
-        // All samples in upper half-plane (with eps for endpoints).
-        for p in &pts {
-            assert!(p.y >= -1e-4);
-        }
-        // Endpoints sit on the same rays as p1 / p3, pushed out to the
-        // area-preserving radius (the documented `(k − 1)·r` jog).
-        assert!((pts.first().unwrap() - Vec2::new(k, 0.0)).length() < 1e-4);
-        assert!((pts.last().unwrap() - Vec2::new(-k, 0.0)).length() < 1e-4);
     }
 
     #[test]
@@ -437,19 +436,18 @@ mod tests {
         // Segments = (IFCARCINDEX((1,2,3)), IFCARCINDEX((3,4,1)))
         let segs = b"IFCARCINDEX((1,2,3)),IFCARCINDEX((3,4,1))";
         let polyline = eval_segments_2d(&pts, segs, 1.0).unwrap();
-        // Should land somewhere near 2 * 16 = 32 chord segments.
-        // (Plus minus one for endpoint dedup.)
+        // 2 × 50 chords for a 1 m radius (0.5 mm sagitta), ± endpoint dedup.
         assert!(
-            polyline.len() >= 30 && polyline.len() <= 34,
-            "got {} samples — expected ~32",
+            (99..=102).contains(&polyline.len()),
+            "got {} samples — expected ~100",
             polyline.len()
         );
-        // All on the area-preserving circle (radius 1.0032 for 16 chords
-        // per semicircle — the polygon area is exactly π, see
+        // Authored points on the unit circle, interior samples on the
+        // area-preserving radius (the polygon area is exactly π, see
         // `two_arc_pipe_profile_is_area_exact_for_any_chord_count`).
         for p in &polyline {
             assert!(
-                (p.length() - 1.0).abs() < 5e-3 && p.length() >= 1.0 - 1e-4,
+                (p.length() - 1.0).abs() < 1e-3 && p.length() >= 1.0 - 1e-5,
                 "point {:?} not on the (area-preserving) unit circle",
                 p
             );
@@ -539,13 +537,14 @@ mod tests {
     }
 
     #[test]
-    fn exact_semicircle_is_16_chords_in_every_orientation() {
-        // r = 200 m -> 32 chords per full turn, so an exact semicircle is
-        // 16 chords / 17 samples. A bare `ceil` on the f32 angle ratio
-        // gives 17 chords wherever libm's `atan2` returns PI + 1 ulp
-        // (Apple), which made the far-origin duct gate platform-dependent
-        // (GH #188).
-        let r = 200.0f32;
+    fn exact_semicircle_is_8_chords_in_every_orientation() {
+        // r = 25 mm in a millimetre file -> 16 chords per full turn by the
+        // sagitta rule, so an exact semicircle is 8 chords / 9 samples. A
+        // bare `ceil` on the f32 angle ratio gives 9 chords wherever libm's
+        // `atan2` returns PI + 1 ulp (Apple), which made the far-origin
+        // duct gate platform-dependent (GH #188).
+        let r = 25.0f32;
+        assert_eq!(crate::mesh::profile::circle_samples(r, 0.001), 16);
         let (east, west) = (Vec2::new(r, 0.0), Vec2::new(-r, 0.0));
         let (north, south) = (Vec2::new(0.0, r), Vec2::new(0.0, -r));
         for (p1, mid, p3) in [
@@ -554,14 +553,164 @@ mod tests {
             (east, south, west), // CW under the bottom
             (west, south, east), // CCW under the bottom
         ] {
-            let pts = arc_samples_2d(p1, mid, p3, 1.0).unwrap();
-            assert_eq!(pts.len(), 17, "semicircle {p1:?} -> {mid:?} -> {p3:?}");
+            let pts = arc_samples_2d(p1, mid, p3, 0.001).unwrap();
+            assert_eq!(pts.len(), 9, "semicircle {p1:?} -> {mid:?} -> {p3:?}");
         }
         // Both halves of a circle built from two IfcArcIndex semicircles
         // must agree, or one side of a duct is finer than the other.
-        let top = arc_samples_2d(east, north, west, 1.0).unwrap();
-        let bottom = arc_samples_2d(west, south, east, 1.0).unwrap();
+        let top = arc_samples_2d(east, north, west, 0.001).unwrap();
+        let bottom = arc_samples_2d(west, south, east, 0.001).unwrap();
         assert_eq!(top.len(), bottom.len());
+    }
+
+    /// Largest deviation of the sampled polyline from the true arc
+    /// (centre `c`, radius `r`): every vertex's radial offset and every
+    /// chord midpoint's inset, in f64.
+    fn max_arc_deviation(pts: &[Vec2], c: glam::DVec2, r: f64) -> f64 {
+        let d = |p: glam::DVec2| ((p - c).length() - r).abs();
+        let mut worst = 0.0f64;
+        for w in pts.windows(2) {
+            let (a, b) = (w[0].as_dvec2(), w[1].as_dvec2());
+            worst = worst.max(d(a)).max(d((a + b) * 0.5));
+        }
+        worst
+    }
+
+    fn on_circle(c: glam::DVec2, r: f64, deg: f64) -> Vec2 {
+        let a = deg.to_radians();
+        (c + glam::DVec2::new(a.cos(), a.sin()) * r).as_vec2()
+    }
+
+    #[test]
+    fn huge_radius_arc_honours_the_sagitta_and_keeps_its_endpoints() {
+        // GH #218, KNM_ARK covering 14$lUH…: a 16.5° arc at R = 98 m in a
+        // millimetre file. The 32-per-turn cap gave 2 chords (253 mm
+        // sagitta) and pushed both endpoints (k − 1)·R = 169 mm outward.
+        let (c, r) = (glam::DVec2::new(1200.0, -300.0), 98_000.0f64);
+        let (p1, mid, p3) = (
+            on_circle(c, r, 80.0),
+            on_circle(c, r, 88.25),
+            on_circle(c, r, 96.5),
+        );
+        for (a, m, b) in [(p1, mid, p3), (p3, mid, p1)] {
+            let pts = arc_samples_2d(a, m, b, 0.001).unwrap();
+            assert_eq!(pts.first().copied(), Some(a));
+            assert_eq!(pts.last().copied(), Some(b));
+            let n = pts.len() - 1;
+            assert!((40..=50).contains(&n), "{n} chords");
+            // 0.5 mm tolerance + f32 noise of 1e5-mm coordinates.
+            let dev = max_arc_deviation(&pts, c, r);
+            assert!(dev < 0.55, "deviation {dev} mm");
+        }
+        // A 3D directrix arc gets the same count, endpoints verbatim.
+        let lift = |p: Vec2| Vec3::new(p.x, p.y, 7.0);
+        let pts3 = arc_samples_3d(lift(p1), lift(mid), lift(p3), 0.001).unwrap();
+        assert_eq!(pts3.first().copied(), Some(lift(p1)));
+        assert!((pts3.last().unwrap() - lift(p3)).length() < 0.02);
+        assert!((40..=50).contains(&(pts3.len() - 1)));
+    }
+
+    #[test]
+    fn arc_far_from_the_profile_origin_stays_on_its_circle() {
+        // GH #218, KNM_ARK opening 1_Qi_zRCcz5PCLiRPmY$_P: Revit profile
+        // points at ~3.6e5 mm. The f32 circumcircle put a 9.2 m arc's
+        // centre millimetres off and the bbox 5.3 mm inside the curve.
+        let (c, r) = (glam::DVec2::new(353_756.0, 320_640.0), 9_220.0f64);
+        let (p1, mid, p3) = (
+            on_circle(c, r, -13.0),
+            on_circle(c, r, 0.0),
+            on_circle(c, r, 12.4),
+        );
+        let pts = arc_samples_2d(p1, mid, p3, 0.001).unwrap();
+        // 0.5 mm tolerance + f32 ulp (0.03 mm) of the emitted points.
+        let dev = max_arc_deviation(&pts, c, r);
+        assert!(dev < 0.55, "deviation {dev} mm");
+        let xmax = pts.iter().map(|p| p.x as f64).fold(f64::MIN, f64::max);
+        assert!(
+            (xmax - (c.x + r)).abs() < 0.55,
+            "xmax {xmax} vs {}",
+            c.x + r
+        );
+    }
+
+    #[test]
+    fn arc_chords_are_bounded_per_arc() {
+        // A near-full turn at 10 km radius would need ~14 000 chords.
+        let c = glam::DVec2::ZERO;
+        let r = 10_000.0f64;
+        let pts = arc_samples_2d(
+            on_circle(c, r, 0.0),
+            on_circle(c, r, 170.0),
+            on_circle(c, r, 340.0),
+            1.0,
+        )
+        .unwrap();
+        assert_eq!(pts.len() - 1, crate::mesh::profile::MAX_ARC_CHORDS);
+    }
+
+    fn segments_cross(a: Vec2, b: Vec2, c: Vec2, d: Vec2) -> bool {
+        let (a, b, c, d) = (a.as_dvec2(), b.as_dvec2(), c.as_dvec2(), d.as_dvec2());
+        let o = |p: glam::DVec2, q: glam::DVec2, r: glam::DVec2| (q - p).perp_dot(r - p);
+        let (d1, d2) = (o(c, d, a), o(c, d, b));
+        let (d3, d4) = (o(a, b, c), o(a, b, d));
+        (d1 > 0.0) != (d2 > 0.0) && (d3 > 0.0) != (d4 > 0.0) && d1 != 0.0 && d3 != 0.0
+    }
+
+    #[test]
+    fn one_millimetre_crescent_between_two_huge_arcs_stays_simple() {
+        // GH #218, KNM_ARK walls 0DzHyetFz01QAC_Uwv$SXu / …SZL: a sliver
+        // bounded by two R ≈ 98 m arcs sharing their endpoints, 1 mm wide
+        // at the middle. Jogged endpoints + 2-chord arcs made the polygon
+        // self-intersect and the extrusion over-count by 14–21 %.
+        let r = 98_000.0f64;
+        let half = 8.25f64.to_radians();
+        let (a, b) = (
+            glam::DVec2::new(r * half.cos(), -r * half.sin()),
+            glam::DVec2::new(r * half.cos(), r * half.sin()),
+        );
+        // Shift the profile next to the origin, as the local profile frame does.
+        let o = glam::DVec2::new(r * half.cos(), 0.0);
+        let pts = vec![
+            (a - o).as_vec2(),
+            (glam::DVec2::new(r, 0.0) - o).as_vec2(),
+            (b - o).as_vec2(),
+            (glam::DVec2::new(r - 1.0, 0.0) - o).as_vec2(),
+        ];
+        let segs = b"IFCARCINDEX((1,2,3)),IFCARCINDEX((3,4,1))";
+        let poly = eval_segments_2d(&pts, segs, 0.001).unwrap();
+        let mut ring = poly.clone();
+        if ring.first() == ring.last() {
+            ring.pop();
+        }
+        let n = ring.len();
+        for i in 0..n {
+            for j in i + 2..n {
+                if i == 0 && j == n - 1 {
+                    continue;
+                }
+                let (p, q) = (ring[i], ring[(i + 1) % n]);
+                let (u, v) = (ring[j], ring[(j + 1) % n]);
+                assert!(!segments_cross(p, q, u, v), "edges {i} and {j} cross");
+            }
+        }
+        // Analytic crescent: outer circular segment minus inner one, both
+        // on chord AB (inner circle through A, B and (r − 1, 0)).
+        let chord = (b - a).length();
+        let seg = |rad: f64| {
+            let phi = 2.0 * (chord / (2.0 * rad)).asin();
+            rad * rad / 2.0 * (phi - phi.sin())
+        };
+        let h = 0.5 * chord;
+        let s_in = r - 1.0 - r * half.cos(); // inner sagitta
+        let r_in = (h * h + s_in * s_in) / (2.0 * s_in);
+        let want = seg(r) - seg(r_in);
+        // f64 shoelace: f32 loses the 1 mm sliver against 14 m coordinates.
+        let got = (0..n)
+            .map(|i| ring[i].as_dvec2().perp_dot(ring[(i + 1) % n].as_dvec2()))
+            .sum::<f64>()
+            .abs()
+            / 2.0;
+        assert!(((got - want) / want).abs() < 0.01, "{got} vs {want} mm²");
     }
 
     #[test]

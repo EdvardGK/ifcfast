@@ -14,8 +14,19 @@
 //! `π·a·b` for every segment count — extruded circular volumes are exact
 //! instead of under-reporting by `2π²/(3n²)` (0.64 % at 32, 10 % at 8).
 //! Profile arcs (trimmed conics, `IfcArcIndex`) get the per-sector
-//! version ([`arc_area_scale`]) so a Revit pipe authored as two
-//! semicircles is exact too; only 3D directrix arcs stay on the curve.
+//! version so a Revit pipe authored as two semicircles is exact too;
+//! only 3D directrix arcs stay on the curve.
+//!
+//! Profile *arcs* (GH #218) are not held to the 32-per-turn cap: their
+//! chord count honours the 0.5 mm sagitta for every radius
+//! ([`arc_samples_per_turn`]), bounded by [`MAX_ARC_CHORDS`] per arc, and
+//! their first/last samples are the authored points themselves — shared
+//! with the neighbouring segments — so only interior samples carry the
+//! sector-area radius ([`arc_area_scale_pinned`]). Before, a 16.5° arc at
+//! R = 98 m got 2 chords (253 mm sagitta) and its endpoints jogged 169 mm
+//! outward; ~1 mm crescent slivers self-intersected. Full circles keep the
+//! `[MIN_CURVE_SAMPLES, CURVE_SAMPLES]` clamp: no shared endpoints, exact
+//! area, and a bounded `≤ 0.32 %·r` radial deviation.
 
 use glam::{DVec2, Mat3, Vec2, Vec3};
 
@@ -44,6 +55,47 @@ pub fn circle_samples(radius: f32, unit_scale: f32) -> usize {
         return CURVE_SAMPLES;
     }
     n.clamp(MIN_CURVE_SAMPLES, CURVE_SAMPLES)
+}
+
+/// Upper bound on the chords of ONE profile arc (GH #218). Honouring the
+/// sagitta needs ~45 chords for a 16.5° arc at R = 98 m and ~250 for a
+/// quarter turn at that radius; the bound only stops a pathological
+/// radius/sweep from emitting an unbounded polygon (beyond it the sagitta
+/// grows past the tolerance instead).
+pub const MAX_ARC_CHORDS: usize = 256;
+
+/// Chords per full turn for a profile ARC of `radius` (file units) — the
+/// sagitta rule of [`circle_samples`] without its [`CURVE_SAMPLES`] cap
+/// (GH #218). Below the cap the value is exactly `circle_samples` (same
+/// f32 rounding, so small arcs keep their tessellation bit-for-bit); at
+/// and above it the uncapped `π / acos(1 − tol / r)` in f64, spelled
+/// `acos(1 − x) = 2·asin(√(x/2))` because `1 − x` rounds to 1 in f32 once
+/// r passes ~4 km. Callers turn it into a chord count for the arc's sweep
+/// through [`chord_count`] and clamp to `[2, MAX_ARC_CHORDS]`.
+pub fn arc_samples_per_turn(radius: f32, unit_scale: f32) -> f32 {
+    let capped = circle_samples(radius, unit_scale);
+    if capped < CURVE_SAMPLES {
+        return capped as f32;
+    }
+    let r_m = radius.abs() as f64 * unit_scale as f64;
+    if !(r_m.is_finite() && r_m > CHORD_TOLERANCE_M as f64) {
+        return capped as f32;
+    }
+    let half_chord_angle = 2.0 * (CHORD_TOLERANCE_M as f64 / (2.0 * r_m)).sqrt().asin();
+    let per_turn = (std::f64::consts::PI / half_chord_angle) as f32;
+    if per_turn.is_finite() {
+        per_turn.max(CURVE_SAMPLES as f32)
+    } else {
+        capped as f32
+    }
+}
+
+/// Chord count for a profile arc whose sweep spans `ratio` chord angles
+/// (`per_turn · sweep / 2π`): [`chord_count`]'s guarded ceil, at least two
+/// chords (an arc is never collapsed to its chord), at most
+/// [`MAX_ARC_CHORDS`].
+pub fn arc_chord_count(ratio: f32) -> usize {
+    chord_count(ratio).clamp(2, MAX_ARC_CHORDS)
 }
 
 /// Guard band subtracted from a chord-count ratio before rounding up.
@@ -97,6 +149,29 @@ pub fn arc_area_scale(sweep: f32, n: usize) -> f32 {
         return 1.0;
     }
     (sweep.abs() / (n * t.sin())).sqrt()
+}
+
+/// Radius multiplier for the INTERIOR samples of an arc of `sweep`
+/// radians sampled as `n` chords whose two endpoints stay on the authored
+/// radius (GH #218): the polygonal sector (centre, endpoint, `n − 1`
+/// interior samples at `k·r`, endpoint) then has exactly the circular
+/// sector's area `sweep·r²/2`. With `k₀² = t / sin t` (`t = sweep / n`) the
+/// sector area condition `2k + (n − 2)k² = n·k₀²` gives
+/// `k = n·k₀² / (1 + √(1 + (n − 2)·n·k₀²))` — `k₀²` for `n = 2`, → `k₀` as
+/// `n` grows. Endpoints are shared with the neighbouring segments, so
+/// moving them (as the uniform [`arc_area_scale`] did) opened a radial jog
+/// of `(k₀ − 1)·r` — 169 mm on a 2-chord R = 98 m arc. f64 inside; the
+/// same `t > 1e-6` guard as [`arc_area_scale`].
+pub fn arc_area_scale_pinned(sweep: f32, n: usize) -> f32 {
+    let n = n.max(1) as f64;
+    let sweep = sweep.abs() as f64;
+    let t = sweep / n;
+    if !(t.is_finite() && t > 1e-6) {
+        return 1.0;
+    }
+    let c = n * t / t.sin();
+    let k = c / (1.0 + (1.0 + (n - 2.0) * c).sqrt());
+    k as f32
 }
 
 /// Metres per file length unit for the mesh pass — memoized on the table,
@@ -596,24 +671,27 @@ fn conic_arc(
     let coincident = COINCIDENT_TRIM_M / length_scale(table) as f64;
     let (start, end) = arc_span(a1, a2, sense, a.abs().max(b.abs()), coincident)?;
     let sweep = (end - start).abs();
-    // Segments per full turn from the larger semi-axis (GH #170), scaled
-    // by the swept angle. Deliberately the same f32 rounding as before the
-    // f64 move, so no ordinary arc changes its chord count.
-    let per_turn = circle_samples(a.abs().max(b.abs()) as f32, length_scale(table));
+    // Chords from the larger semi-axis by the sagitta rule (GH #170),
+    // uncapped for arcs (GH #218), scaled by the swept angle. The same f32
+    // rounding as before the f64 move, so arcs below the old 32-per-turn
+    // cap keep their chord count exactly.
+    let per_turn = arc_samples_per_turn(a.abs().max(b.abs()) as f32, length_scale(table));
     let sweep32 = sweep as f32;
-    let n = chord_count((per_turn as f32) * sweep32 / std::f32::consts::TAU).max(2);
-    // Sector-area-preserving radius (see `arc_area_scale`): the profile's
-    // volume no longer depends on the chord count. The ellipse is the
-    // affine image of the circle, so the same factor on both semi-axes
-    // preserves its sector area too.
-    let k = arc_area_scale(sweep32, n) as f64;
-    let (a, b) = (a * k, b * k);
+    let n = arc_chord_count(per_turn * sweep32 / std::f32::consts::TAU);
+    // Sector-area-preserving radius for the interior samples only (see
+    // `arc_area_scale_pinned`): the profile's volume does not depend on the
+    // chord count, and the trim points — shared with the neighbouring
+    // segments — stay on the conic (GH #218). The ellipse is the affine
+    // image of the circle, so the same factor on both semi-axes preserves
+    // its sector area too.
+    let k = arc_area_scale_pinned(sweep32, n) as f64;
     let (cos, sin) = (ref_dir.x, ref_dir.y);
     let pts = (0..=n)
         .map(|i| {
             let t = start + (end - start) * (i as f64 / n as f64);
-            let lx = a * t.cos();
-            let ly = b * t.sin();
+            let s = if i == 0 || i == n { 1.0 } else { k };
+            let lx = s * a * t.cos();
+            let ly = s * b * t.sin();
             Vec2::new(
                 (center.x + cos * lx - sin * ly) as f32,
                 (center.y + sin * lx + cos * ly) as f32,
@@ -1909,6 +1987,143 @@ ENDSEC;\nEND-ISO-10303-21;\n";
         let want = std::f32::consts::PI * 7.5 * 7.5;
         let got = polygon_area(&poly.outer).abs();
         assert!(((got - want) / want).abs() < 1e-4, "{got} vs {want}");
+    }
+
+    /// A closed profile of one `IfcTrimmedCurve` arc (16.5° on a conic of
+    /// semi-axes `a`, `b` mm, trims 80°..96.5° in radians) + the closing
+    /// polyline through the same two trim points (GH #218).
+    fn huge_trimmed_arc_ifc(basis: &str, p1: &str, p2: &str) -> String {
+        format!(
+            "ISO-10303-21;\nHEADER;\nFILE_DESCRIPTION(('ViewDefinition [ReferenceView]'),'2;1');\n\
+FILE_NAME('a.ifc','2026-10-12T00:00:00',('test'),('skiplum'),'ifcfast','ifcfast','');\n\
+FILE_SCHEMA(('IFC4'));\nENDSEC;\nDATA;\n\
+#1=IFCUNITASSIGNMENT((#2,#3));\n\
+#2=IFCSIUNIT(*,.LENGTHUNIT.,.MILLI.,.METRE.);\n\
+#3=IFCSIUNIT(*,.PLANEANGLEUNIT.,$,.RADIAN.);\n\
+#10=IFCCARTESIANPOINT((0.,0.));\n\
+#11=IFCDIRECTION((1.,0.));\n\
+#12=IFCAXIS2PLACEMENT2D(#10,#11);\n\
+#13={basis};\n\
+#14=IFCTRIMMEDCURVE(#13,(IFCPARAMETERVALUE(1.3962634015954636)),(IFCPARAMETERVALUE(1.684242728174528)),.T.,.PARAMETER.);\n\
+#20=IFCCARTESIANPOINT(({p2}));\n\
+#21=IFCCARTESIANPOINT(({p1}));\n\
+#22=IFCPOLYLINE((#20,#21));\n\
+#16=IFCCOMPOSITECURVESEGMENT(.CONTINUOUS.,.T.,#14);\n\
+#17=IFCCOMPOSITECURVESEGMENT(.CONTINUOUS.,.T.,#22);\n\
+#18=IFCCOMPOSITECURVE((#16,#17),.F.);\n\
+#19=IFCARBITRARYCLOSEDPROFILEDEF(.AREA.,$,#18);\n\
+ENDSEC;\nEND-ISO-10303-21;\n"
+        )
+    }
+
+    #[test]
+    fn huge_radius_trimmed_circle_arc_honours_the_sagitta_and_keeps_its_trim_points() {
+        // GH #218 on the trimmed-conic path: a 16.5° arc at R = 98 m (mm
+        // file) got 2 chords under the 32-per-turn cap and both trim points
+        // jogged (k − 1)·R = 169 mm off the conic.
+        let (p1, p2) = (
+            DVec2::new(17017.52141135918, 96511.15979519639),
+            DVec2::new(-11093.914949254857, 97370.04185630557),
+        );
+        let ifc = huge_trimmed_arc_ifc(
+            "IFCCIRCLE(#12,98000.)",
+            "17017.52141135918,96511.15979519639",
+            "-11093.914949254857,97370.04185630557",
+        );
+        let table = EntityTable::build(ifc.as_bytes());
+        let poly = extract(&table, 19).expect("trimmed arc + polyline resolves");
+        let ring = &poly.outer;
+        // Every vertex is within the tolerance of R (f32 at 1e5 mm adds
+        // ~0.01 mm); every chord midpoint too.
+        let r = 98_000.0f64;
+        let mut worst = 0.0f64;
+        let mut on_arc = 0;
+        for w in ring.windows(2) {
+            let (a, b) = (w[0].as_dvec2(), w[1].as_dvec2());
+            if (a - b).length() > 5_000.0 {
+                continue; // the closing chord
+            }
+            on_arc += 1;
+            worst = worst
+                .max((a.length() - r).abs())
+                .max((((a + b) * 0.5).length() - r).abs());
+        }
+        assert!((40..=50).contains(&on_arc), "{on_arc} chords");
+        assert!(worst < 0.55, "deviation {worst} mm");
+        // Both trim points are on the circle, where the polyline starts/ends.
+        for p in [p1, p2] {
+            let d = ring
+                .iter()
+                .map(|q| (q.as_dvec2() - p).length())
+                .fold(f64::INFINITY, f64::min);
+            assert!(d < 0.02, "trim point {p:?} off by {d} mm");
+        }
+    }
+
+    #[test]
+    fn huge_trimmed_ellipse_arc_keeps_its_trim_points() {
+        // Same on an IfcEllipse (semi-axes 98 m × 60 m): the trim points
+        // stay on the ellipse; interior samples carry the area factor.
+        let (p1, p2) = (
+            DVec2::new(17017.52141135918, 59088.465180732484),
+            DVec2::new(-11093.914949254857, 59614.311340595246),
+        );
+        let ifc = huge_trimmed_arc_ifc(
+            "IFCELLIPSE(#12,98000.,60000.)",
+            "17017.52141135918,59088.465180732484",
+            "-11093.914949254857,59614.311340595246",
+        );
+        let table = EntityTable::build(ifc.as_bytes());
+        let poly = extract(&table, 19).expect("trimmed ellipse arc resolves");
+        for p in [p1, p2] {
+            let d = poly
+                .outer
+                .iter()
+                .map(|q| (q.as_dvec2() - p).length())
+                .fold(f64::INFINITY, f64::min);
+            assert!(d < 0.02, "trim point {p:?} off by {d} mm");
+        }
+        assert!(poly.outer.len() > 20, "{} vertices", poly.outer.len());
+    }
+
+    #[test]
+    fn pinned_arc_area_scale_is_sector_exact_with_authored_endpoints() {
+        // Endpoints at r, n − 1 interior samples at k·r: the polygonal
+        // sector equals π r² / 2 exactly, for any chord count.
+        for n in [2usize, 3, 5, 9, 16, 50] {
+            let r = 7.5f32;
+            let k = arc_area_scale_pinned(std::f32::consts::PI, n);
+            let mut poly = vec![Vec2::ZERO];
+            for i in 0..=n {
+                let t = std::f32::consts::PI * i as f32 / n as f32;
+                let s = if i == 0 || i == n { 1.0 } else { k };
+                poly.push(Vec2::new(r * s * t.cos(), r * s * t.sin()));
+            }
+            let want = std::f32::consts::PI * r * r / 2.0;
+            let got = polygon_area(&poly);
+            assert!(((got - want) / want).abs() < 1e-5, "n={n}: {got} vs {want}");
+        }
+        // n = 2 is k₀², and the factor tends to the uniform one.
+        let k0 = arc_area_scale(1.0, 2);
+        assert!((arc_area_scale_pinned(1.0, 2) - k0 * k0).abs() < 1e-6);
+        assert!((arc_area_scale_pinned(0.3, 200) - arc_area_scale(0.3, 200)).abs() < 1e-6);
+        assert_eq!(arc_area_scale_pinned(0.0, 4), 1.0);
+    }
+
+    #[test]
+    fn arc_samples_per_turn_is_circle_samples_below_the_cap_and_uncapped_above() {
+        for r in [0.0f32, 0.002, 0.0075, 0.025, 0.05, 0.1] {
+            assert_eq!(arc_samples_per_turn(r, 1.0), circle_samples(r, 1.0) as f32);
+        }
+        // 1 m: π / acos(1 − 0.0005) ≈ 99.3; 98 m: ≈ 983; 6.5e6 m stays finite.
+        assert!((arc_samples_per_turn(1.0, 1.0) - 99.34).abs() < 0.05);
+        assert!((arc_samples_per_turn(98_000.0, 0.001) - 983.4).abs() < 0.5);
+        let huge = arc_samples_per_turn(6.5e6, 1.0);
+        assert!(huge.is_finite() && huge > 2.0e5, "{huge}");
+        // The count is clamped per arc.
+        assert_eq!(arc_chord_count(0.01), 2);
+        assert_eq!(arc_chord_count(f32::NAN), 2);
+        assert_eq!(arc_chord_count(1.0e6), MAX_ARC_CHORDS);
     }
 
     #[test]

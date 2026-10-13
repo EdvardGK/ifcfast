@@ -43,7 +43,7 @@ pub type Rollup = HashMap<String, (Option<f64>, Option<f64>, Option<f64>)>;
 /// Mirrors `python/ifcfast/header.py::_CACHE_SCHEMA_VERSION`. Bump in
 /// lockstep — it is hashed into `cache_key`, so a mismatch shows up as a
 /// changed key rather than stale data.
-const CACHE_SCHEMA_VERSION: u32 = 39;
+const CACHE_SCHEMA_VERSION: u32 = 40;
 const HASH_HEAD_BYTES: usize = 4 * 1024 * 1024;
 const HASH_TAIL_BYTES: usize = 4 * 1024 * 1024;
 /// `header.py::_HEADER_READ_BYTES` — the window FILE_SCHEMA is read from.
@@ -2121,9 +2121,13 @@ mod tests {
     const DUCT_B: (&str, f64, f64) = ("1VluSltEX0WftNcGXN68P0", 92_521.899_3, 1_247_315.537_2);
     const Z_BOTTOM_M: f64 = 127.25;
     const Z_TOP_M: f64 = 134.636_5;
-    /// `200 mm * arc_area_scale(pi, 16)` — the area-preserving radius the
-    /// adaptive tessellator (GH #170) samples a 16-chord semicircle at.
-    const OUTER_R_MM: f64 = 200.644_4;
+    /// The duct's authored outer radius: the four IfcArcIndex points stay
+    /// on it verbatim (GH #218).
+    const AUTHORED_R_MM: f64 = 200.0;
+    /// `200 mm * arc_area_scale_pinned(pi, 23)` — the area-preserving
+    /// radius of the interior samples of a 23-chord semicircle (0.5 mm
+    /// sagitta at r = 200 mm, GH #170 / #218).
+    const OUTER_R_MM: f64 = 200.325_5;
 
     fn axis_of(guid: &str) -> (f64, f64) {
         if guid == DUCT_A.0 {
@@ -2140,7 +2144,10 @@ mod tests {
     /// `positions` are shifted world metres; `shift` puts them back.
     struct Probe {
         outer_n: usize,
-        outer_mean_mm: f64,
+        /// Outer vertices on the authored radius (the arc endpoints).
+        authored_n: usize,
+        /// Largest distance (mm) of an outer vertex from the nearer of the
+        /// two expected rings — f32 quantisation shows up here.
         outer_spread_mm: f64,
         centre: (f64, f64),
         z_min: f64,
@@ -2168,12 +2175,14 @@ mod tests {
                 outer.push(r_mm);
             }
         }
-        let mn = outer.iter().cloned().fold(f64::INFINITY, f64::min);
-        let mx = outer.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        let off = |r: f64| (r - AUTHORED_R_MM).abs().min((r - OUTER_R_MM).abs());
         Probe {
             outer_n: outer.len(),
-            outer_mean_mm: outer.iter().sum::<f64>() / outer.len() as f64,
-            outer_spread_mm: mx - mn,
+            authored_n: outer
+                .iter()
+                .filter(|&&r| (r - AUTHORED_R_MM).abs() < 0.05)
+                .count(),
+            outer_spread_mm: outer.iter().map(|&r| off(r)).fold(0.0, f64::max),
             centre: ((x0 + x1) / 2.0, (y0 + y1) / 2.0),
             z_min: z0,
             z_max: z1,
@@ -2211,14 +2220,14 @@ mod tests {
         assert!(pr.outer_n >= 32, "{tag}: only {} outer verts", pr.outer_n);
         assert!(
             pr.outer_spread_mm < 0.05,
-            "{tag} {guid}: outer radius spread {:.4} mm (mean {:.4}) — f32 quantisation at NTM magnitude",
-            pr.outer_spread_mm,
-            pr.outer_mean_mm
+            "{tag} {guid}: outer vertex {:.4} mm off the {AUTHORED_R_MM}/{OUTER_R_MM} mm rings — f32 quantisation at NTM magnitude",
+            pr.outer_spread_mm
         );
         assert!(
-            (pr.outer_mean_mm - OUTER_R_MM).abs() < 0.01,
-            "{tag} {guid}: outer radius {:.4} mm, expected {OUTER_R_MM}",
-            pr.outer_mean_mm
+            pr.authored_n >= 2 && pr.authored_n < pr.outer_n,
+            "{tag} {guid}: {} of {} outer vertices on the authored radius",
+            pr.authored_n,
+            pr.outer_n
         );
         // positions + shift reconstruct absolute world metres: the XY
         // bbox centre is the placement point and the z span is the

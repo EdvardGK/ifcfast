@@ -41,12 +41,26 @@ DUCT_AXIS = {
     "1VluSltEX0WftNcGXN68P0": (92_521.899_3, 1_247_315.537_2),
 }
 Z_SPAN_M = (127.25, 134.636_5)
-# 200 mm * arc_area_scale(pi, 16) — the area-preserving radius the
-# adaptive tessellator (GH #170) samples a 16-chord semicircle at.
-OUTER_R_MM = 200.644_4
-# The bound the issue asked CI to hold: a known IfcArcIndex circle comes
-# back with a radius spread below 0.05 mm.
+# The duct's authored outer radius: the four IfcArcIndex points stay on
+# it verbatim (GH #218).
+AUTHORED_R_MM = 200.0
+# 200 mm * arc_area_scale_pinned(pi, 23) — the area-preserving radius of
+# the interior samples of a 23-chord semicircle (0.5 mm sagitta at
+# r = 200 mm, GH #170 / #218).
+OUTER_R_MM = 200.325_5
+# The bound the issue asked CI to hold: every outer vertex of a known
+# IfcArcIndex circle lies within 0.05 mm of its expected ring.
 SPREAD_TOL_MM = 0.05
+
+
+def ring_spread(outer):
+    """Largest distance (mm) of an outer vertex from the nearer of the two
+    expected rings (authored endpoints / area-preserving interior)."""
+    return float(np.minimum(abs(outer - AUTHORED_R_MM), abs(outer - OUTER_R_MM)).max())
+
+
+def authored_count(outer):
+    return int((abs(outer - AUTHORED_R_MM) < SPREAD_TOL_MM).sum())
 
 
 # ---------------------------------------------------------------------
@@ -197,14 +211,14 @@ def test_far_origin_duct_is_round_in_both_writer_paths(
         pts = local + shift
         outer, centre, (z0, z1) = radius_probe(pts, guid)
         assert len(outer) >= 32, f"{guid}: only {len(outer)} outer vertices"
-        spread = outer.max() - outer.min()
+        spread = ring_spread(outer)
         assert spread < SPREAD_TOL_MM, (
-            f"{guid}: outer radius spread {spread:.4f} mm "
-            f"(mean {outer.mean():.4f}) — f32 quantisation at NTM magnitude"
+            f"{guid}: outer vertex {spread:.4f} mm off the "
+            f"{AUTHORED_R_MM}/{OUTER_R_MM} mm rings — f32 quantisation at NTM magnitude"
         )
         # The quantization denorm is the only error left, and it is
         # ~1/65535 of the node's extent — well inside 0.05 mm here.
-        assert abs(outer.mean() - OUTER_R_MM) < 0.01
+        assert 2 <= authored_count(outer) < len(outer)
         ax, ay = DUCT_AXIS[guid]
         assert abs(centre[0] - ax) < 1.0e-4 and abs(centre[1] - ay) < 1.0e-4
         assert abs(z0 - Z_SPAN_M[0]) < 1.0e-4 and abs(z1 - Z_SPAN_M[1]) < 1.0e-4
@@ -302,7 +316,7 @@ def test_shift_survives_an_unplaced_first_product(tmp_path):
     assert len(ducts) == 2
     for mesh in ducts:
         outer, _, _ = radius_probe(mesh.vertices.astype(np.float64) + shift, mesh.guid)
-        spread = outer.max() - outer.min()
+        spread = ring_spread(outer)
         assert spread < SPREAD_TOL_MM, f"{mesh.guid}: {spread:.4f} mm"
 
     # The GLB self-describes the same value.

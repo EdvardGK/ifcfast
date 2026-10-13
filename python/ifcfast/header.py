@@ -848,7 +848,16 @@ def _resolve_step_escapes(s: str) -> str:
 #       collapsed to null). GH #216 — predefined property sets
 #       (`IfcDoorPanelProperties`, `IfcDoorLiningProperties`, …) are read
 #       into `psets` (new rows).
-_CACHE_SCHEMA_VERSION = 39
+#   40: GH #218 — geometry change: arc sampling. Profile arcs
+#       (`IfcArcIndex`, `IfcTrimmedCurve` on `IfcCircle` / `IfcEllipse`)
+#       and 3D directrix arcs take their chord count from the 0.5 mm
+#       sagitta without the 32-per-turn cap (2..=256 chords per arc), and
+#       their first/last samples are the authored / trim points verbatim;
+#       only interior samples carry the sector-area radius. Large-radius
+#       arcs gain vertices / triangles, bboxes and `volume_m3` move (KNM
+#       bboxes up to 146 mm). Full circle profiles unchanged. Columns
+#       unchanged.
+_CACHE_SCHEMA_VERSION = 40
 
 _FIELD_RE = re.compile(r"\(\s*(.*?)\s*\)\s*;", re.DOTALL)
 

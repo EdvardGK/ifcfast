@@ -493,6 +493,21 @@ describing via `pq.read_schema(...)`):
   `IfcPipeSegment`); a few `prism_fallback` rows become exact `"mesh"`
   (G55_RIV: 3 duct segments, 0.92 → 1.003 of ifcopenshell). Pipe
   volumes move by f32 summation order only (≤ 5e-7 relative).
+  **GH #218 (cache schema v40):** the 8–32-per-turn clamp above now
+  applies to *full* circles / ellipses / CSG primitives only. Profile
+  and directrix *arcs* (`IfcArcIndex`, `IfcTrimmedCurve` on `IfcCircle`
+  / `IfcEllipse`) honour the 0.5 mm sagitta at every radius — 2 to 256
+  chords per arc — and keep their authored / trim points verbatim (they
+  are shared with the neighbouring segments); only interior samples
+  carry the area-preserving radius, so circular `volume_m3` stays
+  analytic. Arc circumcircles are solved in `f64`. Before, a 16.5° arc
+  at R = 98 m got 2 chords and its endpoints jogged 169 mm outward:
+  Revit curved walls / slabs / coverings were up to 146 mm off
+  ifcopenshell and 1 mm crescent slivers over-reported volume by up to
+  21 % with `volume_reliable = True`. KNM_ARK: elements > 1 mm off
+  ifcopenshell 55 → 0 (max 146 → 0.36 mm), +6 % triangles; G55_ARK
+  +0.16 % triangles. Only products with large-radius arcs re-extract
+  visibly; the 0.3 mm residual is the interior samples' area radius.
 - Semantic payload: `materials`, `psets`, `quantities`,
   `classifications` (list-of-struct columns — `UNNEST` in DuckDB).
   Each `psets` and `quantities` struct carries `source`
@@ -555,7 +570,10 @@ an extraction-only batch (no geometry moves): `materials` gains
 `item_name` + `set_name` and `material_name` changes meaning on set
 rows (GH #219 / #213), classification strings keep `''` (GH #217), and
 `psets` gains the predefined property sets (GH #216) — see
-*Conventions you can rely on*.
+*Conventions you can rely on*. Cache schema **v40** is a geometry
+change, columns unchanged: profile / directrix arcs are sampled to the
+0.5 mm sagitta with their authored endpoints kept (GH #218), so
+large-radius arc products move vertices, bboxes and `volume_m3`.
 
 **Cache freshness is verified, not assumed.** The cache key cannot see
 a same-size edit confined to the middle of a >8 MB file (its hash only
