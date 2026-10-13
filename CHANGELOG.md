@@ -25,7 +25,12 @@ Cache schema v41.
   x-sorted segment sweep (proper crossings only, relative tolerance), run
   once per profile. It closes the tripwire gap from KNM_ARK before #218,
   where 1 mm crescent slivers whose sampled outline self-intersected
-  over-counted by +14 % / +21 % with `volume_reliable = True`.
+  over-counted by +14 % / +21 % with `volume_reliable = True`. On 15
+  corpus models (G55 ×4, KNM ×5, HI90 ×6; 88 k products) it flags 5
+  products, all true positives: HI90_RIE recessed sockets whose 0.2 mm
+  annulus item is sampled with its hole crossing the outer loop —
+  +13.4 % vs ifcopenshell, previously `volume_reliable = True`. No
+  measurable mesh-pass cost (G55_ARK / KNM_ARK A/B within noise).
 
 ## [0.6.4] - 2026-10-12
 
