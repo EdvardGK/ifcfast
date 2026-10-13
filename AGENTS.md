@@ -984,7 +984,11 @@ IFC4X3 `IfcQuantityNumber` is read by the property facet (dataType
 **Semantics you can rely on.** Entity matching is exact class (no
 subtypes), as IDS 1.0 and IfcTester. In IFC2X3 an IFC4 occurrence name
 (`IFCAIRTERMINAL`) matches occurrences typed by `<NAME>TYPE` (the
-type-mapping table). Candidates come from every record in the file, not
+type-mapping table), alone or inside an `xs:enumeration` / pattern
+(each member maps like the single name, GH #224); a name that is an
+IFC2X3 class (`IFCCOLUMN`) never matches through its type object. A
+requirement `IFCAIRTERMINAL` under applicability `IFCFLOWTERMINAL` (the
+table's occurrence entity) is valid. Candidates come from every record in the file, not
 the product whitelist. Reals compare with the IDS tolerance
 (`|x−v| ≤ 1e-6·|v| + 1e-6`); several `xs:pattern`s are ORed (XSD); both
 are places IfcTester 0.8.5 differs — see `docs/ids/ambiguities.md`. An

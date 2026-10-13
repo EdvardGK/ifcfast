@@ -27,6 +27,7 @@ pub mod compile;
 pub mod datatypes;
 pub mod eval;
 pub mod graph;
+pub mod ifc2x3_mapping;
 pub mod ifctester_json;
 pub mod ir;
 pub mod report;

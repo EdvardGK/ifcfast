@@ -53,8 +53,8 @@ pub fn seed(ctx: &Ctx, first: &CFacet) -> Vec<u64> {
                 .filter(|(_, ty, _)| ty.eq_ignore_ascii_case(n.as_bytes()))
                 .map(|(id, _, _)| id)
                 .collect(),
-            EntityName::Set(set) => {
-                if set.is_empty() {
+            EntityName::Set { classes, mapped } => {
+                let mut out: Vec<u64> = if classes.is_empty() {
                     Vec::new()
                 } else {
                     table
@@ -63,10 +63,23 @@ pub fn seed(ctx: &Ctx, first: &CFacet) -> Vec<u64> {
                         .copied()
                         .filter(|id| {
                             ctx.class_of(*id)
-                                .is_some_and(|c| set.binary_search(&c).is_ok())
+                                .is_some_and(|c| classes.binary_search(&c).is_ok())
                         })
                         .collect()
+                };
+                // IFC2X3 mapped members (A6, GH #224): the occurrences of
+                // type objects of exactly those classes.
+                if !mapped.is_empty() {
+                    for id in table.order() {
+                        let Some(c) = ctx.class_of(*id) else { continue };
+                        if mapped.binary_search(&c).is_ok() {
+                            if let Some(o) = ctx.occurrences.get(id) {
+                                out.extend_from_slice(o);
+                            }
+                        }
+                    }
                 }
+                out
             }
             EntityName::Mapped2x3 { type_name, .. } => {
                 let mut occ = Vec::new();

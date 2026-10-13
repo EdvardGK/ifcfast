@@ -23,6 +23,7 @@
 
 use super::audit::lexical_ok;
 use super::datatypes::datatype_base;
+use super::ifc2x3_mapping;
 use super::ir::{
     EntityFacet, Facet, FacetCardinality, IdsDocument, Relation, Schema, Spec, SpecCardinality,
     Val, XsdBase,
@@ -185,7 +186,16 @@ pub enum EntityName {
     },
     /// A pattern / enumeration, resolved to the schema classes it matches
     /// (sorted). Matching stays exact-class (no subtypes).
-    Set(Vec<&'static str>),
+    ///
+    /// `mapped` (IFC2X3 only, GH #224 / register A6): the type objects of
+    /// the names the restriction accepts under the `<NAME>TYPE` rule
+    /// ([`super::ifc2x3_mapping::mapped_names`]), sorted. A member name
+    /// maps exactly as the same name would on its own: an occurrence whose
+    /// type object is one of these classes matches.
+    Set {
+        classes: Vec<&'static str>,
+        mapped: Vec<&'static str>,
+    },
 }
 
 impl EntityName {
@@ -194,18 +204,27 @@ impl EntityName {
         match self {
             EntityName::Exact(n) => *n == class,
             EntityName::Mapped2x3 { name, .. } => name == class,
-            EntityName::Set(v) => v.binary_search(&class).is_ok(),
+            EntityName::Set { classes, .. } => classes.binary_search(&class).is_ok(),
         }
     }
 
     /// The name as a plain string, for the IFC2X3 `<name>TYPE` rule.
-    /// `None` for a restriction (IfcTester calls `str.endswith` on it and
-    /// raises; we skip the rule — ambiguity register A6).
+    /// `None` for a restriction: its members' mapping is resolved at
+    /// compile time into `Set::mapped` (register A6).
     pub fn plain(&self) -> Option<&str> {
         match self {
             EntityName::Exact(n) => Some(n),
             EntityName::Mapped2x3 { name, .. } => Some(name),
-            EntityName::Set(_) => None,
+            EntityName::Set { .. } => None,
+        }
+    }
+
+    /// The IFC2X3 type objects a restriction's mapped members accept
+    /// (empty for anything else).
+    pub fn mapped_types(&self) -> &[&'static str] {
+        match self {
+            EntityName::Set { mapped, .. } => mapped,
+            _ => &[],
         }
     }
 }
@@ -350,8 +369,10 @@ fn compile_spec(sp: &Spec, schema: Schema, t: &'static SchemaTables) -> Result<C
                 compile_entity(e, schema, t).map_err(|m| invalid(sp, "applicability", i, m))?;
             context = match &ce.name {
                 EntityName::Exact(n) => Some(vec![n]),
-                EntityName::Set(v) => Some(v.clone()),
-                EntityName::Mapped2x3 { .. } => None,
+                // A mapped member admits occurrences of any class: no
+                // attribute-name context, as for a single mapped name.
+                EntityName::Set { classes, mapped } if mapped.is_empty() => Some(classes.clone()),
+                EntityName::Set { .. } | EntityName::Mapped2x3 { .. } => None,
             };
             applicability.push((i, CFacet::Entity(ce)));
         }
@@ -514,25 +535,26 @@ fn compile_entity(
         Val::Simple(n) => match t.canonical(n) {
             // Exact spelling only: the audit already refused lowercase.
             Some(c) if c == n => EntityName::Exact(c),
-            Some(_) | None => {
-                let type_name = format!("{n}TYPE");
-                match (schema, n.ends_with("TYPE"), t.canonical(&type_name)) {
-                    (Schema::Ifc2x3, false, Some(tn))
-                        if tn == type_name && t.is_type_object(tn) =>
-                    {
-                        EntityName::Mapped2x3 {
-                            name: n.clone(),
-                            type_name: tn,
-                        }
-                    }
-                    _ => {
+            Some(_) | None => match schema {
+                Schema::Ifc2x3 => match ifc2x3_mapping::mapped_type_for(t, n) {
+                    Some(tn) => EntityName::Mapped2x3 {
+                        name: n.clone(),
+                        type_name: tn,
+                    },
+                    None => {
                         return Err(format!(
                             "entity '{n}' does not exist in {}",
                             schema.ids_token()
                         ))
                     }
+                },
+                _ => {
+                    return Err(format!(
+                        "entity '{n}' does not exist in {}",
+                        schema.ids_token()
+                    ))
                 }
-            }
+            },
         },
         v @ Val::Restriction(_) => {
             let cv = CompiledVal::new(v).map_err(|e| e.to_string())?;
@@ -542,7 +564,21 @@ fn compile_entity(
                 .copied()
                 .filter(|c| cv.matches(&Actual::Str((*c).to_string())))
                 .collect();
-            EntityName::Set(set)
+            let mut mapped: Vec<&'static str> = if schema == Schema::Ifc2x3 {
+                ifc2x3_mapping::mapped_names(t)
+                    .into_iter()
+                    .filter(|(n, _)| cv.matches(&Actual::Str(n.clone())))
+                    .map(|(_, tn)| tn)
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            mapped.sort_unstable();
+            mapped.dedup();
+            EntityName::Set {
+                classes: set,
+                mapped,
+            }
         }
     };
     let predefined = match nonempty(e.predefined_type.as_ref()) {
@@ -724,6 +760,41 @@ mod tests {
                 other => panic!("{other:?}"),
             },
             other => panic!("{other:?}"),
+        }
+        // A6 / GH #224: a restriction maps member by member; IFC2X3 classes
+        // stay exact (IFCWALL), IFC4 maps nothing.
+        let en = r#"<entity><name><xs:restriction base="xs:string"><xs:enumeration value="IFCWALL"/><xs:enumeration value="IFCAIRTERMINAL"/><xs:enumeration value="IFCLAMP"/></xs:restriction></name></entity>"#;
+        for (schema, classes, mapped) in [
+            (
+                Schema::Ifc2x3,
+                vec!["IFCWALL"],
+                vec!["IFCAIRTERMINALTYPE", "IFCLAMPTYPE"],
+            ),
+            (
+                Schema::Ifc4,
+                vec!["IFCAIRTERMINAL", "IFCLAMP", "IFCWALL"],
+                vec![],
+            ),
+        ] {
+            let d = doc(schema.ids_token(), en, &attr("Name", "x"));
+            let p = compile(&d, schema).unwrap_or_else(|e| panic!("{e}"));
+            match &p.specs[0].state {
+                SpecState::Active { applicability, .. } => match &applicability[0] {
+                    CFacet::Entity(CEntity {
+                        name:
+                            EntityName::Set {
+                                classes: c,
+                                mapped: m,
+                            },
+                        ..
+                    }) => {
+                        assert_eq!(*c, classes);
+                        assert_eq!(*m, mapped);
+                    }
+                    other => panic!("{other:?}"),
+                },
+                other => panic!("{other:?}"),
+            }
         }
     }
 

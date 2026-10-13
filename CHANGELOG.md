@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **IDS: IFC2X3 entity names inside an `xs:enumeration` / pattern map
+  through the occurrence/type table (GH #224, ambiguity A6).** Each
+  member maps exactly as the same name does alone: on an IFC2X3 file
+  `{IFCAIRTERMINAL, IFCLAMP}` selects `IfcFlowTerminal`s typed by
+  `IfcAirTerminalType` / `IfcLampType`, in applicability and
+  requirement. Before, such an enumeration selected nothing, and in a
+  requirement under `IFCFLOWTERMINAL` it raised `IdsInvalidError`; the
+  requirement audit now accepts a table name under its table occurrence
+  entity. IFC2X3 class names (`IFCCOLUMN`, `IFCDOOR`) still never match
+  through a type object (IfcTester 0.9's wider mapping is not copied).
+
 ## [0.6.4] - 2026-10-12
 
 Tester batch from the Skiplum IFC-substrate parity harness (KNM_ARK,
