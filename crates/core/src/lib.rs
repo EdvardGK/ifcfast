@@ -283,7 +283,10 @@ mod python {
             stats.halfspace_clip_manifold as u64,
         )?;
         // GH #220: products with an invalid swept profile polygon.
-        out.set_item("products_profile_invalid", stats.products_profile_invalid as u64)?;
+        out.set_item(
+            "products_profile_invalid",
+            stats.products_profile_invalid as u64,
+        )?;
         Ok(())
     }
 
@@ -1171,10 +1174,7 @@ mod python {
             out.set_item("volume_reliable", PyList::new(py, sink.volume_reliable)?)?;
             out.set_item("volume_method", PyList::new(py, sink.volume_method)?)?;
             out.set_item("mesh_quality", PyList::new(py, sink.mesh_quality)?)?;
-            out.set_item(
-                "profile_invalid",
-                PyList::new(py, sink.profile_invalid)?,
-            )?;
+            out.set_item("profile_invalid", PyList::new(py, sink.profile_invalid)?)?;
             out.set_item("aabb_volume_m3", PyList::new(py, sink.aabb_volume_m3)?)?;
             out.set_item("surface_area_m2", PyList::new(py, sink.surface_area_m2)?)?;
             out.set_item("area_top_m2", PyList::new(py, sink.area_top_m2)?)?;

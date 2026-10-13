@@ -438,7 +438,7 @@ fn clip_fragment(
                     vertices,
                     indices,
                     rep_origin: mesh.rep_origin,
-                profile_invalid: mesh.profile_invalid,
+                    profile_invalid: mesh.profile_invalid,
                 }),
                 BoundedClip::NonConvex | BoundedClip::Failed => {
                     manifold_bounded_fallback(mesh, &bounded.boundary, xform, p, n, eps)
@@ -475,7 +475,7 @@ fn manifold_bounded_fallback(
             vertices: v,
             indices: i,
             rep_origin: mesh.rep_origin,
-                profile_invalid: mesh.profile_invalid,
+            profile_invalid: mesh.profile_invalid,
         }),
         Err(_) => ClipOutcome::Unapplied,
     }
