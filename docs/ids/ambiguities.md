@@ -208,3 +208,48 @@ and specs: `crates/core/tests/fixtures/ids/duplicate_pset_names.ifc` + `fixtures
 | # | Point | IfcTester reading (source) | ifcfast | Pinning |
 |---|---|---|---|---|
 | A47 | One element with several `IfcPropertySet`s of the same `Name` (Revit writes one per export rule) | `get_psets()` returns a dict keyed by pset name, so only one same-named set is visible; on the fixture it is the first in file order, so the verdict depends on set order (`element.py` `get_psets`) | A Property requirement is evaluated against every same-named set. Required / optional: any set satisfying it satisfies the facet. Prohibited: must hold across all, so one set carrying the property fails it. (Observed engine behaviour equals this rule on all four specs x three walls; see the table in the test.) | `ids_eval.rs` `ids_duplicate_pset_names_evaluate_every_set`; `test_ids_duplicate_psets_193.py` |
+
+## IfcTester 0.9.0 recheck, 2026-10-12 (GH #214)
+
+The pinned reference stays IfcTester **0.8.5**; every citation above is against it. IfcTester
+0.9.0 + ifcopenshell 0.9.0 (separate venv, same ifcfast `_core`, same suite sha) was rerun
+through both oracles:
+
+- Conformance: identical to 0.8.5 on all 334 cases (312 agree, the same 22 disagree; every
+  IfcTester outcome and detail string equal). None of D1–D4 or the three `invalid-` float
+  literal cases is fixed upstream; the root-cause code is unchanged (`facet.py:57-63` `is_x`,
+  `:1074-1079` pattern loop, `:336-357` optional/null, `:922-928` `get_properties`).
+- JSON parity: 0/289 mismatches. Raw `reporter.Json` documents differ on 5/334 cases, all
+  already normalised: `element` strings (ifcopenshell 0.9 writes `42.3` where 0.8.5 wrote
+  `42.299999999999997`) and set-literal order in three `reason` sentences (string hash order).
+  No key added, removed or renamed in `Json`; the new `NotRequired` keys are filled by `Html`
+  only. 0.9 adds a `Sqlite` reporter (not covered by `to_ifctester_json`).
+- Parse IR: the canonical JSON of all 334 IDS files is byte-identical.
+- A47 (duplicate same-named psets) persists: `tests/test_ids_duplicate_psets_193.py` passes
+  under 0.9.
+- Codegen (`gen_schema_tables`, `gen_defined_type_names`, `gen_predefined_psets`,
+  `gen_schema_supertypes`) regenerated under ifcopenshell 0.9.0: identical apart from the
+  version banner.
+
+One behaviour change with no suite case: the IFC2X3 entity mapping (A2, A6). 0.9 rewrote
+`Entity.filter` / `Entity.__call__` (`facet.py:205-252`): for IFC2X3 any name matches an
+occurrence whose type object's class, minus a `TYPE` or `STYLE` suffix, equals it, in the
+applicability as well as the requirement, and a restriction name is now mapped too. Probe
+(synthetic IFC2X3, one proxy/flow terminal + type, `pass`/`fail` of a spec whose requirement
+the element fails):
+
+| Applicability / requirement | Element | 0.8.5 | 0.9.0 | ifcfast | Mapping table |
+|---|---|---|---|---|---|
+| applicability `IFCCOLUMN` | proxy + `IfcColumnType` | not applicable | applicable | not applicable | not listed (IfcColumn exists in IFC2X3) |
+| applicability `IFCDOOR` | proxy + `IfcDoorStyle` | not applicable | applicable | not applicable | not listed |
+| requirement `IFCDOOR` on applicability `IFCBUILDINGELEMENTPROXY` | proxy + `IfcDoorStyle` | fail | pass | `IdsInvalidError` (audit: can never match) | not listed |
+| applicability enumeration `{IFCAIRTERMINAL}` | `IfcFlowTerminal` + `IfcAirTerminalType` | not applicable | applicable | not applicable | listed: IfcAirTerminal = IfcFlowTerminal + IfcAirTerminalType |
+| requirement enumeration `{IFCAIRTERMINAL}` | same | `AttributeError` | pass | `IdsInvalidError` (audit) | listed |
+| applicability `IFCAIRTERMINAL` | proxy + `IfcAirTerminalType` | applicable | applicable | applicable | not listed: the table's occurrence is `IfcFlowTerminal` |
+
+Against `ifc2x3-occurrence-type-mapping-table.md` (57 names, none an IFC2X3 class, each with
+a fixed occurrence entity): 0.9's extension to existing classes and to `…Style` types goes
+past the table, and 0.8.5, 0.9 and ifcfast all skip the occurrence-entity check. 0.9's mapping
+of restriction names agrees with the table where 0.8.5 crashed and ifcfast's A6 choice
+(restriction = exact class) does not. A6 stays **open** until decided; it is the one point
+where 0.9 reads the table better than ifcfast.
