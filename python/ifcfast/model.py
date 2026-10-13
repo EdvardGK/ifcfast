@@ -95,7 +95,7 @@ def _mesh_stats(d) -> dict:
         "triangles",
         "halfspace_clip_unapplied",
         "halfspace_clip_manifold",
-        "profile_invalid",
+        "products_profile_invalid",
     ):
         if k in d:
             out[k] = int(d[k])
@@ -122,7 +122,7 @@ class MeshList(list):
     #: (their mesh is the unclipped operand, tagged
     #: ``"halfspace_unclipped"`` in its segment chain) and
     #: ``halfspace_clip_manifold`` those clipped via the Manifold fallback
-    #: (GH #194). ``profile_invalid`` counts products with a swept profile
+    #: (GH #194). ``products_profile_invalid`` counts products with a swept profile
     #: polygon that is not a valid region (GH #220; their QTO row carries
     #: ``volume_reliable == False`` and the reason in ``profile_invalid``).
     stats: dict = {}

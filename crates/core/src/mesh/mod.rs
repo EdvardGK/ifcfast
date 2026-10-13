@@ -431,7 +431,7 @@ pub struct MeshStats {
     /// Products with at least one swept profile polygon that is not a
     /// valid region (GH #220, [`ProductMesh::profile_invalid`]) — their
     /// `volume_reliable` is `false`.
-    pub profile_invalid: usize,
+    pub products_profile_invalid: usize,
     /// Model-wide global shift in MODEL UNITS, decided once per pass
     /// before the first emission — see [`ProductSink::on_global_shift`].
     /// `[0, 0, 0]` for a near-origin model, and also for a model whose
@@ -1393,7 +1393,7 @@ fn apply_outcome<S: ProductSink>(outcome: ProductOutcome, sink: &mut S, stats: &
                 stats.halfspace_clip_unapplied += 1;
             }
             if product.profile_invalid.is_some() {
-                stats.profile_invalid += 1;
+                stats.products_profile_invalid += 1;
             }
             if has_tag(CLIP_MANIFOLD_TAG) {
                 stats.halfspace_clip_manifold += 1;

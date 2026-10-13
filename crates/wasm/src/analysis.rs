@@ -170,7 +170,7 @@ pub struct MeshCounters {
     /// the wasm crate has no `csg` — but the counter is the wheel's).
     pub halfspace_clip_manifold: usize,
     /// Products with an invalid swept profile polygon (GH #220).
-    pub profile_invalid: usize,
+    pub products_profile_invalid: usize,
     pub mesh_ms: f64,
     pub entity_table_ms: f64,
     pub by_source: Vec<(String, usize)>,
@@ -885,7 +885,7 @@ fn counters_from(mesh_stats: &mesh::MeshStats) -> MeshCounters {
         triangles: mesh_stats.triangles,
         halfspace_clip_unapplied: mesh_stats.halfspace_clip_unapplied,
         halfspace_clip_manifold: mesh_stats.halfspace_clip_manifold,
-        profile_invalid: mesh_stats.profile_invalid,
+        products_profile_invalid: mesh_stats.products_profile_invalid,
         mesh_ms: mesh_stats.elapsed_ms,
         entity_table_ms: mesh_stats.entity_table_build_ms,
         by_source,
@@ -2013,7 +2013,7 @@ impl Analysis {
             "triangles": self.counters.triangles,
             "halfspace_clip_unapplied": self.counters.halfspace_clip_unapplied,
             "halfspace_clip_manifold": self.counters.halfspace_clip_manifold,
-            "profile_invalid": self.counters.profile_invalid,
+            "products_profile_invalid": self.counters.products_profile_invalid,
             "mesh_ms": self.counters.mesh_ms,
             "entity_table_ms": self.counters.entity_table_ms,
             "parse_seconds": self.parse_seconds,

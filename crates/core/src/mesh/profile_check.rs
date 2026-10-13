@@ -184,6 +184,11 @@ fn point_in_loop(p: (f64, f64), l: &[(f64, f64)], tol: f64) -> Option<bool> {
 /// order: < 3 distinct vertices (degenerate) → crossing edges
 /// (self-intersecting) → collapsed loop (degenerate) → hole outside.
 pub fn check(p: &Polygon2D) -> Option<ProfileDefect> {
+    // TEMP (GH #220 timing A/B, not for merge)
+    static SKIP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *SKIP.get_or_init(|| std::env::var_os("IFCFAST_SKIP_PROFILE_CHECK").is_some()) {
+        return None;
+    }
     let outer = clean_loop(&p.outer);
     if outer.len() < 3 {
         return Some(ProfileDefect::Degenerate);

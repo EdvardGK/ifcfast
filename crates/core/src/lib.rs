@@ -283,7 +283,7 @@ mod python {
             stats.halfspace_clip_manifold as u64,
         )?;
         // GH #220: products with an invalid swept profile polygon.
-        out.set_item("profile_invalid", stats.profile_invalid as u64)?;
+        out.set_item("products_profile_invalid", stats.products_profile_invalid as u64)?;
         Ok(())
     }
 

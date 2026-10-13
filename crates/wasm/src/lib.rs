@@ -267,7 +267,7 @@ impl IfcModel {
     /// Engine counters for the UI: products seen / meshed / deferred,
     /// triangles, mesh milliseconds, and the two half-space clip counters
     /// (`halfspace_clip_unapplied`, `halfspace_clip_manifold`; GH #211),
-    /// and `profile_invalid` (products with an invalid swept profile
+    /// and `products_profile_invalid` (products with an invalid swept profile
     /// polygon; GH #220).
     #[wasm_bindgen(js_name = statsJson)]
     pub fn stats_json(&mut self) -> String {
