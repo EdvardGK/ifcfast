@@ -857,7 +857,13 @@ def _resolve_step_escapes(s: str) -> str:
 #       arcs gain vertices / triangles, bboxes and `volume_m3` move (KNM
 #       bboxes up to 146 mm). Full circle profiles unchanged. Columns
 #       unchanged.
-_CACHE_SCHEMA_VERSION = 40
+#   41: GH #215 — `groups` gains `group_name` (the group's `Name`) and
+#       `group_predefined_type` (its `PredefinedType` enum verbatim, for
+#       the IfcGroup subtypes that declare one: IfcDistributionSystem /
+#       …Circuit, IfcBuildingSystem, IfcBuiltSystem, IfcInventory (IFC4+),
+#       IfcStructuralAnalysisModel, IfcStructuralLoadGroup / …Case; else
+#       null), appended after `member_step_id`. No other table changes.
+_CACHE_SCHEMA_VERSION = 41
 
 _FIELD_RE = re.compile(r"\(\s*(.*?)\s*\)\s*;", re.DOTALL)
 

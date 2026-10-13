@@ -262,7 +262,7 @@ here too.
 | Opening → host edges (`IfcRelVoidsElement`) | `m.voids` |
 | Door / window → the opening it fills (`IfcRelFillsElement`) | `m.fills` (`opening_guid`, `element_guid`); join `m.voids` on `opening_guid` for door → opening → wall |
 | Nested parts: ports on a pump, parts of an element, tasks (`IfcRelNests`) | `m.nests` (`parent_guid`, `child_guid`, `position`, `parent_step_id`, `child_step_id`) |
-| System / zone / group membership (`IfcRelAssignsToGroup`, incl. `…ByFactor`) | `m.groups` (`group_guid`, `group_entity`, `member_guid`, `group_step_id`, `member_step_id`); `m.groups[m.groups.group_entity == "IfcDistributionSystem"]` |
+| System / zone / group membership (`IfcRelAssignsToGroup`, incl. `…ByFactor`) | `m.groups` (`group_guid`, `group_entity`, `member_guid`, `group_step_id`, `member_step_id`, `group_name`, `group_predefined_type`); `m.groups[m.groups.group_entity == "IfcDistributionSystem"]`. `group_predefined_type` is the group's `PredefinedType` enum verbatim (`VENTILATION`, `USERDEFINED`, …), null for classes without one (`IfcZone`, `IfcSystem`, `IfcGroup`; IFC2X3 `IfcInventory`) — GH #215, cache v41 |
 | Which representation items made a mesh | `m.segments` (joins `m.drift` on `guid` / `product_index`) |
 | Full agent guide as text (this document) | `ifcfast.agents_guide()` |
 | One label per elevation across discipline models | `ifcfast.federated_floors.synthesise_federated_floors(storeys)` |
@@ -574,6 +574,8 @@ rows (GH #219 / #213), classification strings keep `''` (GH #217), and
 change, columns unchanged: profile / directrix arcs are sampled to the
 0.5 mm sagitta with their authored endpoints kept (GH #218), so
 large-radius arc products move vertices, bboxes and `volume_m3`.
+Cache schema **v41** appends `group_name` and `group_predefined_type`
+to `groups` (GH #215); no other table changes.
 
 **Cache freshness is verified, not assumed.** The cache key cannot see
 a same-size edit confined to the middle of a >8 MB file (its hash only
@@ -1140,6 +1142,10 @@ JSON.parse(m.psetsJson());           // [{guid, pset_name, prop_name, value, val
 JSON.parse(m.quantitiesJson());      // [{guid, qto_name, quantity_name, value, quantity_type, unit_step_id, source}]
 JSON.parse(m.materialsJson());       // [{guid, role, layer_index, material_name, layer_thickness_mm, category, fraction, source, item_name, set_name}]
 JSON.parse(m.classificationsJson()); // [{guid, system_name, edition, identification, name, location, source, assignment_source}]
+// The relation tables graphJson() does not carry (GH #215) = m.groups / m.nests / m.fills:
+JSON.parse(m.groupsJson());   // [{group_guid, group_entity, member_guid, group_step_id, member_step_id, group_name, group_predefined_type}]
+JSON.parse(m.nestsJson());    // [{parent_guid, child_guid, position, parent_step_id, child_step_id}]
+JSON.parse(m.fillsJson());    // [{opening_guid, element_guid}]
 const glb = m.toGlb(true, true);   // Uint8Array — same writer as m.to_gltf()
 JSON.parse(m.shiftJson());    // [sx, sy, sz] metres — add back for absolute coords
 JSON.parse(m.bySourceJson()); // GH #166 counters

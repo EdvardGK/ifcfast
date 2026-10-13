@@ -144,6 +144,21 @@ mod gen {
         (b"IFCWINDOW", 7), (b"IFCWINDOWSTANDARDCASE", 7),
     ];
 
+    /// STEP position of `PredefinedType` per `IfcGroup` subtype (IFC2X3,
+    /// GH #215). A class absent here has no `PredefinedType`.
+    pub(crate) const GROUP_PREDEFINED_POSITION_IFC2X3: &[(&[u8], usize)] = &[
+        (b"IFCSTRUCTURALANALYSISMODEL", 5), (b"IFCSTRUCTURALLOADGROUP", 5),
+    ];
+
+    /// STEP position of `PredefinedType` per `IfcGroup` subtype (IFC4 / IFC4X3,
+    /// GH #215). A class absent here has no `PredefinedType`.
+    pub(crate) const GROUP_PREDEFINED_POSITION_IFC4: &[(&[u8], usize)] = &[
+        (b"IFCBUILDINGSYSTEM", 5), (b"IFCBUILTSYSTEM", 5), (b"IFCDISTRIBUTIONCIRCUIT", 6),
+        (b"IFCDISTRIBUTIONSYSTEM", 6), (b"IFCINVENTORY", 5),
+        (b"IFCSTRUCTURALANALYSISMODEL", 5), (b"IFCSTRUCTURALLOADCASE", 5),
+        (b"IFCSTRUCTURALLOADGROUP", 5),
+    ];
+
     /// STEP token → ifcopenshell spelling for every entity in every schema.
     pub(crate) const ENTITY_NAMES: &[(&[u8], &str)] = &[
         (b"IFC2DCOMPOSITECURVE", "Ifc2DCompositeCurve"),
@@ -956,4 +971,7 @@ mod gen {
     ];
 }
 
-pub(crate) use gen::{ENTITY_NAMES, PRODUCT_TYPES, TAG_POSITION};
+pub(crate) use gen::{
+    ENTITY_NAMES, GROUP_PREDEFINED_POSITION_IFC2X3, GROUP_PREDEFINED_POSITION_IFC4, PRODUCT_TYPES,
+    TAG_POSITION,
+};

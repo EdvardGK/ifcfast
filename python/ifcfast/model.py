@@ -1865,11 +1865,16 @@ class Model:
         ``IfcRelAssignsToGroupByFactor``.
 
         DataFrame with columns ``group_guid``, ``group_entity``,
-        ``member_guid``, ``group_step_id``, ``member_step_id`` — one row
-        per (relation, member), in file order. ``group_entity`` is the
+        ``member_guid``, ``group_step_id``, ``member_step_id``,
+        ``group_name``, ``group_predefined_type`` — one row per
+        (relation, member), in file order. ``group_entity`` is the
         group's class (``IfcDistributionSystem``, ``IfcZone``,
-        ``IfcBuildingSystem``, ``IfcInventory`` …). An element in several
-        systems has several rows. Empty if the IFC declared no groups.
+        ``IfcBuildingSystem``, ``IfcInventory`` …). ``group_name`` is the
+        group's ``Name`` and ``group_predefined_type`` its
+        ``PredefinedType`` enum verbatim (``USERDEFINED`` kept), ``None``
+        for classes without one (``IfcZone``, ``IfcSystem``, ``IfcGroup``)
+        or when unset (GH #215). An element in several systems has
+        several rows. Empty if the IFC declared no groups.
         """
         import pandas as pd
 
@@ -3245,6 +3250,10 @@ def _index_native(
             "member_guid": pd.Series(groups_raw.get("member_guid", []), dtype=object),
             "group_step_id": pd.Series(groups_raw.get("group", []), dtype="int64"),
             "member_step_id": pd.Series(groups_raw.get("member", []), dtype="int64"),
+            "group_name": pd.Series(groups_raw.get("group_name", []), dtype=object),
+            "group_predefined_type": pd.Series(
+                groups_raw.get("group_predefined_type", []), dtype=object
+            ),
         },
         columns=_GROUPS_COLUMNS,
     )
@@ -3442,7 +3451,7 @@ _NESTS_COLUMNS = [
 ]
 _GROUPS_COLUMNS = [
     "group_guid", "group_entity", "member_guid", "group_step_id",
-    "member_step_id",
+    "member_step_id", "group_name", "group_predefined_type",
 ]
 _FILLS_COLUMNS = ["opening_guid", "element_guid"]
 

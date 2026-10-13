@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+Cache schema v41.
+
+### Added
+
+- **Group name and predefined type on `groups`; wasm `groupsJson()` /
+  `nestsJson()` / `fillsJson()` (GH #215).** `m.groups` gains
+  `group_name` (the group's `Name`) and `group_predefined_type` (its
+  `PredefinedType` enum verbatim, for the `IfcGroup` subtypes that
+  declare one: `IfcDistributionSystem` / `…Circuit`,
+  `IfcBuildingSystem`, `IfcBuiltSystem`, `IfcInventory` (IFC4+),
+  `IfcStructuralAnalysisModel`, `IfcStructuralLoadGroup` / `…Case`;
+  null otherwise). Positions come from the generated schema tables.
+  The browser build now hands out the `groups`, `nests` and `fills`
+  rows, so a JS IDS evaluator can answer `partOf
+  relation="IFCRELASSIGNSTOGROUP"` (system / zone / group membership).
+  The native IDS engine already evaluated it.
+
 ### Fixed
 
 - **IDS: IFC2X3 entity names inside an `xs:enumeration` / pattern map
