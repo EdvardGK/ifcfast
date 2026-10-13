@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-Cache schema v41.
+Cache schema v44.
 
 ### Added
 
@@ -25,6 +25,30 @@ Cache schema v41.
   The native IDS engine already evaluated it.
 
 ### Fixed
+
+- **Cut mode: multi-item openings cut their union (GH #232).** An
+  `IfcOpeningElement` whose Body has several items — Archicad writes a
+  window opening as three touching extrusions — was handed to the CSG
+  kernel as one concatenated, self-overlapping mesh, and the difference
+  was undefined: on HI90_ARK_MMI700 45 `IfcWallStandardCase` came out
+  −34 % … +20 % off ifcopenshell with `volume_reliable=True` (class ratio
+  1.0003). Each item is now its own operand (Manifold subtracts their
+  union): 0 walls > 1 %, class ratio 1.0000. Geometry change in
+  `cut_openings=True` only.
+- **Cut mode: no zero-thickness residue after a CSG difference (GH
+  #233).** Where a cutter face is flush with a host face (opening top =
+  wall top, opening end = wall end), the result kept a ~0-volume sheet:
+  `volume_m3` was right, but bboxes / centroids were up to 5.2 m off and
+  a wall its openings fully consume came back as a "closed, reliable"
+  sliver. Residue components thinner than `1e-5 ×` the host's bbox
+  diagonal are now dropped, a sheet still attached to the kept solid
+  triggers one retry in which only the cutter faces flush with a host face
+  are pushed outward (`2e-5 ×` diagonal; reveals do not move), and a fully
+  consumed host is no longer emitted (as in ifcopenshell). World bbox vs
+  ifcopenshell, elements > 1 mm: HI90_ARK_MMI700 19 → 1 (the one left is
+  a wall ifcopenshell fails to cut), G55_ARK 44 → 0. The raw
+  `geom::csg::subtract` / `subtract_many` are unchanged; the cut path
+  uses the new `subtract_many_clean`.
 
 - **IDS: IFC2X3 entity names inside an `xs:enumeration` / pattern map
   through the occurrence/type table (GH #224, ambiguity A6).** Each

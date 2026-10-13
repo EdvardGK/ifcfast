@@ -1741,6 +1741,20 @@ surface (`m.meshes().stats`, `m.mesh_qto()[0].attrs["mesh_stats"]`,
 So on a clipped wall with no opening, `meshes()` and
 `meshes(cut_openings=True)` return the same solid.
 
+Cut-path guarantees (GH #232 / #233, cache v44):
+- An opening whose Body has several items (Archicad: opening + sill
+  notch) cuts the **union** of its items — each item is its own CSG
+  operand, never one concatenated mesh.
+- The cut result carries no zero-thickness residue: components thinner
+  than `1e-5 ×` the host's bbox diagonal (mean thickness `2V/A`) are
+  dropped, and a sheet left where a cutter face is flush with a host face
+  triggers one retry in which only those flush cutter faces are pushed
+  outward by twice that length (only for that host; reveals never move,
+  clean cuts are never perturbed). The bbox / centroid of a cut host is
+  therefore its material's.
+- A host its openings consume completely is **not emitted** in cut mode
+  (no row in `meshes()` / `mesh_qto()`), matching ifcopenshell.
+
 **`keep_cutters` (GH #66 → GH #194).** GH #66 (v0.4.38) stripped the
 ±20 000-model-unit stand-in slabs the tessellator used to emit for an
 infinite half-space from every no-cut surface, and `keep_cutters=True`

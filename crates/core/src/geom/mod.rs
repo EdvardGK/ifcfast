@@ -40,4 +40,7 @@ pub use mesh::{bake_world, build_trimesh, rebase_world, MeshBuildError};
 pub use narrow_phase::{intersects, min_distance, min_distance_within, NarrowPhaseError};
 
 #[cfg(feature = "csg")]
-pub use csg::{build_manifold, manifold_to_buffers, subtract, subtract_many, CsgKernelError};
+pub use csg::{
+    build_manifold, manifold_to_buffers, subtract, subtract_many, subtract_many_clean,
+    CsgKernelError,
+};

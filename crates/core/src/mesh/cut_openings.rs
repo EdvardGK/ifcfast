@@ -245,7 +245,7 @@ fn apply_inner(mesh: &mut ProductMesh, unit_scale: f32) -> Outcome {
     }
 
     // Run remaining solid cutters (real opening extrusions, etc.)
-    // through Manifold. If the host has been emptied by the
+    // through Manifold, residue-cleaned (GH #233). If the host has been emptied by the
     // half-space clips alone, skip the boolean step entirely.
     let (final_v, final_i) = if solid_cutters.is_empty() || host.1.is_empty() {
         host
@@ -254,7 +254,7 @@ fn apply_inner(mesh: &mut ProductMesh, unit_scale: f32) -> Outcome {
             .iter()
             .map(|(v, i)| (v.as_slice(), i.as_slice()))
             .collect();
-        match csg::subtract_many(&host.0, &host.1, &cutter_refs) {
+        match csg::subtract_many_clean(&host.0, &host.1, &cutter_refs) {
             Ok(out) => out,
             Err(_e) => return classify_subtract_failure(&host.1, &solid_cutters),
         }
@@ -971,7 +971,7 @@ mod bounded_halfspace {
 /// on each buffered host first (so a host with BOTH an
 /// `IfcBooleanClippingResult` and cross-product openings folds
 /// cleanly), then subtracts the gathered openings via
-/// `geom::csg::subtract_many`.
+/// `geom::csg::subtract_many_clean`.
 ///
 /// Frame contract: all buffered meshes are expected to live in
 /// `BakeFrame::Local` form — vertices near origin, true world
@@ -992,9 +992,16 @@ mod bounded_halfspace {
 /// *direct* (identity-instance) fragment — the precondition the prism
 /// path needs to map a single `IfcExtrudedAreaSolid` back to params.
 /// `world_transform` / `rep_step_id` are unread without the feature.
+///
+/// GH #232: the opening's body is held as **one cutter per representation
+/// item** (`pieces`), never as one concatenated mesh. Archicad writes a
+/// window / door opening as several extrusions that touch or overlap;
+/// concatenated, they form one self-overlapping, non-manifold "solid" whose
+/// difference Manifold leaves undefined (walls ±34 % on HI90_ARK_MMI700).
+/// As separate operands the kernel subtracts their union — the opening the
+/// author modelled.
 struct HeldOpening {
-    vertices: Vec<f32>,
-    indices: Vec<u32>,
+    pieces: Vec<(Vec<f32>, Vec<u32>)>,
     mesh_anchor: [f64; 3],
     #[cfg_attr(not(feature = "prism-csg-fast"), allow(dead_code))]
     rep_step_id: Option<u64>,
@@ -1083,11 +1090,11 @@ impl CrossProductCut {
         let id = mesh.ifc_id;
         if self.openings.contains(&id) {
             let rep_step_id = single_direct_rep_step_id(&mesh.parts);
+            let pieces = split_opening_items(mesh.vertices, mesh.indices, &mesh.segments);
             self.held_openings.insert(
                 id,
                 HeldOpening {
-                    vertices: mesh.vertices,
-                    indices: mesh.indices,
+                    pieces,
                     mesh_anchor: mesh.mesh_anchor,
                     rep_step_id,
                     world_transform: mesh.world_transform,
@@ -1115,7 +1122,7 @@ impl CrossProductCut {
     /// only the reducible same-axis through-cut; anything else returns
     /// `None` and we fall back to the manifold fold, which translates
     /// each opening's vertices by `(opening.mesh_anchor -
-    /// host.mesh_anchor)` and calls `geom::csg::subtract_many`.
+    /// host.mesh_anchor)` and calls `geom::csg::subtract_many_clean`.
     ///
     /// `table` is the entity table the prism path consults for
     /// `extrude_params`; pass `None` to force the manifold fold (the
@@ -1193,23 +1200,25 @@ impl CrossProductCut {
             // ---- Manifold fold (default path / prism fallback). ------
             // Translate each arrived opening into the host frame by the
             // anchor difference, then subtract via the mesh kernel.
+            // Each opening contributes one cutter per body item (GH #232).
             let cutter_buffers: Vec<(Vec<f32>, Vec<u32>)> = arrived
                 .iter()
-                .filter_map(|oid| {
-                    let op = self.held_openings.get(oid)?;
+                .filter_map(|oid| self.held_openings.get(oid))
+                .flat_map(|op| {
                     let off = [
                         (op.mesh_anchor[0] - host_mesh.mesh_anchor[0]) as f32,
                         (op.mesh_anchor[1] - host_mesh.mesh_anchor[1]) as f32,
                         (op.mesh_anchor[2] - host_mesh.mesh_anchor[2]) as f32,
                     ];
-                    let translated: Vec<f32> = op
-                        .vertices
-                        .as_chunks::<3>()
-                        .0
-                        .iter()
-                        .flat_map(|c| [c[0] + off[0], c[1] + off[1], c[2] + off[2]])
-                        .collect();
-                    Some((translated, op.indices.clone()))
+                    op.pieces.iter().map(move |(v, i)| {
+                        let translated: Vec<f32> = v
+                            .as_chunks::<3>()
+                            .0
+                            .iter()
+                            .flat_map(|c| [c[0] + off[0], c[1] + off[1], c[2] + off[2]])
+                            .collect();
+                        (translated, i.clone())
+                    })
                 })
                 .collect();
 
@@ -1223,7 +1232,11 @@ impl CrossProductCut {
                     .iter()
                     .map(|(v, i)| (v.as_slice(), i.as_slice()))
                     .collect();
-                match csg::subtract_many(&host_mesh.vertices, &host_mesh.indices, &cutter_refs) {
+                match csg::subtract_many_clean(
+                    &host_mesh.vertices,
+                    &host_mesh.indices,
+                    &cutter_refs,
+                ) {
                     Ok((verts, idx)) => {
                         let triangle_count = (idx.len() / 3) as u32;
                         host_mesh.vertices = verts;
@@ -1263,6 +1276,32 @@ impl CrossProductCut {
         self.held_openings.clear();
         out
     }
+}
+
+/// Split an opening product's baked mesh into one cutter per
+/// representation item (GH #232). `segments` carries one entry per item
+/// that contributed triangles; each becomes its own compact
+/// `(vertices, indices)` pair. A single-segment (or segment-less) opening —
+/// the common case — is passed through as-is, so its cutter is
+/// byte-identical to the pre-#232 concatenated buffer.
+fn split_opening_items(
+    vertices: Vec<f32>,
+    indices: Vec<u32>,
+    segments: &[MeshSegment],
+) -> Vec<(Vec<f32>, Vec<u32>)> {
+    if segments.len() <= 1 {
+        return vec![(vertices, indices)];
+    }
+    let pieces: Vec<(Vec<f32>, Vec<u32>)> = segments
+        .iter()
+        .filter_map(|seg| assemble_submesh(&vertices, &indices, &[seg]))
+        .collect();
+    if pieces.is_empty() {
+        // Malformed segment table — keep the whole mesh rather than
+        // silently dropping the opening.
+        return vec![(vertices, indices)];
+    }
+    pieces
 }
 
 /// The single representation-item step_id of a product that meshed as
@@ -1640,6 +1679,83 @@ mod tests {
             bounded_halfspaces: Vec::new(),
             clip_unapplied: false,
         }
+    }
+
+    /// Concatenate boxes into one ProductMesh, one segment per box —
+    /// the extractor's shape for a multi-item representation.
+    fn multi_item_mesh(id: u64, entity: &str, items: &[([f32; 3], [f32; 3])]) -> ProductMesh {
+        let mut vertices = Vec::new();
+        let mut indices = Vec::new();
+        let mut segments = Vec::new();
+        for (lo, hi) in items {
+            let (v, i) = box_at(*lo, *hi);
+            let base = (vertices.len() / 3) as u32;
+            segments.push(MeshSegment {
+                index_start: indices.len() as u32,
+                index_count: i.len() as u32,
+                source: "extrusion".to_string(),
+            });
+            vertices.extend_from_slice(&v);
+            indices.extend(i.iter().map(|x| x + base));
+        }
+        let mut m = synthetic_wall_with_opening();
+        m.guid = format!("guid-{id}");
+        m.entity = entity.to_string();
+        m.ifc_id = id;
+        m.vertices = vertices;
+        m.indices = indices;
+        m.source = "extrusion";
+        m.segments = segments;
+        m
+    }
+
+    /// GH #232: an `IfcOpeningElement` with several touching body items
+    /// (Archicad window: opening + sill notch) must cut exactly what the
+    /// same opening authored as one item cuts. Pre-fix the items were
+    /// concatenated into one self-touching cutter and the difference was
+    /// undefined.
+    #[test]
+    fn multi_item_opening_cuts_like_single_item() {
+        let wall = [([0.0, 0.0, 0.0], [4.0, 0.3, 3.0])];
+        let three_items = [
+            ([1.0, -0.1, 1.0], [2.0, 0.4, 2.0]),
+            ([1.0, -0.1, 2.0], [2.0, 0.4, 2.5]),
+            ([1.2, -0.1, 0.8], [1.8, 0.4, 1.0]),
+        ];
+        let one_item = [([1.0, -0.1, 1.0], [2.0, 0.4, 2.5])];
+        let one_notch = [([1.2, -0.1, 0.8], [1.8, 0.4, 1.0])];
+        let cut = |openings: &[&[([f32; 3], [f32; 3])]]| -> f64 {
+            let ids: Vec<u64> = (0..openings.len() as u64).map(|k| 10 + k).collect();
+            let hosts = vec![1u64; ids.len()];
+            let mut cross = CrossProductCut::from_indexer(&ids, &hosts);
+            for (k, o) in openings.iter().enumerate() {
+                assert!(matches!(
+                    cross.route(multi_item_mesh(ids[k], "IfcOpeningElement", o)),
+                    Routed::Suppressed
+                ));
+            }
+            assert!(matches!(
+                cross.route(multi_item_mesh(1, "IfcWall", &wall)),
+                Routed::Held
+            ));
+            let folded = cross.flush(1.0, None);
+            assert_eq!(folded[0].1, Outcome::Cut);
+            let m = &folded[0].0;
+            csg::build_manifold(&m.vertices, &m.indices)
+                .expect("cut wall is manifold")
+                .volume()
+        };
+        let expected = 4.0 * 0.3 * 3.0 - 0.3 * (1.0 * 1.5 + 0.6 * 0.2);
+        let v3 = cut(&[&three_items]);
+        let v1 = cut(&[&one_item, &one_notch]);
+        assert!(
+            (v3 - expected).abs() < 1e-5,
+            "3-item opening: {v3} vs {expected}"
+        );
+        assert!(
+            (v1 - expected).abs() < 1e-5,
+            "split opening: {v1} vs {expected}"
+        );
     }
 
     #[test]
