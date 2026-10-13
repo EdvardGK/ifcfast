@@ -7,6 +7,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.4] - 2026-10-12
+
+Tester batch from the Skiplum IFC-substrate parity harness (KNM_ARK,
+Revit 2026 IFC4; HI90_ARK, Archicad IFC2x3) — every fix differential-
+tested against ifcopenshell 0.8.5 on 8 real models. Cache schema v40.
+
+### Added
+
+- **`materials.item_name` and `materials.set_name` (GH #219, #213).**
+  `item_name` is the layer / constituent / profile's own `Name` (IFC4),
+  `set_name` the containing `LayerSetName` / constituent-set / profile-set
+  Name, resolved through `*SetUsage`. On the table, the substrate
+  `materials` struct and wasm `materialsJson`; graph.json `layer_set` and
+  `material_layer_sets` are now populated.
+- **Predefined property sets are read into `psets` (GH #216).**
+  `IfcDoorPanelProperties`, `IfcDoorLiningProperties`, the window and
+  permeable-covering variants, `IfcReinforcementDefinitionProperties` and
+  the IFC2x3 energy / electrical / fluid-flow / sound / service-life
+  classes — the list is generated from the schemas with a drift test.
+  `pset_name` = entity Name, one row per non-`$` attribute, declared type
+  as `value_type`; matches ifcopenshell `get_psets` (KNM_ARK 146/146,
+  G55_ARK 728/728 on IFC2x3 DoorStyle sets).
+- `tests/oracle/extraction_parity.py`: per-model classification /
+  material / pset differential against ifcopenshell (CLI + corpus pytest).
+
+### Changed
+
+- **`materials.material_name` is always the referenced `IfcMaterial.Name`
+  (GH #219).** On `constituent`, `profile` and IFC4 `layer` rows it used
+  to be the set item's own Name when set (Revit writes `'KNM-Vegg (2)'`
+  for a material's second use). The old label is
+  `item_name.fillna(material_name)`.
+- **Profile arcs honour the 0.5 mm sagitta tolerance (GH #218).**
+  `IfcArcIndex` and trimmed `IfcCircle` / `IfcEllipse` segments were
+  capped at 32 chords per full turn and the #170 area-preserving radius
+  was applied to their endpoints: R = 5–105 m arcs got 2 chords (sagitta
+  to 310 mm) with endpoints jogged outward by up to 169 mm, so world
+  bboxes were up to 146 mm off ifcopenshell and 1 mm-wide crescent
+  slivers self-intersected (+14 % / +21 % volume, flagged reliable). The
+  chord count is now tolerance-derived in f64 (bounded at 256 per arc),
+  endpoints are the authored points, the area factor applies to interior
+  samples only, and arc circumcircles are solved in f64. KNM_ARK: 1460
+  elements, >1 mm 55 → 0, max 146.4 → 0.36 mm; triangles +6 % there,
+  +0.16 % on G55_ARK. Full circles unchanged (GH #222). Gate green on all
+  18 steps.
+
+### Fixed
+
+- **Empty strings are no longer collapsed to null in `classifications`
+  (GH #217).** `''` and `$` are different facts and ifcopenshell 0.8.x
+  keeps them apart; the issue-#9 rule that mapped `''` to None was the
+  only extractor doing it. Opposite gap in the non-null name columns of
+  `psets` / `quantities` tracked as GH #221.
+
 ## [0.6.3] - 2026-09-29
 
 ### Added
