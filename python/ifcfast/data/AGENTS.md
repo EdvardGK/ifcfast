@@ -530,7 +530,7 @@ describing via `pq.read_schema(...)`):
   item-level `profile AABB × depth` bound cannot catch this class (an
   earcut cap never leaves its polygon's AABB; the KNM sliver item was
   0.5 % of its own bound), so the check is on the polygon itself.
-  Expect it to be rare: 5 of 88 k products on 15 corpus models, all
+  Expect it to be rare: 5 of 84 k products on 15 corpus models, all
   real divergences (HI90_RIE sockets, a 0.2 mm ring whose sampled hole
   crosses its outer loop, +13.4 % vs ifcopenshell).
   Mesh-stats surfaces count the products as
