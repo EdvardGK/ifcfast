@@ -508,6 +508,24 @@ describing via `pq.read_schema(...)`):
   ifcopenshell 55 → 0 (max 146 → 0.36 mm), +6 % triangles; G55_ARK
   +0.16 % triangles. Only products with large-radius arcs re-extract
   visibly; the 0.3 mm residual is the interior samples' area radius.
+  **GH #225 (cache schema v43):** parameterised section profiles carry
+  their corner radii. I, asymmetric I, L, U, T, Z and C sections,
+  rounded rectangles and rectangle-hollow sections round every corner
+  whose radius attribute is set (`FilletRadius`, `FlangeEdgeRadius`,
+  `EdgeRadius`, `WebEdgeRadius`, `InternalFilletRadius` — outer bends
+  at `+ WallThickness` — `Inner`/`OuterFilletRadius`, `RoundingRadius`)
+  with a tangent arc sampled like the profile arcs above, so the
+  extruded `volume_m3` is the analytic section area × length (before:
+  IPE / HEA / HEB −3…−5 % with `volume_reliable = True`). Tapered
+  flanges / legs honour their slope with IfcOpenShell 0.8's reference
+  points (I: thickness at the flange toe; U, L: at mid-extent; T flange:
+  a quarter of the width from the web axis, T web: mid-depth). A `$` or
+  zero radius is a sharp corner, byte-identical to v41. ifcopenshell
+  0.8.5 approximates each fillet with a few chords and no area
+  correction, so expect ifcfast ≈ 0.1 % below it on rolled sections,
+  not 0. L / U / T / Z are still built in a corner frame rather than
+  the bounding-box centre (GH #237): volumes are right, bboxes are
+  offset by half the section.
 - Semantic payload: `materials`, `psets`, `quantities`,
   `classifications` (list-of-struct columns — `UNNEST` in DuckDB).
   Each `psets` and `quantities` struct carries `source`
@@ -576,6 +594,10 @@ change, columns unchanged: profile / directrix arcs are sampled to the
 large-radius arc products move vertices, bboxes and `volume_m3`.
 Cache schema **v41** appends `group_name` and `group_predefined_type`
 to `groups` (GH #215); no other table changes.
+Cache schema **v43** is a geometry change, columns unchanged: section
+profiles get their fillet / edge radii and slopes (GH #225), so
+rolled-section products move vertices and `volume_m3`, and C / asymmetric
+I / rectangle-hollow sections mesh for the first time.
 
 **Cache freshness is verified, not assumed.** The cache key cannot see
 a same-size edit confined to the middle of a >8 MB file (its hash only
