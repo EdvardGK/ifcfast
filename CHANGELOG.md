@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-Cache schema v44.
+Cache schema v47.
 
 ### Added
 
@@ -46,6 +46,21 @@ Cache schema v44.
   measurable mesh-pass cost (G55_ARK / KNM_ARK A/B within noise).
 
 ### Fixed
+
+- **Thin circular rings in `IfcArbitraryProfileDefWithVoids` are valid
+  and area-exact (GH #226, cache schema v47).** Outer loop and circular
+  void were sampled independently — chord count from each loop's own
+  radius, area-preserving interior samples pushed outward — so on a
+  0.2 mm ring (HI90_RIE recessed sockets, r 20 / 19.8 mm) the void
+  crossed the outer polygon and earcut filled the disc: 5233 mm³ per
+  item instead of 300 mm³, +13 % on the product with
+  `volume_reliable = True` (flagged `profile_invalid` since #220). A
+  void that is a full circle (`IfcCircle`, trimmed-circle composite, or
+  all-`IfcArcIndex` polycurve) inside a full-circle outer loop is now
+  the outer polygon scaled by r/R and centred on the void — the rule
+  `IfcCircleHollowProfileDef` already used — so the ring is valid at
+  any wall thickness and its area is π(R² − r²). Other voids are
+  byte-identical.
 
 - **Section profiles carry their fillets, edge radii and slopes (GH #225,
   cache schema v43).** `IfcIShapeProfileDef` and its L / U / T / Z

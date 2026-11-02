@@ -874,15 +874,186 @@ fn arbitrary_with_voids(table: &EntityTable, fields: &[&[u8]]) -> Option<Polygon
     // exit forces them CW by signed area. (A blind `reverse()` here was
     // the GH #62 window bug: Revit authors voids CW already, so reversing
     // made them CCW and inverted every hole-wall normal downstream.)
+    //
+    // GH #226: a circular hole inside a circular outer is re-sampled at the
+    // outer loop's angles (see [`matched_circular_hole`]).
+    let outer_circle = circle_of(table, curve_id);
     let mut holes: Vec<Vec<Vec2>> = Vec::new();
     for hole_field in split_top_level_args(body) {
         if let Field::Ref(hid) = parse_field(hole_field) {
             if let Some(hole) = curve_to_polyline(table, hid) {
-                holes.push(hole);
+                let matched = outer_circle
+                    .zip(circle_of(table, hid))
+                    .and_then(|(oc, hc)| matched_circular_hole(&outer, oc, &hole, hc));
+                holes.push(matched.unwrap_or(hole));
             }
         }
     }
     Some(Polygon2D { outer, holes })
+}
+
+/// Relative tolerance under which two arcs are "the same circle" (GH
+/// #226): centre and radius both within `1e-4·r` — f32-authored points
+/// on the circle carry ~1e-7·r, so the band only absorbs exporter noise.
+const SAME_CIRCLE_REL_TOL: f64 = 1e-4;
+
+/// Whether two `(centre, radius)` circles coincide within
+/// [`SAME_CIRCLE_REL_TOL`].
+pub(crate) fn same_circle(a: (DVec2, f64), b: (DVec2, f64)) -> bool {
+    let tol = SAME_CIRCLE_REL_TOL * a.1.abs().max(b.1.abs());
+    (a.0 - b.0).length() <= tol && (a.1 - b.1).abs() <= tol
+}
+
+/// The circle a profile curve runs along when EVERY piece of it is an arc
+/// of one circle (GH #226): an `IfcCircle`, an `IfcTrimmedCurve` on one,
+/// an all-`IfcArcIndex` `IfcIndexedPolyCurve`, or an `IfcCompositeCurve`
+/// whose parents all are. Whether the arcs cover the full turn is checked
+/// by the caller on the sampled loop's area.
+fn circle_of(table: &EntityTable, curve_id: u64) -> Option<(DVec2, f64)> {
+    let (type_name, args) = table.get(curve_id)?;
+    let fields = split_top_level_args(args);
+    if type_name.eq_ignore_ascii_case(b"IFCCIRCLE") {
+        let radius = number_at(&fields, 1)?;
+        if !(radius.is_finite() && radius > 0.0) {
+            return None;
+        }
+        let centre = match fields.first().copied().map(parse_field) {
+            Some(Field::Ref(pid)) => placement2d_origin_dir_f64(table, pid).0,
+            _ => DVec2::ZERO,
+        };
+        return Some((centre, radius));
+    }
+    if type_name.eq_ignore_ascii_case(b"IFCTRIMMEDCURVE") {
+        let basis_id = match parse_field(fields.first()?) {
+            Field::Ref(id) => id,
+            _ => return None,
+        };
+        let (basis_type, _) = table.get(basis_id)?;
+        if !basis_type.eq_ignore_ascii_case(b"IFCCIRCLE") {
+            return None;
+        }
+        return circle_of(table, basis_id);
+    }
+    if type_name.eq_ignore_ascii_case(b"IFCINDEXEDPOLYCURVE") {
+        let pts_id = match parse_field(fields.first()?) {
+            Field::Ref(id) => id,
+            _ => return None,
+        };
+        let pts = point_list_2d_raw(table, pts_id)?;
+        let segs = list_body(fields.get(1).copied())?;
+        return crate::mesh::indexed_curve::common_circle_2d(&pts, segs);
+    }
+    if type_name.eq_ignore_ascii_case(b"IFCCOMPOSITECURVE") {
+        let body = match parse_field(fields.first()?) {
+            Field::List(b) => b,
+            _ => return None,
+        };
+        let mut circle: Option<(DVec2, f64)> = None;
+        for seg_field in split_top_level_args(body) {
+            let seg_id = match parse_field(seg_field) {
+                Field::Ref(id) => id,
+                _ => return None,
+            };
+            let (_, seg_args) = table.get(seg_id)?;
+            let parent = split_top_level_args(seg_args)
+                .get(2)
+                .copied()
+                .map(parse_field);
+            let parent_id = match parent {
+                Some(Field::Ref(id)) => id,
+                _ => return None,
+            };
+            let c = circle_of(table, parent_id)?;
+            match circle {
+                None => circle = Some(c),
+                Some(c0) if same_circle(c0, c) => {}
+                Some(_) => return None,
+            }
+        }
+        return circle;
+    }
+    None
+}
+
+/// Relative band on `|loop area| / (π r²) − 1` inside which a loop made
+/// only of arcs of one circle is taken to close the full turn. Every arc
+/// sampler here is area-preserving, so a full circle lands within f32
+/// noise of `π r²`; arcs of one circle closed by an implicit chord (a
+/// half-disc, a segment) miss it by tens of percent.
+const FULL_CIRCLE_AREA_REL_TOL: f64 = 1e-3;
+
+fn is_full_circle_loop(pts: &[Vec2], r: f64) -> bool {
+    let area = 0.5 * signed_area_2(pts).abs();
+    (area / (std::f64::consts::PI * r * r) - 1.0).abs() <= FULL_CIRCLE_AREA_REL_TOL
+}
+
+/// GH #226 — sample a circular hole at its circular outer loop's angles.
+///
+/// Each loop used to be sampled on its own: chord count from its own
+/// radius, phase from its own authored points, interior samples pushed
+/// OUTWARD by the area-preserving factor. For a thin ring (HI90_RIE
+/// recessed sockets: r 20 / 19.8 mm, 0.2 mm wall) the hole got 7 chords
+/// per semicircle against the outer's 8, its interior samples landed at
+/// 20.194 mm — outside the outer polygon's chords (~19.91 mm there) — and
+/// earcut filled the whole disc: 1258 mm² cap vs a 25 mm² ring, +13 % on
+/// the product, `volume_reliable` true until #220 flagged it.
+///
+/// The hole is instead the outer polygon scaled by `λ = r / R` about the
+/// outer centre and moved to the hole centre — the same "one sampling for
+/// both rings" rule [`circle_hollow`] uses. Its area is `λ²` times the
+/// outer's area-exact `π R²`, i.e. exactly `π r²`; its vertices sit on the
+/// hole circle (pinned endpoints at `r`, interior at the outer's `k·r`).
+/// For a convex outer polygon with inradius `h` about its centre, the
+/// copy lies strictly inside whenever `|c − C| < (1 − λ)·h` (each edge
+/// half-plane keeps a margin of `(1 − λ)·h − |c − C|`), so the ring is a
+/// valid polygon-with-hole at ANY wall thickness. `None` — keep the
+/// independently sampled hole — when either loop is not a full circle,
+/// the outer polygon is not convex around its centre, or the offset hole
+/// does not provably fit.
+fn matched_circular_hole(
+    outer: &[Vec2],
+    (c_o, r_o): (DVec2, f64),
+    hole: &[Vec2],
+    (c_h, r_h): (DVec2, f64),
+) -> Option<Vec<Vec2>> {
+    if !(r_h > 0.0 && r_h < r_o) || outer.len() < 3 {
+        return None;
+    }
+    if !is_full_circle_loop(outer, r_o) || !is_full_circle_loop(hole, r_h) {
+        return None;
+    }
+    // Convexity + inradius about the outer centre, in the outer's own
+    // orientation (`eval_segments_2d` forces CCW, an IfcCircle samples CCW,
+    // a composite may run either way).
+    let orient = signed_area_2(outer).signum();
+    let n = outer.len();
+    let mut inradius = f64::INFINITY;
+    for i in 0..n {
+        let a = outer[i].as_dvec2();
+        let b = outer[(i + 1) % n].as_dvec2();
+        let c = outer[(i + 2) % n].as_dvec2();
+        let e = b - a;
+        let len = e.length();
+        if len == 0.0 {
+            return None;
+        }
+        // Signed distance of the centre to the edge line, positive inside.
+        let d = orient * e.perp_dot(c_o - a) / len;
+        if orient * e.perp_dot(c - b) < 0.0 || d <= 0.0 {
+            return None;
+        }
+        inradius = inradius.min(d);
+    }
+    let lambda = r_h / r_o;
+    if (c_h - c_o).length() >= (1.0 - lambda) * inradius {
+        return None;
+    }
+    Some(
+        outer
+            .iter()
+            .map(|p| (c_h + (p.as_dvec2() - c_o) * lambda).as_vec2())
+            .collect(),
+    )
 }
 
 fn curve_to_polyline(table: &EntityTable, curve_id: u64) -> Option<Vec<Vec2>> {
@@ -3296,6 +3467,174 @@ FILE_SCHEMA(('{schema}'));\nENDSEC;\nDATA;\n{units}\n#90={profile};\nENDSEC;\nEN
             let got = new(&table, &fields).unwrap();
             assert!(got.holes.is_empty());
             assert_eq!(bits(&got.outer), bits(&old(&fields)), "{profile}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod gh226_annulus_tests {
+    //! GH #226 — circular holes in circular outers are sampled at the
+    //! outer's angles, so a thin ring stays a valid region.
+    use super::*;
+    use crate::mesh::profile_check::{check, ProfileDefect};
+
+    /// `IfcArbitraryProfileDefWithVoids` (#90) over mm + radians with the
+    /// given DATA lines (source text; build the table from it); the outer curve is #20, the void #30.
+    fn src(data: &str) -> String {
+        format!(
+            "ISO-10303-21;\nHEADER;\nFILE_DESCRIPTION(('ViewDefinition [ReferenceView]'),'2;1');\n\
+FILE_NAME('a.ifc','2026-11-02T00:00:00',('test'),('skiplum'),'ifcfast','ifcfast','');\n\
+FILE_SCHEMA(('IFC4'));\nENDSEC;\nDATA;\n\
+#1=IFCUNITASSIGNMENT((#2,#3));\n#2=IFCSIUNIT(*,.LENGTHUNIT.,.MILLI.,.METRE.);\n\
+#3=IFCSIUNIT(*,.PLANEANGLEUNIT.,$,.RADIAN.);\n{data}\n\
+#90=IFCARBITRARYPROFILEDEFWITHVOIDS(.AREA.,$,#20,(#30));\nENDSEC;\nEND-ISO-10303-21;\n"
+        )
+    }
+
+    /// HI90_RIE #4139–#4142 verbatim: r 20 / 19.8 mm, two `IfcArcIndex`
+    /// semicircles each, outer and hole starting on opposite sides.
+    const HI90_RING: &str = "\
+#19=IFCCARTESIANPOINTLIST2D(((-19.999999999999979,-1.6538921594855141E-014),(-1.0840127831033303E-013,-20.000000000000068),(19.999999999999979,1.6538921594855128E-014),(-1.9125741242231807E-014,19.99999999999989)));\n\
+#20=IFCINDEXEDPOLYCURVE(#19,(IFCARCINDEX((1,2,3)),IFCARCINDEX((3,4,1))),.F.);\n\
+#29=IFCCARTESIANPOINTLIST2D(((19.799999999999979,-2.13144017739597E-013),(-3.2105392637845095E-014,-19.800000000000068),(-19.799999999999979,-1.4522508756165893E-013),(-1.4247059022284337E-013,19.799999999999891)));\n\
+#30=IFCINDEXEDPOLYCURVE(#29,(IFCARCINDEX((1,2,3)),IFCARCINDEX((3,4,1))),.F.);";
+
+    fn area(p: &Polygon2D) -> f64 {
+        0.5 * (signed_area_2(&p.outer).abs()
+            - p.holes.iter().map(|h| signed_area_2(h).abs()).sum::<f64>())
+    }
+
+    fn ring_area(r_o: f64, r_i: f64) -> f64 {
+        std::f64::consts::PI * (r_o * r_o - r_i * r_i)
+    }
+
+    fn assert_valid_ring(p: &Polygon2D, want: f64, label: &str) {
+        assert_eq!(check(p), None, "{label}: profile must be a valid region");
+        let got = area(p);
+        assert!(
+            ((got - want) / want).abs() < 1e-3,
+            "{label}: ring area {got} vs analytic {want}"
+        );
+    }
+
+    #[test]
+    fn hi90_thin_ring_independent_sampling_crossed_the_outer() {
+        // The mechanism, pinned: sampled on its own the r = 19.8 hole
+        // crosses the r = 20 outer polygon (pre-#226 output).
+        let s = src(HI90_RING);
+        let t = EntityTable::build(s.as_bytes());
+        let outer = curve_to_polyline(&t, 20).unwrap();
+        let hole = curve_to_polyline(&t, 30).unwrap();
+        assert_ne!(outer.len(), hole.len(), "chord counts differ by radius");
+        let independent = normalize_winding(Polygon2D {
+            outer,
+            holes: vec![hole],
+        });
+        assert_eq!(check(&independent), Some(ProfileDefect::SelfIntersecting));
+    }
+
+    #[test]
+    fn hi90_thin_ring_is_valid_and_area_exact() {
+        let s = src(HI90_RING);
+        let p = extract(&EntityTable::build(s.as_bytes()), 90).unwrap();
+        assert_eq!(p.holes.len(), 1);
+        assert_eq!(
+            p.outer.len(),
+            p.holes[0].len(),
+            "hole sampled at the outer's angles"
+        );
+        assert_valid_ring(&p, ring_area(20.0, 19.8), "HI90 ring");
+        // Every hole vertex sits on the hole circle (pinned endpoints at r,
+        // interior samples at the outer's area factor ≤ 1.1·r).
+        for v in &p.holes[0] {
+            let r = v.as_dvec2().length();
+            assert!(
+                (19.8 - 1e-4..19.8 * 1.1).contains(&r),
+                "hole vertex at r = {r}"
+            );
+        }
+    }
+
+    #[test]
+    fn ifc_circle_rings_any_thickness_and_offset_stay_valid() {
+        // IfcCircle outer + IfcCircle void: 50 µm wall, and an off-centre
+        // void that still fits — both used to sample at radius-dependent
+        // chord counts.
+        for (r_i, cx) in [(19.95, 0.0), (19.8, 0.0), (10.0, 4.0), (5.0, -12.0)] {
+            let data = format!(
+                "#10=IFCCARTESIANPOINT((0.,0.));\n#11=IFCDIRECTION((1.,0.));\n\
+#12=IFCAXIS2PLACEMENT2D(#10,#11);\n#20=IFCCIRCLE(#12,20.);\n\
+#21=IFCCARTESIANPOINT(({cx:?},0.));\n#22=IFCAXIS2PLACEMENT2D(#21,#11);\n\
+#30=IFCCIRCLE(#22,{r_i:?});"
+            );
+            let s = src(&data);
+            let p = extract(&EntityTable::build(s.as_bytes()), 90).unwrap();
+            assert_valid_ring(
+                &p,
+                ring_area(20.0, r_i),
+                &format!("IfcCircle r_i={r_i} cx={cx}"),
+            );
+        }
+    }
+
+    #[test]
+    fn trimmed_semicircle_composite_ring_is_valid() {
+        // Revit-style: each loop an IfcCompositeCurve of two trimmed
+        // semicircles; 0.2 mm wall at r = 7.5.
+        let loop_of = |base: u32, r: f64| {
+            format!(
+                "#{a}=IFCCIRCLE(#12,{r:?});\n\
+#{b}=IFCTRIMMEDCURVE(#{a},(IFCPARAMETERVALUE(0.)),(IFCPARAMETERVALUE(3.14159265358979)),.T.,.PARAMETER.);\n\
+#{c}=IFCTRIMMEDCURVE(#{a},(IFCPARAMETERVALUE(3.14159265358979)),(IFCPARAMETERVALUE(6.28318530717959)),.T.,.PARAMETER.);\n\
+#{d}=IFCCOMPOSITECURVESEGMENT(.CONTINUOUS.,.T.,#{b});\n\
+#{e}=IFCCOMPOSITECURVESEGMENT(.CONTINUOUS.,.T.,#{c});\n\
+#{f}=IFCCOMPOSITECURVE((#{d},#{e}),.F.);",
+                a = base + 1,
+                b = base + 2,
+                c = base + 3,
+                d = base + 4,
+                e = base + 5,
+                f = base + 10,
+            )
+        };
+        let data = format!(
+            "#10=IFCCARTESIANPOINT((0.,0.));\n#11=IFCDIRECTION((1.,0.));\n\
+#12=IFCAXIS2PLACEMENT2D(#10,#11);\n{}\n{}",
+            loop_of(10, 7.5),
+            loop_of(20, 7.3)
+        );
+        let s = src(&data);
+        let p = extract(&EntityTable::build(s.as_bytes()), 90).unwrap();
+        assert_valid_ring(&p, ring_area(7.5, 7.3), "trimmed composite ring");
+    }
+
+    #[test]
+    fn non_circular_and_partial_loops_keep_their_own_sampling() {
+        // A square void in a circle, and a single-arc (half-disc, implicit
+        // closing chord) void: neither is a full circle, so the void is
+        // exactly what `curve_to_polyline` gives on its own.
+        let outer = "#10=IFCCARTESIANPOINT((0.,0.));\n#11=IFCDIRECTION((1.,0.));\n\
+#12=IFCAXIS2PLACEMENT2D(#10,#11);\n#20=IFCCIRCLE(#12,200.);";
+        for void in [
+            "#29=IFCCARTESIANPOINTLIST2D(((-50.,-50.),(50.,-50.),(50.,50.),(-50.,50.)));\n\
+#30=IFCINDEXEDPOLYCURVE(#29,(IFCLINEINDEX((1,2,3,4,1))),.F.);",
+            "#29=IFCCARTESIANPOINTLIST2D(((-50.,0.),(0.,-50.),(50.,0.)));\n\
+#30=IFCINDEXEDPOLYCURVE(#29,(IFCARCINDEX((1,2,3))),.F.);",
+        ] {
+            let s = src(&format!("{outer}\n{void}"));
+            let t = EntityTable::build(s.as_bytes());
+            let p = extract(&t, 90).unwrap();
+            let own = normalize_winding(Polygon2D {
+                outer: curve_to_polyline(&t, 20).unwrap(),
+                holes: vec![curve_to_polyline(&t, 30).unwrap()],
+            });
+            let bits = |v: &[Vec2]| {
+                v.iter()
+                    .map(|q| (q.x.to_bits(), q.y.to_bits()))
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(bits(&p.holes[0]), bits(&own.holes[0]), "{void}");
+            assert_eq!(bits(&p.outer), bits(&own.outer));
         }
     }
 }
