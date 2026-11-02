@@ -314,8 +314,11 @@ describing via `pq.read_schema(...)`):
   `storey_guid` (the storey the product resolves to — **transitive**:
   inherited through `IfcRelAggregates` when the product itself has no
   direct `IfcRelContainedInSpatialStructure`, so it agrees with the
-  graph walk; `None` only when no storey sits above it, e.g. placed
-  straight under a building/site — GH #88, cache schema v21),
+  graph walk, and through an `IfcSpace` container to the space's
+  storey since cache schema v45, GH #236; an opening resolves through
+  the element it voids, GH #203; `None` only when no storey
+  sits above it, e.g. placed straight under a building/site — GH #88,
+  cache schema v21),
   `aggregates_parent_guid`, `type_guid`, `rep_id`.
   `type_guid` / `type_name` resolve through `IfcRelDefinesByType` and
   cover bare `IfcTypeProduct` / `IfcTypeObject` types too (since cache
@@ -2058,6 +2061,9 @@ plus everything required to keep them valid:
 
 - their forward dependencies (geometry, placement, profiles, materials,
   units, representation contexts);
+- the `IfcProject` with its `IfcUnitAssignment` and representation
+  contexts, **always**, whatever the seeds (GH #239 — a subset of
+  uncontained elements such as a lone opening used to lose its units);
 - the **spatial spine** up to `IfcProject`, so the subset has a
   well-formed storey → building → site tree (only the ancestors of kept
   elements are retained);

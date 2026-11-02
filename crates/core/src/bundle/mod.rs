@@ -287,6 +287,16 @@ impl Bundle {
             agg_parent.insert(*child, *parent);
         }
 
+        // Opening step_id -> voided host step_id (IfcRelVoidsElement): an
+        // opening has no containment or aggregation of its own and sits
+        // where its host sits (GH #203).
+        let void_host: HashMap<u64, u64> = idx
+            .voids_opening
+            .iter()
+            .copied()
+            .zip(idx.voids_host.iter().copied())
+            .collect();
+
         // Product step_id -> type_object step_id, from
         // IfcRelDefinesByType. One type per product (the relation fans
         // out N products per type; we record the type each product
@@ -355,7 +365,8 @@ impl Bundle {
             // wall's storey, a stair flight the stair's). See GH #88 — this
             // makes the denormalised `storey_guid` agree with the graph
             // walk that `m.products_in(storey)` performs.
-            let storey_sid = resolve_storey_sid(sid, &contained_in, &agg_parent, &storey_ids);
+            let storey_sid =
+                resolve_storey_sid(sid, &contained_in, &agg_parent, &void_host, &storey_ids);
             let storey_guid = storey_sid.and_then(|s| step_to_guid.get(&s).cloned());
             let storey_name = storey_sid
                 .and_then(|s| storey_name_by_id.get(&s).cloned())
@@ -645,6 +656,7 @@ fn resolve_storey_sid(
     start: u64,
     contained_in: &HashMap<u64, u64>,
     agg_parent: &HashMap<u64, u64>,
+    void_host: &HashMap<u64, u64>,
     storey_ids: &HashSet<u64>,
 ) -> Option<u64> {
     // Direct storey containment takes precedence over any inherited storey.
@@ -670,9 +682,13 @@ fn resolve_storey_sid(
             cur = container;
             continue;
         }
-        // No containment edge — follow the aggregation parent.
+        // No containment edge — follow the aggregation parent, else (an
+        // opening) the element it voids.
         {
-            let parent = agg_parent.get(&cur).copied()?;
+            let parent = agg_parent
+                .get(&cur)
+                .or_else(|| void_host.get(&cur))
+                .copied()?;
             if storey_ids.contains(&parent) {
                 return Some(parent);
             }
@@ -714,6 +730,19 @@ mod tests {
     //   999 = a product placed directly under a building, no storey above
 
     #[test]
+    fn opening_inherits_void_host_storey() {
+        // GH #203: an opening (400) voids the wall (200); it has neither
+        // containment nor aggregation and must resolve to the wall's storey.
+        let storey_ids: HashSet<u64> = [100u64].into_iter().collect();
+        let contained_in: HashMap<u64, u64> = [(200u64, 100u64)].into_iter().collect();
+        let void_host: HashMap<u64, u64> = [(400u64, 200u64)].into_iter().collect();
+        assert_eq!(
+            resolve_storey_sid(400, &contained_in, &HashMap::new(), &void_host, &storey_ids),
+            Some(100)
+        );
+    }
+
+    #[test]
     fn aggregate_part_inherits_host_storey() {
         // The plate (201) is aggregated into the wall (200), and only the
         // wall is spatially contained in the storey (100). The plate must
@@ -724,13 +753,25 @@ mod tests {
         let agg_parent: HashMap<u64, u64> = [(201u64, 200u64)].into_iter().collect();
 
         assert_eq!(
-            resolve_storey_sid(201, &contained_in, &agg_parent, &storey_ids),
+            resolve_storey_sid(
+                201,
+                &contained_in,
+                &agg_parent,
+                &HashMap::new(),
+                &storey_ids
+            ),
             Some(100),
             "aggregate part should inherit its host's storey"
         );
         // And the host itself still resolves directly.
         assert_eq!(
-            resolve_storey_sid(200, &contained_in, &agg_parent, &storey_ids),
+            resolve_storey_sid(
+                200,
+                &contained_in,
+                &agg_parent,
+                &HashMap::new(),
+                &storey_ids
+            ),
             Some(100),
         );
     }
@@ -746,7 +787,13 @@ mod tests {
         let agg_parent: HashMap<u64, u64> = [(201u64, 200u64)].into_iter().collect();
 
         assert_eq!(
-            resolve_storey_sid(201, &contained_in, &agg_parent, &storey_ids),
+            resolve_storey_sid(
+                201,
+                &contained_in,
+                &agg_parent,
+                &HashMap::new(),
+                &storey_ids
+            ),
             Some(100),
             "direct storey containment must override the aggregate ancestor"
         );
@@ -763,7 +810,13 @@ mod tests {
         let agg_parent: HashMap<u64, u64> = HashMap::new();
 
         assert_eq!(
-            resolve_storey_sid(301, &contained_in, &agg_parent, &storey_ids),
+            resolve_storey_sid(
+                301,
+                &contained_in,
+                &agg_parent,
+                &HashMap::new(),
+                &storey_ids
+            ),
             Some(100),
         );
     }
@@ -776,7 +829,13 @@ mod tests {
         let agg_parent: HashMap<u64, u64> = HashMap::new();
 
         assert_eq!(
-            resolve_storey_sid(999, &contained_in, &agg_parent, &storey_ids),
+            resolve_storey_sid(
+                999,
+                &contained_in,
+                &agg_parent,
+                &HashMap::new(),
+                &storey_ids
+            ),
             None,
         );
     }
@@ -792,7 +851,13 @@ mod tests {
             [(201u64, 200u64), (200u64, 201u64)].into_iter().collect();
 
         assert_eq!(
-            resolve_storey_sid(201, &contained_in, &agg_parent, &storey_ids),
+            resolve_storey_sid(
+                201,
+                &contained_in,
+                &agg_parent,
+                &HashMap::new(),
+                &storey_ids
+            ),
             None,
             "aggregate cycle must not hang and resolves to no storey"
         );
@@ -807,7 +872,13 @@ mod tests {
         let agg_parent: HashMap<u64, u64> = HashMap::new();
 
         assert_eq!(
-            resolve_storey_sid(201, &contained_in, &agg_parent, &storey_ids),
+            resolve_storey_sid(
+                201,
+                &contained_in,
+                &agg_parent,
+                &HashMap::new(),
+                &storey_ids
+            ),
             None,
         );
     }

@@ -653,7 +653,9 @@ def _agg_parent(el):
 def _truth_storey(el, budget: int = 16):
     """Storey the product resolves to: direct spatial container, walked
     up through IfcRelAggregates until an IfcBuildingStorey; a product
-    with no containment inherits from its aggregate parent (GH #88).
+    with no containment inherits from its aggregate parent (GH #88), and
+    an opening with neither from the element it voids (GH #203, as
+    ifcopenshell's get_container does).
 
     Returns (storey_or_None, how) with how in direct / via_container /
     via_aggregate / none."""
@@ -674,6 +676,11 @@ def _truth_storey(el, budget: int = 16):
             continue
         p = _agg_parent(cur)
         if p is None:
+            voids = getattr(cur, "VoidsElements", None) or []
+            if voids:
+                how = how or "via_void_host"
+                cur = voids[0].RelatingBuildingElement
+                continue
             return None, "none"
         if p.is_a("IfcBuildingStorey"):
             return p, how or "via_aggregate"

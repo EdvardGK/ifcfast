@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-Cache schema v44.
+Cache schema v45.
 
 ### Added
 
@@ -47,6 +47,34 @@ Cache schema v44.
 
 ### Fixed
 
+- **Products contained in an `IfcSpace` resolve to their storey (GH #236,
+  cache schema v45).** Revit puts furniture, sanitary terminals and
+  coverings in the room, not the storey. The space is also a product, and
+  its `product` kind overwrote `space`, so every
+  `IfcRelContainedInSpatialStructure` edge to a space was dropped: on
+  G55_ARK, 625 products had `storey_guid = None` and were missing from
+  `products_in(storey)` / `filter(storey_guid=…)`. The edges now appear in
+  `contained_in` with `container_kind = "space"` and resolve through the
+  space's storey. `aggregates.parent_kind` reads `space` / `site` (not
+  `product`) for spatial parents that are also products.
+- **Openings resolve to their host's storey (GH #203, cache schema
+  v45).** An `IfcOpeningElement` has no containment or aggregation of its
+  own, so its `storey_guid` was `None` (all 1 304 openings on G55_ARK).
+  It now resolves through the element it voids (`IfcRelVoidsElement`), as
+  ifcopenshell's `get_container` does. `m.parent(opening)` is the voided
+  element, `m.children(host)` lists its openings, and `products_in(storey)`
+  includes them, so it still equals `filter(storey_guid=…)`. Same rule in
+  the substrate (`storey_guid` on products) and the wasm products layer.
+- **IFC4 `IfcDistributionPort.predefined_type` is the PredefinedType
+  (GH #235, cache schema v45).** The indexer took the trailing enum, which
+  on IFC4 ports is `SystemType`, so every port read `CONVEYING` / … instead
+  of `CABLECARRIER` / …. The slot is now read by position. IFC2X3 ports
+  (no PredefinedType) stay `None`.
+- **`m.subset()` always carries `IfcProject`, its units and contexts (GH
+  #239).** The spatial-spine climb reached the project only from seeds
+  with a spatial path, so a subset of uncontained elements (a lone
+  `IfcOpeningElement`) had no `IfcUnitAssignment` and a millimetre model
+  re-opened as metres. Every `IfcProject` is now a closure root.
 - **Section profiles carry their fillets, edge radii and slopes (GH #225,
   cache schema v43).** `IfcIShapeProfileDef` and its L / U / T / Z
   siblings were meshed as their sharp-cornered polygons, so every rolled

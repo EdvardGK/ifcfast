@@ -385,14 +385,16 @@ impl Analysis {
         let mut parent_guid_by_step: HashMap<u64, String> = HashMap::new();
         let mut parent_kind_by_step: HashMap<u64, &'static str> = HashMap::new();
         // Deliberate precedence, lowest first: the "most specific" kind
-        // wins if a step id somehow appears in two tables.
+        // wins if a step id appears in two tables. Products go first: an
+        // IfcSpace (or a bodied IfcSite) is also a product, and its spatial
+        // kind must win or its containment edges are dropped (GH #236).
         for (src, kind) in [
+            (&product_step_to_guid, "product"),
             (&idx.space_step_id_to_guid, "space"),
             (&idx.site_step_id_to_guid, "site"),
             (&idx.project_step_id_to_guid, "project"),
             (&idx.building_step_id_to_guid, "building"),
             (&storey_step_to_guid, "storey"),
-            (&product_step_to_guid, "product"),
         ] {
             for (sid, guid) in src {
                 parent_guid_by_step.insert(*sid, guid.clone());
@@ -443,10 +445,29 @@ impl Analysis {
             contained_in.push((cg.clone(), container_guid.clone(), kind));
         }
 
+        let mut voids: Vec<(String, String)> = Vec::new();
+        let mut opening_guids: HashSet<String> = HashSet::new();
+        for (opening, host) in idx.voids_opening.iter().zip(idx.voids_host.iter()) {
+            if let (Some(og), Some(hg)) = (
+                product_step_to_guid.get(opening),
+                product_step_to_guid.get(host),
+            ) {
+                opening_guids.insert(og.clone());
+                voids.push((og.clone(), hg.clone()));
+            }
+        }
+
         // Transitive storey resolution — the `_GraphIndex` +
         // `_walk_to_storey` pair, ported so `storey_guid` agrees with the
-        // graph walk (GH #88).
-        let graph = GraphIndex::build(&contained_in, &aggregates, &storey_building, &storeys);
+        // graph walk (GH #88). Voids come first: an opening resolves
+        // through its host (GH #203).
+        let graph = GraphIndex::build(
+            &contained_in,
+            &aggregates,
+            &storey_building,
+            &storeys,
+            &voids,
+        );
         let mut storey_guid_by_step: HashMap<u64, Option<String>> = HashMap::new();
         for (sid, guid) in &product_step_to_guid {
             storey_guid_by_step.insert(*sid, graph.walk_to_storey(guid));
@@ -506,18 +527,6 @@ impl Analysis {
                     duplicate_step_ids += 1;
                     products[prev] = row;
                 }
-            }
-        }
-
-        let mut voids: Vec<(String, String)> = Vec::new();
-        let mut opening_guids: HashSet<String> = HashSet::new();
-        for (opening, host) in idx.voids_opening.iter().zip(idx.voids_host.iter()) {
-            if let (Some(og), Some(hg)) = (
-                product_step_to_guid.get(opening),
-                product_step_to_guid.get(host),
-            ) {
-                opening_guids.insert(og.clone());
-                voids.push((og.clone(), hg.clone()));
             }
         }
 
@@ -1122,6 +1131,9 @@ struct GraphIndex {
     storey_of: HashMap<String, String>,
     container_of: HashMap<String, String>,
     storey_guids: HashSet<String>,
+    /// IfcRelVoidsElement opening → host: an opening sits where its host
+    /// sits (GH #203). Last-resort hop after containment and aggregation.
+    void_host_of: HashMap<String, String>,
 }
 
 impl GraphIndex {
@@ -1130,12 +1142,14 @@ impl GraphIndex {
         aggregates: &[(String, String, &'static str)],
         storey_building: &[(String, String)],
         storeys: &[StoreyRow],
+        voids: &[(String, String)],
     ) -> GraphIndex {
         let mut g = GraphIndex {
             parent_of: HashMap::new(),
             storey_of: HashMap::new(),
             container_of: HashMap::new(),
             storey_guids: storeys.iter().map(|s| s.guid.clone()).collect(),
+            void_host_of: voids.iter().cloned().collect(),
         };
         for (child, parent, _) in aggregates {
             g.parent_of.insert(child.clone(), parent.clone());
@@ -1170,7 +1184,10 @@ impl GraphIndex {
                 cur = container.clone();
                 continue;
             }
-            let parent = self.parent_of.get(&cur)?;
+            let parent = self
+                .parent_of
+                .get(&cur)
+                .or_else(|| self.void_host_of.get(&cur))?;
             if self.storey_guids.contains(parent) {
                 return Some(parent.clone());
             }

@@ -490,3 +490,52 @@ def test_summary_spaces_columns_match_the_live_frame_206(minimal):
     assert minimal.summary()["tables"]["spaces"]["columns"] == live
     assert minimal.schemas["spaces"]["columns"] == live
     assert set(minimal.schemas["spaces"]["dtypes"]) == set(live)
+
+
+def test_space_containment_resolves_to_storey(fresh_cache):
+    """GH #236: products contained in an IfcSpace (Revit puts furniture and
+    sanitary terminals in the room) keep their `space` edge in
+    `contained_in` and resolve `storey_guid` through the space's storey.
+    The space is itself a product, and the `product` kind used to overwrite
+    `space`, so the edge was dropped as "container is a product"."""
+    m = ifcfast.open(
+        str(Path(__file__).parent / "fixtures" / "space_containment_236.ifc"),
+        use_cache=False, write_cache=False,
+    )
+    storey, space = "3XvctVUKr0kugbFTf53O9L", "7XvctVUKr0kugbFTf53O9L"
+    wc, bench, wall = (
+        "9XvctVUKr0kugbFTf53O9L", "AXvctVUKr0kugbFTf53O9L", "DXvctVUKr0kugbFTf53O9L",
+    )
+    rows = {r.product_guid: (r.container_guid, r.container_kind)
+            for r in m.contained_in.itertuples(index=False)}
+    assert rows[wc] == (space, "space")
+    assert rows[bench] == (space, "space")
+    assert rows[wall] == (storey, "storey")
+
+    for g in (wc, bench, wall):
+        assert m.storey_of(g) == storey
+    df = m.products_df.set_index("guid")
+    assert df.loc[wc, "storey_guid"] == storey
+    assert df.loc[bench, "storey_guid"] == storey
+    assert {wc, bench, wall} <= set(m.products_in(storey))
+    assert m.aggregates.set_index("child_guid").loc[space, "parent_kind"] == "storey"
+
+
+def test_opening_resolves_to_void_host_storey(fresh_cache):
+    """GH #203: an IfcOpeningElement has no containment or aggregation; it
+    sits where the element it voids sits, as ifcopenshell's get_container
+    resolves it. storey_guid, storey_of, parent and products_in agree."""
+    m = ifcfast.open(
+        str(Path(__file__).parent / "fixtures" / "space_containment_236.ifc"),
+        use_cache=False, write_cache=False,
+    )
+    storey, wall, opening = (
+        "3XvctVUKr0kugbFTf53O9L", "DXvctVUKr0kugbFTf53O9L", "FXvctVUKr0kugbFTf53O9L",
+    )
+    assert m.parent(opening) == wall
+    assert m.storey_of(opening) == storey
+    assert m.products_df.set_index("guid").loc[opening, "storey_guid"] == storey
+    assert opening in m.children(wall)
+    assert set(m.products_in(storey)) == set(
+        m.products_df[m.products_df.storey_guid == storey].guid
+    )

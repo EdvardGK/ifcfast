@@ -78,8 +78,19 @@ pub fn subset(doc: &Doc, seeds: &[u64]) -> (Vec<u8>, SubsetStats) {
         })
         .collect();
 
-    // Phase 1: forward-dependency closure of the seeds.
-    let mut keep = reachable_closure(doc, seeds);
+    // Phase 1: forward-dependency closure of the seeds, plus every
+    // IfcProject. A subset must carry its project (and through it the
+    // IfcUnitAssignment and representation contexts) whatever the seeds:
+    // the spine climb in phase 2 only reaches it from seeds with a spatial
+    // path, and a subset of uncontained elements (a lone IfcOpeningElement)
+    // without units re-opens as metres (GH #239).
+    let mut roots: Vec<u64> = seeds.to_vec();
+    roots.extend(doc.ids().iter().copied().filter(|&id| {
+        doc.record_bytes(id)
+            .and_then(crate::lexer::parse_record_span)
+            .is_some_and(|(_, ty, _)| ty == b"IFCPROJECT")
+    }));
+    let mut keep = reachable_closure(doc, &roots);
 
     // Phase 2: activate rels and pull upstream deps to a fixpoint. Each
     // round collects the pull refs of every activated rel not yet kept,
