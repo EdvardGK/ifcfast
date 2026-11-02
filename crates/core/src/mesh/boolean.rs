@@ -145,7 +145,7 @@ const FAR_ORIGIN_M: f64 = 1.0e4;
 
 /// `true` when any component of `v` (model units) lies beyond
 /// [`FAR_ORIGIN_M`] once scaled to metres by `scale`.
-fn is_far(v: DVec3, scale: f64) -> bool {
+pub(crate) fn is_far(v: DVec3, scale: f64) -> bool {
     v.abs().max_element() * scale > FAR_ORIGIN_M
 }
 

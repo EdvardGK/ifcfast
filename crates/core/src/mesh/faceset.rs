@@ -28,6 +28,55 @@ fn bbox_min(pts: &[DVec3]) -> DVec3 {
     )
 }
 
+/// GH #228: drop `IfcCartesianPointList3D` points that no face
+/// references. Revit toposolid / site exports leave orphan points in the
+/// list (KNM_LARK: two points 9.2 m below every triangle); copied
+/// verbatim they widen every consumer that reads the vertex buffer —
+/// `m.mesh()` bbox, the QTO AABB / prism bound and its signed-tetra
+/// origin, substrate `bbox_*` / `centroid_xyz`, clash broad-phase.
+/// ifcopenshell drops them too.
+///
+/// Order-preserving compaction: the kept points stay in list order and
+/// the indices are remapped. When every point is referenced — the normal
+/// case — this is a strict no-op, so those meshes stay bit-identical. With
+/// orphans the `rep_origin` is re-derived as the bbox-min of the kept
+/// points (same rebase rule, applied to what the mesh actually is) and
+/// the f32 vertices are re-narrowed from the f64 coords.
+fn drop_unreferenced_points(mesh: &mut LocalMesh, coords: &[DVec3]) {
+    // Faces only ever index the coords table (the triangulation helpers
+    // add no vertices); bail rather than guess if that ever changes.
+    if mesh.vertices.len() != coords.len() * 3 {
+        return;
+    }
+    let mut used = vec![false; coords.len()];
+    for &i in &mesh.indices {
+        used[i as usize] = true;
+    }
+    if used.iter().all(|&u| u) {
+        return;
+    }
+    let mut remap = vec![u32::MAX; coords.len()];
+    let mut kept: Vec<DVec3> = Vec::with_capacity(coords.len());
+    for (i, p) in coords.iter().enumerate() {
+        if used[i] {
+            remap[i] = kept.len() as u32;
+            kept.push(*p);
+        }
+    }
+    let origin = bbox_min(&kept);
+    mesh.rep_origin = [origin.x, origin.y, origin.z];
+    mesh.vertices.clear();
+    for p in &kept {
+        let d = *p - origin;
+        mesh.vertices.push(d.x as f32);
+        mesh.vertices.push(d.y as f32);
+        mesh.vertices.push(d.z as f32);
+    }
+    for i in mesh.indices.iter_mut() {
+        *i = remap[*i as usize];
+    }
+}
+
 /// Mesh an `IfcPolygonalFaceSet` (Archicad's primary export format).
 pub fn polygonal_face_set(table: &EntityTable, id: u64) -> Option<LocalMesh> {
     let (type_name, args) = table.get(id)?;
@@ -150,6 +199,7 @@ pub fn polygonal_face_set(table: &EntityTable, id: u64) -> Option<LocalMesh> {
     if mesh.indices.is_empty() {
         return None;
     }
+    drop_unreferenced_points(&mut mesh, &coords);
     Some(mesh)
 }
 
@@ -219,6 +269,7 @@ pub fn triangulated_face_set(table: &EntityTable, id: u64) -> Option<LocalMesh> 
     if mesh.indices.is_empty() {
         return None;
     }
+    drop_unreferenced_points(&mut mesh, &coords);
     Some(mesh)
 }
 
