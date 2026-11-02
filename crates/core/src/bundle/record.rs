@@ -218,7 +218,7 @@ pub struct InstanceRecord {
     /// `"mesh_profile_invalid"`).
     pub volume_method: &'static str,
     /// GH #220: invalid swept-profile reason (`"self_intersecting"` /
-    /// `"degenerate"` / `"hole_outside"`), `None` when valid. See
+    /// `"degenerate"` / `"hole_outside"` / `"overlapping"`), `None` when valid. See
     /// `MeshQto::profile_invalid`.
     pub profile_invalid: Option<&'static str>,
     pub aabb_volume_m3: f32,

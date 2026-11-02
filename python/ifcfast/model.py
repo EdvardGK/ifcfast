@@ -824,7 +824,9 @@ class Model:
           every swept profile of the product is a valid region, else why
           one is not: ``"self_intersecting"`` (edges cross — earcut
           covers a region the author did not mean), ``"degenerate"``
-          (collapsed to a line) or ``"hole_outside"``; a non-null value
+          (collapsed to a line), ``"hole_outside"`` or ``"overlapping"``
+          (GH #234: members of an ``IfcCompositeProfileDef`` share area,
+          which the sweep counts twice); a non-null value
           always comes with ``volume_reliable == False`` (the mesh is
           unchanged).
         * ``surfaces_df`` — long-format, one row per distinct planar

@@ -908,7 +908,15 @@ def _resolve_step_escapes(s: str) -> str:
 #       rings no longer self-intersect (HI90_RIE recessed sockets were
 #       +13 %, profile_invalid since v42); vertex counts of such voids
 #       change, areas stay analytic. Columns unchanged.
-_CACHE_SCHEMA_VERSION = 46
+#   47: GH #234 — geometry change: `IfcCompositeProfileDef` swept areas
+#       (extrusion and revolution) mesh as the concatenation of each
+#       member's sweep (members flattened recursively, each with its own
+#       Position). Products that did not mesh at all (HI90_ARK_MMI700: 19
+#       Archicad walls) now do. `profile_invalid` gains the value
+#       "overlapping" (members share area, counted twice). An unsupported
+#       member fails the whole item (unhandled marker), never a partial
+#       mesh. Columns unchanged.
+_CACHE_SCHEMA_VERSION = 47
 
 _FIELD_RE = re.compile(r"\(\s*(.*?)\s*\)\s*;", re.DOTALL)
 

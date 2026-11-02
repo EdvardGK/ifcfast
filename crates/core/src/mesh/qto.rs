@@ -164,7 +164,8 @@ pub struct MeshQto {
     pub volume_prism_bound_m3: f32,
     /// GH #220: why a swept profile polygon of this product is not a
     /// valid region — `"self_intersecting"`, `"degenerate"` or
-    /// `"hole_outside"` ([`crate::mesh::profile_check::ProfileDefect`]);
+    /// `"hole_outside"` or `"overlapping"` (GH #234: composite-profile
+    /// members share area) ([`crate::mesh::profile_check::ProfileDefect`]);
     /// `None` when every profile is valid (or the product has none). Set
     /// by [`mark_profile_invalid`]; whenever it is `Some`,
     /// `volume_reliable` is `false`.

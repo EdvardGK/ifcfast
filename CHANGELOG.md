@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-Cache schema v46.
+Cache schema v47.
 
 ### Added
 
@@ -89,6 +89,21 @@ Cache schema v46.
   `IfcCircleHollowProfileDef` already used — so the ring is valid at
   any wall thickness and its area is π(R² − r²). Other voids are
   byte-identical.
+- **`IfcCompositeProfileDef` swept solids mesh (GH #234, cache v47).**
+  `profile::extract` had no composite branch, so an extrusion over a
+  composite profile failed and the product was not meshed in any mode
+  and got no QTO row while `products_df` said `has_body=True`
+  (HI90_ARK_MMI700: 19 Archicad walls; only trace
+  `by_source['unhandled:IFCEXTRUDEDAREASOLID']`). Extrusions and
+  revolutions now sweep each member (flattened recursively, each with
+  its own `Position`) and concatenate the prisms. Members are not
+  unioned: they are meant to partition the profile, and when they do
+  share area the row carries the new `profile_invalid = "overlapping"`
+  (so `volume_reliable = False`) instead of a silently changed mesh. A
+  member of an unsupported profile type fails the whole item with the
+  existing `unhandled:` marker rather than meshing a partial profile.
+  Single-member and non-composite profiles are byte-identical; the
+  prism-CSG fast path declines multi-member composites (general fold).
 
 - **Section profiles carry their fillets, edge radii and slopes (GH #225,
   cache schema v43).** `IfcIShapeProfileDef` and its L / U / T / Z

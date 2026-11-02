@@ -191,10 +191,67 @@ pub struct Polygon2D {
     pub holes: Vec<Vec<Vec2>>,
 }
 
+/// Nesting bound for `IfcCompositeProfileDef` recursion. The schema's
+/// `NoRecursion` rule forbids nesting at all; we tolerate a little (it
+/// is cheap) but a reference cycle in a malformed file must terminate.
+const MAX_COMPOSITE_DEPTH: usize = 8;
+
+/// Resolve an `IfcProfileDef` reference to its regions — one
+/// `Polygon2D` per area the profile covers (GH #234).
+///
+/// Every single-area profile yields exactly one region (identical to
+/// [`extract`]). An `IfcCompositeProfileDef(ProfileType, ProfileName,
+/// Profiles, Label)` yields the flattened regions of each member, each
+/// already in the composite's frame (parameterised members carry their
+/// own `Position`; the composite has none). Regions are *not* unioned:
+/// the schema intends the members as a partition of the profile, and
+/// [`crate::mesh::profile_check::check_regions`] flags the
+/// `overlapping` case instead of silently changing the mesh. Any
+/// unsupported or malformed member fails the whole profile (`None`) —
+/// dropping one member would under-report volume with no trace, which
+/// is worse than the typed `unhandled:` marker the caller emits.
+pub fn extract_regions(table: &EntityTable, id: u64) -> Option<Vec<Polygon2D>> {
+    regions_rec(table, id, 0)
+}
+
+fn regions_rec(table: &EntityTable, id: u64, depth: usize) -> Option<Vec<Polygon2D>> {
+    let (type_name, args) = table.get(id)?;
+    if !type_name.eq_ignore_ascii_case(b"IFCCOMPOSITEPROFILEDEF") {
+        return extract(table, id).map(|p| vec![p]);
+    }
+    if depth >= MAX_COMPOSITE_DEPTH {
+        return None;
+    }
+    let fields = split_top_level_args(args);
+    let members = match parse_field(fields.get(2).copied()?) {
+        Field::List(b) => parse_ref_list(b),
+        _ => return None,
+    };
+    if members.is_empty() {
+        return None;
+    }
+    let mut out = Vec::with_capacity(members.len());
+    for m in members {
+        out.extend(regions_rec(table, m, depth + 1)?);
+    }
+    Some(out)
+}
+
 /// Resolve an `IfcProfileDef` reference to a closed `Polygon2D`.
-/// Returns None for profile subtypes we can't handle yet.
+/// Returns None for profile subtypes we can't handle yet, and for an
+/// `IfcCompositeProfileDef` with more than one region (use
+/// [`extract_regions`]; single-polygon consumers such as the prism-CSG
+/// fast path then fall back to the general path).
 pub fn extract(table: &EntityTable, id: u64) -> Option<Polygon2D> {
     let (type_name, args) = table.get(id)?;
+    if type_name.eq_ignore_ascii_case(b"IFCCOMPOSITEPROFILEDEF") {
+        let mut regions = extract_regions(table, id)?;
+        return if regions.len() == 1 {
+            regions.pop()
+        } else {
+            None
+        };
+    }
     let fields = split_top_level_args(args);
 
     // Shared layout for all IfcProfileDef subtypes:

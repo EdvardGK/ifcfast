@@ -61,7 +61,8 @@ pub fn revolved_area_solid(table: &EntityTable, id: u64) -> Option<LocalMesh> {
         Field::Ref(id) => id,
         _ => return None,
     };
-    let polygon = profile::extract(table, swept_id)?;
+    // GH #234: a composite profile revolves region by region into one mesh.
+    let regions = profile::extract_regions(table, swept_id)?;
 
     let position = match fields.get(1).copied().map(parse_field) {
         Some(Field::Ref(pid)) => axis_placement_3d_from_id(table, pid),
@@ -117,78 +118,79 @@ pub fn revolved_area_solid(table: &EntityTable, id: u64) -> Option<LocalMesh> {
 
     let mut mesh = LocalMesh::new();
     // GH #220: an invalid profile ring sweeps an invalid solid too.
-    mesh.profile_invalid = crate::mesh::profile_check::check(&polygon);
+    mesh.profile_invalid = crate::mesh::profile_check::check_regions(&regions);
+    for polygon in &regions {
+        // Build rings: a ring is one rotated copy of the profile boundary
+        // (outer + holes concatenated, in the same order each ring).
+        let ring_vertex_count =
+            polygon.outer.len() + polygon.holes.iter().map(|h| h.len()).sum::<usize>();
+        let n_rings = n_steps + 1;
+        let mut ring_starts: Vec<u32> = Vec::with_capacity(n_rings);
 
-    // Build rings: a ring is one rotated copy of the profile boundary
-    // (outer + holes concatenated, in the same order each ring).
-    let ring_vertex_count =
-        polygon.outer.len() + polygon.holes.iter().map(|h| h.len()).sum::<usize>();
-    let n_rings = n_steps + 1;
-    let mut ring_starts: Vec<u32> = Vec::with_capacity(n_rings);
+        for k in 0..n_rings {
+            let theta = k as f32 * dtheta;
+            let rot = rotation_about_axis(axis_origin, axis_dir, theta);
+            let ring_start = (mesh.vertices.len() / 3) as u32;
+            ring_starts.push(ring_start);
+            push_ring(&mut mesh, &polygon, &rot, &position);
+        }
 
-    for k in 0..n_rings {
-        let theta = k as f32 * dtheta;
-        let rot = rotation_about_axis(axis_origin, axis_dir, theta);
-        let ring_start = (mesh.vertices.len() / 3) as u32;
-        ring_starts.push(ring_start);
-        push_ring(&mut mesh, &polygon, &rot, &position);
-    }
-
-    // Side ribbons. For each loop (outer or hole), connect ring k to
-    // ring k+1 with quads. Outer loop is wound CCW in 2D — when
-    // rotated forward, the outward normal of the side ribbon points
-    // *away* from the axis if the profile is on the +X side.
-    let mut loop_offset: usize = 0;
-    let outer_len = polygon.outer.len();
-    emit_side_ribbon(
-        &mut mesh,
-        &ring_starts,
-        loop_offset,
-        outer_len,
-        dtheta < 0.0,
-    );
-    loop_offset += outer_len;
-    for hole in &polygon.holes {
-        let hole_len = hole.len();
-        // Holes wound opposite to outer in 2D → flip the side
-        // winding so their inward-facing ribbons still face out.
+        // Side ribbons. For each loop (outer or hole), connect ring k to
+        // ring k+1 with quads. Outer loop is wound CCW in 2D — when
+        // rotated forward, the outward normal of the side ribbon points
+        // *away* from the axis if the profile is on the +X side.
+        let mut loop_offset: usize = 0;
+        let outer_len = polygon.outer.len();
         emit_side_ribbon(
             &mut mesh,
             &ring_starts,
             loop_offset,
-            hole_len,
-            dtheta >= 0.0,
+            outer_len,
+            dtheta < 0.0,
         );
-        loop_offset += hole_len;
-    }
+        loop_offset += outer_len;
+        for hole in &polygon.holes {
+            let hole_len = hole.len();
+            // Holes wound opposite to outer in 2D → flip the side
+            // winding so their inward-facing ribbons still face out.
+            emit_side_ribbon(
+                &mut mesh,
+                &ring_starts,
+                loop_offset,
+                hole_len,
+                dtheta >= 0.0,
+            );
+            loop_offset += hole_len;
+        }
 
-    // End caps. The triangulation is shared by both caps — same 2D
-    // earcut applied at the first and last ring.
-    if needs_caps {
-        let triangulation = triangulate(&polygon);
-        let first = ring_starts[0];
-        let last = ring_starts[n_steps];
-        // Start cap: wound so its outward normal points opposite the
-        // sweep direction (≈ -dθ × profile-plane-normal).
-        for tri in triangulation.as_chunks::<3>().0 {
-            // Reverse winding so the start cap faces away from the
-            // material side.
-            mesh.indices.push(first + tri[2] as u32);
-            mesh.indices.push(first + tri[1] as u32);
-            mesh.indices.push(first + tri[0] as u32);
+        // End caps. The triangulation is shared by both caps — same 2D
+        // earcut applied at the first and last ring.
+        if needs_caps {
+            let triangulation = triangulate(&polygon);
+            let first = ring_starts[0];
+            let last = ring_starts[n_steps];
+            // Start cap: wound so its outward normal points opposite the
+            // sweep direction (≈ -dθ × profile-plane-normal).
+            for tri in triangulation.as_chunks::<3>().0 {
+                // Reverse winding so the start cap faces away from the
+                // material side.
+                mesh.indices.push(first + tri[2] as u32);
+                mesh.indices.push(first + tri[1] as u32);
+                mesh.indices.push(first + tri[0] as u32);
+            }
+            // End cap: forward winding.
+            for tri in triangulation.as_chunks::<3>().0 {
+                mesh.indices.push(last + tri[0] as u32);
+                mesh.indices.push(last + tri[1] as u32);
+                mesh.indices.push(last + tri[2] as u32);
+            }
         }
-        // End cap: forward winding.
-        for tri in triangulation.as_chunks::<3>().0 {
-            mesh.indices.push(last + tri[0] as u32);
-            mesh.indices.push(last + tri[1] as u32);
-            mesh.indices.push(last + tri[2] as u32);
-        }
+        let _ = ring_vertex_count; // computed for clarity, not currently asserted
     }
 
     if mesh.indices.is_empty() {
         return None;
     }
-    let _ = ring_vertex_count; // computed for clarity, not currently asserted
     Some(mesh)
 }
 

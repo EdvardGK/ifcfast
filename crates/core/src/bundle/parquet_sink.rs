@@ -573,7 +573,8 @@ fn build_instance_schema() -> Schema {
         Field::new("volume_reliable", DataType::Boolean, false),
         Field::new("volume_method", DataType::Utf8, false),
         // GH #220: why a swept profile polygon is not a valid region
-        // ("self_intersecting" / "degenerate" / "hole_outside"); null when
+        // ("self_intersecting" / "degenerate" / "hole_outside" /
+        // "overlapping", GH #234); null when
         // every profile is valid. Non-null ⇒ `volume_reliable = false`.
         Field::new("profile_invalid", DataType::Utf8, true),
         // List<Struct> of every distinct planar surface, sorted by

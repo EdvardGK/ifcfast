@@ -91,7 +91,24 @@ pub struct ExtrudeParams {
 /// "not a prism" and fall back). Shared by [`extrude`] (which then
 /// meshes them) and the prism-CSG fast path (which subtracts them
 /// parametrically before any mesh exists).
+///
+/// Single-region only: a multi-region `IfcCompositeProfileDef` returns
+/// `None` here (the prism fast path then falls back to the general
+/// fold); [`extrude`] handles it through [`extrude_frame`].
 pub fn extrude_params(table: &EntityTable, id: u64) -> Option<ExtrudeParams> {
+    let (swept_id, dir, depth, local_xform) = extrude_frame(table, id)?;
+    let profile = profile::extract(table, swept_id)?;
+    Some(ExtrudeParams {
+        profile,
+        dir,
+        depth,
+        local_xform,
+    })
+}
+
+/// The non-profile parameters of an `IfcExtrudedAreaSolid`:
+/// `(SweptArea step id, unit direction, depth, Position)`.
+fn extrude_frame(table: &EntityTable, id: u64) -> Option<(u64, Vec3, f32, Mat4)> {
     let (type_name, args) = table.get(id)?;
     if !type_name.eq_ignore_ascii_case(b"IFCEXTRUDEDAREASOLID") {
         return None;
@@ -102,7 +119,6 @@ pub fn extrude_params(table: &EntityTable, id: u64) -> Option<ExtrudeParams> {
         Field::Ref(id) => id,
         _ => return None,
     };
-    let profile = profile::extract(table, swept_id)?;
 
     // ExtrudedDirection (arg[2]), default (0, 0, 1).
     let dir = match fields
@@ -137,20 +153,45 @@ pub fn extrude_params(table: &EntityTable, id: u64) -> Option<ExtrudeParams> {
         })
         .unwrap_or(Mat4::IDENTITY);
 
-    Some(ExtrudeParams {
-        profile,
-        dir,
-        depth,
-        local_xform,
-    })
+    Some((swept_id, dir, depth, local_xform))
 }
 
 /// Build a mesh for an `IfcExtrudedAreaSolid` entity (by step_id).
+///
+/// GH #234: the swept area may have several regions
+/// (`IfcCompositeProfileDef`); each is extruded on its own and the
+/// prisms are concatenated into one mesh. A single-region profile takes
+/// exactly the pre-#234 path (bit-identical output).
 pub fn extrude(table: &EntityTable, id: u64) -> Option<LocalMesh> {
-    let p = extrude_params(table, id)?;
-    let mut mesh = extrude_polygon(&p.profile, p.dir, p.depth, p.local_xform);
-    mesh.profile_invalid = crate::mesh::profile_check::check(&p.profile);
-    Some(mesh)
+    let (swept_id, dir, depth, local_xform) = extrude_frame(table, id)?;
+    let regions = profile::extract_regions(table, swept_id)?;
+    Some(extrude_regions(&regions, dir, depth, local_xform))
+}
+
+/// Extrude every region of a (possibly multi-region) profile into one
+/// mesh. `profile_invalid` carries the first per-region defect, or
+/// `overlapping` when regions share area (that area would be counted
+/// twice — see [`crate::mesh::profile_check::check_regions`]).
+pub fn extrude_regions(
+    regions: &[Polygon2D],
+    dir: Vec3,
+    depth: f32,
+    local_xform: Mat4,
+) -> LocalMesh {
+    let mut mesh = if let [single] = regions {
+        extrude_polygon(single, dir, depth, local_xform)
+    } else {
+        let mut mesh = LocalMesh::new();
+        for r in regions {
+            let m = extrude_polygon(r, dir, depth, local_xform);
+            let base = (mesh.vertices.len() / 3) as u32;
+            mesh.vertices.extend_from_slice(&m.vertices);
+            mesh.indices.extend(m.indices.iter().map(|i| i + base));
+        }
+        mesh
+    };
+    mesh.profile_invalid = crate::mesh::profile_check::check_regions(regions);
+    mesh
 }
 
 /// Build mesh from an already-resolved 2D polygon + extrusion params.
@@ -283,7 +324,7 @@ fn direction(table: &EntityTable, id: u64) -> Option<Vec3> {
 
 /// Triangulate a `Polygon2D` (outer + holes) into a flat triangle index
 /// list. Uses `earcutr` — production-grade ear-clipping with hole support.
-fn triangulate(polygon: &Polygon2D) -> Vec<usize> {
+pub(crate) fn triangulate(polygon: &Polygon2D) -> Vec<usize> {
     // earcutr expects a flat [x, y, x, y, ...] coord array + a list of
     // hole start indices.
     let mut coords: Vec<f64> = Vec::with_capacity(
