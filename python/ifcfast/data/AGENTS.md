@@ -556,9 +556,12 @@ describing via `pq.read_schema(...)`):
   zero radius is a sharp corner, byte-identical to v41. ifcopenshell
   0.8.5 approximates each fillet with a few chords and no area
   correction, so expect ifcfast ≈ 0.1 % below it on rolled sections,
-  not 0. L / U / T / Z are still built in a corner frame rather than
-  the bounding-box centre (GH #237): volumes are right, bboxes are
-  offset by half the section.
+  not 0. **GH #237 (cache schema v49):** L / U / T / Z sit in the spec
+  frame — origin at the centre of the bounding box, as in IfcOpenShell
+  (before: a corner frame, bboxes offset by half the section). Z
+  `FlangeWidth` follows the spec figure (web back face to toe, overall
+  width `2·b − tw`); IfcOpenShell 0.8.5 builds overall `2·b`, so Z bboxes
+  differ from it by `tw/2` per side and Z areas by `tw·tf/2` per flange.
 - Semantic payload: `materials`, `psets`, `quantities`,
   `classifications` (list-of-struct columns — `UNNEST` in DuckDB).
   Each `psets` and `quantities` struct carries `source`

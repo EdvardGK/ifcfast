@@ -60,8 +60,9 @@ def _upn200() -> tuple[str, float]:
 
 
 # name -> (IFC4 profile, analytic area mm², compare with ifcopenshell?)
-# Not compared with ifcopenshell: Z (ifcfast's FlangeWidth reading differs
-# from IfcOpenShell's, GH #237 — a different section) and the asymmetric I
+# Not compared with ifcopenshell: Z (ifcfast follows the spec's FlangeWidth
+# reading, IfcOpenShell 0.8.5 does not — a different section, GH #237) and
+# the asymmetric I
 # (ifcopenshell 0.8.5 raises "Failed to process shape" on IFC4
 # IfcAsymmetricIShapeProfileDef with or without radii / slopes).
 PROFILES: dict[str, tuple[str, float, bool]] = {
@@ -89,7 +90,8 @@ PROFILES: dict[str, tuple[str, float, bool]] = {
     ),
     "Z200": (
         "IFCZSHAPEPROFILEDEF(.AREA.,'Z200',$,200.,80.,8.,8.,8.,4.)",
-        200 * 8 + 2 * 80 * 8 + 2 * Q * (64 - 16),
+        # FlangeWidth from the web's back face to the toe (spec, GH #237).
+        200 * 8 + 2 * (80 - 8) * 8 + 2 * Q * (64 - 16),
         False,
     ),
     "C200x75x20x2.5": (

@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-Cache schema v48.
+Cache schema v49.
 
 ### Added
 
@@ -47,6 +47,18 @@ Cache schema v48.
 
 ### Fixed
 
+- **L / U / T / Z sections sit in the IFC spec frame (GH #237, cache
+  schema v49).** `IfcLShapeProfileDef`, `IfcUShapeProfileDef` and
+  `IfcTShapeProfileDef` were built in a corner frame (an L100x10 member
+  sat 50 mm × 50 mm off, a U's web on x = 0, a T's toe on y = 0); every
+  schema since IFC2x3 puts the profile origin at the centre of the
+  bounding box, which is where IfcOpenShell puts it too. `IfcZShapeProfileDef`
+  is now centred, its flanges point as in the spec figure (bottom +x, top
+  −x), and `FlangeWidth` is read as the spec figure and DIN 1027 measure
+  it — web back face to toe, overall width `2·b − tw` (was `2·b + tw`;
+  Z areas drop by `2·tw·tf`). IfcOpenShell 0.8.5 reads it a third way
+  (overall `2·b`); ifcfast follows the spec. No such section in the local
+  corpus.
 - **Products contained in an `IfcSpace` resolve to their storey (GH #236,
   cache schema v45).** Revit puts furniture, sanitary terminals and
   coverings in the room, not the storey. The space is also a product, and
@@ -105,7 +117,7 @@ Cache schema v48.
   Single-member and non-composite profiles are byte-identical; the
   prism-CSG fast path declines multi-member composites (general fold).
 - **Far `IfcExtrudedAreaSolid.Position` no longer baked in f32
-  (GH #227, cache schema v48).** An extrusion whose `Position` carries
+  (GH #227, cache schema v49).** An extrusion whose `Position` carries
   the georeference (Revit landscape exports, identity `ObjectPlacement`)
   had that
   translation baked into the f32 local vertices: at NTM magnitude every
@@ -116,7 +128,7 @@ Cache schema v48.
   `bundle()` agree with the analytic corners to sub-millimetre.
   Near-origin Positions are byte-identical.
 
-- **Unreferenced faceset points dropped (GH #228, cache schema v48).**
+- **Unreferenced faceset points dropped (GH #228, cache schema v49).**
   `IfcTriangulatedFaceSet` / `IfcPolygonalFaceSet` copied every
   `IfcCartesianPointList3D` point into the vertex buffer, including
   points no face references. On a KNM_LARK terrain two such points sat

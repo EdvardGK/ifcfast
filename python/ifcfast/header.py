@@ -927,7 +927,16 @@ def _resolve_step_escapes(s: str) -> str:
 #       them — 9.2 m on a KNM_LARK terrain). Near-origin extrusions and
 #       facesets without orphan points are byte-identical. Columns
 #       unchanged.
-_CACHE_SCHEMA_VERSION = 48
+#   49: GH #237 — geometry change: IfcLShapeProfileDef /
+#       IfcUShapeProfileDef / IfcTShapeProfileDef / IfcZShapeProfileDef
+#       sit in the spec frame (centre of the bounding box) instead of a
+#       corner frame — such members move by half their bbox in the profile
+#       plane. Z FlangeWidth is read per the spec figure (web back face to
+#       toe; overall width 2·b − tw, was 2·b + tw) and the flanges point
+#       as in the figure (bottom +x, top −x): Z areas shrink by 2·tw·tf.
+#       No L/U/T/Z section in the local corpus (g55 / knm / hi90).
+#       Columns unchanged.
+_CACHE_SCHEMA_VERSION = 49
 
 _FIELD_RE = re.compile(r"\(\s*(.*?)\s*\)\s*;", re.DOTALL)
 

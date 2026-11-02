@@ -661,8 +661,10 @@ fn line_intersection(a: DVec2, da: DVec2, b: DVec2, db: DVec2) -> Option<DVec2> 
 fn l_shape(table: &EntityTable, fields: &[&[u8]]) -> Option<Polygon2D> {
     // (ProfileType, ProfileName, Position, Depth, Width, Thickness,
     //  FilletRadius, EdgeRadius, LegSlope[, CentreOfGravityInX/Y in IFC2X3])
-    // Frame (unchanged by GH #225): outer corner at the origin, Width
-    // along +x, Depth along +y.
+    // Built with the outer corner at the origin (Width along +x, Depth
+    // along +y), then moved to the spec frame: the centre of the bounding
+    // box (IFC2x3+, GH #237). The IFC2X3 CentreOfGravityInX/Y attributes
+    // are informational and do not move the profile.
     let d = number_at(fields, 3)? as f32;
     let w = number_at(fields, 4).unwrap_or_else(|| number_at(fields, 3).unwrap_or(0.0)) as f32;
     let t = number_at(fields, 5)? as f32;
@@ -695,6 +697,7 @@ fn l_shape(table: &EntityTable, fields: &[&[u8]]) -> Option<Polygon2D> {
         (tip_y, r2),
         (Vec2::new(0.0, d), 0.0),
     ];
+    let corners = to_bbox_centre(corners, Vec2::new(w * 0.5, d * 0.5));
     Some(Polygon2D {
         outer: round_corners(&corners, length_scale(table)),
         holes: Vec::new(),
@@ -704,8 +707,9 @@ fn l_shape(table: &EntityTable, fields: &[&[u8]]) -> Option<Polygon2D> {
 fn u_shape(table: &EntityTable, fields: &[&[u8]]) -> Option<Polygon2D> {
     // (…, Position, Depth, FlangeWidth, WebThickness, FlangeThickness,
     //  FilletRadius, EdgeRadius, FlangeSlope[, CentreOfGravityInX in IFC2X3])
-    // Frame (unchanged by GH #225): web's outer face on x = 0, flanges
-    // toward +x, bottom at y = 0.
+    // Built with the web's outer face on x = 0 (flanges toward +x) and the
+    // bottom at y = 0, then moved to the spec frame: the centre of the
+    // bounding box, web at -x (IFC2x3+, GH #237).
     let d = number_at(fields, 3)? as f32;
     let bf = number_at(fields, 4)? as f32;
     let tw = number_at(fields, 5)? as f32;
@@ -734,6 +738,7 @@ fn u_shape(table: &EntityTable, fields: &[&[u8]]) -> Option<Polygon2D> {
         (Vec2::new(bf, d), 0.0),
         (Vec2::new(0.0, d), 0.0),
     ];
+    let corners = to_bbox_centre(corners, Vec2::new(bf * 0.5, d * 0.5));
     Some(Polygon2D {
         outer: round_corners(&corners, length_scale(table)),
         holes: Vec::new(),
@@ -744,8 +749,9 @@ fn t_shape(table: &EntityTable, fields: &[&[u8]]) -> Option<Polygon2D> {
     // (…, Position, Depth, FlangeWidth, WebThickness, FlangeThickness,
     //  FilletRadius, FlangeEdgeRadius, WebEdgeRadius, WebSlope, FlangeSlope
     //  [, CentreOfGravityInY in IFC2X3])
-    // Frame (unchanged by GH #225): web toe at y = 0, flange top at y = d,
-    // centred in x.
+    // Built centred in x with the web toe at y = 0 and the flange top at
+    // y = d, then moved to the spec frame: the centre of the bounding box
+    // (IFC2x3+, GH #237).
     let d = number_at(fields, 3)? as f32;
     let bf = number_at(fields, 4)? as f32;
     let tw = number_at(fields, 5)? as f32;
@@ -785,6 +791,7 @@ fn t_shape(table: &EntityTable, fields: &[&[u8]]) -> Option<Polygon2D> {
         (Vec2::new(-half_bf, tip_y), r2),
         (Vec2::new(-root.x, root.y), r1),
     ];
+    let corners = to_bbox_centre(corners, Vec2::new(0.0, d * 0.5));
     Some(Polygon2D {
         outer: round_corners(&corners, length_scale(table)),
         holes: Vec::new(),
@@ -794,29 +801,46 @@ fn t_shape(table: &EntityTable, fields: &[&[u8]]) -> Option<Polygon2D> {
 fn z_shape(table: &EntityTable, fields: &[&[u8]]) -> Option<Polygon2D> {
     // (…, Position, Depth, FlangeWidth, WebThickness, FlangeThickness,
     //  FilletRadius, EdgeRadius)
-    // Frame and FlangeWidth reading unchanged by GH #225 (flange of length
-    // `bf` beyond each web face).
+    // Spec frame and reading (IFC2x2+ figure, DIN 1027 steel tables;
+    // GH #237): centre of the bounding box, web centred on the y axis, the
+    // bottom flange toward +x and the top flange toward -x. `FlangeWidth`
+    // runs from the web's back face to the flange toe, so it includes the
+    // web thickness and the overall width is `2·b − tw`.
+    // IfcOpenShell 0.8 deviates: it runs each flange from the web's back
+    // face to x = ±b (overall `2·b`), i.e. `tw/2` longer per flange.
     let d = number_at(fields, 3)? as f32;
     let bf = number_at(fields, 4)? as f32;
     let tw = number_at(fields, 5)? as f32;
     let tf = number_at(fields, 6)? as f32;
+    if bf.is_nan() || bf <= tw {
+        return None;
+    }
     let r1 = corner_radius(fields, 7);
     let r2 = corner_radius(fields, 8);
     let half_tw = tw * 0.5;
+    let half_d = d * 0.5;
+    let x = bf - half_tw; // flange toe = half the overall width
+    let y = half_d - tf; // |y| of each flange's inner face
     let corners = [
-        (Vec2::new(-half_tw - bf, 0.0), 0.0),
-        (Vec2::new(half_tw, 0.0), 0.0),
-        (Vec2::new(half_tw, d - tf), r1),
-        (Vec2::new(half_tw + bf, d - tf), r2),
-        (Vec2::new(half_tw + bf, d), 0.0),
-        (Vec2::new(-half_tw, d), 0.0),
-        (Vec2::new(-half_tw, tf), r1),
-        (Vec2::new(-half_tw - bf, tf), r2),
+        (Vec2::new(-half_tw, -half_d), 0.0),
+        (Vec2::new(x, -half_d), 0.0),
+        (Vec2::new(x, -y), r2),
+        (Vec2::new(half_tw, -y), r1),
+        (Vec2::new(half_tw, half_d), 0.0),
+        (Vec2::new(-x, half_d), 0.0),
+        (Vec2::new(-x, y), r2),
+        (Vec2::new(-half_tw, y), r1),
     ];
     Some(Polygon2D {
         outer: round_corners(&corners, length_scale(table)),
         holes: Vec::new(),
     })
+}
+
+/// Move section corners built in a corner frame to the spec frame by
+/// subtracting `centre` (the bounding-box centre in the build frame).
+fn to_bbox_centre<const N: usize>(corners: [(Vec2, f64); N], centre: Vec2) -> [(Vec2, f64); N] {
+    corners.map(|(p, r)| (p - centre, r))
 }
 
 fn c_shape(table: &EntityTable, fields: &[&[u8]]) -> Option<Polygon2D> {
@@ -3279,8 +3303,95 @@ FILE_SCHEMA(('{schema}'));\nENDSEC;\nDATA;\n{units}\n#90={profile};\nENDSEC;\nEN
             "IFC4",
             &format!("IFCZSHAPEPROFILEDEF(.AREA.,$,$,{d:?},{b:?},{tw:?},{tf:?},{r1:?},{r2:?})"),
         );
-        let want = d * tw + 2.0 * b * tf + 2.0 * Q * (r1 * r1 - r2 * r2);
+        // GH #237: FlangeWidth b includes the web (back face to toe).
+        let want = d * tw + 2.0 * (b - tw) * tf + 2.0 * Q * (r1 * r1 - r2 * r2);
         assert_area("Z200", got, want);
+    }
+
+    fn bbox(pts: &[Vec2]) -> (Vec2, Vec2) {
+        let (mut lo, mut hi) = (Vec2::splat(f32::MAX), Vec2::splat(f32::MIN));
+        for p in pts {
+            lo = lo.min(*p);
+            hi = hi.max(*p);
+        }
+        (lo, hi)
+    }
+
+    /// GH #237: L / U / T / Z are centred on their bounding box (IFC2x3+),
+    /// in the orientation of the spec figures, with and without radii and
+    /// slopes, in both schemas.
+    #[test]
+    fn lutz_sections_sit_in_the_spec_frame() {
+        let a = 0.03_f64.atan();
+        // (schema, profile, overall width, overall depth, probe inside, probe outside)
+        let cases: Vec<(&str, String, f32, f32, Vec2, Vec2)> = vec![
+            // L: corner at (-w/2, -d/2), legs along +x / +y.
+            ("IFC4", "IFCLSHAPEPROFILEDEF(.AREA.,$,$,100.,60.,10.,$,$,$)".into(), 60.0, 100.0,
+             Vec2::new(-25.0, 45.0), Vec2::new(25.0, 45.0)),
+            ("IFC2X3", format!("IFCLSHAPEPROFILEDEF(.AREA.,$,$,150.,90.,10.,12.,6.,{a:?},-20.,-40.)"), 90.0, 150.0,
+             Vec2::new(-40.0, 70.0), Vec2::new(40.0, 70.0)),
+            ("IFC2X3", "IFCLSHAPEPROFILEDEF(.AREA.,$,$,100.,$,10.,0.,0.,0.,$,$)".into(), 100.0, 100.0,
+             Vec2::new(45.0, -45.0), Vec2::new(45.0, 45.0)),
+            // U: web at -x, flanges toward +x.
+            ("IFC4", "IFCUSHAPEPROFILEDEF(.AREA.,$,$,200.,75.,8.5,11.5,$,$,$)".into(), 75.0, 200.0,
+             Vec2::new(-34.0, 0.0), Vec2::new(30.0, 0.0)),
+            ("IFC2X3", format!("IFCUSHAPEPROFILEDEF(.AREA.,'UPN200',$,200.,75.,8.5,11.5,11.5,6.,{a:?},-20.)"), 75.0, 200.0,
+             Vec2::new(-34.0, 0.0), Vec2::new(30.0, 0.0)),
+            // T: flange at +y, web toward -y.
+            ("IFC4", "IFCTSHAPEPROFILEDEF(.AREA.,$,$,100.,120.,11.,9.,$,$,$,$,$)".into(), 120.0, 100.0,
+             Vec2::new(55.0, 46.0), Vec2::new(55.0, -46.0)),
+            ("IFC2X3", format!("IFCTSHAPEPROFILEDEF(.AREA.,'T100',$,100.,100.,11.,11.,11.,5.5,3.,{a:?},{a:?},20.)"), 100.0, 100.0,
+             Vec2::new(45.0, 46.0), Vec2::new(45.0, -46.0)),
+            // Z: overall width 2b − tw; bottom flange +x, top flange −x.
+            ("IFC4", "IFCZSHAPEPROFILEDEF(.AREA.,$,$,200.,80.,8.,10.,$,$)".into(), 152.0, 200.0,
+             Vec2::new(70.0, -96.0), Vec2::new(-70.0, -96.0)),
+            ("IFC4", "IFCZSHAPEPROFILEDEF(.AREA.,$,$,200.,80.,8.,8.,8.,4.)".into(), 152.0, 200.0,
+             Vec2::new(-70.0, 97.0), Vec2::new(70.0, 97.0)),
+        ];
+        for (schema, profile, w, d, inside, outside) in &cases {
+            let table_src = src_with(schema, MM_RAD, profile);
+            let table = EntityTable::build(table_src.as_bytes());
+            let poly = extract(&table, 90).unwrap_or_else(|| panic!("{profile} resolves"));
+            let (lo, hi) = bbox(&poly.outer);
+            let tol = 1e-4;
+            assert!(
+                (lo + hi).abs().max_element() < tol,
+                "{profile}: bbox centre {:?}",
+                (lo + hi) * 0.5
+            );
+            assert!(
+                (hi.x - lo.x - w).abs() < tol,
+                "{profile}: width {}",
+                hi.x - lo.x
+            );
+            assert!(
+                (hi.y - lo.y - d).abs() < tol,
+                "{profile}: depth {}",
+                hi.y - lo.y
+            );
+            assert!(
+                point_in_ring(*inside, &poly.outer),
+                "{profile}: {inside:?} should be inside"
+            );
+            assert!(
+                !point_in_ring(*outside, &poly.outer),
+                "{profile}: {outside:?} should be outside"
+            );
+            no_repeated_vertices(&poly.outer);
+        }
+    }
+
+    /// Even-odd ray cast (test-only).
+    fn point_in_ring(p: Vec2, ring: &[Vec2]) -> bool {
+        let mut inside = false;
+        let n = ring.len();
+        for i in 0..n {
+            let (a, b) = (ring[i], ring[(i + 1) % n]);
+            if (a.y > p.y) != (b.y > p.y) && p.x < a.x + (p.y - a.y) * (b.x - a.x) / (b.y - a.y) {
+                inside = !inside;
+            }
+        }
+        inside
     }
 
     #[test]
@@ -3375,7 +3486,11 @@ FILE_SCHEMA(('{schema}'));\nENDSEC;\nDATA;\n{units}\n#90={profile};\nENDSEC;\nEN
     }
 
     // ------------------------------------------------------------------
-    // Sharp corners: bit-identical to the pre-GH #225 output.
+    // Sharp corners: bit-identical to the pre-GH #225 output — I and
+    // rectangle verbatim; L / U / T translated by the bounding-box centre
+    // (GH #237 moved them to the spec frame). Z changed reading and
+    // orientation in GH #237 and is pinned by `z_section` /
+    // `lutz_sections_sit_in_the_spec_frame` instead.
     // ------------------------------------------------------------------
 
     /// Verbatim copies of the pre-GH #225 builders (commit 659412e).
@@ -3408,19 +3523,27 @@ FILE_SCHEMA(('{schema}'));\nENDSEC;\nDATA;\n{units}\n#90={profile};\nENDSEC;\nEN
             ]
         }
 
+        /// Pre-GH #237 corner frame → spec frame (bbox centre).
+        fn centred(pts: Vec<Vec2>, c: Vec2) -> Vec<Vec2> {
+            pts.into_iter().map(|p| p - c).collect()
+        }
+
         pub fn l_shape(fields: &[&[u8]]) -> Vec<Vec2> {
             let d = number_at(fields, 3).unwrap() as f32;
             let w =
                 number_at(fields, 4).unwrap_or_else(|| number_at(fields, 3).unwrap_or(0.0)) as f32;
             let t = number_at(fields, 5).unwrap() as f32;
-            vec![
-                Vec2::new(0.0, 0.0),
-                Vec2::new(w, 0.0),
-                Vec2::new(w, t),
-                Vec2::new(t, t),
-                Vec2::new(t, d),
-                Vec2::new(0.0, d),
-            ]
+            centred(
+                vec![
+                    Vec2::new(0.0, 0.0),
+                    Vec2::new(w, 0.0),
+                    Vec2::new(w, t),
+                    Vec2::new(t, t),
+                    Vec2::new(t, d),
+                    Vec2::new(0.0, d),
+                ],
+                Vec2::new(w * 0.5, d * 0.5),
+            )
         }
 
         pub fn u_shape(fields: &[&[u8]]) -> Vec<Vec2> {
@@ -3428,16 +3551,19 @@ FILE_SCHEMA(('{schema}'));\nENDSEC;\nDATA;\n{units}\n#90={profile};\nENDSEC;\nEN
             let bf = number_at(fields, 4).unwrap() as f32;
             let tw = number_at(fields, 5).unwrap() as f32;
             let tf = number_at(fields, 6).unwrap() as f32;
-            vec![
-                Vec2::new(0.0, 0.0),
-                Vec2::new(bf, 0.0),
-                Vec2::new(bf, tf),
-                Vec2::new(tw, tf),
-                Vec2::new(tw, d - tf),
-                Vec2::new(bf, d - tf),
-                Vec2::new(bf, d),
-                Vec2::new(0.0, d),
-            ]
+            centred(
+                vec![
+                    Vec2::new(0.0, 0.0),
+                    Vec2::new(bf, 0.0),
+                    Vec2::new(bf, tf),
+                    Vec2::new(tw, tf),
+                    Vec2::new(tw, d - tf),
+                    Vec2::new(bf, d - tf),
+                    Vec2::new(bf, d),
+                    Vec2::new(0.0, d),
+                ],
+                Vec2::new(bf * 0.5, d * 0.5),
+            )
         }
 
         pub fn t_shape(fields: &[&[u8]]) -> Vec<Vec2> {
@@ -3447,34 +3573,19 @@ FILE_SCHEMA(('{schema}'));\nENDSEC;\nDATA;\n{units}\n#90={profile};\nENDSEC;\nEN
             let tf = number_at(fields, 6).unwrap() as f32;
             let half_bf = bf * 0.5;
             let half_tw = tw * 0.5;
-            vec![
-                Vec2::new(-half_tw, 0.0),
-                Vec2::new(half_tw, 0.0),
-                Vec2::new(half_tw, d - tf),
-                Vec2::new(half_bf, d - tf),
-                Vec2::new(half_bf, d),
-                Vec2::new(-half_bf, d),
-                Vec2::new(-half_bf, d - tf),
-                Vec2::new(-half_tw, d - tf),
-            ]
-        }
-
-        pub fn z_shape(fields: &[&[u8]]) -> Vec<Vec2> {
-            let d = number_at(fields, 3).unwrap() as f32;
-            let bf = number_at(fields, 4).unwrap() as f32;
-            let tw = number_at(fields, 5).unwrap() as f32;
-            let tf = number_at(fields, 6).unwrap() as f32;
-            let half_tw = tw * 0.5;
-            vec![
-                Vec2::new(-half_tw - bf, 0.0),
-                Vec2::new(half_tw, 0.0),
-                Vec2::new(half_tw, d - tf),
-                Vec2::new(half_tw + bf, d - tf),
-                Vec2::new(half_tw + bf, d),
-                Vec2::new(-half_tw, d),
-                Vec2::new(-half_tw, tf),
-                Vec2::new(-half_tw - bf, tf),
-            ]
+            centred(
+                vec![
+                    Vec2::new(-half_tw, 0.0),
+                    Vec2::new(half_tw, 0.0),
+                    Vec2::new(half_tw, d - tf),
+                    Vec2::new(half_bf, d - tf),
+                    Vec2::new(half_bf, d),
+                    Vec2::new(-half_bf, d),
+                    Vec2::new(-half_bf, d - tf),
+                    Vec2::new(-half_tw, d - tf),
+                ],
+                Vec2::new(0.0, d * 0.5),
+            )
         }
 
         pub fn rectangle(fields: &[&[u8]]) -> Vec<Vec2> {
@@ -3496,7 +3607,7 @@ FILE_SCHEMA(('{schema}'));\nENDSEC;\nDATA;\n{units}\n#90={profile};\nENDSEC;\nEN
     }
 
     #[test]
-    fn sharp_sections_are_bit_identical_to_the_pre_gh225_output() {
+    fn sharp_sections_are_bit_identical_to_the_pre_gh225_output_in_the_spec_frame() {
         type New = fn(&EntityTable, &[&[u8]]) -> Option<Polygon2D>;
         type Old = fn(&[&[u8]]) -> Vec<Vec2>;
         // Awkward decimals (Archicad-style 1e-12 noise) so any change in the
@@ -3512,8 +3623,6 @@ FILE_SCHEMA(('{schema}'));\nENDSEC;\nDATA;\n{units}\n#90={profile};\nENDSEC;\nEN
             ("IFC2X3", "IFCUSHAPEPROFILEDEF(.AREA.,$,$,200.3,75.1,8.5,11.5,0.,0.,0.,$)", u_shape, legacy::u_shape),
             ("IFC4", "IFCTSHAPEPROFILEDEF(.AREA.,$,$,100.3,100.1,11.3,10.9,$,$,$,$,$)", t_shape, legacy::t_shape),
             ("IFC2X3", "IFCTSHAPEPROFILEDEF(.AREA.,$,$,100.3,100.1,11.3,10.9,0.,0.,0.,0.,0.,$)", t_shape, legacy::t_shape),
-            ("IFC4", "IFCZSHAPEPROFILEDEF(.AREA.,$,$,200.3,80.1,8.3,7.9,$,$)", z_shape, legacy::z_shape),
-            ("IFC4", "IFCZSHAPEPROFILEDEF(.AREA.,$,$,200.3,80.1,8.3,7.9,0.,0.)", z_shape, legacy::z_shape),
             ("IFC4", "IFCROUNDEDRECTANGLEPROFILEDEF(.AREA.,$,$,300.3,200.1,0.)", rounded_rectangle, legacy::rectangle),
         ];
         for (schema, profile, new, old) in cases {
