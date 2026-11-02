@@ -891,7 +891,16 @@ def _resolve_step_escapes(s: str) -> str:
 #       stay). A host its openings fully consume is
 #       no longer emitted. `volume_m3`, bboxes and triangle counts move
 #       on affected hosts only. Columns unchanged.
-_CACHE_SCHEMA_VERSION = 44
+#   45: GH #236 — graph change. Products contained in an IfcSpace keep
+#       their `space` edge in `contained_in` (it was dropped because the
+#       space is also a product) and resolve `storey_guid` through the
+#       space's storey. `aggregates.parent_kind` reads `space` / `site`
+#       for spatial parents that are also products. GH #235 — IFC4
+#       `IfcDistributionPort.predefined_type` reads PredefinedType (attr 8),
+#       not the trailing SystemType enum. GH #203 — an IfcOpeningElement
+#       with no containment / aggregation resolves `storey_guid` through
+#       the element it voids. Columns unchanged.
+_CACHE_SCHEMA_VERSION = 45
 
 _FIELD_RE = re.compile(r"\(\s*(.*?)\s*\)\s*;", re.DOTALL)
 

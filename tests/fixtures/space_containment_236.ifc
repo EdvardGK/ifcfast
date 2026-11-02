@@ -1,0 +1,39 @@
+ISO-10303-21;
+HEADER;
+FILE_DESCRIPTION(('ViewDefinition [ReferenceView]'),'2;1');
+FILE_NAME('space_containment_236.ifc','2026-11-02T00:00:00',('ifcfast tests'),('Skiplum'),'ifcfast','ifcfast-tests','');
+FILE_SCHEMA(('IFC2X3'));
+ENDSEC;
+DATA;
+#1=IFCPROJECT('0YvctVUKr0kugbFTf53O9L',$,'Space Containment Project',$,$,$,$,(#5),#2);
+#2=IFCUNITASSIGNMENT((#3,#4));
+#3=IFCSIUNIT(*,.LENGTHUNIT.,.MILLI.,.METRE.);
+#4=IFCSIUNIT(*,.PLANEANGLEUNIT.,$,.RADIAN.);
+#5=IFCGEOMETRICREPRESENTATIONCONTEXT($,'Model',3,1.0E-5,#6,$);
+#6=IFCAXIS2PLACEMENT3D(#7,$,$);
+#7=IFCCARTESIANPOINT((0.,0.,0.));
+#10=IFCSITE('1XvctVUKr0kugbFTf53O9L',$,'Site',$,$,#15,$,$,.ELEMENT.,(59,56,0),(10,45,0),0.,$,$);
+#11=IFCBUILDING('2XvctVUKr0kugbFTf53O9L',$,'Building A',$,$,#15,$,$,.ELEMENT.,$,$,$);
+#12=IFCBUILDINGSTOREY('3XvctVUKr0kugbFTf53O9L',$,'Plan 02',$,$,#15,$,'Plan 02',.ELEMENT.,0.0);
+#15=IFCLOCALPLACEMENT($,#6);
+#16=IFCLOCALPLACEMENT(#15,#6);
+#20=IFCRELAGGREGATES('4XvctVUKr0kugbFTf53O9L',$,$,$,#1,(#10));
+#21=IFCRELAGGREGATES('5XvctVUKr0kugbFTf53O9L',$,$,$,#10,(#11));
+#22=IFCRELAGGREGATES('6XvctVUKr0kugbFTf53O9L',$,$,$,#11,(#12));
+/* GH #236 (G55_ARK shape): a room aggregated under the storey, and a
+   toilet + a furnishing contained in the ROOM, not in the storey. Both
+   must resolve storey_guid = #12 through the space. */
+#30=IFCSPACE('7XvctVUKr0kugbFTf53O9L',$,'2210',$,$,#16,$,'WC',.ELEMENT.,.INTERNAL.,$);
+#31=IFCRELAGGREGATES('8XvctVUKr0kugbFTf53O9L',$,$,$,#12,(#30));
+#32=IFCFLOWTERMINAL('9XvctVUKr0kugbFTf53O9L',$,'Toalett',$,$,#16,$,'tag-wc');
+#33=IFCFURNISHINGELEMENT('AXvctVUKr0kugbFTf53O9L',$,'Benk',$,$,#16,$,'tag-bench');
+#34=IFCRELCONTAINEDINSPATIALSTRUCTURE('BXvctVUKr0kugbFTf53O9L',$,$,$,(#32,#33),#30);
+/* Control: a wall directly in the storey. */
+#40=IFCWALL('DXvctVUKr0kugbFTf53O9L',$,'Wall-001',$,$,#16,$,'tag-wall');
+#41=IFCRELCONTAINEDINSPATIALSTRUCTURE('EXvctVUKr0kugbFTf53O9L',$,$,$,(#40),#12);
+/* GH #203: an opening in the wall, with no containment of its own. It
+   resolves to the wall's storey through IfcRelVoidsElement. */
+#50=IFCOPENINGELEMENT('FXvctVUKr0kugbFTf53O9L',$,'Opening',$,$,#16,$,$);
+#51=IFCRELVOIDSELEMENT('GXvctVUKr0kugbFTf53O9L',$,$,$,#40,#50);
+ENDSEC;
+END-ISO-10303-21;

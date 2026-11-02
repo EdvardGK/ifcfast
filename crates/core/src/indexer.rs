@@ -1146,6 +1146,15 @@ fn extract_product(
             // null / star, skip exactly one enum (Operation/Partitioning),
             // then the next enum is PredefinedType. See #74.
             predefined = predefined_for_door_window(fields);
+        } else if !is_ifc2x3 && type_name == b"IFCDISTRIBUTIONPORT" {
+            // IFC4+ IfcDistributionPort ends
+            //   …, FlowDirection(7), PredefinedType(8), SystemType(9)
+            // so the trailing enum is SystemType (`.CONVEYING.` where
+            // PredefinedType is `.CABLECARRIER.`). Read the slot by
+            // position (GH #235).
+            if let Some(Field::Enum(e)) = fields.get(8).map(|f| parse_field(f)) {
+                predefined = std::str::from_utf8(e).ok().map(str::to_string);
+            }
         } else {
             for f in fields.iter().rev() {
                 match parse_field(f) {
@@ -1767,6 +1776,30 @@ FILE_SCHEMA(('IFC2X3'));\nENDSEC;\n";
             Some("INTERNAL"),
             "IFC4 IfcSpace's trailing enum IS PredefinedType"
         );
+    }
+
+    /// IFC4 IfcDistributionPort: PredefinedType is attr 8, followed by the
+    /// SystemType enum (GH #235). IFC2X3 has FlowDirection only → None.
+    #[test]
+    fn distribution_port_predefined_type_is_positional() {
+        let port4 = "#1=IFCDISTRIBUTIONPORT('1ByefIL6L3jGYiL2dp7UtT',$,'Port_0','Flow',$,$,$,\
+                     .SOURCEANDSINK.,.CABLECARRIER.,.CONVEYING.);\n";
+        let out4 = index(format!("{HDR4}DATA;\n{port4}ENDSEC;\nEND-ISO-10303-21;\n").as_bytes());
+        assert_eq!(
+            out4.product_predefined_type[0].as_deref(),
+            Some("CABLECARRIER")
+        );
+        let unset = port4.replace(".CABLECARRIER.", "$");
+        let out4 = index(format!("{HDR4}DATA;\n{unset}ENDSEC;\nEND-ISO-10303-21;\n").as_bytes());
+        assert_eq!(
+            out4.product_predefined_type[0], None,
+            "unset PredefinedType must not fall back to SystemType"
+        );
+        let port2x3 =
+            "#1=IFCDISTRIBUTIONPORT('1ByefIL6L3jGYiL2dp7UtT',$,'Port_0','Flow',$,$,$,.SINK.);\n";
+        let out2x3 =
+            index(format!("{HDR2X3}DATA;\n{port2x3}ENDSEC;\nEND-ISO-10303-21;\n").as_bytes());
+        assert_eq!(out2x3.product_predefined_type[0], None);
     }
 
     /// IFC2X3 IfcRoof's trailing enum is ShapeType, not PredefinedType.

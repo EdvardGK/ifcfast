@@ -250,6 +250,45 @@ fn subset_of_all_ids_is_byte_identical_to_source() {
 }
 
 #[test]
+fn subset_of_uncontained_seed_keeps_project_and_units() {
+    // GH #239: an IfcOpeningElement has no spatial containment, so the spine
+    // climb never reaches IfcProject. The subset must still carry the
+    // project and its IfcUnitAssignment, or a mm model re-opens as metres.
+    let mut checked = 0;
+    for path in ifc_fixtures() {
+        let doc = Doc::open_editable(&path).expect("open");
+        let src = fs::read(&path).expect("read");
+        if !contains(&src, b"IFCPROJECT(") || !contains(&src, b"IFCUNITASSIGNMENT(") {
+            continue;
+        }
+        for &seed in doc.ids() {
+            if !doc
+                .record_bytes(seed)
+                .is_some_and(|b| contains(b, b"IFCOPENINGELEMENT("))
+            {
+                continue;
+            }
+            let (bytes, _) = subset(&doc, &[seed]);
+            assert!(
+                contains(&bytes, b"IFCPROJECT("),
+                "no IfcProject, seed #{seed} in {path:?}"
+            );
+            assert!(
+                contains(&bytes, b"IFCUNITASSIGNMENT("),
+                "no IfcUnitAssignment, seed #{seed} in {path:?}"
+            );
+            assert_no_dropped_deps(&Doc::from_bytes(bytes), &doc);
+            checked += 1;
+        }
+    }
+    assert!(checked > 0, "no fixture has an IfcOpeningElement");
+}
+
+fn contains(hay: &[u8], needle: &[u8]) -> bool {
+    hay.windows(needle.len()).any(|w| w == needle)
+}
+
+#[test]
 fn subset_single_seed_reopens_self_contained() {
     // Every single-product seed across the fixtures yields a self-contained
     // subset — no dangling ref, seed present.

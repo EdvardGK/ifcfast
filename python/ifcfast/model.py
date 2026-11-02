@@ -1979,6 +1979,7 @@ class Model:
                 self.storey_building,
                 product_guids,
                 storey_guids={s.guid for s in self.storeys},
+                voids=self.voids,
             )
         return self._graph
 
@@ -1990,13 +1991,18 @@ class Model:
         project). Otherwise falls back to whichever spatial container
         the element sits in via ``IfcRelContainedInSpatialStructure``
         — a storey, but also a site / building / space when the file
-        uses non-storey containment (GH #32). ``None`` if neither.
+        uses non-storey containment (GH #32). For an opening with
+        neither, the element it voids (``IfcRelVoidsElement``, GH #203).
+        ``None`` if none of these.
         """
         g = self._graph_index()
         p = g.parent_of.get(guid)
         if p is not None:
             return p
-        return g.container_of.get(guid)
+        c = g.container_of.get(guid)
+        if c is not None:
+            return c
+        return g.void_host_of.get(guid)
 
     def children(self, guid: str) -> list[str]:
         """Unified direct children.
@@ -2005,18 +2011,25 @@ class Model:
         products plus any aggregate children (e.g., IfcSpaces) — products
         first to keep ordering stable. For aggregates (buildings, sites,
         projects, assemblies), returns the ``IfcRelAggregates`` children.
+        A voided element also lists the openings that void it (GH #203).
         Empty if there are no children or the guid is unknown.
         """
         g = self._graph_index()
         spatial_kids = g.products_in.get(guid, ())
         agg_kids = g.children_of.get(guid, ())
-        if not spatial_kids:
+        # Openings voiding this element, unless they have a parent of
+        # their own (then they are reached through it) — mirrors parent().
+        void_kids = [
+            o for o in g.openings_of.get(guid, ())
+            if o not in g.parent_of and o not in g.container_of
+        ]
+        if not spatial_kids and not void_kids:
             return list(agg_kids)
-        if not agg_kids:
+        if not agg_kids and not void_kids:
             return list(spatial_kids)
         seen: set[str] = set(spatial_kids)
         out: list[str] = list(spatial_kids)
-        for k in agg_kids:
+        for k in (*agg_kids, *void_kids):
             if k not in seen:
                 seen.add(k)
                 out.append(k)
@@ -2627,11 +2640,13 @@ class _GraphIndex:
         "container_kind_of",
         "product_guids",
         "storey_guids",
+        "void_host_of",
+        "openings_of",
     )
 
     def __init__(
         self, contained_in, aggregates, storey_building, product_guids,
-        storey_guids=None,
+        storey_guids=None, voids=None,
     ):
         self.parent_of: dict[str, str] = {}
         self.children_of: dict[str, list[str]] = {}
@@ -2659,6 +2674,19 @@ class _GraphIndex:
         # storey aggregated directly under IfcSite has no entry in
         # `building_of`).
         self.storey_guids: set[str] = set(storey_guids or ())
+        # IfcRelVoidsElement opening -> host, and host -> [openings]. An
+        # opening has no containment or aggregation of its own; it sits
+        # where its host sits (GH #203). Used as the last-resort hop.
+        self.void_host_of: dict[str, str] = {}
+        self.openings_of: dict[str, list[str]] = {}
+        if voids is not None and len(voids) > 0:
+            for opening, host in zip(
+                voids["opening_guid"].values, voids["host_guid"].values
+            ):
+                if opening is None or host is None:
+                    continue
+                self.void_host_of[opening] = host
+                self.openings_of.setdefault(host, []).append(opening)
 
         if len(aggregates) > 0:
             for child, parent in zip(
@@ -2716,8 +2744,9 @@ def _walk_to_storey(g: "_GraphIndex", guid: str, _budget: int = 16) -> Optional[
 
     Tries (in order): direct storey containment, then chains through
     non-storey spatial containers (an ``IfcSpace`` contained in a
-    storey is the canonical case), then walks aggregate parents until
-    a storey is found. The depth budget guards against malformed
+    storey is the canonical case), then walks aggregate parents, and
+    for an opening with neither, its ``IfcRelVoidsElement`` host (GH
+    #203), until a storey is found. The depth budget guards against malformed
     cyclic data in the wild.
 
     Returns ``None`` for elements that genuinely have no storey above
@@ -2739,7 +2768,7 @@ def _walk_to_storey(g: "_GraphIndex", guid: str, _budget: int = 16) -> Optional[
                 return container
             cur = container
             continue
-        parent = g.parent_of.get(cur)
+        parent = g.parent_of.get(cur) or g.void_host_of.get(cur)
         if parent is None:
             return None
         if parent in g.storey_guids:
@@ -2998,6 +3027,12 @@ def _index_native(
     # (shouldn't happen in valid IFC but be defensive).
     parent_step_to_guid: dict[int, str] = {}
     parent_kind_by_step: dict[int, str] = {}
+    # Products first: an IfcSpace (and a bodied IfcSite) is also in the
+    # product table, and its spatial kind must win, or the space's
+    # containment edges are dropped as "container is a product" (GH #236).
+    for sid, g in product_step_to_guid.items():
+        parent_step_to_guid[sid] = g
+        parent_kind_by_step[sid] = "product"
     for sid, g in space_step_to_guid.items():
         parent_step_to_guid[sid] = g
         parent_kind_by_step[sid] = "space"
@@ -3013,9 +3048,6 @@ def _index_native(
     for sid, g in storey_step_to_guid.items():
         parent_step_to_guid[sid] = g
         parent_kind_by_step[sid] = "storey"
-    for sid, g in product_step_to_guid.items():
-        parent_step_to_guid[sid] = g
-        parent_kind_by_step[sid] = "product"
 
     parent_lookup: dict[int, str] = {}
     aggregates_rows: list[tuple[str, str, str]] = []
@@ -3075,6 +3107,21 @@ def _index_native(
     # product into a step_id → storey_guid map; direct storey containment
     # keeps precedence (it's the first thing `_walk_to_storey` checks),
     # and the walk is cycle-guarded by its depth budget + seen-set.
+
+    # Voids — IfcRelVoidsElement (opening_step_id, host_step_id) marshalled
+    # from Rust. Resolve to guids via the product step→guid lookup; openings
+    # are products too, so the same map works for both sides. Built before
+    # the storey resolution: an opening resolves through its host (GH #203).
+    voids_rows: list[tuple[str, str]] = []
+    voids_raw = raw.get("voids") or {}
+    for opening, host in zip(
+        voids_raw.get("opening", []), voids_raw.get("host", [])
+    ):
+        og = product_step_to_guid.get(int(opening))
+        hg = product_step_to_guid.get(int(host))
+        if og is not None and hg is not None:
+            voids_rows.append((og, hg))
+
     import pandas as _pd_resolve
 
     _resolve_graph = _GraphIndex(
@@ -3091,6 +3138,9 @@ def _index_native(
         ),
         set(product_step_to_guid.values()),
         storey_guids={sr.guid for sr in storeys},
+        voids=_pd_resolve.DataFrame(
+            voids_rows, columns=["opening_guid", "host_guid"]
+        ),
     )
     storey_guid_by_step: dict[int, Optional[str]] = {}
     for _sid_int, _guid in product_step_to_guid.items():
@@ -3199,19 +3249,6 @@ def _index_native(
         type_objects.append(
             TypeObjectRow(guid=tguid, entity=tent, name=tname, step_id=int(tsid))
         )
-
-    # Voids — IfcRelVoidsElement (opening_step_id, host_step_id) marshalled
-    # from Rust. Resolve to guids via the product step→guid lookup; openings
-    # are products too, so the same map works for both sides.
-    voids_rows: list[tuple[str, str]] = []
-    voids_raw = raw.get("voids") or {}
-    for opening, host in zip(
-        voids_raw.get("opening", []), voids_raw.get("host", [])
-    ):
-        og = product_step_to_guid.get(int(opening))
-        hg = product_step_to_guid.get(int(host))
-        if og is not None and hg is not None:
-            voids_rows.append((og, hg))
 
     import pandas as pd
 
