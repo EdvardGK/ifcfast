@@ -891,7 +891,16 @@ def _resolve_step_escapes(s: str) -> str:
 #       stay). A host its openings fully consume is
 #       no longer emitted. `volume_m3`, bboxes and triangle counts move
 #       on affected hosts only. Columns unchanged.
-_CACHE_SCHEMA_VERSION = 44
+#   45: (reserved — coordinator branch, GH #229 / #231 shell repair.)
+#   46: GH #234 — geometry change: `IfcCompositeProfileDef` swept areas
+#       (extrusion and revolution) mesh as the concatenation of each
+#       member's sweep (members flattened recursively, each with its own
+#       Position). Products that did not mesh at all (HI90_ARK_MMI700: 19
+#       Archicad walls) now do. `profile_invalid` gains the value
+#       "overlapping" (members share area, counted twice). An unsupported
+#       member fails the whole item (unhandled marker), never a partial
+#       mesh. Columns unchanged.
+_CACHE_SCHEMA_VERSION = 46
 
 _FIELD_RE = re.compile(r"\(\s*(.*?)\s*\)\s*;", re.DOTALL)
 

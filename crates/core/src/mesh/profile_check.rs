@@ -37,6 +37,10 @@ pub enum ProfileDefect {
     /// A hole lies outside the outer loop (it subtracts nothing a kernel
     /// would subtract; earcut's result is undefined).
     HoleOutside,
+    /// Two regions of a multi-region profile (`IfcCompositeProfileDef`,
+    /// GH #234) share area. Each region is swept separately, so the
+    /// shared area is counted twice in the mesh volume.
+    Overlapping,
 }
 
 impl ProfileDefect {
@@ -46,6 +50,7 @@ impl ProfileDefect {
             ProfileDefect::SelfIntersecting => "self_intersecting",
             ProfileDefect::Degenerate => "degenerate",
             ProfileDefect::HoleOutside => "hole_outside",
+            ProfileDefect::Overlapping => "overlapping",
         }
     }
 }
@@ -279,6 +284,161 @@ pub fn check(p: &Polygon2D) -> Option<ProfileDefect> {
     None
 }
 
+/// Where a point sits relative to a region's material (outer minus holes).
+#[derive(PartialEq, Eq)]
+enum Side {
+    Inside,
+    Outside,
+    Boundary,
+}
+
+fn classify(p: (f64, f64), outer: &[(f64, f64)], holes: &[Vec<(f64, f64)>], tol: f64) -> Side {
+    match point_in_loop(p, outer, tol) {
+        None => Side::Boundary,
+        Some(false) => Side::Outside,
+        Some(true) => {
+            for h in holes {
+                match point_in_loop(p, h, tol) {
+                    Some(true) => return Side::Outside,
+                    None => return Side::Boundary,
+                    Some(false) => {}
+                }
+            }
+            Side::Inside
+        }
+    }
+}
+
+/// Validate a multi-region profile (GH #234 — the flattened members of
+/// an `IfcCompositeProfileDef`, each swept separately). Each region must
+/// pass [`check`]; across regions, any shared *area* is
+/// [`ProfileDefect::Overlapping`] (the sweep would count it twice).
+/// Shared vertices and shared/collinear edges are not overlap — that is
+/// how a composite partitions a profile.
+///
+/// Overlap test, per region pair with intersecting bboxes: a proper edge
+/// crossing, or a vertex / earcut-triangle centroid of one region strictly
+/// inside the other's material. The centroid probe catches containment
+/// and duplicates whose vertices all lie on the other's boundary. It is a
+/// tripwire (no false positives on partitions), not a full 2D Boolean.
+pub fn check_regions(regions: &[Polygon2D]) -> Option<ProfileDefect> {
+    for r in regions {
+        if let Some(d) = check(r) {
+            return Some(d);
+        }
+    }
+    if regions.len() < 2 {
+        return None;
+    }
+
+    struct Region {
+        outer: Vec<(f64, f64)>,
+        holes: Vec<Vec<(f64, f64)>>,
+        probes: Vec<(f64, f64)>,
+        bbox: (f64, f64, f64, f64),
+    }
+    let (mut gx0, mut gy0, mut gx1, mut gy1) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
+    let rs: Vec<Region> = regions
+        .iter()
+        .map(|p| {
+            let outer = clean_loop(&p.outer);
+            let holes: Vec<Vec<(f64, f64)>> = p.holes.iter().map(|h| clean_loop(h)).collect();
+            let (mut x0, mut y0, mut x1, mut y1) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
+            for &(x, y) in &outer {
+                x0 = x0.min(x);
+                x1 = x1.max(x);
+                y0 = y0.min(y);
+                y1 = y1.max(y);
+            }
+            gx0 = gx0.min(x0);
+            gx1 = gx1.max(x1);
+            gy0 = gy0.min(y0);
+            gy1 = gy1.max(y1);
+            let mut probes: Vec<(f64, f64)> = outer.clone();
+            let flat: Vec<Vec2> = p
+                .outer
+                .iter()
+                .copied()
+                .chain(p.holes.iter().flat_map(|h| h.iter().copied()))
+                .collect();
+            for t in crate::mesh::extrusion::triangulate(p).chunks_exact(3) {
+                let (a, b, c) = (flat[t[0]], flat[t[1]], flat[t[2]]);
+                probes.push((
+                    (a.x as f64 + b.x as f64 + c.x as f64) / 3.0,
+                    (a.y as f64 + b.y as f64 + c.y as f64) / 3.0,
+                ));
+            }
+            Region {
+                outer,
+                holes,
+                probes,
+                bbox: (x0, y0, x1, y1),
+            }
+        })
+        .collect();
+    if !(gx0.is_finite() && gy0.is_finite() && gx1.is_finite() && gy1.is_finite()) {
+        return None;
+    }
+    let diag = (gx1 - gx0).hypot(gy1 - gy0);
+    let max_abs = gx0.abs().max(gx1.abs()).max(gy0.abs()).max(gy1.abs());
+    let tol = (REL_TOL * diag).max(ULP_TOL * max_abs);
+
+    let segs_of = |r: &Region| -> Vec<Seg> {
+        let mut out = Vec::new();
+        for l in std::iter::once(&r.outer).chain(r.holes.iter()) {
+            let n = l.len();
+            for i in 0..n {
+                let (a, b) = (l[i], l[(i + 1) % n]);
+                out.push(Seg {
+                    a,
+                    b,
+                    loop_id: 0,
+                    idx: i,
+                    loop_len: n,
+                    xmin: a.0.min(b.0),
+                    xmax: a.0.max(b.0),
+                    ymin: a.1.min(b.1),
+                    ymax: a.1.max(b.1),
+                });
+            }
+        }
+        out
+    };
+
+    for i in 0..rs.len() {
+        for j in (i + 1)..rs.len() {
+            let (a, b) = (&rs[i], &rs[j]);
+            if a.bbox.0 > b.bbox.2 + tol
+                || b.bbox.0 > a.bbox.2 + tol
+                || a.bbox.1 > b.bbox.3 + tol
+                || b.bbox.1 > a.bbox.3 + tol
+            {
+                continue;
+            }
+            let (sa, sb) = (segs_of(a), segs_of(b));
+            for s in &sa {
+                for t in &sb {
+                    if t.xmin > s.xmax || t.xmax < s.xmin || t.ymin > s.ymax || t.ymax < s.ymin {
+                        continue;
+                    }
+                    if crosses(s, t, tol) {
+                        return Some(ProfileDefect::Overlapping);
+                    }
+                }
+            }
+            for (p, q) in [(a, b), (b, a)] {
+                if p.probes
+                    .iter()
+                    .any(|&v| classify(v, &q.outer, &q.holes, tol) == Side::Inside)
+                {
+                    return Some(ProfileDefect::Overlapping);
+                }
+            }
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -291,6 +451,76 @@ mod tests {
                 .map(|h| h.iter().map(|&(x, y)| Vec2::new(x, y)).collect())
                 .collect(),
         }
+    }
+
+    fn rect(x0: f32, y0: f32, x1: f32, y1: f32) -> Polygon2D {
+        poly(&[(x0, y0), (x1, y0), (x1, y1), (x0, y1)], &[])
+    }
+
+    #[test]
+    fn regions_partition_is_valid() {
+        // GH #234 corpus shape: two triangles touching at one vertex.
+        let a = poly(&[(-190., 190.), (-220., 190.), (-165.2, 165.2)], &[]);
+        let b = poly(&[(-165.2, 165.2), (0., 0.), (200., 0.)], &[]);
+        assert_eq!(check_regions(&[a, b]), None);
+        // Shared edge; a U-shape with its notch filled (all filler
+        // vertices on the U's boundary) — partitions, not overlap.
+        assert_eq!(
+            check_regions(&[rect(0., 0., 1., 1.), rect(1., 0., 2., 1.)]),
+            None
+        );
+        let u = poly(
+            &[
+                (0., 0.),
+                (3., 0.),
+                (3., 2.),
+                (2., 2.),
+                (2., 1.),
+                (1., 1.),
+                (1., 2.),
+                (0., 2.),
+            ],
+            &[],
+        );
+        assert_eq!(check_regions(&[u, rect(1., 1., 2., 2.)]), None);
+        // Filling a hole exactly.
+        let holed = poly(
+            &[(0., 0.), (4., 0.), (4., 4.), (0., 4.)],
+            &[&[(1., 1.), (1., 3.), (3., 3.), (3., 1.)]],
+        );
+        assert_eq!(check_regions(&[holed, rect(1., 1., 3., 3.)]), None);
+    }
+
+    #[test]
+    fn regions_overlap_is_flagged() {
+        let ov = Some(ProfileDefect::Overlapping);
+        // Proper crossing.
+        assert_eq!(
+            check_regions(&[rect(0., 0., 2., 2.), rect(1., 1., 3., 3.)]),
+            ov
+        );
+        // Collinear partial overlap (no proper crossing, no vertex inside).
+        assert_eq!(
+            check_regions(&[rect(0., 0., 2., 1.), rect(1., 0., 3., 1.)]),
+            ov
+        );
+        // Containment and exact duplicate.
+        assert_eq!(
+            check_regions(&[rect(0., 0., 4., 4.), rect(1., 1., 2., 2.)]),
+            ov
+        );
+        assert_eq!(
+            check_regions(&[rect(0., 0., 1., 1.), rect(0., 0., 1., 1.)]),
+            ov
+        );
+        // A per-region defect still wins.
+        let bowtie = poly(&[(0., 0.), (1., 1.), (1., 0.), (0., 1.)], &[]);
+        assert_eq!(
+            check_regions(&[bowtie, rect(5., 5., 6., 6.)]),
+            Some(ProfileDefect::SelfIntersecting)
+        );
+        // A single region is just `check`.
+        assert_eq!(check_regions(&[rect(0., 0., 1., 1.)]), None);
     }
 
     #[test]

@@ -516,8 +516,11 @@ describing via `pq.read_schema(...)`):
   valid region: `"self_intersecting"` (two edges properly cross —
   earcut then covers a region the author did not mean),
   `"degenerate"` (< 3 distinct vertices, or mean width `2·area /
-  perimeter` below 1e-6 of the profile's extent — collapsed to a line)
-  or `"hole_outside"` (a void loop outside the outer loop). Null when
+  perimeter` below 1e-6 of the profile's extent — collapsed to a line),
+  `"hole_outside"` (a void loop outside the outer loop) or
+  `"overlapping"` (GH #234: two members of an `IfcCompositeProfileDef`
+  share area — each member is swept separately, so the shared area is
+  counted twice). Null when
   every profile is valid or the product has none. **Non-null ⇒
   `volume_reliable == False`**; a mesh-derived `volume_method`
   (`"mesh"` / `"mesh_open"`) becomes `"mesh_profile_invalid"`,
