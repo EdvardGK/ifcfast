@@ -7,7 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-Cache schema v48.
+## [0.6.5] - 2026-11-02
+
+Discovery-wave batch (v0.6.4 corpus sweep against ifcopenshell 0.8.5 on 19
+models) plus the subset report from the Skiplum substrate worker. Every
+geometry change passed the oracle gate on G55 with zero class drift, and
+wasm parity matches the wheel 17/17. Cache schema v48.
 
 ### Added
 
