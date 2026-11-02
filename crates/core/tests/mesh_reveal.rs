@@ -1177,6 +1177,178 @@ fn parts_transform_reconstructs_baked_local_vertices() {
         err_far < 64.0,
         "parts transform must land within f32 quantum at 5e7 (worst error {err_far})"
     );
+
+    // GH #227: an extrusion whose far Position is split onto rep_origin
+    // must keep the invariant too. Checked just past the 10 km far gate
+    // (1.2e7 mm, f32 quantum 1 mm) so the bound is tight, and at the
+    // fixture's NTM magnitude (Y 1.25e9 mm, f32 quantum 128 mm in the
+    // f32 instance column) for the magnitude class only.
+    let ext = far_extrusion_fixture();
+    let err_ext_far = worst_reconstruction_error(&ext);
+    assert!(
+        err_ext_far < 128.0,
+        "extrusion parts transform at NTM magnitude (worst error {err_ext_far})"
+    );
+    let gate = ext
+        .replace("92636623.58515", "12036623.58515")
+        .replace("1247354037.73415", "11354037.73415");
+    let err_ext = worst_reconstruction_error(&gate);
+    assert!(
+        err_ext < 2.0,
+        "extrusion parts transform just past the far gate (worst error {err_ext})"
+    );
+}
+
+fn far_extrusion_fixture() -> String {
+    let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/far_origin_extrusion_position_mm.ifc");
+    std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("{}: {e}", p.display()))
+}
+
+/// Analytic world corners (mm, f64) of the fixture's ramp body: a
+/// centred 37454.59 x 2085 rectangle swept 200 along +Z of the Position
+/// frame `loc` / RefDirection (0.79607, 0.60521, 0).
+fn far_extrusion_analytic_corners(loc: glam::DVec3) -> Vec<glam::DVec3> {
+    use glam::DVec3;
+    let x = DVec3::new(0.79607, 0.60521, 0.0).normalize();
+    let z = DVec3::Z;
+    let y = z.cross(x);
+    let (hx, hy) = (37454.59 / 2.0, 2085.0 / 2.0);
+    let mut out = Vec::new();
+    for sx in [-1.0, 1.0] {
+        for sy in [-1.0, 1.0] {
+            for h in [0.0, 200.0] {
+                out.push(loc + x * (sx * hx) + y * (sy * hy) + z * h);
+            }
+        }
+    }
+    out
+}
+
+/// GH #227: `IfcExtrudedAreaSolid.Position` carrying the georeference
+/// (KNM_LARK ramp `3gvBAx9cjCzg2jOt2$eqfj`) under an identity
+/// ObjectPlacement. Baking that Position into the f32 local vertices put
+/// every corner on the 8 mm (X) / 128 mm (Y) f32 grid — up to 62 mm off.
+/// With the translation split onto `rep_origin` (f64) the Local-frame
+/// vertices + f64 `mesh_anchor` must hit the analytic corners to well
+/// under a millimetre.
+#[test]
+fn far_extrusion_position_meshes_to_mm_accuracy() {
+    use _core::mesh::{mesh_ifc_streaming_framed, BakeFrame};
+    use glam::DVec3;
+
+    struct Cap(Vec<ProductMesh>);
+    impl ProductSink for Cap {
+        fn on_product(&mut self, m: ProductMesh) {
+            self.0.push(m);
+        }
+    }
+    let ifc = far_extrusion_fixture();
+    let mut cap = Cap(Vec::new());
+    mesh_ifc_streaming_framed(ifc.as_bytes(), &mut cap, BakeFrame::Local);
+    assert_eq!(cap.0.len(), 1, "one product expected");
+    let m = &cap.0[0];
+    let anchor = DVec3::new(m.mesh_anchor[0], m.mesh_anchor[1], m.mesh_anchor[2]);
+    let loc = DVec3::new(92636623.58515, 1247354037.73415, 121000.);
+    // The anchor IS the Position location now (identity placements).
+    assert!(
+        (anchor - loc).length() < 1e-6,
+        "mesh_anchor should be the f64 Position location, got {anchor:?}"
+    );
+    let verts: Vec<DVec3> = m
+        .vertices
+        .as_chunks::<3>()
+        .0
+        .iter()
+        .map(|c| DVec3::new(c[0] as f64, c[1] as f64, c[2] as f64) + anchor)
+        .collect();
+    let corners = far_extrusion_analytic_corners(loc);
+    // Every analytic corner is matched by a vertex, and every vertex is a
+    // corner (the rectangle's 8 vertices, nothing else).
+    let nearest = |p: DVec3, set: &[DVec3]| {
+        set.iter()
+            .map(|q| (*q - p).length())
+            .fold(f64::INFINITY, f64::min)
+    };
+    let worst_corner = corners
+        .iter()
+        .map(|c| nearest(*c, &verts))
+        .fold(0.0_f64, f64::max);
+    let worst_vertex = verts
+        .iter()
+        .map(|v| nearest(*v, &corners))
+        .fold(0.0_f64, f64::max);
+    assert!(
+        worst_corner < 0.1 && worst_vertex < 0.1,
+        "far Position extrusion corners off by {worst_corner} mm / stray vertex {worst_vertex} mm \
+         (pre-fix: up to 62 mm on the f32 grid)"
+    );
+}
+
+/// GH #227 guard: a near-origin Position is NOT split — `rep_origin`
+/// stays zero and the legacy f32 bake is untouched, so every ordinary
+/// extrusion's output is unchanged.
+#[test]
+fn near_extrusion_position_keeps_legacy_bake() {
+    use _core::entity_table::EntityTable;
+    use _core::mesh::extrusion::{extrude, extrude_params};
+    let near = far_extrusion_fixture()
+        .replace("92636623.58515", "5000.25")
+        .replace("1247354037.73415", "-3000.5");
+    let table = EntityTable::build(near.as_bytes());
+    let p = extrude_params(&table, 65).expect("params");
+    assert_eq!(p.origin, [0.0; 3]);
+    assert!((p.local_xform.w_axis.x - 5000.25).abs() < 1e-3);
+    let mesh = extrude(&table, 65).expect("mesh");
+    assert_eq!(mesh.rep_origin, [0.0; 3]);
+
+    let far = far_extrusion_fixture();
+    let table = EntityTable::build(far.as_bytes());
+    let p = extrude_params(&table, 65).expect("params");
+    assert_eq!(p.origin, [92636623.58515, 1247354037.73415, 121000.]);
+    assert_eq!(p.local_xform.w_axis.truncate(), glam::Vec3::ZERO);
+}
+
+/// GH #228: `IfcCartesianPointList3D` points no face references must not
+/// reach the vertex buffer. Cube A (triangulated, orphan 9.2 m below,
+/// mid-list) and cube B (polygonal, orphan 9 m above, end of list) must
+/// both come back as exactly their 8 cube corners: bbox [0, 1000] in Z,
+/// closed, volume 1 m³.
+#[test]
+fn faceset_orphan_points_are_dropped() {
+    let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/faceset_orphan_points.ifc");
+    let buf = std::fs::read(&p).expect("fixture");
+    let (meshes, _) = mesh_ifc(&buf);
+    assert_eq!(meshes.len(), 2, "two products expected");
+    for m in &meshes {
+        assert_eq!(m.vertices.len(), 8 * 3, "{}: orphan vertex kept", m.guid);
+        let (mut lo, mut hi) = ([f32::INFINITY; 3], [f32::NEG_INFINITY; 3]);
+        for c in m.vertices.as_chunks::<3>().0 {
+            for k in 0..3 {
+                lo[k] = lo[k].min(c[k]);
+                hi[k] = hi[k].max(c[k]);
+            }
+        }
+        let x0 = if m.guid == "2abeJIBM57sAgviUE16td7" { 0.0 } else { 3000.0 };
+        let want_lo = [x0, 0.0, 0.0];
+        let want_hi = [x0 + 1000.0, 1000.0, 1000.0];
+        for k in 0..3 {
+            assert!(
+                (lo[k] - want_lo[k]).abs() < 1e-3 && (hi[k] - want_hi[k]).abs() < 1e-3,
+                "{}: bbox {lo:?}..{hi:?}",
+                m.guid
+            );
+        }
+        let q = _core::mesh::qto::compute(&m.vertices, &m.indices, 0.001);
+        assert_eq!(q.mesh_quality, "closed", "{}", m.guid);
+        assert!(
+            (q.volume_best_m3 - 1.0).abs() < 1e-4,
+            "{}: volume {}",
+            m.guid,
+            q.volume_best_m3
+        );
+    }
 }
 
 /// End-to-end style extraction (GH #3): a synthetic IFC4 wall with an

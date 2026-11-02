@@ -1,0 +1,55 @@
+ISO-10303-21;
+HEADER;
+FILE_DESCRIPTION(('ViewDefinition [ReferenceView]'),'2;1');
+FILE_NAME('far_origin_extrusion_position_mm.ifc','2026-11-02T09:00:00',(''),(''),'ifcfast test fixture','ifcfast test fixture','');
+FILE_SCHEMA(('IFC4'));
+ENDSEC;
+DATA;
+/* GH #227 - the georeference rides on IfcExtrudedAreaSolid.Position.
+
+   MILLIMETRE units. Every IfcLocalPlacement is the identity; the NTM
+   georeference of the KNM_LARK ramp (IfcRamp 3gvBAx9cjCzg2jOt2$eqfj,
+   entities #80312-#80316) sits on the extrusion's own Position (#64):
+   location (92636623.58515, 1247354037.73415, 121000.), RefDirection
+   (0.79607, 0.60521, 0.). At that magnitude the f32 grid is 8 mm in X
+   and 128 mm in Y, so baking the Position into the f32 local vertices
+   moved the corners by up to 62 mm. The mesh_anchor / global-shift
+   machinery (GH #188) only sees placement translations and rep_origin,
+   so the fix splits the Position translation onto rep_origin in f64.
+
+   Geometry: IfcRectangleProfileDef 37454.59 x 2085.00 (centred),
+   extruded 200 mm along +Z of the Position frame. */
+#1=IFCPROJECT('2nYw1Qh0P8AuKc8B3zF1aa',$,'Far Extrusion Position',$,$,$,$,(#10),#8);
+#2=IFCSIUNIT(*,.LENGTHUNIT.,.MILLI.,.METRE.);
+#3=IFCSIUNIT(*,.AREAUNIT.,$,.SQUARE_METRE.);
+#4=IFCSIUNIT(*,.VOLUMEUNIT.,$,.CUBIC_METRE.);
+#8=IFCUNITASSIGNMENT((#2,#3,#4));
+#5=IFCCARTESIANPOINT((0.,0.,0.));
+#6=IFCDIRECTION((0.,0.,1.));
+#7=IFCDIRECTION((1.,0.,0.));
+#9=IFCAXIS2PLACEMENT3D(#5,#6,#7);
+#10=IFCGEOMETRICREPRESENTATIONCONTEXT($,'Model',3,1.E-05,#9,$);
+#11=IFCGEOMETRICREPRESENTATIONSUBCONTEXT('Body','Model',*,*,*,*,#10,$,.MODEL_VIEW.,$);
+#12=IFCSITE('2nYw1Qh0P8AuKc8B3zF1ab',$,'Site',$,$,#32,$,$,.ELEMENT.,$,$,$,$,$);
+#13=IFCBUILDING('2nYw1Qh0P8AuKc8B3zF1ac',$,'Building',$,$,#33,$,$,.ELEMENT.,$,$,$);
+#14=IFCBUILDINGSTOREY('2nYw1Qh0P8AuKc8B3zF1ad',$,'Level 0',$,$,#34,$,$,.ELEMENT.,0.);
+#15=IFCRELAGGREGATES('2nYw1Qh0P8AuKc8B3zF1ae',$,$,$,#1,(#12));
+#16=IFCRELAGGREGATES('2nYw1Qh0P8AuKc8B3zF1af',$,$,$,#12,(#13));
+#17=IFCRELAGGREGATES('2nYw1Qh0P8AuKc8B3zF1ag',$,$,$,#13,(#14));
+/* --- placements: all identity ------------------------------------ */
+#32=IFCLOCALPLACEMENT($,#9);
+#33=IFCLOCALPLACEMENT(#32,#9);
+#34=IFCLOCALPLACEMENT(#33,#9);
+#35=IFCLOCALPLACEMENT(#34,#9);
+/* --- the ramp body: the georeference is on the Position ---------- */
+#60=IFCRECTANGLEPROFILEDEF(.AREA.,$,$,37454.59,2085.);
+#61=IFCCARTESIANPOINT((92636623.58515,1247354037.73415,121000.));
+#62=IFCDIRECTION((0.79607,0.60521,0.));
+#64=IFCAXIS2PLACEMENT3D(#61,$,#62);
+#65=IFCEXTRUDEDAREASOLID(#60,#64,#6,200.);
+#66=IFCSHAPEREPRESENTATION(#11,'Body','SweptSolid',(#65));
+#67=IFCPRODUCTDEFINITIONSHAPE($,$,(#66));
+#70=IFCRAMP('3gvBAx9cjCzg2jOt2$eqfj',$,'Ramp',$,$,#35,#67,$,.STRAIGHT_RUN_RAMP.);
+#71=IFCRELCONTAINEDINSPATIALSTRUCTURE('2nYw1Qh0P8AuKc8B3zF1ah',$,$,$,(#70),#14);
+ENDSEC;
+END-ISO-10303-21;

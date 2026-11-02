@@ -1,0 +1,65 @@
+ISO-10303-21;
+HEADER;
+FILE_DESCRIPTION(('ViewDefinition [ReferenceView]'),'2;1');
+FILE_NAME('faceset_orphan_points.ifc','2026-11-02T09:00:00',(''),(''),'ifcfast test fixture','ifcfast test fixture','');
+FILE_SCHEMA(('IFC4'));
+ENDSEC;
+DATA;
+/* GH #228 - IfcCartesianPointList3D points that no face references.
+
+   MILLIMETRE units, identity placements. Two closed 1000 mm cubes:
+   * #42 IfcTriangulatedFaceSet: an orphan point (500, 500, -9200) is
+     inserted at list position 5 (1-based), mid-list, so the compaction
+     must remap the indices of every point after it. Mirrors the
+     KNM_LARK IfcGeographicElement 2abeJIBM57sAgviUE16td7 (#1543), whose
+     points 10607/10608 sit 9.2 m below every triangle.
+   * #52 IfcPolygonalFaceSet: quad faces, orphan (500, 500, 10000) at
+     the end of the list.
+   The second cube is offset 3000 mm in X by its Position-free
+   placement #36. Expected world bbox: cube A [0,1]^3 m, cube B
+   [3,4]x[0,1]x[0,1] m; volume 1 m^3 each, closed. */
+#1=IFCPROJECT('1OrphanPts0Fixture0000',$,'Orphan points',$,$,$,$,(#10),#8);
+#2=IFCSIUNIT(*,.LENGTHUNIT.,.MILLI.,.METRE.);
+#3=IFCSIUNIT(*,.AREAUNIT.,$,.SQUARE_METRE.);
+#4=IFCSIUNIT(*,.VOLUMEUNIT.,$,.CUBIC_METRE.);
+#8=IFCUNITASSIGNMENT((#2,#3,#4));
+#5=IFCCARTESIANPOINT((0.,0.,0.));
+#6=IFCDIRECTION((0.,0.,1.));
+#7=IFCDIRECTION((1.,0.,0.));
+#9=IFCAXIS2PLACEMENT3D(#5,#6,#7);
+#10=IFCGEOMETRICREPRESENTATIONCONTEXT($,'Model',3,1.E-05,#9,$);
+#11=IFCGEOMETRICREPRESENTATIONSUBCONTEXT('Body','Model',*,*,*,*,#10,$,.MODEL_VIEW.,$);
+#12=IFCSITE('1OrphanPts0Fixture0001',$,'Site',$,$,#32,$,$,.ELEMENT.,$,$,$,$,$);
+#13=IFCBUILDING('1OrphanPts0Fixture0002',$,'Building',$,$,#33,$,$,.ELEMENT.,$,$,$);
+#14=IFCBUILDINGSTOREY('1OrphanPts0Fixture0003',$,'Level 0',$,$,#34,$,$,.ELEMENT.,0.);
+#15=IFCRELAGGREGATES('1OrphanPts0Fixture0004',$,$,$,#1,(#12));
+#16=IFCRELAGGREGATES('1OrphanPts0Fixture0005',$,$,$,#12,(#13));
+#17=IFCRELAGGREGATES('1OrphanPts0Fixture0006',$,$,$,#13,(#14));
+#32=IFCLOCALPLACEMENT($,#9);
+#33=IFCLOCALPLACEMENT(#32,#9);
+#34=IFCLOCALPLACEMENT(#33,#9);
+#35=IFCLOCALPLACEMENT(#34,#9);
+#30=IFCCARTESIANPOINT((3000.,0.,0.));
+#31=IFCAXIS2PLACEMENT3D(#30,#6,#7);
+#36=IFCLOCALPLACEMENT(#34,#31);
+/* --- cube A: triangulated, orphan mid-list ----------------------- */
+#41=IFCCARTESIANPOINTLIST3D(((0.,0.,0.),(1000.,0.,0.),(1000.,1000.,0.),(0.,1000.,0.),(500.,500.,-9200.),(0.,0.,1000.),(1000.,0.,1000.),(1000.,1000.,1000.),(0.,1000.,1000.)));
+#42=IFCTRIANGULATEDFACESET(#41,$,.T.,((1,4,3),(1,3,2),(6,7,8),(6,8,9),(1,2,7),(1,7,6),(2,3,8),(2,8,7),(3,4,9),(3,9,8),(4,1,6),(4,6,9)),$);
+#43=IFCSHAPEREPRESENTATION(#11,'Body','Tessellation',(#42));
+#44=IFCPRODUCTDEFINITIONSHAPE($,$,(#43));
+#45=IFCGEOGRAPHICELEMENT('2abeJIBM57sAgviUE16td7',$,'Terrain',$,$,#35,#44,$,.TERRAIN.);
+/* --- cube B: polygonal, orphan at the end ------------------------ */
+#51=IFCCARTESIANPOINTLIST3D(((0.,0.,0.),(1000.,0.,0.),(1000.,1000.,0.),(0.,1000.,0.),(0.,0.,1000.),(1000.,0.,1000.),(1000.,1000.,1000.),(0.,1000.,1000.),(500.,500.,10000.)));
+#53=IFCINDEXEDPOLYGONALFACE((1,4,3,2));
+#54=IFCINDEXEDPOLYGONALFACE((5,6,7,8));
+#55=IFCINDEXEDPOLYGONALFACE((1,2,6,5));
+#56=IFCINDEXEDPOLYGONALFACE((2,3,7,6));
+#57=IFCINDEXEDPOLYGONALFACE((3,4,8,7));
+#58=IFCINDEXEDPOLYGONALFACE((4,1,5,8));
+#52=IFCPOLYGONALFACESET(#51,.T.,(#53,#54,#55,#56,#57,#58),$);
+#59=IFCSHAPEREPRESENTATION(#11,'Body','Tessellation',(#52));
+#60=IFCPRODUCTDEFINITIONSHAPE($,$,(#59));
+#61=IFCBUILDINGELEMENTPROXY('1OrphanPts0Fixture0007',$,'Block',$,$,#36,#60,$,.NOTDEFINED.);
+#62=IFCRELCONTAINEDINSPATIALSTRUCTURE('1OrphanPts0Fixture0008',$,$,$,(#45,#61),#14);
+ENDSEC;
+END-ISO-10303-21;

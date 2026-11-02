@@ -83,6 +83,13 @@ impl From<ExtrudeParams> for PrismParams {
     /// from different products (cross-product `IfcRelVoidsElement`),
     /// rebase into one shared near-origin frame via [`rebase_params`]
     /// first.
+    ///
+    /// `ExtrudeParams::origin` (a far `Position` split off in f64, GH
+    /// #227) is deliberately dropped: the bake loop folds it into the
+    /// product's f64 `mesh_anchor` (via `LocalMesh::rep_origin`), and the
+    /// prism frame contract is "relative to `mesh_anchor`" — so the
+    /// near-origin `local_xform` alone is already the right frame, and
+    /// the far magnitude never enters the f32 matrix.
     fn from(p: ExtrudeParams) -> Self {
         PrismParams {
             profile: p.profile,
@@ -536,6 +543,7 @@ mod tests {
             dir: Vec3::Z,
             depth: 1.5,
             local_xform: Mat4::IDENTITY,
+            origin: [0.0; 3],
         };
         let pp: PrismParams = ep.into();
         assert_eq!(pp.profile.outer.len(), 4);

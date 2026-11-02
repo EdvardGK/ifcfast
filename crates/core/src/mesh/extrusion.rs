@@ -17,7 +17,7 @@ use glam::{Mat4, Vec3};
 
 use crate::entity_table::EntityTable;
 use crate::lexer::{parse_field, split_top_level_args, Field};
-use crate::mesh::placement::axis_placement_3d_from_id;
+use crate::mesh::placement::{axis_placement_3d_f64, axis_placement_3d_from_id};
 use crate::mesh::profile::{self, Polygon2D};
 
 /// Triangle-list mesh in local 3D coordinates.
@@ -28,8 +28,11 @@ use crate::mesh::profile::{self, Polygon2D};
 /// bake loop adds it back through an f64 anchor so a transform that
 /// baked huge world coords into the geometry items (rather than the
 /// `IfcLocalPlacement`) doesn't collapse the mesh under f32. Kernels
-/// that don't rebase (extrusion, profile-dim, csg, revolved) leave it
-/// at `[0, 0, 0]` and behave exactly as before.
+/// that don't rebase (profile-dim, csg, revolved) leave it at
+/// `[0, 0, 0]` and behave exactly as before. An extrusion leaves it at
+/// zero too unless its `Position` sits beyond the far-origin gate
+/// (GH #227): that translation then rides here in f64 instead of being
+/// baked into the f32 vertices.
 #[derive(Debug, Clone, Default)]
 pub struct LocalMesh {
     pub vertices: Vec<f32>, // [x, y, z, ...]
@@ -84,6 +87,16 @@ pub struct ExtrudeParams {
     pub dir: Vec3,
     pub depth: f32,
     pub local_xform: Mat4,
+    /// f64 translation split OFF `local_xform` (GH #227). Zero — and
+    /// `local_xform` the exact legacy f32 placement — unless the
+    /// `Position` location lies beyond the far-origin gate
+    /// ([`crate::mesh::boolean::is_far`], 10 km once scaled to metres).
+    /// Then `local_xform` keeps only the rotation and this carries the
+    /// location, so the mesh is `origin + local_xform · profile` with the
+    /// f32 part near the origin. [`extrude`] puts it on
+    /// `LocalMesh::rep_origin`, which the bake loop re-applies through
+    /// the f64 anchor exactly like the faceset / brep rebase (GH #153).
+    pub origin: [f64; 3],
 }
 
 /// Parse an `IfcExtrudedAreaSolid`'s parameters without tessellating.
@@ -96,19 +109,22 @@ pub struct ExtrudeParams {
 /// `None` here (the prism fast path then falls back to the general
 /// fold); [`extrude`] handles it through [`extrude_frame`].
 pub fn extrude_params(table: &EntityTable, id: u64) -> Option<ExtrudeParams> {
-    let (swept_id, dir, depth, local_xform) = extrude_frame(table, id)?;
+    let (swept_id, dir, depth, local_xform, origin) = extrude_frame(table, id)?;
     let profile = profile::extract(table, swept_id)?;
     Some(ExtrudeParams {
         profile,
         dir,
         depth,
         local_xform,
+        origin,
     })
 }
 
 /// The non-profile parameters of an `IfcExtrudedAreaSolid`:
-/// `(SweptArea step id, unit direction, depth, Position)`.
-fn extrude_frame(table: &EntityTable, id: u64) -> Option<(u64, Vec3, f32, Mat4)> {
+/// `(SweptArea step id, unit direction, depth, Position, far origin)` —
+/// the last is [`ExtrudeParams::origin`] (GH #227).
+#[allow(clippy::type_complexity)]
+fn extrude_frame(table: &EntityTable, id: u64) -> Option<(u64, Vec3, f32, Mat4, [f64; 3])> {
     let (type_name, args) = table.get(id)?;
     if !type_name.eq_ignore_ascii_case(b"IFCEXTRUDEDAREASOLID") {
         return None;
@@ -144,16 +160,34 @@ fn extrude_frame(table: &EntityTable, id: u64) -> Option<(u64, Vec3, f32, Mat4)>
     };
 
     // Position (arg[1]) — solid-local axis placement; optional.
-    let local_xform = fields
-        .get(1)
-        .copied()
-        .and_then(|f| match parse_field(f) {
-            Field::Ref(pid) => Some(axis_placement_3d_from_id(table, pid)),
-            _ => None,
-        })
+    let position_id = fields.get(1).copied().and_then(|f| match parse_field(f) {
+        Field::Ref(pid) => Some(pid),
+        _ => None,
+    });
+    let mut local_xform = position_id
+        .map(|pid| axis_placement_3d_from_id(table, pid))
         .unwrap_or(Mat4::IDENTITY);
 
-    Some((swept_id, dir, depth, local_xform))
+    // GH #227: a Position that carries a georeference (Revit landscape
+    // exports put ~1e9 mm here under an identity ObjectPlacement) cannot
+    // be baked into f32 vertices — the grid at that magnitude is 8–128
+    // mm. Beyond the shared far-origin gate the location is re-read in
+    // f64 and split off onto `origin` (→ `rep_origin`); only the rotation
+    // stays in the f32 matrix. Near-origin Positions — every ordinary
+    // extrusion — keep the legacy f32 matrix bit-identically.
+    let mut origin = [0.0_f64; 3];
+    if let Some(pid) = position_id {
+        let loc = axis_placement_3d_f64(table, pid).w_axis.truncate();
+        let scale = crate::mesh::profile::length_scale(table) as f64;
+        if crate::mesh::boolean::is_far(loc, scale) {
+            origin = [loc.x, loc.y, loc.z];
+            local_xform.w_axis.x = 0.0;
+            local_xform.w_axis.y = 0.0;
+            local_xform.w_axis.z = 0.0;
+        }
+    }
+
+    Some((swept_id, dir, depth, local_xform, origin))
 }
 
 /// Build a mesh for an `IfcExtrudedAreaSolid` entity (by step_id).
@@ -163,9 +197,11 @@ fn extrude_frame(table: &EntityTable, id: u64) -> Option<(u64, Vec3, f32, Mat4)>
 /// prisms are concatenated into one mesh. A single-region profile takes
 /// exactly the pre-#234 path (bit-identical output).
 pub fn extrude(table: &EntityTable, id: u64) -> Option<LocalMesh> {
-    let (swept_id, dir, depth, local_xform) = extrude_frame(table, id)?;
+    let (swept_id, dir, depth, local_xform, origin) = extrude_frame(table, id)?;
     let regions = profile::extract_regions(table, swept_id)?;
-    Some(extrude_regions(&regions, dir, depth, local_xform))
+    let mut mesh = extrude_regions(&regions, dir, depth, local_xform);
+    mesh.rep_origin = origin;
+    Some(mesh)
 }
 
 /// Extrude every region of a (possibly multi-region) profile into one

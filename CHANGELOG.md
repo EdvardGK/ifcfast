@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-Cache schema v47.
+Cache schema v48.
 
 ### Added
 
@@ -104,6 +104,26 @@ Cache schema v47.
   existing `unhandled:` marker rather than meshing a partial profile.
   Single-member and non-composite profiles are byte-identical; the
   prism-CSG fast path declines multi-member composites (general fold).
+- **Far `IfcExtrudedAreaSolid.Position` no longer baked in f32
+  (GH #227, cache schema v48).** An extrusion whose `Position` carries
+  the georeference (Revit landscape exports, identity `ObjectPlacement`)
+  had that
+  translation baked into the f32 local vertices: at NTM magnitude every
+  corner landed on the 8 mm / 128 mm f32 grid, up to 62 mm off
+  (KNM_LARK ramp). Beyond the 10 km far-origin gate the Position
+  translation is now split off in f64 onto `rep_origin`, like the
+  faceset / brep rebase; `m.mesh()`, `iter_meshes()`, `mesh_qto` and
+  `bundle()` agree with the analytic corners to sub-millimetre.
+  Near-origin Positions are byte-identical.
+
+- **Unreferenced faceset points dropped (GH #228, cache schema v48).**
+  `IfcTriangulatedFaceSet` / `IfcPolygonalFaceSet` copied every
+  `IfcCartesianPointList3D` point into the vertex buffer, including
+  points no face references. On a KNM_LARK terrain two such points sat
+  9.2 m below every triangle and widened the mesh bbox, the QTO AABB /
+  prism bound / signed-tetra origin, and the substrate `bbox_*` /
+  `centroid_xyz`. Only referenced points are emitted now (order kept,
+  indices remapped); facesets without orphans are byte-identical.
 
 - **Section profiles carry their fillets, edge radii and slopes (GH #225,
   cache schema v43).** `IfcIShapeProfileDef` and its L / U / T / Z

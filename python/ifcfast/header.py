@@ -916,7 +916,18 @@ def _resolve_step_escapes(s: str) -> str:
 #       "overlapping" (members share area, counted twice). An unsupported
 #       member fails the whole item (unhandled marker), never a partial
 #       mesh. Columns unchanged.
-_CACHE_SCHEMA_VERSION = 47
+#   48: GH #227 / #228 — geometry change, input side. An
+#       IfcExtrudedAreaSolid whose `Position` lies beyond the 10 km
+#       far-origin gate carries that translation on `rep_origin` in f64
+#       instead of baking it into f32 vertices (KNM_LARK ramp: corners
+#       up to 62 mm off); its `mesh_anchor` / part `instance_transform`
+#       now include the Position. IfcTriangulatedFaceSet /
+#       IfcPolygonalFaceSet drop IfcCartesianPointList3D points no face
+#       references (bbox / AABB / prism bound / centroid were widened by
+#       them — 9.2 m on a KNM_LARK terrain). Near-origin extrusions and
+#       facesets without orphan points are byte-identical. Columns
+#       unchanged.
+_CACHE_SCHEMA_VERSION = 48
 
 _FIELD_RE = re.compile(r"\(\s*(.*?)\s*\)\s*;", re.DOTALL)
 
