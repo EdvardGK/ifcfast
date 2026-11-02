@@ -116,6 +116,34 @@ pub fn eval_segments_2d(pts: &[Vec2], segments_raw: &[u8], unit_scale: f32) -> O
     Some(out)
 }
 
+/// The one circle every segment of an all-`IfcArcIndex` curve lies on
+/// (GH #226), as `(centre, radius)` in f64 — `None` when any segment is a
+/// line, malformed, or on a different circle (centre or radius off by more
+/// than [`crate::mesh::profile::same_circle`]'s tolerance). Says nothing
+/// about whether the arcs close the full turn; the caller checks that on
+/// the sampled loop.
+pub fn common_circle_2d(pts: &[Vec2], segments_raw: &[u8]) -> Option<(DVec2, f64)> {
+    let mut circle: Option<(DVec2, f64)> = None;
+    for seg_field in split_top_level_args(segments_raw) {
+        let (name, body_with_parens) = parse_typed_inline(seg_field)?;
+        if !name.eq_ignore_ascii_case(b"IFCARCINDEX") {
+            return None;
+        }
+        let idx = parse_index_list(body_with_parens)?;
+        if idx.len() != 3 {
+            return None;
+        }
+        let p = |i: usize| pts.get(i.checked_sub(1)?).map(|v| v.as_dvec2());
+        let c = circumcircle_2d(p(idx[0])?, p(idx[1])?, p(idx[2])?)?;
+        match circle {
+            None => circle = Some(c),
+            Some(c0) if crate::mesh::profile::same_circle(c0, c) => {}
+            Some(_) => return None,
+        }
+    }
+    circle
+}
+
 fn signed_area_2d(pts: &[Vec2]) -> f32 {
     let n = pts.len();
     if n < 3 {

@@ -900,7 +900,15 @@ def _resolve_step_escapes(s: str) -> str:
 #       not the trailing SystemType enum. GH #203 — an IfcOpeningElement
 #       with no containment / aggregation resolves `storey_guid` through
 #       the element it voids. Columns unchanged.
-_CACHE_SCHEMA_VERSION = 45
+#   46: GH #226 — geometry change. A circular void inside a circular
+#       outer loop of an IfcArbitraryProfileDefWithVoids (IfcCircle,
+#       trimmed-circle composite, or all-IfcArcIndex polycurve) is
+#       sampled at the outer loop's angles (the outer polygon scaled
+#       r/R about its centre) instead of on its own chord count. Thin
+#       rings no longer self-intersect (HI90_RIE recessed sockets were
+#       +13 %, profile_invalid since v42); vertex counts of such voids
+#       change, areas stay analytic. Columns unchanged.
+_CACHE_SCHEMA_VERSION = 46
 
 _FIELD_RE = re.compile(r"\(\s*(.*?)\s*\)\s*;", re.DOTALL)
 
