@@ -158,6 +158,9 @@ impl<'a> ParquetSink<'a> {
         let props = WriterProperties::builder()
             .set_compression(Compression::ZSTD(ZstdLevel::default()))
             .set_dictionary_enabled(true)
+            // parquet 60 truncates min/max statistics to 64 bytes by
+            // default; pin the pre-bump (parquet 53) untruncated behaviour.
+            .set_statistics_truncate_length(None)
             .build();
 
         let rep_writer =

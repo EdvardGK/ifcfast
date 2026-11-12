@@ -92,6 +92,9 @@ fn write_staged(path: &Path, pairs: &[ClashPair]) -> parquet::errors::Result<()>
     let props = WriterProperties::builder()
         .set_compression(Compression::ZSTD(ZstdLevel::default()))
         .set_dictionary_enabled(true)
+        // parquet 60 truncates min/max statistics to 64 bytes by
+        // default; pin the pre-bump (parquet 53) untruncated behaviour.
+        .set_statistics_truncate_length(None)
         .build();
 
     let mut writer = ArrowWriter::try_new(file, schema.clone(), Some(props))?;

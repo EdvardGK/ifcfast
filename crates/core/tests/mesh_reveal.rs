@@ -1330,7 +1330,11 @@ fn faceset_orphan_points_are_dropped() {
                 hi[k] = hi[k].max(c[k]);
             }
         }
-        let x0 = if m.guid == "2abeJIBM57sAgviUE16td7" { 0.0 } else { 3000.0 };
+        let x0 = if m.guid == "2abeJIBM57sAgviUE16td7" {
+            0.0
+        } else {
+            3000.0
+        };
         let want_lo = [x0, 0.0, 0.0];
         let want_hi = [x0 + 1000.0, 1000.0, 1000.0];
         for k in 0..3 {

@@ -284,6 +284,18 @@ pub const DEFAULT_MAX_EXPANSION_RATIO: f64 = 200.0;
 /// the ratio is both noisy and harmless.
 pub const DEFAULT_RATIO_FLOOR_BYTES: u64 = 8 * 1024 * 1024;
 
+/// Decoded member name. zip >= 9 makes `ZipFile::name()` fallible
+/// (UTF-8-flagged names that are not valid UTF-8); zip 2.x decoded those
+/// lossily at archive open. Keep the 2.x behaviour: the name is only
+/// matched on its ASCII extension and quoted in error messages, never
+/// used as a filesystem path.
+fn member_name<R: io::Read + ?Sized>(f: &zip::read::ZipFile<'_, R>) -> String {
+    match f.name() {
+        Ok(n) => n.into_owned(),
+        Err(_) => String::from_utf8_lossy(f.name_raw()).into_owned(),
+    }
+}
+
 /// Default [`DecompressLimits::max_members`]. Real `.ifczip` containers
 /// hold one model plus a handful of sidecars.
 pub const DEFAULT_MAX_MEMBERS: u64 = 4096;
@@ -466,16 +478,17 @@ pub fn decompress_ifczip_with(zip_bytes: &[u8], limits: &DecompressLimits) -> io
         let f = archive
             .by_index(i)
             .map_err(|e| invalid(format!(".ifczip entry {i}: {e}")))?;
-        let raw_name = f.name();
-        if raw_name.len() > limits.max_name_len {
+        // Bound the stored name bytes before decoding them (zip >= 9
+        // decodes lazily in `name()`).
+        let raw_len = f.name_raw().len();
+        if raw_len > limits.max_name_len {
             return Err(invalid(format!(
-                ".ifczip: entry {i} carries a {}-byte member name, over the limit of {} \
+                ".ifczip: entry {i} carries a {raw_len}-byte member name, over the limit of {} \
                  (DecompressLimits::max_name_len).",
-                raw_name.len(),
                 limits.max_name_len
             )));
         }
-        let name = raw_name.to_ascii_lowercase();
+        let name = member_name(&f).to_ascii_lowercase();
         if name.ends_with(".ifc") || name.ends_with(".step") || name.ends_with(".stp") {
             let size = f.size();
             if best.map(|(_, s)| size > s).unwrap_or(true) {
@@ -490,7 +503,7 @@ pub fn decompress_ifczip_with(zip_bytes: &[u8], limits: &DecompressLimits) -> io
     let mut entry = archive
         .by_index(idx)
         .map_err(|e| invalid(format!(".ifczip member: {e}")))?;
-    let member = entry.name().to_string();
+    let member = member_name(&entry);
 
     // Cheap refusal first: a header that *declares* more than the cap
     // never gets inflated at all.
