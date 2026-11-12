@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Cache schema v49.
 
+### Security
+
+- **Dependencies bumped to clear `cargo audit`.** `parquet` / `arrow`
+  53 → 60 (drops `thrift` 0.17, RUSTSEC-2026-0435), `zip` 2 → 9
+  (RUSTSEC-2026-0367/0368/0369/0429), `zstd` 0.13 → 0.14 / `zstd-safe` 8 /
+  `zstd-sys` 2.1 (RUSTSEC-2026-0391/0403/0410), `memmap2`, `rustix`.
+  Substrate parquet output is unchanged: same Arrow schema and key-value
+  metadata, same data, same statistics and ZSTD compression on G55_RIB;
+  only the footer `created_by` now reads parquet-rs 60.1.0. Statistics
+  truncation is pinned off as in parquet 53. ifczip member-name limit
+  measures the stored name bytes.
+
 ### Fixed
 
 - **L / U / T / Z sections sit in the IFC spec frame (GH #237, cache
