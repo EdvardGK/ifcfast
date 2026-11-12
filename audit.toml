@@ -9,10 +9,9 @@
 ignore = [
     # `paste` 1.0.15 unmaintained (RUSTSEC-2024-0436). No exploit path —
     # it's a proc-macro helper for compile-time identifier pasting.
-    # Reaches us transitively via `parquet` (substrate I/O) and
-    # `simba` (under `nalgebra` + `parry3d`, used by the clash engine).
-    # Both upstreams are tracking the migration to alternatives
-    # (`pastey` / inlined). Re-evaluate when bumping parquet → 58 or
-    # parry3d → 0.28.
+    # Since the parquet 60 bump it reaches us only via `simba` (under
+    # `nalgebra` + `parry3d`, used by the clash engine). Upstream is
+    # tracking the migration to alternatives (`pastey` / inlined).
+    # Re-evaluate when bumping parry3d → 0.28 / nalgebra.
     "RUSTSEC-2024-0436",
 ]
