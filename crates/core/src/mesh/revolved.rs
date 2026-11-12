@@ -132,7 +132,7 @@ pub fn revolved_area_solid(table: &EntityTable, id: u64) -> Option<LocalMesh> {
             let rot = rotation_about_axis(axis_origin, axis_dir, theta);
             let ring_start = (mesh.vertices.len() / 3) as u32;
             ring_starts.push(ring_start);
-            push_ring(&mut mesh, &polygon, &rot, &position);
+            push_ring(&mut mesh, polygon, &rot, &position);
         }
 
         // Side ribbons. For each loop (outer or hole), connect ring k to
@@ -166,7 +166,7 @@ pub fn revolved_area_solid(table: &EntityTable, id: u64) -> Option<LocalMesh> {
         // End caps. The triangulation is shared by both caps — same 2D
         // earcut applied at the first and last ring.
         if needs_caps {
-            let triangulation = triangulate(&polygon);
+            let triangulation = triangulate(polygon);
             let first = ring_starts[0];
             let last = ring_starts[n_steps];
             // Start cap: wound so its outward normal points opposite the

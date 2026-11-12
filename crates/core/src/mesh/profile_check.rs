@@ -361,7 +361,7 @@ pub fn check_regions(regions: &[Polygon2D]) -> Option<ProfileDefect> {
                 .copied()
                 .chain(p.holes.iter().flat_map(|h| h.iter().copied()))
                 .collect();
-            for t in crate::mesh::extrusion::triangulate(p).chunks_exact(3) {
+            for t in crate::mesh::extrusion::triangulate(p).as_chunks::<3>().0 {
                 let (a, b, c) = (flat[t[0]], flat[t[1]], flat[t[2]]);
                 probes.push((
                     (a.x as f64 + b.x as f64 + c.x as f64) / 3.0,
