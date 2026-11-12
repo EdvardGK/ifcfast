@@ -64,19 +64,31 @@ fn composite_profile_meshes_with_analytic_volume() {
 
     let a = by_guid["3Rk2cW9Nt1HfJ4sBpLgD1a"];
     let vol_a = signed_volume(&a.vertices, &a.indices) / 1e9; // mm³ → m³
-    assert!((vol_a - 2.7).abs() < 1e-6, "disjoint composite volume {vol_a} != 2.7");
-    assert!(is_closed(&a.indices), "disjoint composite must be two closed prisms");
+    assert!(
+        (vol_a - 2.7).abs() < 1e-6,
+        "disjoint composite volume {vol_a} != 2.7"
+    );
+    assert!(
+        is_closed(&a.indices),
+        "disjoint composite must be two closed prisms"
+    );
     assert_eq!(a.profile_invalid, None);
 
     let b = by_guid["3Rk2cW9Nt1HfJ4sBpLgD1b"];
     let vol_b = signed_volume(&b.vertices, &b.indices) / 1e9;
-    assert!((vol_b - 6.0).abs() < 1e-6, "overlapping composite mesh volume {vol_b} != 6.0");
+    assert!(
+        (vol_b - 6.0).abs() < 1e-6,
+        "overlapping composite mesh volume {vol_b} != 6.0"
+    );
     assert_eq!(b.profile_invalid, Some(ProfileDefect::Overlapping));
 
     assert!(
         !by_guid.contains_key("3Rk2cW9Nt1HfJ4sBpLgD1c"),
         "unsupported member must not produce a partial mesh"
     );
-    assert_eq!(stats.by_source.get("unhandled:IFCEXTRUDEDAREASOLID"), Some(&1));
+    assert_eq!(
+        stats.by_source.get("unhandled:IFCEXTRUDEDAREASOLID"),
+        Some(&1)
+    );
     assert_eq!(stats.products_profile_invalid, 1);
 }
